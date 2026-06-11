@@ -20,3 +20,6 @@ expect_used = "deny"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+[profile.release]
+overflow-checks = true

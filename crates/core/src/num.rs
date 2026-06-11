@@ -68,12 +68,16 @@ const fn div_ceil_i128(n: i128, d: i128) -> i128 {
 }
 
 /// Cash to BUY `qty` micro-shares at `px_micro` µUSDC/share. Rounds UP (against us).
+/// Callers must pass px_micro ≤ 1_000_000 (the only intended producer is Px::microusdc).
 pub fn buy_cost(px_micro: u64, qty: Qty) -> Usdc {
+    debug_assert!(px_micro <= ONE_USDC_MICRO);
     Usdc(div_ceil_i128(px_micro as i128 * qty.0 as i128, ONE_SHARE_MICRO as i128))
 }
 
 /// Cash received SELLING `qty` micro-shares at `px_micro`. Rounds DOWN (against us).
+/// Callers must pass px_micro ≤ 1_000_000 (the only intended producer is Px::microusdc).
 pub fn sell_proceeds(px_micro: u64, qty: Qty) -> Usdc {
+    debug_assert!(px_micro <= ONE_USDC_MICRO);
     Usdc((px_micro as i128 * qty.0 as i128) / ONE_SHARE_MICRO as i128)
 }
 
@@ -82,7 +86,8 @@ pub fn edge_bps(net: Usdc, basis: Usdc) -> Option<Bps> {
     if basis.0 <= 0 {
         return None;
     }
-    Some(Bps((net.0 * 10_000).div_euclid(basis.0) as i32))
+    let bps = (net.0 * 10_000).div_euclid(basis.0);
+    Some(Bps(bps.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32))
 }
 
 #[cfg(test)]
@@ -105,6 +110,8 @@ mod tests {
         assert!(Px::new(100, TickSize::Cent).is_err());
         assert!(Px::new(1000, TickSize::Milli).is_err());
         assert_eq!(Px::new(46, TickSize::Cent).unwrap().get(), 46);
+        assert!(Px::new(99, TickSize::Cent).is_ok());
+        assert!(Px::new(999, TickSize::Milli).is_ok());
     }
 
     #[test]
@@ -131,6 +138,8 @@ mod tests {
         assert_eq!(edge_bps(Usdc(-1), Usdc(100)), Some(Bps(-100)));
         assert_eq!(edge_bps(Usdc(1), Usdc(0)), None);
         assert_eq!(edge_bps(Usdc(1), Usdc(-5)), None);
+        // dust basis with huge net saturates instead of wrapping negative
+        assert_eq!(edge_bps(Usdc(10_000_000_000_000), Usdc(1)), Some(Bps(i32::MAX)));
     }
 
     proptest! {
