@@ -119,11 +119,11 @@ mod tests {
     fn thirty_bps_floor_filters_thin_edges() {
         // asks sum to 0.998 on a Milli book → ~20 bps gross: below the 30 floor.
         let ts = TickSize::Milli;
-        let p = |t: u16| Px::new(t, ts).unwrap();
+        let mk_px = |t: u16| Px::new(t, ts).unwrap();
         let mut yes = Book::new(ts);
         let mut no = Book::new(ts);
-        yes.apply(Side::Ask, p(499), Qty(100_000_000));
-        no.apply(Side::Ask, p(499), Qty(100_000_000));
+        yes.apply(Side::Ask, mk_px(499), Qty(100_000_000));
+        no.apply(Side::Ask, mk_px(499), Qty(100_000_000));
         let m = Market { tick: ts, ..market(0) };
         assert!(detect(&m, &yes, &no, &zero_gas_params()).is_empty());
     }
@@ -149,5 +149,7 @@ mod tests {
         let (yes, no) = books(46, 50, 55, 52, 100_000_000);
         let ops = detect(&market(0), &yes, &no, &zero_gas_params());
         assert_eq!(ops.len(), 2);
+        assert!(ops.iter().any(|o| o.class == ArbClass::C1Long));
+        assert!(ops.iter().any(|o| o.class == ArbClass::C1Short));
     }
 }

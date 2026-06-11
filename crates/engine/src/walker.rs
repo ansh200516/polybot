@@ -37,7 +37,7 @@ pub struct WalkResult {
 impl WalkResult {
     /// Adapt to an Opportunity for the UNIFORM classes (1–3): every leg fills
     /// exactly `units`. (C4Lp builds Opportunity directly.)
-    pub fn into_opportunity(self, class: crate::ArbClass) -> crate::Opportunity {
+    pub(crate) fn into_opportunity(self, class: crate::ArbClass) -> crate::Opportunity {
         debug_assert!(self.fills.iter().all(|f| f.qty == self.units));
         crate::Opportunity {
             class,
