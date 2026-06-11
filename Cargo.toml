@@ -17,3 +17,6 @@ criterion = "0.5"
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
