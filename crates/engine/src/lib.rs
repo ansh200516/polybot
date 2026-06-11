@@ -1,5 +1,6 @@
 //! Detection engine: sizing walker, arb classes 1–3, LP detector, dedup.
 
+pub mod class1;
 pub mod walker;
 
 use pm_core::instrument::{MarketId, TokenId};

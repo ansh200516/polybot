@@ -34,6 +34,23 @@ pub struct WalkResult {
     pub fills: Vec<LegFill>,
 }
 
+impl WalkResult {
+    /// Adapt to an Opportunity for the UNIFORM classes (1–3): every leg fills
+    /// exactly `units`. (C4Lp builds Opportunity directly.)
+    pub fn into_opportunity(self, class: crate::ArbClass) -> crate::Opportunity {
+        debug_assert!(self.fills.iter().all(|f| f.qty == self.units));
+        crate::Opportunity {
+            class,
+            fills: self.fills,
+            units: self.units,
+            net: self.net,
+            basis: self.basis,
+            edge: self.edge,
+            splits: Vec::new(),
+        }
+    }
+}
+
 /// Signed per-share drag on profit, scaled ×10⁴ so the fee term stays
 /// integral: positive for buys (cost + fee out), negative for sells
 /// (proceeds − fee in). The march folds both via `marginal -= cost`.
