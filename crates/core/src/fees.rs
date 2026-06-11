@@ -1,17 +1,18 @@
 //! Venue fee formula (spec §6). Symmetric in price, rounded up (against us).
 
-use crate::num::{Bps, Qty, Usdc};
+use crate::num::{Bps, Qty, Usdc, ONE_USDC_MICRO};
 
 /// Fee in µUSDC for a fill of `qty` micro-shares at `px_micro` µUSDC/share.
-/// Polymarket schedule shape: rate · min(p, 1−p) · size, levied on the
-/// output asset. Rounded UP. Negative rates are treated as zero.
+/// Polymarket's documented schedule shape: rate · min(p, 1−p) · size. Rounded UP.
+/// Negative rates are treated as zero. Returns µUSDC; the levy asset (USDC vs.
+/// shares) must be re-verified against live docs in M2 before reliance.
 /// Callers must pass px_micro ≤ 1_000_000 (the only intended producer is Px::microusdc).
 pub fn fee_microusdc(rate: Bps, px_micro: u64, qty: Qty) -> Usdc {
-    debug_assert!(px_micro <= 1_000_000);
+    debug_assert!(px_micro <= ONE_USDC_MICRO);
     let rate = i128::from(rate.0.max(0));
-    let base = i128::from(px_micro.min(1_000_000 - px_micro));
+    let base = i128::from(px_micro.min(ONE_USDC_MICRO - px_micro));
     let num = rate * base * i128::from(qty.0);
-    const DEN: i128 = 10_000 * 1_000_000;
+    const DEN: i128 = 10_000 * ONE_USDC_MICRO as i128;
     Usdc((num + DEN - 1) / DEN)
 }
 
@@ -24,6 +25,11 @@ mod tests {
     #[test]
     fn zero_rate_is_free() {
         assert_eq!(fee_microusdc(Bps(0), 460_000, Qty(10_000_000)), Usdc(0));
+    }
+
+    #[test]
+    fn negative_rate_is_free() {
+        assert_eq!(fee_microusdc(Bps(-1), 500_000, Qty(1_000_000)), Usdc(0));
     }
 
     #[test]
@@ -59,6 +65,14 @@ mod tests {
             prop_assert!(f_more_q >= f);
             prop_assert!(f_more_r >= f);
             prop_assert!(f >= 0);
+        }
+
+        #[test]
+        fn symmetric_in_price_proptest(rate in 0i32..500, p in 1u64..500_000, q in 0u64..100_000_000_000) {
+            prop_assert_eq!(
+                fee_microusdc(Bps(rate), p, Qty(q)),
+                fee_microusdc(Bps(rate), 1_000_000 - p, Qty(q))
+            );
         }
     }
 }
