@@ -113,6 +113,7 @@ Never price from midpoints or best quotes. For a candidate basket (one or more l
 - Typed edges: `Implies(a, b)`, `MutuallyExclusive(a, b)`, `Equivalent(a, b)`, `ExhaustivePartition([markets])`.
 - Source of truth: a TOML file, hot-reloaded on change. Each entry: `kind`, market refs, `status: pending | approved | rejected`, `source: manual | suggested`, free-text note.
 - **Only `approved` entries are tradable.** The auto-suggester (M6) writes `pending` entries; a human edits them to `approved`. A wrong link is not an arbitrage.
+- Registry load validation: symmetric relationships (`MutuallyExclusive`, `Equivalent`) are canonicalized to `a ≤ b` and deduplicated; self-referential entries (`a == b`) are rejected; the registry is the sole production constructor of `Partition` values and enforces parallel-lane well-formedness and exhaustiveness verification at build time.
 - The registry exposes connected components over (tokens of one market) ∪ (NegRisk partitions) ∪ (approved relationship edges) — these are the LP scopes and the class-3 trigger index.
 
 ## 10. LP detector (class 4)
