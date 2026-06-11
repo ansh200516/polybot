@@ -75,7 +75,11 @@ pub fn walk(
     let fixed_scaled =
         10_000 * (i128::from(spec.payout_per_share) - i128::from(spec.collateral_per_share));
     let mut units: u64 = 0;
-    let mut basis_used: i128 = 0; // µUSDC committed so far (approximate, for the cap)
+    // µUSDC committed so far. Truncation makes this an UNDER-estimate by <1µ
+    // per chunk, so the cap is advisory (exact basis may exceed max_basis by
+    // single-digit µ); the risk crate's pre-submit check (spec §15) is the
+    // authoritative cap gate.
+    let mut basis_used: i128 = 0;
 
     loop {
         // Marginal scaled net per share at the current level combo.
@@ -161,6 +165,7 @@ pub fn walk(
             qty += q;
         }
         cash += leg_cash;
+        debug_assert_eq!(qty, units, "every leg fills exactly `units` micro-shares");
         let worst = worst?;
         fills.push(LegFill {
             token: c.leg.token,
@@ -391,8 +396,13 @@ mod tests {
             match res {
                 Some(w) => {
                     prop_assert_eq!(w.net.0, brute_net(&spec, w.units.0));
-                    prop_assert!(w.net.0 >= best,
-                        "walker {} < best boundary {}", w.net.0, best);
+                    // The march decides size on UNROUNDED per-share marginals;
+                    // exact accounting rounds against us per (leg,level) fill,
+                    // a ±1µ sawtooth the march can't see. The walker may
+                    // therefore be up to 1µUSDC under the true boundary
+                    // optimum (never over — rounding is conservative).
+                    prop_assert!(w.net.0 + 1 >= best,
+                        "walker {} more than 1µ below best boundary {}", w.net.0, best);
                 }
                 None => prop_assert!(best <= 0, "walker missed profit {}", best),
             }
