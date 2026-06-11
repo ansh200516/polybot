@@ -13,7 +13,7 @@ pub struct Ladder {
     ts: TickSize,
     side: Side,
     lvls: Box<[u64]>, // index = tick; 0 and levels() unused by Px's invariant
-    best: Option<u16>,
+    best: Option<Px>,
 }
 
 impl Ladder {
@@ -39,8 +39,7 @@ impl Ladder {
     }
 
     pub fn best(&self) -> Option<Px> {
-        // Invariant: `best` only ever stores in-range interior ticks.
-        self.best.and_then(|t| Px::new(t, self.ts).ok())
+        self.best
     }
 
     /// Replace the resting quantity at `px` (deltas arrive as absolute levels).
@@ -52,30 +51,31 @@ impl Ladder {
             Side::Ask => cand < cur,
         };
         if qty.0 > 0 {
-            if self.best.is_none_or(|b| improves(t, b)) {
-                self.best = Some(t);
+            if self.best.is_none_or(|b| improves(t, b.get())) {
+                self.best = Some(px);
             }
-        } else if self.best == Some(t) {
+        } else if self.best.map(Px::get) == Some(t) {
             self.best = self.rescan_from(t);
         }
     }
 
     /// Find the next non-empty level strictly worse than `from`.
-    fn rescan_from(&self, from: u16) -> Option<u16> {
-        match self.side {
+    /// Worst case O(levels) — a cache-friendly sequential scan over ≤8 KB —
+    /// but amortized O(1): a level only triggers a rescan once per time it
+    /// became best, which required an insert that paid for it.
+    fn rescan_from(&self, from: u16) -> Option<Px> {
+        let t = match self.side {
             Side::Bid => (1..from).rev().find(|&i| self.lvls[i as usize] > 0),
             Side::Ask => ((from + 1)..self.ts.levels()).find(|&i| self.lvls[i as usize] > 0),
-        }
+        };
+        t.and_then(|i| Px::new(i, self.ts).ok())
     }
 
     /// Non-empty levels from best toward worse.
     pub fn iter_from_best(&self) -> impl Iterator<Item = (Px, Qty)> + '_ {
-        let (start, ascending) = match (self.best, self.side) {
-            (Some(b), Side::Ask) => (b, true),
-            (Some(b), Side::Bid) => (b, false),
-            (None, _) => (0, true), // empty range below
-        };
-        LadderIter { ladder: self, cur: if self.best.is_some() { Some(start) } else { None }, ascending }
+        let start = self.best.map(Px::get);
+        let ascending = matches!(self.side, Side::Ask);
+        LadderIter { ladder: self, cur: start, ascending }
     }
 }
 
@@ -113,6 +113,11 @@ impl<'a> Iterator for LadderIter<'a> {
     }
 }
 
+/// Two sides of one market token's book.
+///
+/// TODO(M2): ingestion wraps this with seq/hash integrity and `last_update`
+/// staleness per spec §5; once those land, `bids`/`asks` should become
+/// private with `apply()` as the sole mutation path.
 #[derive(Clone, Debug)]
 pub struct Book {
     pub bids: Ladder,
@@ -203,6 +208,39 @@ mod tests {
         b.apply(Side::Ask, px(55), Qty(20));
         assert_eq!(b.bids.best(), Some(px(45)));
         assert_eq!(b.asks.best(), Some(px(55)));
+    }
+
+    #[test]
+    fn qty_at_reflects_zeroing() {
+        let mut l = Ladder::new(TickSize::Cent, Side::Ask);
+        l.set(px(40), Qty(7));
+        assert_eq!(l.qty_at(px(40)), Qty(7));
+        l.set(px(40), Qty(0));
+        assert_eq!(l.qty_at(px(40)), Qty(0));
+    }
+
+    #[test]
+    fn clone_is_deep() {
+        let mut a = Ladder::new(TickSize::Cent, Side::Ask);
+        a.set(px(40), Qty(7));
+        let b = a.clone();
+        a.set(px(40), Qty(0));
+        assert_eq!(b.qty_at(px(40)), Qty(7));
+        assert_eq!(b.best(), Some(px(40)));
+    }
+
+    #[test]
+    fn boundary_ticks_iterate() {
+        let mut asks = Ladder::new(TickSize::Cent, Side::Ask);
+        asks.set(px(1), Qty(1));
+        asks.set(px(99), Qty(2));
+        let got: Vec<u16> = asks.iter_from_best().map(|(p, _)| p.get()).collect();
+        assert_eq!(got, vec![1, 99]);
+        let mut bids = Ladder::new(TickSize::Cent, Side::Bid);
+        bids.set(px(1), Qty(1));
+        bids.set(px(99), Qty(2));
+        let got: Vec<u16> = bids.iter_from_best().map(|(p, _)| p.get()).collect();
+        assert_eq!(got, vec![99, 1]);
     }
 
     proptest! {
