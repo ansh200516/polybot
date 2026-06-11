@@ -7,10 +7,6 @@ use crate::{Action, ArbClass, EngineParams, Opportunity};
 use pm_core::book::Book;
 use pm_core::instrument::{Market, Partition, TokenId};
 
-fn fee_of(markets: &[Market], token: TokenId) -> Option<pm_core::num::Bps> {
-    markets.iter().find(|m| m.yes == token || m.no == token).map(|m| m.fee_bps)
-}
-
 /// Detect underpriced YES sets (long) and underpriced NO sets (short, via the
 /// NegRisk identity: a full NO set pays $(n−1) per unit at resolution).
 pub fn detect(
@@ -25,6 +21,11 @@ pub fn detect(
     }
     let n = part.yes_tokens.len() as u64;
 
+    let fee_map: HashMap<TokenId, pm_core::num::Bps> = markets
+        .iter()
+        .flat_map(|m| [(m.yes, m.fee_bps), (m.no, m.fee_bps)])
+        .collect();
+
     let build = |tokens: &[TokenId]| -> Option<Vec<LegSpec<'_>>> {
         tokens
             .iter()
@@ -33,7 +34,7 @@ pub fn detect(
                     token: t,
                     action: Action::Buy,
                     ladder: &books.get(&t)?.asks,
-                    fee_bps: fee_of(markets, t)?,
+                    fee_bps: *fee_map.get(&t)?,
                 })
             })
             .collect()
@@ -53,7 +54,7 @@ pub fn detect(
     if let Some(legs) = build(&part.no_tokens) {
         let spec = BasketSpec {
             legs,
-            payout_per_share: (n - 1) * 1_000_000,
+            payout_per_share: (n - 1) * 1_000_000, // NegRisk identity: n NOs resolve to exactly $(n−1)
             collateral_per_share: 0,
             gas: p.gas.negrisk_convert,
         };
@@ -174,5 +175,15 @@ mod tests {
         let (part, markets, mut books) = fixture(&[(30, 72), (30, 72), (35, 66)], true);
         books.remove(&part.yes_tokens[2]);
         assert!(detect(&part, &markets, &books, &zero_gas_params()).is_empty());
+    }
+
+    #[test]
+    fn both_sets_can_fire_on_crossed_quotes() {
+        // Degenerate: YES set 0.95 AND NO set 1.94 simultaneously cheap.
+        let (part, markets, books) = fixture(&[(30, 62), (30, 62), (35, 70)], true);
+        let ops = detect(&part, &markets, &books, &zero_gas_params());
+        assert_eq!(ops.len(), 2);
+        assert!(ops.iter().any(|o| o.class == ArbClass::C2Long));
+        assert!(ops.iter().any(|o| o.class == ArbClass::C2Short));
     }
 }
