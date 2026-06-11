@@ -119,12 +119,13 @@ Never price from midpoints or best quotes. For a candidate basket (one or more l
 
 Per dirty component, on a background task pool (never in shard tasks):
 
-- **Worlds** `W`: product of outcomes per event in the component (binary market = 2 outcomes; NegRisk partition = its outcomes). Hard cap `max_worlds` (default 4096): components exceeding it are skipped with a warning counter.
+- **Worlds** `W`: product of outcomes per event in the component (binary market = 2 outcomes; NegRisk partition = its outcomes), **pruned to worlds consistent with approved relationship semantics** (`Implies` removes `A ∧ ¬B` worlds, `MutuallyExclusive` removes `A ∧ B`, `Equivalent` removes disagreements) — this pruning is exactly how class-3 violations surface as LP profits. Hard cap `max_worlds` (default 4096) applies to the pre-prune product; components exceeding it are skipped with a warning counter.
 - **Variables**: `b_{i,l} ∈ [0, depth]` buy at ask level `l` of token `i`; `s_{i,l} ∈ [0, depth]` sell into bid level `l`; `c_k ≥ 0` conversion actions (split, merge, NegRisk convert) with their gas costs; `t` free.
 - **Objective**: maximize `t` (guaranteed profit).
 - **Constraints**: for every world `w`: `Σ_i payoff_i(w) · pos_i − total_cost + total_proceeds − gas ≥ t`; budget `total_cost ≤ component cap`; per-market caps; sell quantities bounded by holdings acquirable via splits/conversions within the same basket.
 - Solver: HiGHS (`highs` crate), f64 at the boundary only.
 - **Integer re-validation**: the candidate basket from the solver is re-priced exactly by the §7 walker logic; if exact `t` fails the floor/dust gates, the opportunity is discarded. Solver tolerance can never manufacture an edge.
+- Floor: a class-4 opportunity uses the 30 bps floor when its component contains no relationship edges, and the 100 bps floor when it does (logical links carry resolution risk regardless of which detector found the trade).
 - Required tests: synthetic books where classes 1, 2, and 3 each are the optimum — the LP must recover them (PRD acceptance).
 - Trigger discipline: book deltas mark their component dirty; per-component min re-solve interval; global solver concurrency cap.
 
