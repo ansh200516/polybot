@@ -988,6 +988,14 @@ git add -A && git commit -m "feat(engine): opportunity types and engine params"
 
 ### Task 7: `pm-engine::walker` — the sizing core
 
+> **AS-BUILT NOTE (2026-06-12, post-review):** the committed walker differs from
+> the code blocks below in four reviewed ways — ceil basis-cap accumulation
+> (the floor version below had a cap-blowthrough bug on fee-bearing tail
+> chunks, fixed in `ca98a7f`), an explicit `constrained` flag replacing the
+> `u64::MAX` sentinel, a 1 µUSDC sawtooth tolerance in the optimality
+> proptest, and an added fee-bearing cap test. `crates/engine/src/walker.rs`
+> is authoritative.
+
 **Files:**
 - Modify: `crates/engine/src/walker.rs`
 
