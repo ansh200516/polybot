@@ -1,7 +1,7 @@
 //! Exact numeric core (spec §4). Prices are native-tick integers, sizes are
 //! micro-shares, cash is signed micro-USDC. Rounding is always against us.
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum TickSize {
     /// 0.01 markets — 100 levels per dollar.
     Cent,

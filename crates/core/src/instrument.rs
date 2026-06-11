@@ -2,6 +2,8 @@
 
 use crate::num::{Bps, TickSize};
 
+/// Dense intern index assigned by the registry (M2). This is NOT the venue's
+/// uint256 token id — those never enter the hot path.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TokenId(pub u64);
 
@@ -33,6 +35,16 @@ pub struct Partition {
     pub verified_exhaustive: bool,
 }
 
+impl Partition {
+    /// Structural sanity: ≥2 outcomes and parallel lanes of equal length.
+    /// The registry (M2) is the sole production constructor and enforces this
+    /// at build time; detectors must skip partitions that fail it.
+    pub fn is_well_formed(&self) -> bool {
+        let n = self.markets.len();
+        n >= 2 && self.yes_tokens.len() == n && self.no_tokens.len() == n
+    }
+}
+
 /// Approved logical relationships (spec §9), stated about market YES outcomes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Relationship {
@@ -49,16 +61,27 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    #[test]
-    fn partition_lanes_stay_parallel() {
-        let p = Partition {
+    fn part(n_markets: usize, n_yes: usize, n_no: usize) -> Partition {
+        Partition {
             event: EventId(1),
-            markets: vec![MarketId(1), MarketId(2)],
-            yes_tokens: vec![TokenId(10), TokenId(20)],
-            no_tokens: vec![TokenId(11), TokenId(21)],
+            markets: (0..n_markets as u32).map(MarketId).collect(),
+            yes_tokens: (0..n_yes as u64).map(TokenId).collect(),
+            no_tokens: (100..100 + n_no as u64).map(TokenId).collect(),
             verified_exhaustive: true,
-        };
-        assert_eq!(p.markets.len(), p.yes_tokens.len());
-        assert_eq!(p.markets.len(), p.no_tokens.len());
+        }
+    }
+
+    #[test]
+    fn well_formed_partition_passes() {
+        assert!(part(2, 2, 2).is_well_formed());
+        assert!(part(5, 5, 5).is_well_formed());
+    }
+
+    #[test]
+    fn malformed_partitions_fail() {
+        assert!(!part(2, 1, 2).is_well_formed()); // yes lane short
+        assert!(!part(2, 2, 3).is_well_formed()); // no lane long
+        assert!(!part(1, 1, 1).is_well_formed()); // single outcome
+        assert!(!part(0, 0, 0).is_well_formed()); // empty
     }
 }
