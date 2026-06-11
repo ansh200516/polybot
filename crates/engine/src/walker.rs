@@ -34,8 +34,9 @@ pub struct WalkResult {
     pub fills: Vec<LegFill>,
 }
 
-/// Marginal value of one share of `leg` at price `pm`, scaled ×10⁴ so the fee
-/// term stays integral. Positive contributions reduce profit for buys.
+/// Signed per-share drag on profit, scaled ×10⁴ so the fee term stays
+/// integral: positive for buys (cost + fee out), negative for sells
+/// (proceeds − fee in). The march folds both via `marginal -= cost`.
 fn scaled_leg_cost(action: Action, fee_bps: Bps, pm: u64) -> i128 {
     let p = i128::from(pm);
     let fee = i128::from(fee_bps.0.max(0)) * i128::from(pm.min(1_000_000 - pm));
@@ -75,16 +76,16 @@ pub fn walk(
     let fixed_scaled =
         10_000 * (i128::from(spec.payout_per_share) - i128::from(spec.collateral_per_share));
     let mut units: u64 = 0;
-    // µUSDC committed so far. Truncation makes this an UNDER-estimate by <1µ
-    // per chunk, so the cap is advisory (exact basis may exceed max_basis by
-    // single-digit µ); the risk crate's pre-submit check (spec §15) is the
-    // authoritative cap gate.
+    // µUSDC committed so far, ceil-accumulated per chunk (slight OVER-estimate)
+    // so the advisory cap always binds and terminates; the risk crate's
+    // pre-submit check (spec §15) is the authoritative cap gate.
     let mut basis_used: i128 = 0;
 
     loop {
         // Marginal scaled net per share at the current level combo.
         let mut marginal = fixed_scaled;
         let mut chunk = u64::MAX;
+        let mut constrained = false;
         let mut basis_per_share_scaled: i128 = 10_000 * i128::from(spec.collateral_per_share);
         let mut exhausted = false;
         for c in &cursors {
@@ -97,13 +98,14 @@ pub fn walk(
                         basis_per_share_scaled += cost;
                     }
                     chunk = chunk.min(rem);
+                    constrained = true;
                 }
                 None => {
                     exhausted = true;
                 }
             }
         }
-        if exhausted || marginal <= 0 || chunk == 0 || chunk == u64::MAX {
+        if exhausted || !constrained || marginal <= 0 || chunk == 0 {
             break;
         }
         if basis_per_share_scaled > 0 {
@@ -134,7 +136,13 @@ pub fn walk(
             }
         }
         units += chunk;
-        basis_used += basis_per_share_scaled * i128::from(chunk) / (10_000 * 1_000_000);
+        // Ceil: over-charge the advisory accumulator so the cap binds and the
+        // tail loop terminates; exact basis can still exceed the cap only by
+        // per-segment exact-rounding (≤ a few µUSDC), which spec §15's risk
+        // check re-validates authoritatively.
+        const BASIS_DEN: i128 = 10_000 * 1_000_000;
+        basis_used +=
+            (basis_per_share_scaled * i128::from(chunk) + BASIS_DEN - 1) / BASIS_DEN;
     }
 
     if units == 0 {
@@ -364,6 +372,24 @@ mod tests {
             gas: 0,
         };
         assert!(walk(&spec, Usdc(i128::MAX), Usdc(0), Bps(0)).is_none());
+    }
+
+    #[test]
+    fn basis_cap_with_fees_stays_close() {
+        // Fees make per-share basis fractional → basis_used truncation is
+        // exercised; the cap is advisory within single-digit µUSDC.
+        let yes = ladder(Side::Ask, &[(46, 100_000_000)]);
+        let no = ladder(Side::Ask, &[(52, 100_000_000)]);
+        let spec = BasketSpec {
+            legs: vec![buy_leg(1, &yes, 137), buy_leg(2, &no, 137)],
+            payout_per_share: 1_000_000,
+            collateral_per_share: 0,
+            gas: 0,
+        };
+        let cap = Usdc(10_000_000); // $10
+        let w = walk(&spec, cap, Usdc(0), Bps(0)).unwrap();
+        assert!(w.basis.0 <= cap.0 + 10, "basis {} exceeds advisory band", w.basis.0);
+        assert!(w.basis.0 >= cap.0 - 2_000_000, "cap left too much unused");
     }
 
     proptest! {
