@@ -5,8 +5,12 @@ pub mod class2;
 pub mod class3;
 pub mod walker;
 
-use pm_core::instrument::{MarketId, TokenId};
+use pm_core::instrument::{Market, MarketId, TokenId};
 use pm_core::num::{Bps, Px, Qty, TickSize, Usdc};
+
+pub(crate) fn find_market(markets: &[Market], id: MarketId) -> Option<&Market> {
+    markets.iter().find(|m| m.id == id)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ArbClass {

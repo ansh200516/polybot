@@ -5,24 +5,19 @@ use std::collections::HashMap;
 use crate::walker::{walk, BasketSpec, LegSpec};
 use crate::{Action, ArbClass, EngineParams, Opportunity};
 use pm_core::book::Book;
-use pm_core::instrument::{Market, MarketId, Relationship, TokenId};
+use pm_core::instrument::{Market, Relationship, TokenId};
 
-fn find(markets: &[Market], id: MarketId) -> Option<&Market> {
-    markets.iter().find(|m| m.id == id)
-}
-
-/// Buy `first` + buy `second`, guaranteed ≥ $1/unit payout, class-3 floor.
+/// Buy `first` + buy `second`. The approved relationship guarantees at least
+/// one leg pays $1 in every reachable world, so payout_per_share = $1 is a
+/// floor, not an estimate. Class-3 floor (100 bps) applies.
 fn pair_basket(
     class: ArbClass,
-    first: (TokenId, &Book, pm_core::num::Bps),
-    second: (TokenId, &Book, pm_core::num::Bps),
+    first: LegSpec<'_>,
+    second: LegSpec<'_>,
     p: &EngineParams,
 ) -> Option<Opportunity> {
     let spec = BasketSpec {
-        legs: vec![
-            LegSpec { token: first.0, action: Action::Buy, ladder: &first.1.asks, fee_bps: first.2 },
-            LegSpec { token: second.0, action: Action::Buy, ladder: &second.1.asks, fee_bps: second.2 },
-        ],
+        legs: vec![first, second],
         payout_per_share: 1_000_000,
         collateral_per_share: 0,
         gas: p.gas.redeem,
@@ -38,36 +33,41 @@ pub fn detect(
     p: &EngineParams,
 ) -> Vec<Opportunity> {
     let mut out = Vec::new();
-    let leg = |token: TokenId, m: &Market| -> Option<(TokenId, &Book, pm_core::num::Bps)> {
-        Some((token, books.get(&token)?, m.fee_bps))
+    let leg = |token: TokenId, m: &Market| -> Option<LegSpec<'_>> {
+        Some(LegSpec {
+            token,
+            action: Action::Buy,
+            ladder: &books.get(&token)?.asks,
+            fee_bps: m.fee_bps,
+        })
     };
     match *rel {
         Relationship::Implies { a, b } => {
-            let (Some(ma), Some(mb)) = (find(markets, a), find(markets, b)) else { return out };
+            let (Some(ma), Some(mb)) = (crate::find_market(markets, a), crate::find_market(markets, b)) else { return out };
             let (Some(no_a), Some(yes_b)) = (leg(ma.no, ma), leg(mb.yes, mb)) else { return out };
             if let Some(op) = pair_basket(ArbClass::C3Implies, no_a, yes_b, p) {
                 out.push(op);
             }
         }
         Relationship::MutuallyExclusive { a, b } => {
-            let (Some(ma), Some(mb)) = (find(markets, a), find(markets, b)) else { return out };
+            let (Some(ma), Some(mb)) = (crate::find_market(markets, a), crate::find_market(markets, b)) else { return out };
             let (Some(no_a), Some(no_b)) = (leg(ma.no, ma), leg(mb.no, mb)) else { return out };
             if let Some(op) = pair_basket(ArbClass::C3MutEx, no_a, no_b, p) {
                 out.push(op);
             }
         }
         Relationship::Equivalent { a, b } => {
-            let (Some(ma), Some(mb)) = (find(markets, a), find(markets, b)) else { return out };
-            // a⇒b direction
-            let (Some(no_a), Some(yes_b)) = (leg(ma.no, ma), leg(mb.yes, mb)) else { return out };
-            if let Some(op) = pair_basket(ArbClass::C3Equiv, no_a, yes_b, p) {
-                out.push(op);
-            }
-            // b⇒a direction
-            let (Some(no_b), Some(yes_a)) = (leg(mb.no, mb), leg(ma.yes, ma)) else { return out };
-            if let Some(op) = pair_basket(ArbClass::C3Equiv, no_b, yes_a, p) {
-                out.push(op);
-            }
+            let (Some(ma), Some(mb)) = (crate::find_market(markets, a), crate::find_market(markets, b)) else { return out };
+            // a⇒b direction: buy NO_a + YES_b
+            if let (Some(no_a), Some(yes_b)) = (leg(ma.no, ma), leg(mb.yes, mb))
+                && let Some(op) = pair_basket(ArbClass::C3Equiv, no_a, yes_b, p) {
+                    out.push(op);
+                }
+            // b⇒a direction: buy NO_b + YES_a (evaluated independently)
+            if let (Some(no_b), Some(yes_a)) = (leg(mb.no, mb), leg(ma.yes, ma))
+                && let Some(op) = pair_basket(ArbClass::C3Equiv, no_b, yes_a, p) {
+                    out.push(op);
+                }
         }
     }
     out
@@ -78,6 +78,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use pm_core::book::Side;
+    use pm_core::instrument::MarketId;
     use pm_core::num::{Bps, Px, Qty, TickSize, Usdc};
 
     const TS: TickSize = TickSize::Cent;
@@ -185,5 +186,50 @@ mod tests {
         let rel = Relationship::Implies { a: MarketId(0), b: MarketId(1) };
         books.remove(&TokenId(12)); // YES_b book gone
         assert!(detect(&rel, &markets, &books, &zero_gas_params()).is_empty());
+    }
+
+    #[test]
+    fn equivalent_directions_are_independent_under_missing_books() {
+        // b⇒a is priced (NO_b 0.45 + YES_a 0.40 = 0.85); remove YES_b's book so
+        // a⇒b can't even be evaluated — b⇒a must still fire.
+        let (markets, mut books) = fixture((40, 62), (57, 45));
+        books.remove(&TokenId(12)); // YES_b
+        let rel = Relationship::Equivalent { a: MarketId(0), b: MarketId(1) };
+        let ops = detect(&rel, &markets, &books, &zero_gas_params());
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].net, Usdc(15_000_000));
+    }
+
+    #[test]
+    fn equivalent_both_directions_can_fire() {
+        // Degenerate: NO_a+YES_b = 0.35+0.40 = 0.75 AND NO_b+YES_a = 0.45+0.30 = 0.75.
+        let (markets, books) = fixture((30, 35), (40, 45));
+        let rel = Relationship::Equivalent { a: MarketId(0), b: MarketId(1) };
+        let ops = detect(&rel, &markets, &books, &zero_gas_params());
+        assert_eq!(ops.len(), 2);
+        assert!(ops.iter().all(|o| o.class == ArbClass::C3Equiv));
+    }
+
+    #[test]
+    fn coherent_mutex_is_quiet() {
+        // NO_a 0.60 + NO_b 0.55 = 1.15 → no arb.
+        let (markets, books) = fixture((42, 60), (47, 55));
+        let rel = Relationship::MutuallyExclusive { a: MarketId(0), b: MarketId(1) };
+        assert!(detect(&rel, &markets, &books, &zero_gas_params()).is_empty());
+    }
+
+    #[test]
+    fn fees_shrink_class3_net() {
+        // Same books as implies_violation but 100 bps fee on both markets:
+        // fee/share = 1% × (min(0.35,0.65) + min(0.55,0.45)) = 1% × 0.80 = 0.8¢
+        // → net = $10 − $0.80 = $9.20 on 100sh.
+        let (mut markets, books) = fixture((68, 35), (55, 50));
+        for m in &mut markets {
+            m.fee_bps = Bps(100);
+        }
+        let rel = Relationship::Implies { a: MarketId(0), b: MarketId(1) };
+        let ops = detect(&rel, &markets, &books, &zero_gas_params());
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].net, Usdc(9_200_000));
     }
 }
