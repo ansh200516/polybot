@@ -2,6 +2,7 @@
 
 pub mod class1;
 pub mod class2;
+pub mod class3;
 pub mod walker;
 
 use pm_core::instrument::{MarketId, TokenId};
