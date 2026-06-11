@@ -198,6 +198,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pm-engine"
+version = "0.1.0"
+dependencies = [
+ "pm-core",
+ "proptest",
+]
+
+[[package]]
 name = "ppv-lite86"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,13 @@
+[package]
+name = "pm-engine"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pm-core.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
