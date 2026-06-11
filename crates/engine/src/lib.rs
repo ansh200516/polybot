@@ -40,13 +40,18 @@ pub struct LegFill {
 pub struct Opportunity {
     pub class: ArbClass,
     pub fills: Vec<LegFill>,
-    /// Basket units in micro-shares (each unit = 1 micro-share of every leg).
+    /// Uniform basket size for classes 1–3 (each unit = 1 micro-share of every
+    /// leg; equals every fill's qty). `Qty(0)` for `C4Lp`, whose legs are
+    /// non-uniform — per-leg `fills[i].qty` are authoritative there.
     pub units: Qty,
     pub net: Usdc,
     pub basis: Usdc,
     pub edge: Bps,
-    /// Complete-set splits execution must perform first (market, units).
-    /// Empty for pure-buy baskets.
+    /// Complete-set splits execution MUST perform before the fills (market,
+    /// units) — required for sell legs (e.g. C1Short). Empty for pure-buy
+    /// baskets. Note C2Short needs no entry here: a full NO set redeems
+    /// $(n−1) at resolution by itself; NegRisk conversion is an optional
+    /// early-realization step (its gas is already charged conservatively).
     pub splits: Vec<(MarketId, Qty)>,
 }
 
@@ -84,10 +89,10 @@ impl Default for EngineParams {
         EngineParams {
             floor_c12: Bps(30),
             floor_c3: Bps(100),
-            min_profit: Usdc(1_000_000), // $1 dust filter
+            min_profit: Usdc(1_000_000), // $1 dust filter (1_000_000 µUSDC = $1)
             gas: GasTable { split: 10_000, merge: 10_000, redeem: 15_000, negrisk_convert: 20_000 },
             redeem: RedeemStrategy::Merge,
-            max_basis: Usdc(1_000_000_000), // $1k
+            max_basis: Usdc(1_000_000_000), // $1k per-market cap, in µUSDC
             max_worlds: 4096,
             cooldown_ms: 2_000,
             reemit_improvement_pct: 20,
@@ -111,5 +116,9 @@ mod tests {
         assert_eq!(p.cooldown_ms, 2_000);
         assert_eq!(p.reemit_improvement_pct, 20);
         assert_eq!(p.redeem, RedeemStrategy::Merge);
+        assert_eq!(p.gas.split, 10_000);
+        assert_eq!(p.gas.merge, 10_000);
+        assert_eq!(p.gas.redeem, 15_000);
+        assert_eq!(p.gas.negrisk_convert, 20_000);
     }
 }

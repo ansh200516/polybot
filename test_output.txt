@@ -1,0 +1,51 @@
+   Compiling pm-engine v0.1.0 (/Users/ansh.singh/test/crates/engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.98s
+     Running unittests src/lib.rs (target/debug/deps/pm_core-2a1917be1bf12bbf)
+
+running 24 tests
+test book::tests::zeroing_best_rescans_to_next_level ... ok
+test book::tests::empty_ladder_has_no_best ... ok
+test book::tests::qty_at_reflects_zeroing ... ok
+test book::tests::iter_from_best_orders_correctly_and_skips_zeros ... ok
+test book::tests::best_tracks_inserts_per_side ... ok
+test book::tests::boundary_ticks_iterate ... ok
+test book::tests::clone_is_deep ... ok
+test book::tests::book_apply_routes_sides ... ok
+test fees::tests::ceil_rounds_against_us ... ok
+test fees::tests::golden_value ... ok
+test fees::tests::negative_rate_is_free ... ok
+test fees::tests::symmetric_in_price ... ok
+test fees::tests::zero_rate_is_free ... ok
+test instrument::tests::malformed_partitions_fail ... ok
+test instrument::tests::well_formed_partition_passes ... ok
+test num::tests::buy_cost_rounds_up_sell_proceeds_round_down ... ok
+test num::tests::edge_bps_floors_and_rejects_nonpositive_basis ... ok
+test num::tests::px_microusdc_value ... ok
+test num::tests::px_rejects_boundary_ticks ... ok
+test num::tests::ticksize_levels_and_units ... ok
+test fees::tests::monotone_in_qty_and_rate ... ok
+test fees::tests::symmetric_in_price_proptest ... ok
+test num::tests::rounding_is_against_us ... ok
+test book::tests::matches_reference_model ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running unittests src/lib.rs (target/debug/deps/pm_engine-c1aa58a866f33b87)
+
+running 1 test
+test tests::defaults_match_spec_section_2_and_6 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests pm_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests pm_engine
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
