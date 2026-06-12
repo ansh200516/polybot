@@ -4,6 +4,7 @@ pub mod decimal;
 pub mod livebook;
 pub mod rest;
 pub mod shard;
+pub mod ws;
 
 // ---------------------------------------------------------------------------
 // Crate-level error type
@@ -27,7 +28,7 @@ impl std::fmt::Display for IngestError {
         match self {
             IngestError::Http(s) => write!(f, "HTTP error: {s}"),
             IngestError::Parse(s) => write!(f, "parse error: {s}"),
-            IngestError::Decimal(e) => write!(f, "decimal error: {e:?}"),
+            IngestError::Decimal(e) => write!(f, "decimal error: {e}"),
             IngestError::Ws(s) => write!(f, "WebSocket error: {s}"),
         }
     }
