@@ -340,13 +340,22 @@ pub enum LpResult {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
+struct VarMeta {
+    token: TokenId,
+    px_micro: u64,
+    ts: pm_core::num::TickSize,
+    fee_bps: Bps,
+    depth_micro: u64,
+}
+
+#[derive(Clone, Debug)]
 enum VarKind {
-    Buy { token: TokenId, px_micro: u64, ts: pm_core::num::TickSize, fee_bps: Bps, depth: u64 },
-    Sell { token: TokenId, px_micro: u64, ts: pm_core::num::TickSize, fee_bps: Bps, depth: u64 },
+    Trade { action: Action, meta: VarMeta },
 }
 
 /// Solve one component. Gas-less LP objective; exact reval applies gas and the
-/// §10 floor rule (30 bps relationship-free, 100 bps otherwise).
+/// §10 floor rule (uses `p.floor_c12` when the component has no relationships,
+/// `p.floor_c3` otherwise (spec §10)).
 pub fn solve_component(
     spec: &ComponentSpec,
     p: &crate::EngineParams,
@@ -401,12 +410,15 @@ pub fn solve_component(
                 let depth_shares = qty.0 as f64 / 1_000_000.0;
                 let col = pb.add_column(0.0, 0.0..depth_shares);
                 buy_sell_cols.push(col);
-                var_meta.push(VarKind::Buy {
-                    token,
-                    px_micro: pm,
-                    ts,
-                    fee_bps: market.fee_bps,
-                    depth: qty.0,
+                var_meta.push(VarKind::Trade {
+                    action: Action::Buy,
+                    meta: VarMeta {
+                        token,
+                        px_micro: pm,
+                        ts,
+                        fee_bps: market.fee_bps,
+                        depth_micro: qty.0,
+                    },
                 });
             }
 
@@ -419,19 +431,21 @@ pub fn solve_component(
                 let depth_shares = qty.0 as f64 / 1_000_000.0;
                 let col = pb.add_column(0.0, 0.0..depth_shares);
                 buy_sell_cols.push(col);
-                var_meta.push(VarKind::Sell {
-                    token,
-                    px_micro: pm,
-                    ts,
-                    fee_bps: market.fee_bps,
-                    depth: qty.0,
+                var_meta.push(VarKind::Trade {
+                    action: Action::Sell,
+                    meta: VarMeta {
+                        token,
+                        px_micro: pm,
+                        ts,
+                        fee_bps: market.fee_bps,
+                        depth_micro: qty.0,
+                    },
                 });
             }
         }
     }
 
     // Split vars: one per market in spec.markets order
-    let split_market_ids: Vec<MarketId> = spec.markets.iter().map(|m| m.id).collect();
     for _ in &spec.markets {
         let col = pb.add_column(0.0, 0.0..max_basis_dollars);
         split_cols.push(col);
@@ -439,16 +453,17 @@ pub fn solve_component(
 
     // Helper: cash-per-share in dollars (negative = outflow for buys)
     let cash_per_share = |kind: &VarKind| -> f64 {
-        match kind {
-            VarKind::Buy { px_micro, fee_bps, .. } => {
-                let pm = *px_micro;
-                let fee = fee_microusdc(*fee_bps, pm, Qty(1_000_000));
+        let VarKind::Trade { action, meta } = kind;
+        match action {
+            Action::Buy => {
+                let pm = meta.px_micro;
+                let fee = fee_microusdc(meta.fee_bps, pm, Qty(1_000_000));
                 let cost = buy_cost(pm, Qty(1_000_000));
                 -(cost.0 + fee.0) as f64 / 1_000_000.0
             }
-            VarKind::Sell { px_micro, fee_bps, .. } => {
-                let pm = *px_micro;
-                let fee = fee_microusdc(*fee_bps, pm, Qty(1_000_000));
+            Action::Sell => {
+                let pm = meta.px_micro;
+                let fee = fee_microusdc(meta.fee_bps, pm, Qty(1_000_000));
                 let proceeds = sell_proceeds(pm, Qty(1_000_000));
                 (proceeds.0 - fee.0) as f64 / 1_000_000.0
             }
@@ -457,13 +472,14 @@ pub fn solve_component(
 
     // Helper: payoff-per-share in a given world (for world-row coefficients)
     let payoff_per_share = |kind: &VarKind, w: &World| -> f64 {
-        match kind {
-            VarKind::Buy { token, .. } => {
-                if token_pays(spec, w, *token) == Some(true) { 1.0 } else { 0.0 }
+        let VarKind::Trade { action, meta } = kind;
+        match action {
+            Action::Buy => {
+                if token_pays(spec, w, meta.token) == Some(true) { 1.0 } else { 0.0 }
             }
-            VarKind::Sell { token, .. } => {
+            Action::Sell => {
                 // Sells are short positions: costs 1 if token pays
-                if token_pays(spec, w, *token) == Some(true) { -1.0 } else { 0.0 }
+                if token_pays(spec, w, meta.token) == Some(true) { -1.0 } else { 0.0 }
             }
         }
     };
@@ -489,17 +505,17 @@ pub fn solve_component(
     for &token in &all_tokens {
         let mut row: Vec<(Col, f64)> = Vec::new();
         for (col, kind) in buy_sell_cols.iter().zip(var_meta.iter()) {
-            match kind {
-                VarKind::Buy { token: t, .. } if *t == token => row.push((*col, 1.0)),
-                VarKind::Sell { token: t, .. } if *t == token => row.push((*col, -1.0)),
-                _ => {}
+            let VarKind::Trade { action, meta } = kind;
+            if meta.token == token {
+                match action {
+                    Action::Buy => row.push((*col, 1.0)),
+                    Action::Sell => row.push((*col, -1.0)),
+                }
             }
         }
         // A split on market m creates one YES and one NO per share
-        for (split_col, &market_id) in split_cols.iter().zip(split_market_ids.iter()) {
-            if let Some(m) = crate::find_market(&spec.markets, market_id)
-                && (m.yes == token || m.no == token)
-            {
+        for (split_col, market) in split_cols.iter().zip(spec.markets.iter()) {
+            if market.yes == token || market.no == token {
                 row.push((*split_col, 1.0));
             }
         }
@@ -544,41 +560,34 @@ pub fn solve_component(
         if micro == 0 {
             continue;
         }
-        match kind {
-            VarKind::Buy { token, px_micro, ts, depth, .. } => {
-                let qty = Qty(micro.min(*depth));
-                if qty.0 == 0 {
-                    continue;
-                }
-                // px_micro comes from a valid book Px value; reconstruction is infallible.
-                let Some(px) = pm_core::num::Px::new(
-                    (*px_micro / ts.unit_microusdc()) as u16,
-                    *ts,
-                ).ok() else { continue };
-                let cost = buy_cost(*px_micro, qty);
+        let VarKind::Trade { action, meta } = kind;
+        let qty = Qty(micro.min(meta.depth_micro));
+        if qty.0 == 0 {
+            continue;
+        }
+        // px_micro comes from a valid book Px value; reconstruction is infallible.
+        let Some(px) = pm_core::num::Px::new(
+            (meta.px_micro / meta.ts.unit_microusdc()) as u16,
+            meta.ts,
+        ).ok() else { continue };
+        match action {
+            Action::Buy => {
+                let cost = buy_cost(meta.px_micro, qty);
                 fills.push(LegFill {
-                    token: *token,
+                    token: meta.token,
                     action: Action::Buy,
-                    ts: *ts,
+                    ts: meta.ts,
                     limit_px: px,
                     qty,
                     cash: Usdc(-cost.0),
                 });
             }
-            VarKind::Sell { token, px_micro, ts, depth, .. } => {
-                let qty = Qty(micro.min(*depth));
-                if qty.0 == 0 {
-                    continue;
-                }
-                let Some(px) = pm_core::num::Px::new(
-                    (*px_micro / ts.unit_microusdc()) as u16,
-                    *ts,
-                ).ok() else { continue };
-                let proceeds = sell_proceeds(*px_micro, qty);
+            Action::Sell => {
+                let proceeds = sell_proceeds(meta.px_micro, qty);
                 fills.push(LegFill {
-                    token: *token,
+                    token: meta.token,
                     action: Action::Sell,
-                    ts: *ts,
+                    ts: meta.ts,
                     limit_px: px,
                     qty,
                     cash: proceeds,
@@ -587,17 +596,19 @@ pub fn solve_component(
         }
     }
 
-    // Gather splits
+    // Gather splits (zip split_cols with spec.markets directly — no separate id vec)
     let mut splits: Vec<(MarketId, Qty)> = Vec::new();
-    for (i, &market_id) in split_market_ids.iter().enumerate() {
+    for (i, market) in spec.markets.iter().enumerate() {
         let raw = sol_cols[1 + n_bs + i];
         let micro = (raw * 1_000_000.0).floor() as u64;
         if micro > 0 {
-            splits.push((market_id, Qty(micro)));
+            splits.push((market.id, Qty(micro)));
         }
     }
 
-    // Clamp sells to holdings (buys + splits per token), then recompute cash
+    // Clamp sells to holdings (buys + splits per token), then recompute cash.
+    // Invariant: after clamping a sell, decrement holdings by clamped qty so
+    // that multi-level sells on the same token cannot double-count.
     let mut holdings: HashMap<TokenId, u64> = HashMap::new();
     for &(market_id, qty) in &splits {
         if let Some(m) = crate::find_market(&spec.markets, market_id) {
@@ -617,6 +628,9 @@ pub fn solve_component(
             fill.qty = Qty(clamped);
             let proceeds = sell_proceeds(fill.limit_px.microusdc(fill.ts), fill.qty);
             fill.cash = proceeds;
+            // Consume holdings so subsequent sells on the same token can't reuse them.
+            *holdings.entry(fill.token).or_insert(0) =
+                avail.saturating_sub(clamped);
         }
     }
     // Drop zero fills
@@ -628,11 +642,9 @@ pub fn solve_component(
 
     // --- exact re-validation ------------------------------------------------
     let lp_sol = LpSolution { fills: fills.clone(), splits: splits.clone() };
-    let gas = if splits.is_empty() {
-        p.gas.redeem
-    } else {
-        p.gas.split + p.gas.redeem
-    };
+    // Charge one split gas per on-chain split (one per market that is split).
+    let split_gas = (splits.len() as u64).saturating_mul(p.gas.split);
+    let gas = split_gas + p.gas.redeem;
 
     let (worst, basis) = match exact_worst_net(spec, &worlds, &lp_sol, gas) {
         Some(r) => r,
@@ -1128,5 +1140,40 @@ mod tests {
         };
         assert!(op.basis <= Usdc(9_800_010), "basis {:?}", op.basis); // small reval slack
         assert!(op.net >= Usdc(190_000)); // ~2% of ~$9.8
+    }
+
+    #[test]
+    fn multi_market_split_gas_charged_per_split() {
+        // Same fixture as lp_recovers_class2_long: optimum splits all 3
+        // markets (net $9 gasless). With per-split gas the net must drop by
+        // 3×split + redeem.
+        let mut books = HashMap::new();
+        quote(&mut books, TokenId(10), 30, 28, 100_000_000);
+        quote(&mut books, TokenId(11), 72, 70, 100_000_000);
+        quote(&mut books, TokenId(12), 30, 28, 100_000_000);
+        quote(&mut books, TokenId(13), 72, 70, 100_000_000);
+        quote(&mut books, TokenId(14), 35, 33, 100_000_000);
+        quote(&mut books, TokenId(15), 66, 64, 100_000_000);
+        let part = Partition {
+            event: EventId(0),
+            markets: vec![MarketId(0), MarketId(1), MarketId(2)],
+            yes_tokens: vec![TokenId(10), TokenId(12), TokenId(14)],
+            no_tokens: vec![TokenId(11), TokenId(13), TokenId(15)],
+            verified_exhaustive: true,
+        };
+        let spec = ComponentSpec {
+            markets: vec![mk(0), mk(1), mk(2)],
+            partitions: vec![part],
+            relationships: vec![],
+            books: &books,
+        };
+        let mut p = solver_params();
+        p.gas.split = 10_000;
+        p.gas.redeem = 15_000;
+        let LpResult::Found(op) = solve_component(&spec, &p) else {
+            panic!("expected Found");
+        };
+        assert_eq!(op.splits.len(), 3);
+        assert_eq!(op.net, Usdc(9_000_000 - 3 * 10_000 - 15_000));
     }
 }
