@@ -22,6 +22,12 @@ pub enum StoreError {
         token: i64,
         missing_micro: i64,
     },
+    /// An enum-like string field contained an unrecognised value.
+    /// `kind` names the field (e.g. `"action"`); `got` is the received value.
+    BadVariant {
+        kind: &'static str,
+        got: String,
+    },
 }
 
 impl From<rusqlite::Error> for StoreError {
@@ -43,6 +49,9 @@ impl std::fmt::Display for StoreError {
                     f,
                     "oversell on token {token}: {missing_micro} micro-shares missing"
                 )
+            }
+            StoreError::BadVariant { kind, got } => {
+                write!(f, "unknown {kind} variant: {got}")
             }
         }
     }
@@ -120,6 +129,8 @@ pub struct FillRow {
     pub qty_micro: i64,
     /// Signed cash net of fee: negative for buys, positive for sells.
     pub cash_micro: i64,
+    /// Informational only — never used in P&L math (cash_micro is already net
+    /// of fee).
     pub fee_micro: i64,
 }
 
@@ -344,6 +355,17 @@ impl Store {
     /// Sells consume FIFO lots; returns the realized P&L delta in µUSDC
     /// (sell cash − consumed cost). Oversell rolls the whole fill back.
     pub fn insert_fill(&mut self, r: &FillRow) -> Result<i64, StoreError> {
+        // Fail-closed: reject unrecognised actions BEFORE opening a transaction
+        // so no lot mutation can occur on a typo'd string.
+        match r.action.as_str() {
+            "Buy" | "Sell" => {}
+            other => {
+                return Err(StoreError::BadVariant {
+                    kind: "action",
+                    got: other.to_string(),
+                });
+            }
+        }
         let tx = self.conn.transaction()?;
         let realized: i64 = match r.action.as_str() {
             "Buy" => {
@@ -351,6 +373,7 @@ impl Store {
                 0
             }
             _ => {
+                // "Sell" — validated above
                 let consumed = lots::consume_lots(&tx, r.token, r.qty_micro)?;
                 r.cash_micro - consumed
             }
@@ -380,10 +403,36 @@ impl Store {
     /// is conserved and YES never under-counts) or a merge (consumes one lot
     /// quantity from each side; returns realized = proceeds − consumed costs).
     pub fn apply_conversion(&mut self, r: &ConversionRow) -> Result<i64, StoreError> {
+        // Fail-closed: validate kind and cash sign BEFORE opening a transaction
+        // so no lot mutation can occur on a typo'd string or wrong-sign cash.
+        match r.kind.as_str() {
+            "split" => {
+                if r.cash_micro >= 0 {
+                    return Err(StoreError::BadVariant {
+                        kind: "conversion cash sign",
+                        got: format!("split requires cash_micro < 0, got {}", r.cash_micro),
+                    });
+                }
+            }
+            "merge" => {
+                if r.cash_micro <= 0 {
+                    return Err(StoreError::BadVariant {
+                        kind: "conversion cash sign",
+                        got: format!("merge requires cash_micro > 0, got {}", r.cash_micro),
+                    });
+                }
+            }
+            other => {
+                return Err(StoreError::BadVariant {
+                    kind: "conversion kind",
+                    got: other.to_string(),
+                });
+            }
+        }
         let tx = self.conn.transaction()?;
         let realized: i64 = match r.kind.as_str() {
             "split" => {
-                let total_cost = -r.cash_micro; // cash is negative for splits
+                let total_cost = -r.cash_micro; // cash is negative for splits (validated above)
                 let yes_cost = (total_cost + 1) / 2; // ceil(total/2)
                 let no_cost = total_cost - yes_cost;
                 lots::insert_lot(&tx, r.yes_token, r.ts_ms, r.units_micro, yes_cost)?;
@@ -391,6 +440,7 @@ impl Store {
                 0
             }
             _ => {
+                // "merge" — validated above
                 let cost_yes = lots::consume_lots(&tx, r.yes_token, r.units_micro)?;
                 let cost_no = lots::consume_lots(&tx, r.no_token, r.units_micro)?;
                 r.cash_micro - cost_yes - cost_no
@@ -466,6 +516,13 @@ impl Store {
     /// Record a session start at `now_ms`, prune entries older than `window_ms`,
     /// and return how many session starts (including this one) fall inside the
     /// window — the restart-storm input (spec §15).
+    ///
+    /// Clock skew / backwards clock: if `now_ms` is earlier than a stored
+    /// entry, `now_ms - t` is negative, which is always `< window_ms`, so the
+    /// entry is retained. This fails safe: a corrupt or rewound clock inflates
+    /// the count toward tripping the storm detector rather than suppressing it.
+    /// Corrupt CSV entries (non-numeric tokens) are silently dropped since the
+    /// meta table is bot-owned and such entries are never written by this code.
     pub fn record_session_start(
         &mut self,
         now_ms: i64,
@@ -796,6 +853,153 @@ mod tests {
         assert_eq!(s.position(7).unwrap(), (0, 0));
         assert_eq!(s.position(8).unwrap(), (0, 0));
         assert_eq!(s.realized_total().unwrap(), 5_990_000);
+    }
+
+    #[test]
+    fn repeated_partial_sells_conserve_lot_cost_exactly() {
+        let mut s = mem();
+        s.insert_order(&order_row("o1")).unwrap();
+        // 3 µshares costing 10 µUSDC; sell 1 µshare three times at 4 µUSDC each.
+        // Consumed cost per sell: ceil(10·1/3)=4, ceil(6·1/2)=3, exact=3 → total 10.
+        // Total realized: (4−4) + (4−3) + (4−3) = 0 + 1 + 1 = 2.
+        s.insert_fill(&FillRow {
+            order_id: "o1".into(),
+            ts_ms: 1,
+            token: 9,
+            action: "Buy".into(),
+            px_ticks: 1,
+            tick_levels: 100,
+            qty_micro: 3,
+            cash_micro: -10,
+            fee_micro: 0,
+        })
+        .unwrap();
+        let mut total_realized = 0;
+        for i in 0..3 {
+            total_realized += s
+                .insert_fill(&FillRow {
+                    order_id: "o1".into(),
+                    ts_ms: 2 + i,
+                    token: 9,
+                    action: "Sell".into(),
+                    px_ticks: 4,
+                    tick_levels: 100,
+                    qty_micro: 1,
+                    cash_micro: 4,
+                    fee_micro: 0,
+                })
+                .unwrap();
+        }
+        assert_eq!(total_realized, 2);
+        assert_eq!(s.position(9).unwrap(), (0, 0));
+        assert_eq!(s.realized_total().unwrap(), 2);
+    }
+
+    #[test]
+    fn sell_spanning_partial_lots_conserves() {
+        let mut s = mem();
+        s.insert_order(&order_row("o1")).unwrap();
+        // Lot 1: 7 µshares costing 13; Lot 2: 5 µshares costing 11.
+        // Sell 9: full lot 1 (consumed=13) + 2/5 of lot 2 (ceil(11·2/5)=5) → consumed=18.
+        // realized = 20 − 18 = 2; lot 2 remaining: 3 µshares, 6 µUSDC cost.
+        s.insert_fill(&FillRow {
+            order_id: "o1".into(),
+            ts_ms: 1,
+            token: 9,
+            action: "Buy".into(),
+            px_ticks: 1,
+            tick_levels: 100,
+            qty_micro: 7,
+            cash_micro: -13,
+            fee_micro: 0,
+        })
+        .unwrap();
+        s.insert_fill(&FillRow {
+            order_id: "o1".into(),
+            ts_ms: 2,
+            token: 9,
+            action: "Buy".into(),
+            px_ticks: 1,
+            tick_levels: 100,
+            qty_micro: 5,
+            cash_micro: -11,
+            fee_micro: 0,
+        })
+        .unwrap();
+        let realized = s
+            .insert_fill(&FillRow {
+                order_id: "o1".into(),
+                ts_ms: 3,
+                token: 9,
+                action: "Sell".into(),
+                px_ticks: 2,
+                tick_levels: 100,
+                qty_micro: 9,
+                cash_micro: 20,
+                fee_micro: 0,
+            })
+            .unwrap();
+        assert_eq!(realized, 2);
+        assert_eq!(s.position(9).unwrap(), (3, 6));
+    }
+
+    #[test]
+    fn unknown_action_and_bad_conversion_signs_are_rejected() {
+        let mut s = mem();
+        s.insert_order(&order_row("o1")).unwrap();
+
+        // lowercase "sell" is not a valid action
+        let r = s.insert_fill(&FillRow {
+            order_id: "o1".into(),
+            ts_ms: 1,
+            token: 7,
+            action: "sell".into(),
+            px_ticks: 50,
+            tick_levels: 100,
+            qty_micro: 1,
+            cash_micro: 1,
+            fee_micro: 0,
+        });
+        assert!(matches!(r, Err(StoreError::BadVariant { .. })));
+        assert_eq!(s.count_fills().unwrap(), 0); // no lot mutation
+
+        // capitalised "Split" is not a valid kind
+        let r = s.apply_conversion(&ConversionRow {
+            kind: "Split".into(),
+            ts_ms: 1,
+            market: 0,
+            yes_token: 7,
+            no_token: 8,
+            units_micro: 1,
+            cash_micro: -1,
+        });
+        assert!(matches!(r, Err(StoreError::BadVariant { .. })));
+
+        // split with non-negative cash is wrong sign
+        let r = s.apply_conversion(&ConversionRow {
+            kind: "split".into(),
+            ts_ms: 1,
+            market: 0,
+            yes_token: 7,
+            no_token: 8,
+            units_micro: 1,
+            cash_micro: 5,
+        });
+        assert!(r.is_err());
+
+        // merge with non-positive cash is wrong sign
+        let r = s.apply_conversion(&ConversionRow {
+            kind: "merge".into(),
+            ts_ms: 1,
+            market: 0,
+            yes_token: 7,
+            no_token: 8,
+            units_micro: 1,
+            cash_micro: -5,
+        });
+        assert!(r.is_err());
+
+        assert_eq!(s.position(7).unwrap(), (0, 0)); // no lots leaked
     }
 
     #[test]
