@@ -4,6 +4,7 @@ use crate::num::{Bps, TickSize};
 
 /// Dense intern index assigned by the registry (M2). This is NOT the venue's
 /// uint256 token id — those never enter the hot path.
+/// u64 handle space: token count mirrors venue listings (a few thousand), but u64 keeps headroom trivially free.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TokenId(pub u64);
 
@@ -46,7 +47,7 @@ impl Partition {
 }
 
 /// Approved logical relationships (spec §9), stated about market YES outcomes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Relationship {
     /// a true ⇒ b true.
     Implies { a: MarketId, b: MarketId },

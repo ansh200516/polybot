@@ -1,0 +1,16 @@
+[package]
+name = "pm-registry"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pm-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

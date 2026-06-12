@@ -12,6 +12,9 @@ pub struct Config {
     pub lp: Lp,
     pub dedup: Dedup,
     pub mode: Mode,
+    pub endpoints: Endpoints,
+    pub universe: Universe,
+    pub ingestion: Ingestion,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
@@ -55,6 +58,36 @@ pub struct Dedup {
 #[serde(deny_unknown_fields, default)]
 pub struct Mode {
     pub paper: bool,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Endpoints {
+    pub gamma_base: String,
+    pub clob_base: String,
+    pub ws_market_url: String,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Universe {
+    pub max_markets: usize,
+    pub require_active: bool,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Ingestion {
+    pub staleness_ms: u64,
+    pub feed_silence_ms: u64,
+    pub ws_chunk_size: usize,
+    pub resync_interval_s: u64,
+    pub sweep_interval_ms: u64,
+    pub rest_rate_capacity: u32,
+    pub rest_rate_per_sec: f64,
+    pub backoff_base_ms: u64,
+    pub backoff_cap_ms: u64,
+    pub relationships_path: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -118,6 +151,39 @@ impl Default for Mode {
         Mode { paper: true }
     }
 }
+impl Default for Endpoints {
+    fn default() -> Self {
+        Endpoints {
+            gamma_base: "https://gamma-api.polymarket.com".to_string(),
+            clob_base: "https://clob.polymarket.com".to_string(),
+            ws_market_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string(),
+        }
+    }
+}
+impl Default for Universe {
+    fn default() -> Self {
+        Universe {
+            max_markets: 200,
+            require_active: true,
+        }
+    }
+}
+impl Default for Ingestion {
+    fn default() -> Self {
+        Ingestion {
+            staleness_ms: 1_500,
+            feed_silence_ms: 15_000,
+            ws_chunk_size: 50,
+            resync_interval_s: 300,
+            sweep_interval_ms: 1000,
+            rest_rate_capacity: 10,
+            rest_rate_per_sec: 5.0,
+            backoff_base_ms: 250,
+            backoff_cap_ms: 30_000,
+            relationships_path: "relationships.toml".to_string(),
+        }
+    }
+}
 
 impl Config {
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
@@ -143,6 +209,53 @@ impl Config {
         if self.dedup.reemit_improvement_pct > 100 {
             return Err(ConfigError::BadMoney(
                 "reemit_improvement_pct must be ≤ 100",
+            ));
+        }
+        // Ingestion validation
+        if self.ingestion.staleness_ms < 100 {
+            return Err(ConfigError::BadMoney("staleness_ms must be ≥ 100"));
+        }
+        if self.ingestion.feed_silence_ms < 1000 {
+            return Err(ConfigError::BadMoney("feed_silence_ms must be ≥ 1000"));
+        }
+        if self.ingestion.ws_chunk_size < 1 {
+            return Err(ConfigError::BadMoney("ws_chunk_size must be ≥ 1"));
+        }
+        if self.ingestion.rest_rate_per_sec <= 0.0 {
+            return Err(ConfigError::BadMoney("rest_rate_per_sec must be > 0.0"));
+        }
+        if self.ingestion.rest_rate_capacity < 1 {
+            return Err(ConfigError::BadMoney("rest_rate_capacity must be ≥ 1"));
+        }
+        if self.ingestion.backoff_base_ms > self.ingestion.backoff_cap_ms {
+            return Err(ConfigError::BadMoney(
+                "backoff_base_ms must be ≤ backoff_cap_ms",
+            ));
+        }
+        // Endpoints validation
+        if self.endpoints.gamma_base.is_empty() {
+            return Err(ConfigError::BadMoney("gamma_base must be non-empty"));
+        }
+        if !self.endpoints.gamma_base.starts_with("https://") {
+            return Err(ConfigError::BadMoney("gamma_base must start with https://"));
+        }
+        if self.endpoints.clob_base.is_empty() {
+            return Err(ConfigError::BadMoney("clob_base must be non-empty"));
+        }
+        if !self.endpoints.clob_base.starts_with("https://") {
+            return Err(ConfigError::BadMoney("clob_base must start with https://"));
+        }
+        if self.endpoints.ws_market_url.is_empty() {
+            return Err(ConfigError::BadMoney("ws_market_url must be non-empty"));
+        }
+        if !self.endpoints.ws_market_url.starts_with("wss://") {
+            return Err(ConfigError::BadMoney(
+                "ws_market_url must start with wss://",
+            ));
+        }
+        if self.ingestion.relationships_path.is_empty() {
+            return Err(ConfigError::BadMoney(
+                "relationships_path must be non-empty",
             ));
         }
         Ok(())
@@ -179,6 +292,24 @@ mod tests {
         assert_eq!(c.dedup.cooldown_ms, 2000);
         assert_eq!(c.dedup.reemit_improvement_pct, 20);
         assert!(c.mode.paper);
+        assert_eq!(c.endpoints.gamma_base, "https://gamma-api.polymarket.com");
+        assert_eq!(c.endpoints.clob_base, "https://clob.polymarket.com");
+        assert_eq!(
+            c.endpoints.ws_market_url,
+            "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+        );
+        assert_eq!(c.universe.max_markets, 200);
+        assert!(c.universe.require_active);
+        assert_eq!(c.ingestion.staleness_ms, 1_500);
+        assert_eq!(c.ingestion.feed_silence_ms, 15_000);
+        assert_eq!(c.ingestion.ws_chunk_size, 50);
+        assert_eq!(c.ingestion.resync_interval_s, 300);
+        assert_eq!(c.ingestion.sweep_interval_ms, 1000);
+        assert_eq!(c.ingestion.rest_rate_capacity, 10);
+        assert_eq!(c.ingestion.rest_rate_per_sec, 5.0);
+        assert_eq!(c.ingestion.backoff_base_ms, 250);
+        assert_eq!(c.ingestion.backoff_cap_ms, 30_000);
+        assert_eq!(c.ingestion.relationships_path, "relationships.toml");
     }
 
     #[test]
@@ -214,5 +345,71 @@ mod tests {
         assert!(usd_to_microusdc(-1.0).is_err());
         assert!(usd_to_microusdc(f64::NAN).is_err());
         assert!(usd_to_microusdc(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn endpoints_override_parses() {
+        let c = Config::from_toml_str("[endpoints]\ngamma_base = \"https://custom-gamma.com\"\n")
+            .unwrap();
+        assert_eq!(c.endpoints.gamma_base, "https://custom-gamma.com");
+        assert_eq!(c.endpoints.clob_base, "https://clob.polymarket.com");
+        assert_eq!(
+            c.endpoints.ws_market_url,
+            "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+        );
+    }
+
+    #[test]
+    fn universe_override_parses() {
+        let c = Config::from_toml_str("[universe]\nmax_markets = 100\n").unwrap();
+        assert_eq!(c.universe.max_markets, 100);
+        assert!(c.universe.require_active);
+    }
+
+    #[test]
+    fn ingestion_override_parses() {
+        let c = Config::from_toml_str("[ingestion]\nstaleness_ms = 2000\n").unwrap();
+        assert_eq!(c.ingestion.staleness_ms, 2000);
+        assert_eq!(c.ingestion.ws_chunk_size, 50);
+    }
+
+    #[test]
+    fn validate_rejects_bad_ingestion_values() {
+        // staleness_ms < 100
+        assert!(Config::from_toml_str("[ingestion]\nstaleness_ms = 50\n").is_err());
+        // feed_silence_ms < 1000
+        assert!(Config::from_toml_str("[ingestion]\nfeed_silence_ms = 500\n").is_err());
+        // ws_chunk_size < 1
+        assert!(Config::from_toml_str("[ingestion]\nws_chunk_size = 0\n").is_err());
+        // rest_rate_per_sec <= 0.0
+        assert!(Config::from_toml_str("[ingestion]\nrest_rate_per_sec = 0.0\n").is_err());
+        // rest_rate_capacity < 1
+        assert!(Config::from_toml_str("[ingestion]\nrest_rate_capacity = 0\n").is_err());
+        // backoff_base_ms > backoff_cap_ms
+        assert!(
+            Config::from_toml_str("[ingestion]\nbackoff_base_ms = 40000\nbackoff_cap_ms = 30000\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_endpoint_urls() {
+        // gamma_base empty
+        assert!(Config::from_toml_str("[endpoints]\ngamma_base = \"\"\n").is_err());
+        // gamma_base with http:// instead of https://
+        assert!(Config::from_toml_str("[endpoints]\ngamma_base = \"http://gamma.com\"\n").is_err());
+        // clob_base empty
+        assert!(Config::from_toml_str("[endpoints]\nclob_base = \"\"\n").is_err());
+        // clob_base with http:// instead of https://
+        assert!(Config::from_toml_str("[endpoints]\nclob_base = \"http://clob.com\"\n").is_err());
+        // ws_market_url empty
+        assert!(Config::from_toml_str("[endpoints]\nws_market_url = \"\"\n").is_err());
+        // ws_market_url with http:// instead of wss://
+        assert!(Config::from_toml_str("[endpoints]\nws_market_url = \"http://ws.com\"\n").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_relationships_path() {
+        assert!(Config::from_toml_str("[ingestion]\nrelationships_path = \"\"\n").is_err());
     }
 }

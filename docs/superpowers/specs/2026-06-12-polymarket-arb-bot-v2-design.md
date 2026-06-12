@@ -66,7 +66,7 @@ Dependency rule: `core` and `engine` do no I/O and have no async; they are pure 
 - Apply delta: write the level, repair `best` by scanning from the previous best (amortized O(1)).
 - `Book`: `{ bids: Ladder, asks: Ladder, seq/hash: u64, last_update: Instant }`. Polymarket book messages carry a hash; on mismatch with local state, mark the book invalid and request a REST resnapshot.
 - Ownership: N shard tasks (token id hashed to shard). A shard exclusively owns its books — single writer, zero locks. Detection for a book runs in its owning shard immediately after apply.
-- Staleness: a book older than `staleness_ms` (config, default 1500) is excluded from detection and blocks new orders on its market.
+- Staleness: a book older than `staleness_ms` (config, default 1500) is excluded from detection and blocks new orders on its market. **Delta-feed amendment (M2, live-verified):** the venue pushes deltas only — a quiet book on a live connection is *current*, not stale. Staleness therefore gates at FEED level: a book is suspect iff it is integrity-invalid or its connection is down/silent beyond `feed_silence_ms` (default 15000, forces reconnect). M3's detection gate must combine book validity with feed liveness, not raw per-book age.
 
 ## 6. Cost model
 

@@ -1,0 +1,174 @@
+{
+  "next_cursor": "MTAwMA==",
+  "limit": 1000,
+  "count": 1000,
+  "data": [
+    {
+      "enable_order_book": false,
+      "active": true,
+      "closed": true,
+      "archived": false,
+      "accepting_orders": false,
+      "accepting_order_timestamp": null,
+      "minimum_order_size": 15,
+      "minimum_tick_size": 0.01,
+      "condition_id": "0x5eed579ff6763914d78a966c83473ba2485ac8910d0a0914eef6d9fcb33085de",
+      "question_id": "0x2d5ddf657e4a090bc22921bf6865bcdb741a7b96ce45eb583be041756fad04a0",
+      "question": "NCAAB: Arizona State Sun Devils vs. Nevada Wolf Pack 2023-03-15",
+      "market_slug": "ncaab-arst-nev-2023-03-15",
+      "end_date_iso": "2023-03-15T00:00:00Z",
+      "game_start_time": "2023-03-16T01:10:00Z",
+      "seconds_delay": 3,
+      "fpmm": "0x28560c82A95e9882a7ed131FD4477BCfeB0B8575",
+      "maker_base_fee": 0,
+      "taker_base_fee": 0,
+      "notifications_enabled": true,
+      "neg_risk": false,
+      "neg_risk_market_id": "",
+      "neg_risk_request_id": "",
+      "is_50_50_outcome": false,
+      "tokens": [
+        {
+          "token_id": "73470541315377973562501025254719659796416871135081220986683321361000395461644",
+          "outcome": "Arizona State",
+          "price": 1,
+          "winner": true
+        },
+        {
+          "token_id": "56393761733830483601097051857899348522495376869600726893014309766300892311293",
+          "outcome": "Nevada",
+          "price": 0,
+          "winner": false
+        }
+      ],
+      "tags": [
+        "All"
+      ],
+      "rewards": {
+        "rates": null,
+        "min_size": 0,
+        "max_spread": 0
+      }
+    },
+    {
+      "enable_order_book": false,
+      "active": true,
+      "closed": true,
+      "archived": false,
+      "accepting_orders": false,
+      "accepting_order_timestamp": null,
+      "minimum_order_size": 5,
+      "minimum_tick_size": 0.001,
+      "condition_id": "0x3648ab7c146a9a85957e07c1d43a82272be71fde767822fd425e10ba0d6c0757",
+      "question_id": "0x1fea5ae35e50abf6a074232210ac75c87429c2b78d2ef0d4ce205a5a590bcbbd",
+      "question": "[Single Market] Will Glenn Youngkin win the 2024 Republican presidential nomination?",
+      "market_slug": "will-glenn-youngkin-win-the-2024-republican-presidential-nomination",
+      "end_date_iso": "2024-09-10T00:00:00Z",
+      "game_start_time": null,
+      "seconds_delay": 0,
+      "fpmm": "0x7b26b9c0b5BDE661C53eF619138C67094bDb43ae",
+      "maker_base_fee": 0,
+      "taker_base_fee": 0,
+      "notifications_enabled": true,
+      "neg_risk": false,
+      "neg_risk_market_id": "",
+      "neg_risk_request_id": "",
+      "is_50_50_outcome": false,
+      "tokens": [
+        {
+          "token_id": "2006684570364241896555682377056547936147873475006821796350135481625081540323",
+          "outcome": "Yes",
+          "price": 0,
+          "winner": false
+        },
+        {
+          "token_id": "38580130314633104723975394735082095016667349014635620492800619699027053776775",
+          "outcome": "No",
+          "price": 1,
+          "winner": true
+        }
+      ],
+      "tags": [
+        "Politics",
+        "tim scott",
+        "republican party",
+        "vivek ramaswamy",
+        "republicans",
+        "2024 presidential election",
+        "u.s. 2024 elections",
+        "Trump",
+        "u.s. 2024 republican presidential nomination",
+        "Elections",
+        "ron desantis",
+        "u.s. presidential election",
+        "ben shapiro",
+        "2024 election",
+        "joe rogan",
+        "kanye west",
+        "U.S. Politics",
+        "presidential nomination",
+        "donald trump jr.",
+        "presidential election 2024",
+        "glenn youngkin",
+        "chris christie",
+        "mike pence",
+        "peter thiel",
+        "u.s. presidency",
+        "2024 republican presidential nomination",
+        "All"
+      ],
+      "rewards": {
+        "rates": null,
+        "min_size": 0,
+        "max_spread": 0
+      }
+    },
+    {
+      "enable_order_book": false,
+      "active": false,
+      "closed": false,
+      "archived": true,
+      "accepting_orders": false,
+      "accepting_order_timestamp": null,
+      "minimum_order_size": 15,
+      "minimum_tick_size": 0.04,
+      "condition_id": "",
+      "question_id": "",
+      "question": "Will Coinbase staking be available in the US through March 31?",
+      "market_slug": "will-coinbase-staking-be-available-in-the-us-through-march-31",
+      "end_date_iso": null,
+      "game_start_time": null,
+      "seconds_delay": 0,
+      "fpmm": "",
+      "maker_base_fee": 0,
+      "taker_base_fee": 0,
+      "notifications_enabled": true,
+      "neg_risk": false,
+      "neg_risk_market_id": "",
+      "neg_risk_request_id": "",
+      "is_50_50_outcome": false,
+      "tokens": [
+        {
+          "token_id": "",
+          "outcome": "",
+          "price": 0,
+          "winner": false
+        },
+        {
+          "token_id": "",
+          "outcome": "",
+          "price": 0,
+          "winner": false
+        }
+      ],
+      "tags": [
+        "All"
+      ],
+      "rewards": {
+        "rates": null,
+        "min_size": 0,
+        "max_spread": 0
+      }
+    }
+  ]
+}
