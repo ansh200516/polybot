@@ -737,6 +737,10 @@ mod tests {
         errors_once: HashSet<TokenId>,
         /// Record of every (token, action, limit_ticks, qty) passed to submit_fak.
         submitted: Vec<(TokenId, Action, u16, u64)>,
+        /// When true, `merge` returns `NotSupportedLive` (models the live venue,
+        /// which rejects all on-chain ops). The `merges` recorder still captures
+        /// any call, so tests can assert merge was never *reached*.
+        merge_unsupported: bool,
         gas: GasTable,
         merges: Vec<(MarketId, Qty)>,
         splits: Vec<(MarketId, Qty)>,
@@ -752,6 +756,7 @@ mod tests {
                 gas: gas(),
                 merges: Vec::new(),
                 splits: Vec::new(),
+                merge_unsupported: false,
             }
         }
 
@@ -790,7 +795,13 @@ mod tests {
         }
 
         async fn merge(&mut self, market: MarketId, units: Qty) -> Result<Usdc, VenueError> {
+            // Record the call BEFORE the error so a recorder assertion can tell
+            // "merge was reached but rejected" (non-empty) from "merge was never
+            // reached" (empty — the Hold path short-circuits in `settle`).
             self.merges.push((market, units));
+            if self.merge_unsupported {
+                return Err(VenueError::NotSupportedLive("merge"));
+            }
             Ok(Usdc(units.0 as i128 - i128::from(self.gas.merge)))
         }
     }
@@ -945,6 +956,72 @@ mod tests {
             ]
         );
         assert_eq!(store.position(1).unwrap(), (100_000_000, 44_000_000));
+    }
+
+    /// Live reality: the live venue rejects `merge` (on-chain op → NotSupportedLive).
+    /// With the Hold strategy a clean-filled C1Long must NEVER reach `merge`, so a
+    /// merge-hostile venue is irrelevant — the basket still fills clean and keeps
+    /// its complete set. This pins the path the live arm is forced onto.
+    #[tokio::test]
+    async fn clean_fill_with_hold_never_touches_merge_even_if_unsupported() {
+        let mut v = MockVenue::new();
+        v.merge_unsupported = true; // merge would Err(NotSupportedLive) if reached
+        v.script(TokenId(1), will_fill(TokenId(1), Action::Buy, 44, Qty(SH)));
+        v.script(TokenId(2), will_fill(TokenId(2), Action::Buy, 50, Qty(SH)));
+        // run() unwraps execute_basket → reaching the asserts proves Ok(_).
+        let (report, store) = run(&mut v, &c1long(), params(RedeemStrategy::Hold)).await;
+
+        assert_eq!(report.outcome, BasketOutcome::FilledClean);
+        assert!(v.merges.is_empty(), "Hold must short-circuit before merge");
+        assert_eq!(report.cash_delta, Usdc(-94_000_000));
+        assert_eq!(
+            report.positions,
+            vec![
+                (TokenId(1), Qty(100_000_000), Usdc(44_000_000)),
+                (TokenId(2), Qty(100_000_000), Usdc(50_000_000)),
+            ]
+        );
+        assert_eq!(store.position(1).unwrap(), (100_000_000, 44_000_000));
+    }
+
+    /// Inverse pin documenting WHY live must force Hold: the SAME clean C1Long
+    /// fill, but with redeem = Merge against the same merge-hostile venue, drives
+    /// `settle` → `venue.merge` → NotSupportedLive, so `execute_basket` returns
+    /// Err. In live this fails the basket AFTER real money has filled — the
+    /// integration-review bug. (Bypasses `run`, which unwraps.)
+    #[tokio::test]
+    async fn clean_fill_with_merge_against_unsupported_venue_errors() {
+        let mut v = MockVenue::new();
+        v.merge_unsupported = true;
+        v.script(TokenId(1), will_fill(TokenId(1), Action::Buy, 44, Qty(SH)));
+        v.script(TokenId(2), will_fill(TokenId(2), Action::Buy, 50, Qty(SH)));
+
+        let store = Store::open_in_memory().unwrap();
+        let (tx, rx) = mpsc::channel(64);
+        let writer = tokio::spawn(run_writer(store, rx));
+        let (token_market, market_tokens) = maps();
+        let token_fee: HashMap<TokenId, Bps> = HashMap::new();
+        let opp = c1long();
+        let p = params(RedeemStrategy::Merge);
+        let result = execute_basket(
+            &mut v,
+            &tx,
+            &opp,
+            &token_market,
+            &market_tokens,
+            &token_fee,
+            &p,
+            1,
+        )
+        .await;
+        drop(tx);
+        let _ = writer.await.unwrap();
+
+        assert!(
+            matches!(result, Err(ExecError::Venue(_))),
+            "Merge against an unsupported venue must fail the basket: {result:?}"
+        );
+        assert_eq!(v.merges.len(), 1, "merge was reached (and rejected)");
     }
 
     #[tokio::test]

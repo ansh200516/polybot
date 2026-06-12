@@ -35,6 +35,7 @@ use pm_app::wiring::{
 };
 use pm_config::Config;
 use pm_core::instrument::Relationship;
+use pm_engine::RedeemStrategy;
 use pm_execution::basket::ExecParams;
 use pm_execution::venue::PaperVenue;
 use pm_ingestion::rest::ClobRest;
@@ -530,6 +531,8 @@ async fn main() {
     ));
 
     // ---- execution task -----------------------------------------------------
+    // Config-driven base; used as-is by the PAPER arm. The LIVE arm derives its
+    // own params via live_exec_params (forces redeem = Hold — see that fn).
     let exec_params = ExecParams {
         fill_window: Duration::from_millis(config.execution.fill_window_ms),
         max_unhedged: risk_cfg.max_unhedged,
@@ -608,7 +611,10 @@ async fn main() {
             token_market.clone(),
             market_tokens,
             token_fee,
-            exec_params,
+            // Live never performs on-chain ops: a filled C1Long HOLDS its complete set
+            // (manual redeem until M6). venue.merge would return NotSupportedLive and
+            // fail the basket AFTER real money filled (integration-review catch).
+            live_exec_params(&exec_params),
         ))
     } else {
         let venue = PaperVenue::new(
@@ -710,6 +716,7 @@ async fn main() {
             fills_rows: config.tui.fills_rows,
             log_lines: config.tui.log_lines,
             mode_paper: config.mode.paper,
+            shadow: args.shadow,
             start: Instant::now(),
             last_frames: 0,
             last_at: Instant::now(),
@@ -919,6 +926,18 @@ async fn recv_tui(
     }
 }
 
+/// ExecParams for the LIVE arm: identical to the (config-derived) base except
+/// `redeem` is forced to `Hold`. Live never performs on-chain ops, so a filled
+/// C1Long HOLDS its complete set (manual redeem until M6); `venue.merge` would
+/// return `NotSupportedLive` and fail the basket AFTER real money filled
+/// (integration-review catch). The paper arm keeps the config-driven redeem.
+fn live_exec_params(base: &ExecParams) -> ExecParams {
+    ExecParams {
+        redeem: RedeemStrategy::Hold,
+        ..*base
+    }
+}
+
 /// Log app stats plus aggregated ingest gauges across every supervisor cell.
 fn log_stats(stats: &AppStats, cells: &[Arc<StatsCell>], elapsed: Duration) {
     let mut books = 0u64;
@@ -951,5 +970,30 @@ mod tests {
         let a = Args::from_iter(["--live".into(), "--shadow".into()].into_iter()).unwrap();
         assert!(a.live && a.shadow);
         assert!(Args::from_iter(["--shadow".into()].into_iter()).is_err());
+    }
+
+    /// Integration-review catch: the live arm must NEVER inherit a `merge`
+    /// redeem strategy, because `LiveVenue::merge` is an on-chain op that returns
+    /// `NotSupportedLive` and would fail a basket AFTER real money filled. The
+    /// live ExecParams is derived by forcing redeem = Hold regardless of config,
+    /// while preserving the other fields.
+    #[test]
+    fn live_exec_params_forces_hold_regardless_of_config() {
+        use pm_engine::RedeemStrategy;
+        let base = ExecParams {
+            fill_window: Duration::from_millis(750),
+            max_unhedged: pm_core::num::Usdc(123_000_000),
+            redeem: RedeemStrategy::Merge, // config default — the dangerous one
+        };
+        let live = live_exec_params(&base);
+        assert_eq!(live.redeem, RedeemStrategy::Hold, "live must force Hold");
+        assert_eq!(live.fill_window, base.fill_window, "fill_window preserved");
+        assert_eq!(live.max_unhedged, base.max_unhedged, "max_unhedged preserved");
+        // Already-Hold config stays Hold (idempotent).
+        let base_hold = ExecParams {
+            redeem: RedeemStrategy::Hold,
+            ..base
+        };
+        assert_eq!(live_exec_params(&base_hold).redeem, RedeemStrategy::Hold);
     }
 }
