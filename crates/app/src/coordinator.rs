@@ -221,6 +221,8 @@ impl Coordinator {
     fn handle_ctl(&mut self, cmd: CtlCommand) {
         match cmd {
             CtlCommand::SetPaused(p) => {
+                // Resume tail: opps seen while paused consumed their cooldown admit slot —
+                // identical shapes stay suppressed up to cooldown_ms (2s) after resume.
                 self.paused = p;
                 self.risk.set_paused(p);
                 info!("control: paused={p}");
@@ -360,6 +362,8 @@ impl Coordinator {
                 self.risk.release(&c);
             }
             self.busy = false;
+        } else {
+            self.publish_status();
         }
     }
 
@@ -489,6 +493,9 @@ impl Coordinator {
                             .best()
                             .map(|a| a.microusdc(ts))
                             .unwrap_or(bid_micro);
+                        // M5 note: mid is uncapped — a wide/stale ask inflates it and delays the halt.
+                        // Before real money: cap mid (e.g. bid + spread cap) or prefer last-trade
+                        // for the risk feed. Paper-safe: the durable rows stay bid-marked.
                         let mid_micro = (bid_micro + ask_micro) / 2;
                         (sell_proceeds(bid_micro, q), sell_proceeds(mid_micro, q))
                     }
@@ -1024,7 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn status_watch_reflects_pause_kill_and_busy() {
         let kill = Arc::new(AtomicBool::new(false));
-        let (mut coord, opp_tx, _exec_rx, _report_tx, _store_rx, _stats) = build_coord(
+        let (mut coord, opp_tx, exec_rx, _report_tx, _store_rx, _stats) = build_coord(
             Arc::clone(&kill),
             BookFetcher::new(HashMap::new()),
             crate::wiring::risk_config(&Config::default()).unwrap(),
@@ -1063,6 +1070,50 @@ mod tests {
             .expect("timeout waiting for kill status")
             .unwrap();
         assert!(status.borrow().killed, "status must reflect killed=true");
+
+        drop(ctl);
+        drop(opp_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        drop(exec_rx);
+    }
+
+    #[tokio::test]
+    async fn status_watch_reflects_busy_during_in_flight() {
+        let kill = Arc::new(AtomicBool::new(false));
+        let (mut coord, opp_tx, mut exec_rx, _report_tx, _store_rx, _stats) = build_coord(
+            Arc::clone(&kill),
+            BookFetcher::new(HashMap::new()),
+            crate::wiring::risk_config(&Config::default()).unwrap(),
+        );
+        let ctl = coord.control_channel(4);
+        let mut status = coord.status_channel();
+        let handle = tokio::spawn(coord.run());
+
+        // Dispatch an approvable opp; the harness exec_rx receives it (but does
+        // not reply), leaving the coordinator in the busy=true in-flight window.
+        opp_tx
+            .send(DetectedOpp {
+                opp: opp_fixture(50),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+
+        // The exec_rx must receive the request (confirms dispatch happened).
+        let _req = tokio::time::timeout(Duration::from_secs(2), exec_rx.recv())
+            .await
+            .expect("timeout waiting for exec dispatch")
+            .expect("exec channel closed before dispatch");
+
+        // publish_status() was called on the success path — status must now show busy.
+        tokio::time::timeout(Duration::from_secs(2), status.changed())
+            .await
+            .expect("timeout waiting for busy status")
+            .unwrap();
+        assert!(
+            status.borrow().busy,
+            "status must reflect busy=true during in-flight"
+        );
 
         drop(ctl);
         drop(opp_tx);
