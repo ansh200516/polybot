@@ -405,6 +405,9 @@ impl<R: RestBookSource> Supervisor<R> {
 
         // Take the command receiver out of self so the select loop can hold it
         // as a local without conflicting with &mut self in arm bodies.
+        // Safety note: the receiver would be lost if this future were cancelled
+        // between take and restore; safe today because the only awaiter (`run()`)
+        // never cancels it — do not select against run_session.
         let mut cmd_rx = self.cmd_rx.take();
 
         // Step 1: subscribe.
@@ -447,6 +450,9 @@ impl<R: RestBookSource> Supervisor<R> {
                         }
                     }
                 }
+                // Commands may be delayed under frame saturation — accepted cost
+                // of frames-first bias; a delayed BookSnapshot only means a
+                // fresher book at fill time.
                 cmd = recv_cmd(&mut cmd_rx) => {
                     self.handle_command(cmd);
                 }
@@ -909,10 +915,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (book, valid) = orx
-            .await
-            .unwrap()
-            .expect("book exists after resnapshot_all");
+        let (book, valid) = orx.await.unwrap().unwrap();
         assert!(valid);
         assert_eq!(book.bids.best().unwrap().get(), 44);
 
@@ -976,5 +979,58 @@ mod tests {
         // the SupStats field exists and defaults to zero.
         let stats = SupStats::default();
         assert_eq!(stats.unknown_token_changes, 0);
+    }
+
+    /// REST source that returns a crossed book (bid 0.60 ≥ ask 0.40), which
+    /// causes `apply_snapshot` to return `NeedsResnapshot` rather than `Ok`.
+    struct CrossedRest;
+
+    impl RestBookSource for CrossedRest {
+        async fn book(&mut self, venue_token_id: &str) -> Result<ParsedBook, crate::IngestError> {
+            Ok(ParsedBook {
+                asset_id: venue_token_id.to_string(),
+                hash: "bad".into(),
+                bids: vec![RawLevel {
+                    price_micro: 600_000,
+                    size_micro: 1_000_000,
+                }],
+                asks: vec![RawLevel {
+                    price_micro: 400_000,
+                    size_micro: 1_000_000,
+                }],
+            })
+        }
+    }
+
+    /// The `on_apply` hook must NOT fire when `apply_snapshot` returns
+    /// `NeedsResnapshot` (crossed book).  Even if resnapshot_all is retried,
+    /// the count must stay at zero.
+    #[tokio::test]
+    async fn on_apply_does_not_fire_on_crossed_resnapshot() {
+        let mut sup = Supervisor::new(
+            vec![(TokenId(5), "tok1".to_string(), TickSize::Cent)],
+            CrossedRest,
+            SupervisorConfig::default(),
+        );
+        let fired = Arc::new(Mutex::new(0u32));
+        let fired2 = Arc::clone(&fired);
+        sup.set_on_apply(Box::new(move |_t, _s| {
+            *fired2.lock().unwrap() += 1;
+        }));
+        // SeqTransport with no frames and release pre-notified — session ends
+        // immediately after resnapshot_all without delivering any delta frames.
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        release.notify_one();
+        let mut t = SeqTransport {
+            frames: [].into(),
+            release,
+        };
+        let end = sup.run_session(&mut t).await;
+        assert_eq!(end, SessionEnd::TransportLost);
+        assert_eq!(
+            *fired.lock().unwrap(),
+            0,
+            "hook must not fire on NeedsResnapshot"
+        );
     }
 }
