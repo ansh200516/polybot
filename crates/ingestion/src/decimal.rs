@@ -13,7 +13,9 @@ impl std::fmt::Display for DecimalError {
         match self {
             DecimalError::Empty => write!(f, "decimal string is empty"),
             DecimalError::BadChar => write!(f, "decimal string contains invalid characters"),
-            DecimalError::TooManyDecimals => write!(f, "decimal string has more than 6 fractional digits"),
+            DecimalError::TooManyDecimals => {
+                write!(f, "decimal string has more than 6 fractional digits")
+            }
             DecimalError::Overflow => write!(f, "decimal value overflows u64"),
         }
     }
@@ -82,7 +84,19 @@ mod tests {
 
     #[test]
     fn rejects_garbage() {
-        for bad in ["", ".", "-1", "+1", "1e3", "0.0000001", "1.2.3", "abc", "0x10", " 1", "1 "] {
+        for bad in [
+            "",
+            ".",
+            "-1",
+            "+1",
+            "1e3",
+            "0.0000001",
+            "1.2.3",
+            "abc",
+            "0x10",
+            " 1",
+            "1 ",
+        ] {
             assert!(parse_micro(bad).is_err(), "{bad:?} must be rejected");
         }
     }

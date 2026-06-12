@@ -7,8 +7,8 @@
 
 use std::time::{Duration, Instant};
 
-use crate::livebook::RawLevel;
 use crate::IngestError;
+use crate::livebook::RawLevel;
 
 // ---------------------------------------------------------------------------
 // Token bucket (pure, clock injected)
@@ -37,7 +37,12 @@ pub struct TokenBucket {
 impl TokenBucket {
     /// Create a full bucket (starts at capacity).
     pub fn new(capacity: u32, rate_per_sec: f64) -> Self {
-        TokenBucket { capacity, tokens: f64::from(capacity), rate_per_sec, last: None }
+        TokenBucket {
+            capacity,
+            tokens: f64::from(capacity),
+            rate_per_sec,
+            last: None,
+        }
     }
 
     /// Try to consume one token.
@@ -85,29 +90,36 @@ pub fn parse_book_response(body: &str) -> Result<ParsedBook, IngestError> {
 
     let mut bids = Vec::with_capacity(raw.bids.len());
     for lvl in &raw.bids {
-        let price_micro =
-            crate::decimal::parse_micro(&lvl.price).map_err(IngestError::Decimal)?;
-        let size_micro =
-            crate::decimal::parse_micro(&lvl.size).map_err(IngestError::Decimal)?;
+        let price_micro = crate::decimal::parse_micro(&lvl.price).map_err(IngestError::Decimal)?;
+        let size_micro = crate::decimal::parse_micro(&lvl.size).map_err(IngestError::Decimal)?;
         if size_micro == 0 {
             continue; // silently skip zero-size levels
         }
-        bids.push(RawLevel { price_micro, size_micro });
+        bids.push(RawLevel {
+            price_micro,
+            size_micro,
+        });
     }
 
     let mut asks = Vec::with_capacity(raw.asks.len());
     for lvl in &raw.asks {
-        let price_micro =
-            crate::decimal::parse_micro(&lvl.price).map_err(IngestError::Decimal)?;
-        let size_micro =
-            crate::decimal::parse_micro(&lvl.size).map_err(IngestError::Decimal)?;
+        let price_micro = crate::decimal::parse_micro(&lvl.price).map_err(IngestError::Decimal)?;
+        let size_micro = crate::decimal::parse_micro(&lvl.size).map_err(IngestError::Decimal)?;
         if size_micro == 0 {
             continue;
         }
-        asks.push(RawLevel { price_micro, size_micro });
+        asks.push(RawLevel {
+            price_micro,
+            size_micro,
+        });
     }
 
-    Ok(ParsedBook { asset_id: raw.asset_id, hash: raw.hash, bids, asks })
+    Ok(ParsedBook {
+        asset_id: raw.asset_id,
+        hash: raw.hash,
+        bids,
+        asks,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -132,16 +144,16 @@ impl ClobRest {
     /// # Errors
     /// Returns `IngestError::Http` if the underlying TLS stack fails to
     /// initialise (extremely unlikely with the default rustls config).
-    pub fn new(
-        base: &str,
-        capacity: u32,
-        rate_per_sec: f64,
-    ) -> Result<Self, IngestError> {
+    pub fn new(base: &str, capacity: u32, rate_per_sec: f64) -> Result<Self, IngestError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| IngestError::Http(e.to_string()))?;
-        Ok(ClobRest { http, base: base.to_owned(), bucket: TokenBucket::new(capacity, rate_per_sec) })
+        Ok(ClobRest {
+            http,
+            base: base.to_owned(),
+            bucket: TokenBucket::new(capacity, rate_per_sec),
+        })
     }
 
     /// Sleep until the bucket has a token.
@@ -306,8 +318,7 @@ mod tests {
 
     #[test]
     fn book_response_parses_to_raw_levels() {
-        let raw =
-            std::fs::read_to_string("../registry/tests/fixtures/clob_book.json").unwrap();
+        let raw = std::fs::read_to_string("../registry/tests/fixtures/clob_book.json").unwrap();
         let parsed = parse_book_response(&raw).unwrap();
         assert!(!parsed.bids.is_empty() || !parsed.asks.is_empty());
         assert!(!parsed.hash.is_empty());
@@ -321,9 +332,11 @@ mod tests {
     #[test]
     fn malformed_book_is_a_parse_error() {
         assert!(parse_book_response("{").is_err());
-        assert!(parse_book_response(
-            r#"{"asset_id":"1","hash":"h","bids":[{"price":"abc","size":"1"}],"asks":[]}"#
-        )
-        .is_err());
+        assert!(
+            parse_book_response(
+                r#"{"asset_id":"1","hash":"h","bids":[{"price":"abc","size":"1"}],"asks":[]}"#
+            )
+            .is_err()
+        );
     }
 }

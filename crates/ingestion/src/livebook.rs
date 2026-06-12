@@ -198,9 +198,7 @@ impl LiveBook {
     ) -> ApplyOutcome {
         // Idempotent demand on invalid books.
         if !self.valid {
-            let reason = self
-                .invalid_reason
-                .unwrap_or(ResnapshotReason::CrossedBook);
+            let reason = self.invalid_reason.unwrap_or(ResnapshotReason::CrossedBook);
             return ApplyOutcome::NeedsResnapshot(reason);
         }
 
@@ -272,7 +270,10 @@ mod tests {
         assert_eq!(lb.book().bids.best().unwrap().get(), 44);
         assert_eq!(lb.book().asks.best().unwrap().get(), 46);
         assert!(!lb.is_stale(t0 + Duration::from_millis(100), Duration::from_millis(1500)));
-        assert!(lb.is_stale(t0 + Duration::from_millis(2000), Duration::from_millis(1500)));
+        assert!(lb.is_stale(
+            t0 + Duration::from_millis(2000),
+            Duration::from_millis(1500)
+        ));
     }
 
     #[test]
@@ -281,7 +282,11 @@ mod tests {
         let mut lb = snapshot(t0);
         let out = lb.apply_changes(
             t0 + Duration::from_millis(10),
-            &[RawChange { side_buy: true, price_micro: 440_000, size_micro: 0 }],
+            &[RawChange {
+                side_buy: true,
+                price_micro: 440_000,
+                size_micro: 0,
+            }],
             Some("hash-2"),
         );
         assert_eq!(out, ApplyOutcome::Ok);
@@ -296,7 +301,11 @@ mod tests {
         // 0.445 is off-tick on a Cent market
         let out = lb.apply_changes(
             t0,
-            &[RawChange { side_buy: true, price_micro: 445_000, size_micro: 5_000_000 }],
+            &[RawChange {
+                side_buy: true,
+                price_micro: 445_000,
+                size_micro: 5_000_000,
+            }],
             None,
         );
         assert_eq!(out, ApplyOutcome::Ok);
@@ -308,7 +317,11 @@ mod tests {
     fn persistent_off_tick_demands_resnapshot() {
         let t0 = Instant::now();
         let mut lb = snapshot(t0);
-        let bad = RawChange { side_buy: true, price_micro: 445_000, size_micro: 5_000_000 };
+        let bad = RawChange {
+            side_buy: true,
+            price_micro: 445_000,
+            size_micro: 5_000_000,
+        };
         for _ in 0..OFF_TICK_RESNAPSHOT_THRESHOLD - 1 {
             assert_eq!(lb.apply_changes(t0, &[bad], None), ApplyOutcome::Ok);
         }
@@ -324,10 +337,17 @@ mod tests {
         let mut lb = snapshot(t0);
         let out = lb.apply_changes(
             t0,
-            &[RawChange { side_buy: true, price_micro: 470_000, size_micro: 5_000_000 }],
+            &[RawChange {
+                side_buy: true,
+                price_micro: 470_000,
+                size_micro: 5_000_000,
+            }],
             None,
         );
-        assert_eq!(out, ApplyOutcome::NeedsResnapshot(ResnapshotReason::CrossedBook));
+        assert_eq!(
+            out,
+            ApplyOutcome::NeedsResnapshot(ResnapshotReason::CrossedBook)
+        );
         assert!(!lb.valid());
         // a fresh snapshot restores validity
         let out = lb.apply_snapshot(t0, &[lvl("0.44", "10")], &[lvl("0.46", "10")], "hash-3");
@@ -342,10 +362,17 @@ mod tests {
         for p in [0u64, 1_000_000, 1_010_000] {
             let out = lb.apply_changes(
                 t0,
-                &[RawChange { side_buy: false, price_micro: p, size_micro: 1 }],
+                &[RawChange {
+                    side_buy: false,
+                    price_micro: p,
+                    size_micro: 1,
+                }],
                 None,
             );
-            assert!(matches!(out, ApplyOutcome::Ok | ApplyOutcome::NeedsResnapshot(_)));
+            assert!(matches!(
+                out,
+                ApplyOutcome::Ok | ApplyOutcome::NeedsResnapshot(_)
+            ));
         }
         assert_eq!(lb.off_tick_count(), 3);
     }
@@ -355,13 +382,11 @@ mod tests {
         let t0 = Instant::now();
         let mut lb = LiveBook::new(TickSize::Cent);
         // Best bid (0.60) ≥ best ask (0.40) → crossed snapshot
-        let out = lb.apply_snapshot(
-            t0,
-            &[lvl("0.60", "10")],
-            &[lvl("0.40", "10")],
-            "bad-hash",
+        let out = lb.apply_snapshot(t0, &[lvl("0.60", "10")], &[lvl("0.40", "10")], "bad-hash");
+        assert_eq!(
+            out,
+            ApplyOutcome::NeedsResnapshot(ResnapshotReason::CrossedBook)
         );
-        assert_eq!(out, ApplyOutcome::NeedsResnapshot(ResnapshotReason::CrossedBook));
         assert!(!lb.valid());
     }
 
@@ -372,7 +397,11 @@ mod tests {
         // Invalidate via crossed book
         let _ = lb.apply_changes(
             t0,
-            &[RawChange { side_buy: true, price_micro: 470_000, size_micro: 5_000_000 }],
+            &[RawChange {
+                side_buy: true,
+                price_micro: 470_000,
+                size_micro: 5_000_000,
+            }],
             None,
         );
         assert!(!lb.valid());
@@ -380,10 +409,17 @@ mod tests {
         // Applying more changes on an invalid book must return the pending reason
         let out = lb.apply_changes(
             t0 + Duration::from_millis(50),
-            &[RawChange { side_buy: true, price_micro: 440_000, size_micro: 10_000_000 }],
+            &[RawChange {
+                side_buy: true,
+                price_micro: 440_000,
+                size_micro: 10_000_000,
+            }],
             Some("hash-new"),
         );
-        assert_eq!(out, ApplyOutcome::NeedsResnapshot(ResnapshotReason::CrossedBook));
+        assert_eq!(
+            out,
+            ApplyOutcome::NeedsResnapshot(ResnapshotReason::CrossedBook)
+        );
         // last_update must not advance
         assert_eq!(lb.last_update(), last_update_before);
     }

@@ -19,8 +19,8 @@
 
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -91,7 +91,12 @@ impl Args {
             }
         }
 
-        Ok(Args { config_path, duration_secs, max_markets, relationships_path })
+        Ok(Args {
+            config_path,
+            duration_secs,
+            max_markets,
+            relationships_path,
+        })
     }
 }
 
@@ -204,7 +209,11 @@ async fn main() {
     );
 
     // Log partitions verified vs total.
-    let verified = registry.partitions().iter().filter(|p| p.verified_exhaustive).count();
+    let verified = registry
+        .partitions()
+        .iter()
+        .filter(|p| p.verified_exhaustive)
+        .count();
     info!(
         verified = verified,
         total = registry.partitions().len(),
@@ -217,7 +226,10 @@ async fn main() {
         .iter()
         .map(|m| registry.component_of(m.id))
         .collect();
-    info!(components = component_ids.len(), "distinct market components");
+    info!(
+        components = component_ids.len(),
+        "distinct market components"
+    );
 
     // Log exclusion entries.
     for (event_id, reason) in registry.exclusion_log() {

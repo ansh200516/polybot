@@ -242,7 +242,11 @@ mod tests {
         for m in &markets {
             assert!(!m.condition_id.is_empty());
             let toks = m.clob_token_ids().unwrap();
-            assert_eq!(toks.len(), 2, "binary market must have YES and NO token ids");
+            assert_eq!(
+                toks.len(),
+                2,
+                "binary market must have YES and NO token ids"
+            );
             assert!(
                 toks.iter().all(|t| t.chars().all(|c| c.is_ascii_digit())),
                 "token ids must be pure decimal"
@@ -252,8 +256,7 @@ mod tests {
 
     #[test]
     fn parses_gamma_events_fixture() {
-        let events: Vec<GammaEvent> =
-            serde_json::from_str(&fixture("gamma_events.json")).unwrap();
+        let events: Vec<GammaEvent> = serde_json::from_str(&fixture("gamma_events.json")).unwrap();
         assert!(!events.is_empty());
         assert!(
             events.iter().any(|e| e.neg_risk),
@@ -264,8 +267,7 @@ mod tests {
 
     #[test]
     fn parses_clob_markets_fixture_including_legacy_ticks() {
-        let page: ClobMarketsPage =
-            serde_json::from_str(&fixture("clob_markets.json")).unwrap();
+        let page: ClobMarketsPage = serde_json::from_str(&fixture("clob_markets.json")).unwrap();
         assert!(!page.data.is_empty());
         assert!(!page.next_cursor.is_empty());
         // all tick sizes PARSE (incl. legacy 0.04); supported-ness is Task 12's policy
@@ -291,8 +293,7 @@ mod tests {
 
     #[test]
     fn parses_clob_time_fixture() {
-        let t: u64 =
-            serde_json::from_str(&fixture("clob_time.json")).unwrap();
+        let t: u64 = serde_json::from_str(&fixture("clob_time.json")).unwrap();
         assert!(t > 1_700_000_000);
     }
 
@@ -311,8 +312,7 @@ mod tests {
 
     #[test]
     fn missing_token_ids_is_a_clean_error() {
-        let m: GammaMarket =
-            serde_json::from_str(r#"{"conditionId":"0xa"}"#).unwrap();
+        let m: GammaMarket = serde_json::from_str(r#"{"conditionId":"0xa"}"#).unwrap();
         assert_eq!(m.clob_token_ids(), Err(GammaError::MissingTokenIds));
         let m: GammaMarket =
             serde_json::from_str(r#"{"conditionId":"0xa","clobTokenIds":"not json"}"#).unwrap();

@@ -31,7 +31,11 @@ mod tests {
 
     #[test]
     fn clean_negrisk_event_verifies() {
-        let members = vec![member(0, "Will Alice win?"), member(1, "Will Bob win?"), member(2, "Will Carol win?")];
+        let members = vec![
+            member(0, "Will Alice win?"),
+            member(1, "Will Bob win?"),
+            member(2, "Will Carol win?"),
+        ];
         let (p, reasons) = derive_partition(EventId(7), true, &members);
         assert!(reasons.is_empty());
         assert!(p.verified_exhaustive);
@@ -49,12 +53,19 @@ mod tests {
 
     #[test]
     fn placeholder_outcomes_block_verification() {
-        for bad in ["Will another candidate win?", "Other", "None of the above wins", "Will any other person win?"] {
+        for bad in [
+            "Will another candidate win?",
+            "Other",
+            "None of the above wins",
+            "Will any other person win?",
+        ] {
             let members = vec![member(0, "Will Alice win?"), member(1, bad)];
             let (p, reasons) = derive_partition(EventId(7), true, &members);
             assert!(!p.verified_exhaustive, "{bad:?} should block");
             assert!(
-                reasons.iter().any(|r| matches!(r, ExclusionReason::PlaceholderOutcome { .. })),
+                reasons
+                    .iter()
+                    .any(|r| matches!(r, ExclusionReason::PlaceholderOutcome { .. })),
                 "{bad:?} should produce PlaceholderOutcome"
             );
         }
@@ -72,7 +83,11 @@ mod tests {
         let members = vec![member(0, "A?"), m];
         let (p, reasons) = derive_partition(EventId(7), true, &members);
         assert!(!p.verified_exhaustive);
-        assert!(reasons.iter().any(|r| matches!(r, ExclusionReason::PlaceholderOutcome { .. })));
+        assert!(
+            reasons
+                .iter()
+                .any(|r| matches!(r, ExclusionReason::PlaceholderOutcome { .. }))
+        );
     }
 
     #[test]
@@ -83,7 +98,9 @@ mod tests {
         let members = vec![member(0, "A?"), m];
         let (p, reasons) = derive_partition(EventId(7), true, &members);
         assert!(!p.verified_exhaustive);
-        assert!(reasons.iter().any(|r| matches!(r, ExclusionReason::InactiveMember { market } if *market == MarketId(1))));
+        assert!(reasons.iter().any(
+            |r| matches!(r, ExclusionReason::InactiveMember { market } if *market == MarketId(1))
+        ));
 
         // active = false arm
         let mut m2 = member(1, "B?");
@@ -91,7 +108,9 @@ mod tests {
         let members2 = vec![member(0, "A?"), m2];
         let (p2, reasons2) = derive_partition(EventId(7), true, &members2);
         assert!(!p2.verified_exhaustive);
-        assert!(reasons2.iter().any(|r| matches!(r, ExclusionReason::InactiveMember { market } if *market == MarketId(1))));
+        assert!(reasons2.iter().any(
+            |r| matches!(r, ExclusionReason::InactiveMember { market } if *market == MarketId(1))
+        ));
     }
 
     #[test]
@@ -114,12 +133,18 @@ mod tests {
 
     #[test]
     fn word_boundaries_protect_proper_nouns() {
-        let members = vec![member(0, "Will Motherwell win the league?"), member(1, "Will Celtic win the league?")];
+        let members = vec![
+            member(0, "Will Motherwell win the league?"),
+            member(1, "Will Celtic win the league?"),
+        ];
         let (p, reasons) = derive_partition(EventId(7), true, &members);
         assert!(reasons.is_empty(), "{reasons:?}");
         assert!(p.verified_exhaustive);
         // but a real standalone "other" still blocks
-        let members = vec![member(0, "Will Motherwell win?"), member(1, "Will some other team win?")];
+        let members = vec![
+            member(0, "Will Motherwell win?"),
+            member(1, "Will some other team win?"),
+        ];
         let (_, reasons) = derive_partition(EventId(7), true, &members);
         assert!(reasons.iter().any(|r| matches!(r, ExclusionReason::PlaceholderOutcome { market } if *market == MarketId(1))));
     }
@@ -185,7 +210,9 @@ pub fn derive_partition(
         None => true,
         Some(q) => {
             let q = q.to_lowercase();
-            PLACEHOLDER_MARKERS.iter().any(|p| word_boundary_contains(&q, p))
+            PLACEHOLDER_MARKERS
+                .iter()
+                .any(|p| word_boundary_contains(&q, p))
         }
     }) {
         reasons.push(ExclusionReason::PlaceholderOutcome { market: m.market });

@@ -15,7 +15,8 @@ struct RelEntry {
     b: String,
     status: String,
     #[serde(default)]
-    #[allow(dead_code)] // populated by serde deserialization only; kept so deny_unknown_fields accepts it
+    #[allow(dead_code)]
+    // populated by serde deserialization only; kept so deny_unknown_fields accepts it
     note: Option<String>,
 }
 
@@ -46,7 +47,10 @@ impl std::fmt::Display for RelationshipError {
                 write!(f, "self-referential relationship: {a}")
             }
             RelationshipError::Duplicate { a, b } => {
-                write!(f, "duplicate relationship after canonicalization: ({a:?}, {b:?})")
+                write!(
+                    f,
+                    "duplicate relationship after canonicalization: ({a:?}, {b:?})"
+                )
             }
         }
     }
@@ -114,7 +118,11 @@ pub fn load_relationships(
         }
         approved.push(rel);
     }
-    Ok(LoadedRelationships { approved, pending_count, unresolved })
+    Ok(LoadedRelationships {
+        approved,
+        pending_count,
+        unresolved,
+    })
 }
 
 #[cfg(test)]
@@ -124,7 +132,12 @@ mod tests {
     use pm_core::instrument::{MarketId, Relationship};
 
     fn resolver<'a>(pairs: &'a [(&'a str, u32)]) -> impl Fn(&str) -> Option<MarketId> + 'a {
-        move |s: &str| pairs.iter().find(|(k, _)| *k == s).map(|(_, v)| MarketId(*v))
+        move |s: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == s)
+                .map(|(_, v)| MarketId(*v))
+        }
     }
 
     const SAMPLE: &str = r#"
@@ -150,13 +163,25 @@ status = "pending"
 
     #[test]
     fn parses_approves_and_canonicalizes() {
-        let r = resolver(&[("0xaaa", 5), ("0xbbb", 1), ("0xccc", 9), ("0xddd", 2), ("0xeee", 3)]);
+        let r = resolver(&[
+            ("0xaaa", 5),
+            ("0xbbb", 1),
+            ("0xccc", 9),
+            ("0xddd", 2),
+            ("0xeee", 3),
+        ]);
         let out = load_relationships(SAMPLE, &r).unwrap();
         // pending entry excluded from tradable set
         assert_eq!(out.approved.len(), 2);
-        assert!(out.approved.contains(&Relationship::Implies { a: MarketId(5), b: MarketId(1) }));
+        assert!(out.approved.contains(&Relationship::Implies {
+            a: MarketId(5),
+            b: MarketId(1)
+        }));
         // mutex canonicalized a ≤ b: (9,1) → (1,9)
-        assert!(out.approved.contains(&Relationship::MutuallyExclusive { a: MarketId(1), b: MarketId(9) }));
+        assert!(out.approved.contains(&Relationship::MutuallyExclusive {
+            a: MarketId(1),
+            b: MarketId(9)
+        }));
         assert_eq!(out.pending_count, 1);
     }
 
@@ -171,7 +196,13 @@ b = "0xbbb"
 status = "approved"
 "#;
         let out = load_relationships(toml, &r).unwrap();
-        assert_eq!(out.approved[0], Relationship::Implies { a: MarketId(9), b: MarketId(1) });
+        assert_eq!(
+            out.approved[0],
+            Relationship::Implies {
+                a: MarketId(9),
+                b: MarketId(1)
+            }
+        );
     }
 
     #[test]
@@ -184,7 +215,10 @@ a = "0xaaa"
 b = "0xaaa"
 status = "approved"
 "#;
-        assert!(matches!(load_relationships(toml, &r), Err(RelationshipError::SelfReferential { .. })));
+        assert!(matches!(
+            load_relationships(toml, &r),
+            Err(RelationshipError::SelfReferential { .. })
+        ));
     }
 
     #[test]
@@ -203,7 +237,10 @@ a = "0xbbb"
 b = "0xaaa"
 status = "approved"
 "#;
-        assert!(matches!(load_relationships(toml, &r), Err(RelationshipError::Duplicate { .. })));
+        assert!(matches!(
+            load_relationships(toml, &r),
+            Err(RelationshipError::Duplicate { .. })
+        ));
     }
 
     #[test]

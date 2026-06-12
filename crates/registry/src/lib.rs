@@ -91,7 +91,9 @@ impl Registry {
 
     /// Look up a market by its venue condition-id string (e.g. `"0xabc..."`).
     pub fn market_by_condition(&self, condition_id: &str) -> Option<&Market> {
-        self.interner.find_market(condition_id).and_then(|mid| self.markets.get(mid.0 as usize))
+        self.interner
+            .find_market(condition_id)
+            .and_then(|mid| self.markets.get(mid.0 as usize))
     }
 
     /// Which market owns this token?
@@ -132,10 +134,7 @@ impl Registry {
 
     /// All token ids interned (yes and no for every market).
     pub fn all_tokens(&self) -> Vec<TokenId> {
-        self.markets
-            .iter()
-            .flat_map(|m| [m.yes, m.no])
-            .collect()
+        self.markets.iter().flat_map(|m| [m.yes, m.no]).collect()
     }
 
     /// Venue token id string for an interned token handle.
@@ -241,7 +240,11 @@ impl RegistryBuilder {
             self.event_members.entry(eid).or_default().push(mid);
         }
 
-        self.meta.push(MarketMeta { question, active, closed });
+        self.meta.push(MarketMeta {
+            question,
+            active,
+            closed,
+        });
     }
 
     /// Finalise the registry with the relationship TOML source.
@@ -251,7 +254,12 @@ impl RegistryBuilder {
     /// - Builds the union-find components.
     /// - Returns the immutable [`Registry`].
     pub fn finish(self, relationship_toml: &str) -> Result<Registry, RegistryError> {
-        let RegistryBuilder { interner, markets, meta, event_members } = self;
+        let RegistryBuilder {
+            interner,
+            markets,
+            meta,
+            event_members,
+        } = self;
 
         // ---- 1. Derive partitions per event --------------------------------
         let mut partitions: Vec<Partition> = Vec::new();
@@ -338,9 +346,42 @@ mod tests {
 
     fn sample() -> Registry {
         let mut b = RegistryBuilder::default();
-        b.add_market("0xaaa", "tokyes_a", "tokno_a", TickSize::Cent, 0, false, Some("Will A win?".into()), true, false, None);
-        b.add_market("0xbbb", "tokyes_b", "tokno_b", TickSize::Milli, 0, true, Some("Will B win?".into()), true, false, Some("ev1"));
-        b.add_market("0xccc", "tokyes_c", "tokno_c", TickSize::Milli, 0, true, Some("Will C win?".into()), true, false, Some("ev1"));
+        b.add_market(
+            "0xaaa",
+            "tokyes_a",
+            "tokno_a",
+            TickSize::Cent,
+            0,
+            false,
+            Some("Will A win?".into()),
+            true,
+            false,
+            None,
+        );
+        b.add_market(
+            "0xbbb",
+            "tokyes_b",
+            "tokno_b",
+            TickSize::Milli,
+            0,
+            true,
+            Some("Will B win?".into()),
+            true,
+            false,
+            Some("ev1"),
+        );
+        b.add_market(
+            "0xccc",
+            "tokyes_c",
+            "tokno_c",
+            TickSize::Milli,
+            0,
+            true,
+            Some("Will C win?".into()),
+            true,
+            false,
+            Some("ev1"),
+        );
         b.finish("").unwrap()
     }
 
@@ -376,8 +417,30 @@ mod tests {
     #[test]
     fn relationships_wire_into_components() {
         let mut b = RegistryBuilder::default();
-        b.add_market("0xaaa", "ya", "na", TickSize::Cent, 0, false, None, true, false, None);
-        b.add_market("0xbbb", "yb", "nb", TickSize::Cent, 0, false, None, true, false, None);
+        b.add_market(
+            "0xaaa",
+            "ya",
+            "na",
+            TickSize::Cent,
+            0,
+            false,
+            None,
+            true,
+            false,
+            None,
+        );
+        b.add_market(
+            "0xbbb",
+            "yb",
+            "nb",
+            TickSize::Cent,
+            0,
+            false,
+            None,
+            true,
+            false,
+            None,
+        );
         let toml = "[[relationship]]\nkind = \"implies\"\na = \"0xaaa\"\nb = \"0xbbb\"\nstatus = \"approved\"\n";
         let r = b.finish(toml).unwrap();
         assert_eq!(r.approved_relationships().len(), 1);
@@ -414,7 +477,18 @@ mod tests {
     #[test]
     fn fee_of_returns_correct_bps() {
         let mut b = RegistryBuilder::default();
-        b.add_market("0xfee", "fy", "fn", TickSize::Cent, 200, false, None, true, false, None);
+        b.add_market(
+            "0xfee",
+            "fy",
+            "fn",
+            TickSize::Cent,
+            200,
+            false,
+            None,
+            true,
+            false,
+            None,
+        );
         let r = b.finish("").unwrap();
         let m = r.market_by_condition("0xfee").unwrap();
         assert_eq!(r.fee_of(m.yes), Some(Bps(200)));

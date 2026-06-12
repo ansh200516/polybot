@@ -13,15 +13,15 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use pm_core::instrument::TokenId;
+use pm_core::num::TickSize;
+use pm_ingestion::IngestError;
 use pm_ingestion::livebook::RawLevel;
 use pm_ingestion::rest::ParsedBook;
 use pm_ingestion::supervisor::{
     FactoryDecision, RestBookSource, SessionEnd, Supervisor, SupervisorConfig,
 };
 use pm_ingestion::ws::WsTransport;
-use pm_ingestion::IngestError;
-use pm_core::instrument::TokenId;
-use pm_core::num::TickSize;
 
 // ---------------------------------------------------------------------------
 // FakeTransport
@@ -66,7 +66,9 @@ struct FakeTransportBlocking {
 
 impl FakeTransportBlocking {
     fn new(frames: Vec<Result<String, IngestError>>) -> Self {
-        FakeTransportBlocking { incoming: frames.into_iter().collect() }
+        FakeTransportBlocking {
+            incoming: frames.into_iter().collect(),
+        }
     }
 }
 
@@ -97,10 +99,11 @@ struct FakeRest {
 }
 
 impl FakeRest {
-    fn new(
-        books: HashMap<String, (Vec<(String, String)>, Vec<(String, String)>, String)>,
-    ) -> Self {
-        FakeRest { books, call_log: Arc::new(Mutex::new(Vec::new())) }
+    fn new(books: HashMap<String, (Vec<(String, String)>, Vec<(String, String)>, String)>) -> Self {
+        FakeRest {
+            books,
+            call_log: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 }
 
@@ -116,7 +119,10 @@ fn parse_lvls(pairs: &[(String, String)]) -> Vec<RawLevel> {
 
 impl RestBookSource for FakeRest {
     async fn book(&mut self, venue_token_id: &str) -> Result<ParsedBook, IngestError> {
-        self.call_log.lock().unwrap().push(venue_token_id.to_owned());
+        self.call_log
+            .lock()
+            .unwrap()
+            .push(venue_token_id.to_owned());
         match self.books.get(venue_token_id) {
             Some((bids, asks, hash)) => Ok(ParsedBook {
                 asset_id: venue_token_id.to_owned(),
@@ -124,7 +130,9 @@ impl RestBookSource for FakeRest {
                 bids: parse_lvls(bids),
                 asks: parse_lvls(asks),
             }),
-            None => Err(IngestError::Http(format!("no canned book for {venue_token_id}"))),
+            None => Err(IngestError::Http(format!(
+                "no canned book for {venue_token_id}"
+            ))),
         }
     }
 }
@@ -137,7 +145,14 @@ impl RestBookSource for FakeRest {
 ///
 /// Shape matches ws_book.json: array of objects with asset_id, hash, bids, asks,
 /// event_type.
-fn book_frame(asset_id: &str, bid_price: &str, bid_size: &str, ask_price: &str, ask_size: &str, hash: &str) -> String {
+fn book_frame(
+    asset_id: &str,
+    bid_price: &str,
+    bid_size: &str,
+    ask_price: &str,
+    ask_size: &str,
+    hash: &str,
+) -> String {
     serde_json::json!([{
         "event_type": "book",
         "asset_id": asset_id,
@@ -177,8 +192,16 @@ fn price_change_frame(
 /// Build a price_change frame with multiple changes across two tokens.
 fn price_change_frame_two(
     market: &str,
-    asset_id1: &str, side1: &str, price1: &str, size1: &str, hash1: &str,
-    asset_id2: &str, side2: &str, price2: &str, size2: &str, hash2: &str,
+    asset_id1: &str,
+    side1: &str,
+    price1: &str,
+    size1: &str,
+    hash1: &str,
+    asset_id2: &str,
+    side2: &str,
+    price2: &str,
+    size2: &str,
+    hash2: &str,
 ) -> String {
     serde_json::json!({
         "event_type": "price_change",
@@ -277,8 +300,16 @@ async fn snapshot_then_deltas_builds_books() {
     // price_change frame: remove 0.44 bid on token_a (size=0) + add bid on token_b
     let f2 = price_change_frame_two(
         "market_cond",
-        "token_a", "BUY", "0.44", "0", "hash-a2",
-        "token_b", "BUY", "0.43", "200", "hash-b2",
+        "token_a",
+        "BUY",
+        "0.44",
+        "0",
+        "hash-a2",
+        "token_b",
+        "BUY",
+        "0.43",
+        "200",
+        "hash-b2",
     );
 
     let mut transport = FakeTransport::new(vec![Ok(f1), Ok(f2)]);
@@ -287,7 +318,11 @@ async fn snapshot_then_deltas_builds_books() {
 
     // REST calls: resnapshot_all() for 2 tokens at session start
     let calls = call_log.lock().unwrap();
-    assert_eq!(calls.len(), 2, "initial resnapshot_all should fetch both tokens");
+    assert_eq!(
+        calls.len(),
+        2,
+        "initial resnapshot_all should fetch both tokens"
+    );
 
     let shard = sup.shard();
     let book_a = shard.book(TokenId(0)).expect("book_a must exist");
@@ -349,14 +384,8 @@ async fn crossed_book_triggers_rest_resnapshot() {
     );
 
     // Delta that crosses the book: add a bid at 0.60 (above current ask 0.56)
-    let crossing_delta = price_change_frame(
-        "market_cond",
-        "token_a",
-        "BUY",
-        "0.60",
-        "500",
-        "hash-cross",
-    );
+    let crossing_delta =
+        price_change_frame("market_cond", "token_a", "BUY", "0.60", "500", "hash-cross");
 
     let mut transport = FakeTransport::new(vec![Ok(crossing_delta)]);
 
@@ -376,7 +405,8 @@ async fn crossed_book_triggers_rest_resnapshot() {
     // resnapshots counts ALL successful REST applies: 1 initial (resnapshot_all) + 1 after
     // crossing = 2 total.  This confirms the resnapshot path fired for the crossing event.
     assert_eq!(
-        sup.stats().resnapshots, 2,
+        sup.stats().resnapshots,
+        2,
         "2 total resnapshots: 1 initial + 1 triggered by crossed book"
     );
 }
@@ -409,11 +439,19 @@ impl FakeRestFailFirst {
 
 impl RestBookSource for FakeRestFailFirst {
     async fn book(&mut self, venue_token_id: &str) -> Result<ParsedBook, IngestError> {
-        self.call_log.lock().unwrap().push(venue_token_id.to_owned());
-        let count = self.call_counts.entry(venue_token_id.to_owned()).or_insert(0);
+        self.call_log
+            .lock()
+            .unwrap()
+            .push(venue_token_id.to_owned());
+        let count = self
+            .call_counts
+            .entry(venue_token_id.to_owned())
+            .or_insert(0);
         *count += 1;
         if *count == 1 && self.fail_first.contains(venue_token_id) {
-            return Err(IngestError::Http(format!("first call for {venue_token_id} forced to fail")));
+            return Err(IngestError::Http(format!(
+                "first call for {venue_token_id} forced to fail"
+            )));
         }
         match self.books.get(venue_token_id) {
             Some((bids, asks, hash)) => Ok(ParsedBook {
@@ -422,7 +460,9 @@ impl RestBookSource for FakeRestFailFirst {
                 bids: parse_lvls(bids),
                 asks: parse_lvls(asks),
             }),
-            None => Err(IngestError::Http(format!("no canned book for {venue_token_id}"))),
+            None => Err(IngestError::Http(format!(
+                "no canned book for {venue_token_id}"
+            ))),
         }
     }
 }
@@ -479,14 +519,7 @@ async fn delta_for_unknown_token_requests_snapshot() {
 
     // price_change for token_b — its initial REST snapshot failed so book is stale/invalid.
     // apply_changes returns NeedsResnapshot(FeedLost) → supervisor calls REST again.
-    let delta_b = price_change_frame(
-        "market_cond",
-        "token_b",
-        "BUY",
-        "0.43",
-        "100",
-        "hash-b1",
-    );
+    let delta_b = price_change_frame("market_cond", "token_b", "BUY", "0.43", "100", "hash-b1");
 
     let mut transport = FakeTransport::new(vec![Ok(delta_b)]);
 
@@ -679,8 +712,8 @@ async fn invalid_books_resnapshot_via_sweep() {
 async fn feed_silence_forces_reconnect() {
     // Configuration: tiny silence window and fast sweep for this test.
     let cfg = SupervisorConfig {
-        feed_silence: Duration::from_millis(5_000),   // 5s silence window
-        sweep_interval: Duration::from_millis(500),   // sweep every 500ms
+        feed_silence: Duration::from_millis(5_000), // 5s silence window
+        sweep_interval: Duration::from_millis(500), // sweep every 500ms
         ..default_cfg()
     };
 
@@ -719,14 +752,22 @@ async fn feed_silence_forces_reconnect() {
         } => unreachable!("time-advance arm should never complete"),
     };
 
-    assert_eq!(result, SessionEnd::FeedSilent, "expected FeedSilent when feed is silent");
     assert_eq!(
-        sup.stats().feed_silence_reconnects, 1,
+        result,
+        SessionEnd::FeedSilent,
+        "expected FeedSilent when feed is silent"
+    );
+    assert_eq!(
+        sup.stats().feed_silence_reconnects,
+        1,
         "feed_silence_reconnects should be 1 after one silent session"
     );
     // All books should be invalid after mark_all_stale (called by FeedSilent path).
     assert!(
-        !sup.shard().book(TokenId(0)).map(|b| b.valid()).unwrap_or(true),
+        !sup.shard()
+            .book(TokenId(0))
+            .map(|b| b.valid())
+            .unwrap_or(true),
         "book should be invalid after feed-silence mark_all_stale"
     );
 }

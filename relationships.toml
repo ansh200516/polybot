@@ -1,0 +1,11 @@
+# Human-curated logical relationships between markets (spec §9).
+# Only status = "approved" entries are tradable. The auto-suggester (M6)
+# writes status = "pending" entries; a human reviews and edits them.
+# Reference markets by their CLOB condition id (0x…), not slugs.
+#
+# [[relationship]]
+# kind = "implies"            # implies | mutually_exclusive | equivalent
+# a = "0x<condition-id>"      # for implies: a true ⇒ b true
+# b = "0x<condition-id>"
+# status = "pending"
+# note = "why this link holds"

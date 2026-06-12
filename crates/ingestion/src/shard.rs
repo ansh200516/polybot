@@ -33,7 +33,9 @@ impl Shard {
     /// Ensure a book slot exists for `token` with the given tick size.
     /// No-op if it already exists (tick size changes are not supported in-band).
     pub fn ensure_book(&mut self, token: TokenId, tick: TickSize) {
-        self.books.entry(token).or_insert_with(|| LiveBook::new(tick));
+        self.books
+            .entry(token)
+            .or_insert_with(|| LiveBook::new(tick));
     }
 
     /// Apply a REST snapshot to `token`. Creates the book slot if absent.
@@ -49,7 +51,10 @@ impl Shard {
         hash: &str,
     ) -> ApplyOutcome {
         self.stats.snapshots += 1;
-        let book = self.books.entry(token).or_insert_with(|| LiveBook::new(tick));
+        let book = self
+            .books
+            .entry(token)
+            .or_insert_with(|| LiveBook::new(tick));
         let outcome = book.apply_snapshot(now, bids, asks, hash);
         if let ApplyOutcome::NeedsResnapshot(reason) = outcome {
             self.stats.resnapshots_requested += 1;
@@ -205,15 +210,25 @@ mod tests {
         let out = shard.apply_changes(
             t0,
             tok_a,
-            &[RawChange { side_buy: true, price_micro: 440_000, size_micro: 0 }],
+            &[RawChange {
+                side_buy: true,
+                price_micro: 440_000,
+                size_micro: 0,
+            }],
             None,
         );
         assert_eq!(out, ApplyOutcome::Ok);
 
         // tok_a best bid moved to 43
-        assert_eq!(shard.book(tok_a).unwrap().book().bids.best().unwrap().get(), 43);
+        assert_eq!(
+            shard.book(tok_a).unwrap().book().bids.best().unwrap().get(),
+            43
+        );
         // tok_b unchanged
-        assert_eq!(shard.book(tok_b).unwrap().book().bids.best().unwrap().get(), 44);
+        assert_eq!(
+            shard.book(tok_b).unwrap().book().bids.best().unwrap().get(),
+            44
+        );
     }
 
     #[test]
@@ -264,18 +279,32 @@ mod tests {
         let out_a = shard.apply_changes(
             t0 + Duration::from_millis(100),
             tok_a,
-            &[RawChange { side_buy: true, price_micro: 440_000, size_micro: 0 }],
+            &[RawChange {
+                side_buy: true,
+                price_micro: 440_000,
+                size_micro: 0,
+            }],
             None,
         );
-        assert_eq!(out_a, ApplyOutcome::NeedsResnapshot(ResnapshotReason::FeedLost));
+        assert_eq!(
+            out_a,
+            ApplyOutcome::NeedsResnapshot(ResnapshotReason::FeedLost)
+        );
 
         let out_b = shard.apply_changes(
             t0 + Duration::from_millis(100),
             tok_b,
-            &[RawChange { side_buy: true, price_micro: 440_000, size_micro: 0 }],
+            &[RawChange {
+                side_buy: true,
+                price_micro: 440_000,
+                size_micro: 0,
+            }],
             None,
         );
-        assert_eq!(out_b, ApplyOutcome::NeedsResnapshot(ResnapshotReason::FeedLost));
+        assert_eq!(
+            out_b,
+            ApplyOutcome::NeedsResnapshot(ResnapshotReason::FeedLost)
+        );
     }
 
     #[test]
@@ -292,7 +321,11 @@ mod tests {
         let ok = shard.apply_changes(
             t0,
             tok,
-            &[RawChange { side_buy: true, price_micro: 440_000, size_micro: 0 }],
+            &[RawChange {
+                side_buy: true,
+                price_micro: 440_000,
+                size_micro: 0,
+            }],
             None,
         );
         assert_eq!(ok, ApplyOutcome::Ok);
@@ -302,7 +335,11 @@ mod tests {
         shard.apply_changes(
             t0,
             tok,
-            &[RawChange { side_buy: true, price_micro: 445_000, size_micro: 1_000_000 }],
+            &[RawChange {
+                side_buy: true,
+                price_micro: 445_000,
+                size_micro: 1_000_000,
+            }],
             None,
         );
         assert_eq!(shard.stats().off_tick, 1);
@@ -319,10 +356,17 @@ mod tests {
         let out = shard.apply_changes(
             t0,
             tok,
-            &[RawChange { side_buy: true, price_micro: 470_000, size_micro: 5_000_000 }],
+            &[RawChange {
+                side_buy: true,
+                price_micro: 470_000,
+                size_micro: 5_000_000,
+            }],
             None,
         );
-        assert_eq!(out, ApplyOutcome::NeedsResnapshot(ResnapshotReason::CrossedBook));
+        assert_eq!(
+            out,
+            ApplyOutcome::NeedsResnapshot(ResnapshotReason::CrossedBook)
+        );
         assert_eq!(shard.stats().resnapshots_requested, 1);
         assert_eq!(shard.stats().resnap_crossed, 1);
     }
@@ -336,10 +380,17 @@ mod tests {
         let out = shard.apply_changes(
             t0,
             tok,
-            &[RawChange { side_buy: true, price_micro: 440_000, size_micro: 10_000_000 }],
+            &[RawChange {
+                side_buy: true,
+                price_micro: 440_000,
+                size_micro: 10_000_000,
+            }],
             None,
         );
-        assert_eq!(out, ApplyOutcome::NeedsResnapshot(ResnapshotReason::UnknownToken));
+        assert_eq!(
+            out,
+            ApplyOutcome::NeedsResnapshot(ResnapshotReason::UnknownToken)
+        );
         assert_eq!(shard.stats().resnapshots_requested, 1);
         assert_eq!(shard.stats().resnap_unknown, 1);
     }

@@ -26,8 +26,8 @@
 //! frame and once per sweep tick. The probe drains/merges per print.
 
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -57,7 +57,10 @@ impl StageHistos {
         #[allow(clippy::expect_used)]
         let mut h2 = Histogram::<u64>::new(3).expect("histogram alloc");
         h2.auto(true);
-        StageHistos { recv_to_parsed: h1, parsed_to_applied: h2 }
+        StageHistos {
+            recv_to_parsed: h1,
+            parsed_to_applied: h2,
+        }
     }
 }
 
@@ -145,10 +148,14 @@ impl StatsCell {
         // here is acceptable for monitoring purposes.
         self.frames.store(sup_stats.frames, Ordering::Relaxed);
         self.events.store(sup_stats.events, Ordering::Relaxed);
-        self.parse_errors.store(sup_stats.parse_errors, Ordering::Relaxed);
-        self.reconnects.store(sup_stats.reconnects, Ordering::Relaxed);
-        self.resnapshots.store(sup_stats.resnapshots, Ordering::Relaxed);
-        self.resnapshot_errors.store(sup_stats.resnapshot_errors, Ordering::Relaxed);
+        self.parse_errors
+            .store(sup_stats.parse_errors, Ordering::Relaxed);
+        self.reconnects
+            .store(sup_stats.reconnects, Ordering::Relaxed);
+        self.resnapshots
+            .store(sup_stats.resnapshots, Ordering::Relaxed);
+        self.resnapshot_errors
+            .store(sup_stats.resnapshot_errors, Ordering::Relaxed);
         self.unknown_token_changes
             .store(sup_stats.unknown_token_changes, Ordering::Relaxed);
         self.feed_silence_reconnects
@@ -265,10 +272,12 @@ impl ProbeStats {
         self.parse_errors = self.parse_errors.saturating_add(sup_stats.parse_errors);
         self.reconnects = self.reconnects.saturating_add(sup_stats.reconnects);
         self.resnapshots = self.resnapshots.saturating_add(sup_stats.resnapshots);
-        self.resnapshot_errors =
-            self.resnapshot_errors.saturating_add(sup_stats.resnapshot_errors);
-        self.unknown_token_changes =
-            self.unknown_token_changes.saturating_add(sup_stats.unknown_token_changes);
+        self.resnapshot_errors = self
+            .resnapshot_errors
+            .saturating_add(sup_stats.resnapshot_errors);
+        self.unknown_token_changes = self
+            .unknown_token_changes
+            .saturating_add(sup_stats.unknown_token_changes);
         self.books = self.books.saturating_add(books);
         self.stale = self.stale.saturating_add(stale);
     }
@@ -425,7 +434,10 @@ mod tests {
 
         // Exactly 1% parse errors → healthy (parse_errors*100 == frames)
         ps.parse_errors = 1;
-        assert!(ps.healthy(), "1% parse error rate should be healthy (boundary)");
+        assert!(
+            ps.healthy(),
+            "1% parse error rate should be healthy (boundary)"
+        );
 
         // 2% parse errors → unhealthy
         ps.parse_errors = 2;
@@ -440,11 +452,17 @@ mod tests {
         ps.frames = 0;
         ps.parse_errors = 0;
         // 0 parse errors * 100 <= max(1, 0) = 1 → healthy
-        assert!(ps.healthy(), "zero frames and zero errors should be healthy");
+        assert!(
+            ps.healthy(),
+            "zero frames and zero errors should be healthy"
+        );
 
         ps.parse_errors = 1;
         // 1 * 100 = 100 > 1 → unhealthy
-        assert!(!ps.healthy(), "parse error with 0 frames should be unhealthy");
+        assert!(
+            !ps.healthy(),
+            "parse error with 0 frames should be unhealthy"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -528,10 +546,18 @@ mod tests {
         assert_eq!(cell.stale.load(Ordering::Relaxed), 5);
 
         // Check histogram entries
-        let p50_parse = cell.recv_to_parsed_us.lock().unwrap().value_at_quantile(0.50);
+        let p50_parse = cell
+            .recv_to_parsed_us
+            .lock()
+            .unwrap()
+            .value_at_quantile(0.50);
         assert_eq!(p50_parse, 10, "p50 of recv_to_parsed_us should be 10µs");
 
-        let p50_apply = cell.parsed_to_applied_us.lock().unwrap().value_at_quantile(0.50);
+        let p50_apply = cell
+            .parsed_to_applied_us
+            .lock()
+            .unwrap()
+            .value_at_quantile(0.50);
         assert_eq!(p50_apply, 3, "p50 of parsed_to_applied_us should be 3µs");
     }
 }

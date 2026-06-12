@@ -11,9 +11,9 @@
 
 use serde::Deserialize;
 
+use crate::IngestError;
 use crate::decimal::parse_micro;
 use crate::livebook::RawLevel;
-use crate::IngestError;
 
 // ---------------------------------------------------------------------------
 // Raw serde shapes (direct JSON model)
@@ -50,7 +50,10 @@ impl BookEvent {
             if size_micro == 0 {
                 continue;
             }
-            bids.push(RawLevel { price_micro, size_micro });
+            bids.push(RawLevel {
+                price_micro,
+                size_micro,
+            });
         }
         let mut asks = Vec::with_capacity(self.asks.len());
         for lvl in &self.asks {
@@ -59,7 +62,10 @@ impl BookEvent {
             if size_micro == 0 {
                 continue;
             }
-            asks.push(RawLevel { price_micro, size_micro });
+            asks.push(RawLevel {
+                price_micro,
+                size_micro,
+            });
         }
         Ok((bids, asks))
     }
@@ -108,10 +114,7 @@ pub enum WsEvent {
     /// Price-level changes for one or more tokens in a market.
     PriceChange(PriceChangeEvent),
     /// Tick-size change notification.
-    TickSizeChange {
-        asset_id: String,
-        new_tick: String,
-    },
+    TickSizeChange { asset_id: String, new_tick: String },
     /// Any event type not explicitly handled (e.g. `last_trade_price`).
     Other,
 }
@@ -137,21 +140,20 @@ pub fn parse_frame(text: &str) -> Result<Vec<WsEvent>, IngestError> {
             Ok(out)
         }
         serde_json::Value::Object(_) => Ok(vec![parse_one(&v)?]),
-        other => Err(IngestError::Parse(format!("unexpected frame shape: {other}"))),
+        other => Err(IngestError::Parse(format!(
+            "unexpected frame shape: {other}"
+        ))),
     }
 }
 
 /// Parse a single JSON object into one `WsEvent`.
 fn parse_one(v: &serde_json::Value) -> Result<WsEvent, IngestError> {
-    let event_type = v
-        .get("event_type")
-        .and_then(|x| x.as_str())
-        .unwrap_or("");
+    let event_type = v.get("event_type").and_then(|x| x.as_str()).unwrap_or("");
 
     match event_type {
         "book" => {
-            let ev: BookEvent = serde_json::from_value(v.clone())
-                .map_err(|e| IngestError::Parse(e.to_string()))?;
+            let ev: BookEvent =
+                serde_json::from_value(v.clone()).map_err(|e| IngestError::Parse(e.to_string()))?;
             Ok(WsEvent::Book(ev))
         }
         "price_change" => {
@@ -177,12 +179,10 @@ fn parse_one(v: &serde_json::Value) -> Result<WsEvent, IngestError> {
                     .and_then(|x| x.as_str())
                     .unwrap_or("")
                     .to_owned();
-                let change_hash =
-                    item.get("hash").and_then(|x| x.as_str()).map(str::to_owned);
-                let price_str = item
-                    .get("price")
-                    .and_then(|x| x.as_str())
-                    .ok_or_else(|| IngestError::Parse("price_changes entry missing price".into()))?;
+                let change_hash = item.get("hash").and_then(|x| x.as_str()).map(str::to_owned);
+                let price_str = item.get("price").and_then(|x| x.as_str()).ok_or_else(|| {
+                    IngestError::Parse("price_changes entry missing price".into())
+                })?;
                 let size_str = item
                     .get("size")
                     .and_then(|x| x.as_str())
@@ -198,7 +198,7 @@ fn parse_one(v: &serde_json::Value) -> Result<WsEvent, IngestError> {
                     other => {
                         return Err(IngestError::Parse(format!(
                             "unknown side value in price_changes: {other:?}"
-                        )))
+                        )));
                     }
                 };
                 let price_micro =
@@ -215,22 +215,22 @@ fn parse_one(v: &serde_json::Value) -> Result<WsEvent, IngestError> {
                 });
             }
 
-            Ok(WsEvent::PriceChange(PriceChangeEvent { market_condition_id: asset_id, hash, changes }))
+            Ok(WsEvent::PriceChange(PriceChangeEvent {
+                market_condition_id: asset_id,
+                hash,
+                changes,
+            }))
         }
         "tick_size_change" => {
             let asset_id = v
                 .get("asset_id")
                 .and_then(|x| x.as_str())
-                .ok_or_else(|| {
-                    IngestError::Parse("tick_size_change missing asset_id".into())
-                })?
+                .ok_or_else(|| IngestError::Parse("tick_size_change missing asset_id".into()))?
                 .to_owned();
             let new_tick = v
                 .get("new_tick_size")
                 .and_then(|x| x.as_str())
-                .ok_or_else(|| {
-                    IngestError::Parse("tick_size_change missing new_tick_size".into())
-                })?
+                .ok_or_else(|| IngestError::Parse("tick_size_change missing new_tick_size".into()))?
                 .to_owned();
             Ok(WsEvent::TickSizeChange { asset_id, new_tick })
         }
@@ -247,8 +247,10 @@ fn parse_one(v: &serde_json::Value) -> Result<WsEvent, IngestError> {
 ///
 /// Shape: `{"type":"market","assets_ids":["id1","id2",...]}`.
 pub fn subscribe_message(asset_ids: &[String]) -> String {
-    let ids: Vec<serde_json::Value> =
-        asset_ids.iter().map(|s| serde_json::Value::String(s.clone())).collect();
+    let ids: Vec<serde_json::Value> = asset_ids
+        .iter()
+        .map(|s| serde_json::Value::String(s.clone()))
+        .collect();
     serde_json::json!({
         "type": "market",
         "assets_ids": ids,
@@ -281,11 +283,7 @@ pub trait WsTransport {
 // ---------------------------------------------------------------------------
 
 use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::Message,
-    WebSocketStream,
-};
+use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
 
 /// Production WebSocket transport backed by `tokio-tungstenite`.
 ///
@@ -299,8 +297,9 @@ pub struct TungsteniteTransport<S> {
 impl TungsteniteTransport<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     /// Connect to the given WebSocket URL and return a transport.
     pub async fn connect(url: &str) -> Result<Self, IngestError> {
-        let (stream, _response) =
-            connect_async(url).await.map_err(|e| IngestError::Ws(e.to_string()))?;
+        let (stream, _response) = connect_async(url)
+            .await
+            .map_err(|e| IngestError::Ws(e.to_string()))?;
         Ok(Self { stream })
     }
 }
@@ -349,7 +348,9 @@ mod tests {
     fn parses_book_event_fixture() {
         let evs = parse_frame(&fixture("ws_book.json")).unwrap();
         assert!(!evs.is_empty());
-        let WsEvent::Book(b) = &evs[0] else { panic!("expected Book, got {:?}", evs[0]) };
+        let WsEvent::Book(b) = &evs[0] else {
+            panic!("expected Book, got {:?}", evs[0])
+        };
         assert!(!b.asset_id.is_empty());
         assert!(!b.hash.is_empty());
         assert!(!b.bids.is_empty() || !b.asks.is_empty());
@@ -358,10 +359,15 @@ mod tests {
     #[test]
     fn parses_price_change_fixture() {
         let evs = parse_frame(&fixture("ws_price_change.json")).unwrap();
-        let WsEvent::PriceChange(pc) = &evs[0] else { panic!("expected PriceChange") };
+        let WsEvent::PriceChange(pc) = &evs[0] else {
+            panic!("expected PriceChange")
+        };
         // market field from the fixture is the condition id, not a token asset_id
-        assert_eq!(pc.market_condition_id, "0x7976b8dbacf9077eb1453a62bcefd6ab2df199acd28aad276ff0d920d6992892",
-            "market_condition_id must match the fixture's 'market' field exactly");
+        assert_eq!(
+            pc.market_condition_id,
+            "0x7976b8dbacf9077eb1453a62bcefd6ab2df199acd28aad276ff0d920d6992892",
+            "market_condition_id must match the fixture's 'market' field exactly"
+        );
         assert!(!pc.changes.is_empty());
         for c in &pc.changes {
             assert!(c.price_micro > 0 && c.price_micro < 1_000_000);
@@ -372,16 +378,24 @@ mod tests {
     #[test]
     fn unknown_side_fails() {
         let frame = r#"{"event_type":"price_change","market":"mkt","price_changes":[{"asset_id":"1","price":"0.50","size":"100","side":"LEFT"}]}"#;
-        assert!(parse_frame(frame).is_err(), "unknown side value must return Err");
+        assert!(
+            parse_frame(frame).is_err(),
+            "unknown side value must return Err"
+        );
     }
 
     #[test]
     fn size_zero_change_is_preserved() {
         let frame = r#"{"event_type":"price_change","market":"mkt","price_changes":[{"asset_id":"1","price":"0.50","size":"0","side":"BUY"}]}"#;
         let evs = parse_frame(frame).unwrap();
-        let WsEvent::PriceChange(pc) = &evs[0] else { panic!("expected PriceChange") };
+        let WsEvent::PriceChange(pc) = &evs[0] else {
+            panic!("expected PriceChange")
+        };
         assert_eq!(pc.changes.len(), 1);
-        assert_eq!(pc.changes[0].size_micro, 0, "size 0 must be preserved in ParsedChange (it signals level removal)");
+        assert_eq!(
+            pc.changes[0].size_micro, 0,
+            "size 0 must be preserved in ParsedChange (it signals level removal)"
+        );
     }
 
     #[test]
@@ -415,7 +429,9 @@ mod tests {
     fn tick_size_change_parses() {
         let frame = r#"{"event_type":"tick_size_change","asset_id":"1","old_tick_size":"0.01","new_tick_size":"0.001"}"#;
         let evs = parse_frame(frame).unwrap();
-        assert!(matches!(&evs[0], WsEvent::TickSizeChange { asset_id, new_tick } if asset_id == "1" && new_tick == "0.001"));
+        assert!(
+            matches!(&evs[0], WsEvent::TickSizeChange { asset_id, new_tick } if asset_id == "1" && new_tick == "0.001")
+        );
     }
 
     #[test]

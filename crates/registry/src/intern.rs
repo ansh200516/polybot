@@ -13,14 +13,19 @@ mod tests {
     #[test]
     fn intern_is_idempotent_and_dense() {
         let mut it = Interner::default();
-        let a = it.token("11015470973684177829729219287262166995141465048508201953575582100565462316560");
+        let a = it
+            .token("11015470973684177829729219287262166995141465048508201953575582100565462316560");
         let b = it.token("4");
-        let a2 = it.token("11015470973684177829729219287262166995141465048508201953575582100565462316560");
+        let a2 = it
+            .token("11015470973684177829729219287262166995141465048508201953575582100565462316560");
         assert_eq!(a, a2);
         assert_ne!(a, b);
         assert_eq!(a, TokenId(0));
         assert_eq!(b, TokenId(1));
-        assert_eq!(it.token_str(a).unwrap(), "11015470973684177829729219287262166995141465048508201953575582100565462316560");
+        assert_eq!(
+            it.token_str(a).unwrap(),
+            "11015470973684177829729219287262166995141465048508201953575582100565462316560"
+        );
         assert!(it.token_str(TokenId(99)).is_none());
     }
 
@@ -86,7 +91,9 @@ impl Interner {
 
     #[must_use]
     pub fn token_str(&self, t: TokenId) -> Option<&str> {
-        self.tokens.get(usize::try_from(t.0).ok()?).map(AsRef::as_ref)
+        self.tokens
+            .get(usize::try_from(t.0).ok()?)
+            .map(AsRef::as_ref)
     }
 
     pub fn market(&mut self, venue_id: &str) -> MarketId {
@@ -107,7 +114,9 @@ impl Interner {
 
     #[must_use]
     pub fn market_str(&self, m: MarketId) -> Option<&str> {
-        self.markets.get(usize::try_from(m.0).ok()?).map(AsRef::as_ref)
+        self.markets
+            .get(usize::try_from(m.0).ok()?)
+            .map(AsRef::as_ref)
     }
 
     pub fn event(&mut self, venue_id: &str) -> EventId {
@@ -128,6 +137,8 @@ impl Interner {
 
     #[must_use]
     pub fn event_str(&self, e: EventId) -> Option<&str> {
-        self.events.get(usize::try_from(e.0).ok()?).map(AsRef::as_ref)
+        self.events
+            .get(usize::try_from(e.0).ok()?)
+            .map(AsRef::as_ref)
     }
 }

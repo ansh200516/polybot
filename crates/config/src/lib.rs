@@ -228,7 +228,9 @@ impl Config {
             return Err(ConfigError::BadMoney("rest_rate_capacity must be ≥ 1"));
         }
         if self.ingestion.backoff_base_ms > self.ingestion.backoff_cap_ms {
-            return Err(ConfigError::BadMoney("backoff_base_ms must be ≤ backoff_cap_ms"));
+            return Err(ConfigError::BadMoney(
+                "backoff_base_ms must be ≤ backoff_cap_ms",
+            ));
         }
         // Endpoints validation
         if self.endpoints.gamma_base.is_empty() {
@@ -247,10 +249,14 @@ impl Config {
             return Err(ConfigError::BadMoney("ws_market_url must be non-empty"));
         }
         if !self.endpoints.ws_market_url.starts_with("wss://") {
-            return Err(ConfigError::BadMoney("ws_market_url must start with wss://"));
+            return Err(ConfigError::BadMoney(
+                "ws_market_url must start with wss://",
+            ));
         }
         if self.ingestion.relationships_path.is_empty() {
-            return Err(ConfigError::BadMoney("relationships_path must be non-empty"));
+            return Err(ConfigError::BadMoney(
+                "relationships_path must be non-empty",
+            ));
         }
         Ok(())
     }
@@ -288,7 +294,10 @@ mod tests {
         assert!(c.mode.paper);
         assert_eq!(c.endpoints.gamma_base, "https://gamma-api.polymarket.com");
         assert_eq!(c.endpoints.clob_base, "https://clob.polymarket.com");
-        assert_eq!(c.endpoints.ws_market_url, "wss://ws-subscriptions-clob.polymarket.com/ws/market");
+        assert_eq!(
+            c.endpoints.ws_market_url,
+            "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+        );
         assert_eq!(c.universe.max_markets, 200);
         assert!(c.universe.require_active);
         assert_eq!(c.ingestion.staleness_ms, 1_500);
@@ -340,10 +349,14 @@ mod tests {
 
     #[test]
     fn endpoints_override_parses() {
-        let c = Config::from_toml_str("[endpoints]\ngamma_base = \"https://custom-gamma.com\"\n").unwrap();
+        let c = Config::from_toml_str("[endpoints]\ngamma_base = \"https://custom-gamma.com\"\n")
+            .unwrap();
         assert_eq!(c.endpoints.gamma_base, "https://custom-gamma.com");
         assert_eq!(c.endpoints.clob_base, "https://clob.polymarket.com");
-        assert_eq!(c.endpoints.ws_market_url, "wss://ws-subscriptions-clob.polymarket.com/ws/market");
+        assert_eq!(
+            c.endpoints.ws_market_url,
+            "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+        );
     }
 
     #[test]
@@ -373,7 +386,10 @@ mod tests {
         // rest_rate_capacity < 1
         assert!(Config::from_toml_str("[ingestion]\nrest_rate_capacity = 0\n").is_err());
         // backoff_base_ms > backoff_cap_ms
-        assert!(Config::from_toml_str("[ingestion]\nbackoff_base_ms = 40000\nbackoff_cap_ms = 30000\n").is_err());
+        assert!(
+            Config::from_toml_str("[ingestion]\nbackoff_base_ms = 40000\nbackoff_cap_ms = 30000\n")
+                .is_err()
+        );
     }
 
     #[test]

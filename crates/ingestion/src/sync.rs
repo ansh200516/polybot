@@ -21,12 +21,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use pm_core::num::TickSize;
 use pm_registry::gamma::{ClobMarket, GammaEvent};
 use pm_registry::{RegistryBuilder, RegistryError};
-use pm_core::num::TickSize;
 
-use crate::rest::ClobRest;
 use crate::IngestError;
+use crate::rest::ClobRest;
 
 // ---------------------------------------------------------------------------
 // Universe filter
@@ -43,7 +43,10 @@ pub struct UniverseFilter {
 
 impl Default for UniverseFilter {
     fn default() -> Self {
-        UniverseFilter { max_markets: 200, require_active: true }
+        UniverseFilter {
+            max_markets: 200,
+            require_active: true,
+        }
     }
 }
 
@@ -114,8 +117,12 @@ fn pick_yes_no(tokens: &[pm_registry::gamma::ClobToken]) -> Option<(String, Stri
     let no_id;
 
     // Check whether the tokens carry explicit "Yes"/"No" labels.
-    let yes_pos = tokens.iter().position(|t| t.outcome.eq_ignore_ascii_case("yes"));
-    let no_pos = tokens.iter().position(|t| t.outcome.eq_ignore_ascii_case("no"));
+    let yes_pos = tokens
+        .iter()
+        .position(|t| t.outcome.eq_ignore_ascii_case("yes"));
+    let no_pos = tokens
+        .iter()
+        .position(|t| t.outcome.eq_ignore_ascii_case("no"));
 
     if let (Some(yi), Some(ni)) = (yes_pos, no_pos) {
         yes_id = tokens[yi].token_id.clone();
@@ -204,16 +211,23 @@ pub fn assemble_registry(
             };
 
             // ---- fee (CLOB taker_base_fee is authoritative) ----------------
-            let fee_bps = i32::try_from(clob.taker_base_fee)
-                .unwrap_or_else(|_| {
-                    if clob.taker_base_fee > i64::from(i32::MAX) { i32::MAX } else { i32::MIN }
-                });
+            let fee_bps = i32::try_from(clob.taker_base_fee).unwrap_or_else(|_| {
+                if clob.taker_base_fee > i64::from(i32::MAX) {
+                    i32::MAX
+                } else {
+                    i32::MIN
+                }
+            });
 
             // ---- negRisk (defensive or) ------------------------------------
             let neg_risk = clob.neg_risk || gm.neg_risk;
 
             // ---- event key (skip grouping when empty) ----------------------
-            let event_key: Option<&str> = if event.id.is_empty() { None } else { Some(&event.id) };
+            let event_key: Option<&str> = if event.id.is_empty() {
+                None
+            } else {
+                Some(&event.id)
+            };
 
             builder.add_market(
                 &gm.condition_id,
@@ -233,7 +247,10 @@ pub fn assemble_registry(
     }
 
     let registry = builder.finish(relationship_toml)?;
-    Ok(AssembledUniverse { registry: Arc::new(registry), skipped })
+    Ok(AssembledUniverse {
+        registry: Arc::new(registry),
+        skipped,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -467,8 +484,13 @@ impl SyncTask {
         // Reload relationships from disk only when mtime has changed (or first call).
         self.maybe_reload_relationships();
 
-        let universe = assemble_registry(&events, &clob_by_condition, &self.relationship_toml, &self.filter)
-            .map_err(|e| IngestError::Parse(e.to_string()))?;
+        let universe = assemble_registry(
+            &events,
+            &clob_by_condition,
+            &self.relationship_toml,
+            &self.filter,
+        )
+        .map_err(|e| IngestError::Parse(e.to_string()))?;
 
         let _ = self.tx.send(Arc::clone(&universe.registry));
         Ok(universe)
@@ -483,8 +505,8 @@ impl SyncTask {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use std::collections::HashMap;
     use pm_registry::gamma::{ClobMarket, ClobToken, GammaEvent};
+    use std::collections::HashMap;
 
     // ---- helpers ------------------------------------------------------------
 
@@ -502,7 +524,16 @@ mod tests {
 
     /// Build a minimal ClobMarket via serde for a binary market.
     fn make_clob(spec: ClobSpec<'_>) -> ClobMarket {
-        let ClobSpec { condition_id, tick, taker_fee, active, closed, neg_risk, yes_token, no_token } = spec;
+        let ClobSpec {
+            condition_id,
+            tick,
+            taker_fee,
+            active,
+            closed,
+            neg_risk,
+            yes_token,
+            no_token,
+        } = spec;
         let json = format!(
             r#"{{
                 "condition_id": {cid:?},
@@ -595,15 +626,48 @@ mod tests {
         // Event 1: single Cent market, taker fee 0
         let ev1 = make_event("ev1", "0xaaa", "ya", "na", false, true);
         // Event 2: two Milli negRisk markets, one with taker fee 200
-        let ev2 = make_event_multi("ev2", true, &[
-            ("0xbbb", "yb", "nb"),
-            ("0xccc", "yc", "nc"),
-        ]);
+        let ev2 = make_event_multi("ev2", true, &[("0xbbb", "yb", "nb"), ("0xccc", "yc", "nc")]);
 
         let mut clob = HashMap::new();
-        clob.insert("0xaaa".into(), make_clob(ClobSpec { condition_id: "0xaaa", tick: 0.01, taker_fee: 0, active: true, closed: false, neg_risk: false, yes_token: "ya", no_token: "na" }));
-        clob.insert("0xbbb".into(), make_clob(ClobSpec { condition_id: "0xbbb", tick: 0.001, taker_fee: 200, active: true, closed: false, neg_risk: true, yes_token: "yb", no_token: "nb" }));
-        clob.insert("0xccc".into(), make_clob(ClobSpec { condition_id: "0xccc", tick: 0.001, taker_fee: 0, active: true, closed: false, neg_risk: true, yes_token: "yc", no_token: "nc" }));
+        clob.insert(
+            "0xaaa".into(),
+            make_clob(ClobSpec {
+                condition_id: "0xaaa",
+                tick: 0.01,
+                taker_fee: 0,
+                active: true,
+                closed: false,
+                neg_risk: false,
+                yes_token: "ya",
+                no_token: "na",
+            }),
+        );
+        clob.insert(
+            "0xbbb".into(),
+            make_clob(ClobSpec {
+                condition_id: "0xbbb",
+                tick: 0.001,
+                taker_fee: 200,
+                active: true,
+                closed: false,
+                neg_risk: true,
+                yes_token: "yb",
+                no_token: "nb",
+            }),
+        );
+        clob.insert(
+            "0xccc".into(),
+            make_clob(ClobSpec {
+                condition_id: "0xccc",
+                tick: 0.001,
+                taker_fee: 0,
+                active: true,
+                closed: false,
+                neg_risk: true,
+                yes_token: "yc",
+                no_token: "nc",
+            }),
+        );
 
         let events = vec![ev1, ev2];
         let universe = assemble_registry(&events, &clob, "", &UniverseFilter::default()).unwrap();
@@ -629,7 +693,10 @@ mod tests {
 
         // ev2 has 2 negRisk members → partition should be derived
         let partitions = reg.partitions();
-        assert!(!partitions.is_empty(), "ev2 negRisk event must produce a partition");
+        assert!(
+            !partitions.is_empty(),
+            "ev2 negRisk event must produce a partition"
+        );
     }
 
     // ---- Test 2: unsupported tick -------------------------------------------
@@ -638,14 +705,28 @@ mod tests {
     fn skips_unsupported_tick_with_reason() {
         let ev = make_event("ev1", "0xbad", "y1", "n1", false, true);
         let mut clob = HashMap::new();
-        clob.insert("0xbad".into(), make_clob(ClobSpec { condition_id: "0xbad", tick: 0.04, taker_fee: 0, active: true, closed: false, neg_risk: false, yes_token: "y1", no_token: "n1" }));
+        clob.insert(
+            "0xbad".into(),
+            make_clob(ClobSpec {
+                condition_id: "0xbad",
+                tick: 0.04,
+                taker_fee: 0,
+                active: true,
+                closed: false,
+                neg_risk: false,
+                yes_token: "y1",
+                no_token: "n1",
+            }),
+        );
 
-        let universe =
-            assemble_registry(&[ev], &clob, "", &UniverseFilter::default()).unwrap();
+        let universe = assemble_registry(&[ev], &clob, "", &UniverseFilter::default()).unwrap();
 
         assert_eq!(universe.registry.markets().len(), 0);
         assert_eq!(universe.skipped.len(), 1);
-        assert_eq!(universe.skipped[0], ("0xbad".to_string(), SkippedReason::UnsupportedTick));
+        assert_eq!(
+            universe.skipped[0],
+            ("0xbad".to_string(), SkippedReason::UnsupportedTick)
+        );
     }
 
     // ---- Test 3: empty condition id + failed lookup --------------------------
@@ -662,9 +743,13 @@ mod tests {
 
         let clob: HashMap<String, ClobMarket> = HashMap::new(); // empty — nothing will match
 
-        let universe =
-            assemble_registry(&[ev_empty, ev_missing], &clob, "", &UniverseFilter::default())
-                .unwrap();
+        let universe = assemble_registry(
+            &[ev_empty, ev_missing],
+            &clob,
+            "",
+            &UniverseFilter::default(),
+        )
+        .unwrap();
 
         assert_eq!(universe.registry.markets().len(), 0);
         assert_eq!(universe.skipped.len(), 2);
@@ -683,17 +768,60 @@ mod tests {
         let ev2 = make_event("ev2", "0xc", "yc", "nc", false, true);
 
         let mut clob = HashMap::new();
-        clob.insert("0xa".into(), make_clob(ClobSpec { condition_id: "0xa", tick: 0.01, taker_fee: 0, active: true, closed: false, neg_risk: false, yes_token: "ya", no_token: "na" }));
-        clob.insert("0xb".into(), make_clob(ClobSpec { condition_id: "0xb", tick: 0.01, taker_fee: 0, active: true, closed: false, neg_risk: false, yes_token: "yb", no_token: "nb" }));
-        clob.insert("0xc".into(), make_clob(ClobSpec { condition_id: "0xc", tick: 0.01, taker_fee: 0, active: true, closed: false, neg_risk: false, yes_token: "yc", no_token: "nc" }));
+        clob.insert(
+            "0xa".into(),
+            make_clob(ClobSpec {
+                condition_id: "0xa",
+                tick: 0.01,
+                taker_fee: 0,
+                active: true,
+                closed: false,
+                neg_risk: false,
+                yes_token: "ya",
+                no_token: "na",
+            }),
+        );
+        clob.insert(
+            "0xb".into(),
+            make_clob(ClobSpec {
+                condition_id: "0xb",
+                tick: 0.01,
+                taker_fee: 0,
+                active: true,
+                closed: false,
+                neg_risk: false,
+                yes_token: "yb",
+                no_token: "nb",
+            }),
+        );
+        clob.insert(
+            "0xc".into(),
+            make_clob(ClobSpec {
+                condition_id: "0xc",
+                tick: 0.01,
+                taker_fee: 0,
+                active: true,
+                closed: false,
+                neg_risk: false,
+                yes_token: "yc",
+                no_token: "nc",
+            }),
+        );
 
-        let filter = UniverseFilter { max_markets: 2, require_active: true };
+        let filter = UniverseFilter {
+            max_markets: 2,
+            require_active: true,
+        };
         let universe = assemble_registry(&[ev1, ev2], &clob, "", &filter).unwrap();
 
         // exactly 2 added; 0xc was not visited — no skip entry for it
         assert_eq!(universe.registry.markets().len(), 2);
         // capped markets simply aren't visited — no skip entries expected
-        assert_eq!(universe.skipped.len(), 0, "capped markets produce no skip entries");
+        assert_eq!(
+            universe.skipped.len(),
+            0,
+            "capped markets produce no skip entries"
+        );
     }
 
     // ---- Test 5: inactive skipped vs included when require_active=false ------
@@ -703,17 +831,36 @@ mod tests {
         let ev = make_event("ev1", "0xclosed", "y", "n", false, true);
         let mut clob = HashMap::new();
         // closed=true → inactive under require_active
-        clob.insert("0xclosed".into(), make_clob(ClobSpec { condition_id: "0xclosed", tick: 0.01, taker_fee: 0, active: true, closed: true, neg_risk: false, yes_token: "y", no_token: "n" }));
+        clob.insert(
+            "0xclosed".into(),
+            make_clob(ClobSpec {
+                condition_id: "0xclosed",
+                tick: 0.01,
+                taker_fee: 0,
+                active: true,
+                closed: true,
+                neg_risk: false,
+                yes_token: "y",
+                no_token: "n",
+            }),
+        );
 
         // require_active = true → skip
-        let filter_strict = UniverseFilter { max_markets: 200, require_active: true };
-        let strict = assemble_registry(std::slice::from_ref(&ev), &clob, "", &filter_strict).unwrap();
+        let filter_strict = UniverseFilter {
+            max_markets: 200,
+            require_active: true,
+        };
+        let strict =
+            assemble_registry(std::slice::from_ref(&ev), &clob, "", &filter_strict).unwrap();
         assert_eq!(strict.registry.markets().len(), 0);
         assert_eq!(strict.skipped.len(), 1);
         assert_eq!(strict.skipped[0].1, SkippedReason::InactiveOrClosed);
 
         // require_active = false → include
-        let filter_lax = UniverseFilter { max_markets: 200, require_active: false };
+        let filter_lax = UniverseFilter {
+            max_markets: 200,
+            require_active: false,
+        };
         let lax = assemble_registry(&[ev], &clob, "", &filter_lax).unwrap();
         assert_eq!(lax.registry.markets().len(), 1);
         assert!(lax.skipped.is_empty());
@@ -723,9 +870,8 @@ mod tests {
 
     #[test]
     fn fixture_events_assemble() {
-        let events_json = std::fs::read_to_string(
-            "../registry/tests/fixtures/gamma_events.json",
-        ).unwrap();
+        let events_json =
+            std::fs::read_to_string("../registry/tests/fixtures/gamma_events.json").unwrap();
         let events: Vec<GammaEvent> = serde_json::from_str(&events_json).unwrap();
 
         // Build a synthetic CLOB map for all member markets found in the fixture.
@@ -746,20 +892,28 @@ mod tests {
                 };
                 clob_by_condition.insert(
                     gm.condition_id.clone(),
-                    make_clob(ClobSpec { condition_id: &gm.condition_id, tick: 0.001, taker_fee: 0, active: true, closed: false, neg_risk: gm.neg_risk, yes_token: &yes_tok, no_token: &no_tok }),
+                    make_clob(ClobSpec {
+                        condition_id: &gm.condition_id,
+                        tick: 0.001,
+                        taker_fee: 0,
+                        active: true,
+                        closed: false,
+                        neg_risk: gm.neg_risk,
+                        yes_token: &yes_tok,
+                        no_token: &no_tok,
+                    }),
                 );
             }
         }
 
-        let universe = assemble_registry(
-            &events,
-            &clob_by_condition,
-            "",
-            &UniverseFilter::default(),
-        ).unwrap();
+        let universe =
+            assemble_registry(&events, &clob_by_condition, "", &UniverseFilter::default()).unwrap();
 
         // At least some markets should have been assembled.
-        assert!(!universe.registry.markets().is_empty(), "must have assembled at least one market");
+        assert!(
+            !universe.registry.markets().is_empty(),
+            "must have assembled at least one market"
+        );
 
         // The fixture contains negRisk events with only 1 member market each.
         // The partition derivation will record TooFewMembers exclusions.
@@ -769,10 +923,16 @@ mod tests {
         let exclusion_log = universe.registry.exclusion_log();
 
         // partitions should exist (one per event that has grouping)
-        assert!(!partitions.is_empty(), "partitions must be derived from fixture events");
+        assert!(
+            !partitions.is_empty(),
+            "partitions must be derived from fixture events"
+        );
 
         // All fixture negRisk events have 1 member, which hits TooFewMembers
-        assert!(!exclusion_log.is_empty(), "TooFewMembers exclusions expected for single-member negRisk events");
+        assert!(
+            !exclusion_log.is_empty(),
+            "TooFewMembers exclusions expected for single-member negRisk events"
+        );
     }
 
     // ---- Test 7: keyset envelope parser ------------------------------------
@@ -780,9 +940,8 @@ mod tests {
     #[test]
     fn events_keyset_envelope_parses_object_wrapper() {
         // Build a synthetic envelope wrapping the first event from the fixture.
-        let events_json = std::fs::read_to_string(
-            "../registry/tests/fixtures/gamma_events.json",
-        ).unwrap();
+        let events_json =
+            std::fs::read_to_string("../registry/tests/fixtures/gamma_events.json").unwrap();
         let raw_events: Vec<serde_json::Value> = serde_json::from_str(&events_json).unwrap();
         let first_event = raw_events.into_iter().next().unwrap();
 
@@ -793,7 +952,11 @@ mod tests {
         let envelope_str = serde_json::to_string(&envelope).unwrap();
 
         let parsed = events_keyset_envelope(&envelope_str).unwrap();
-        assert_eq!(parsed.len(), 1, "should parse exactly 1 event from envelope");
+        assert_eq!(
+            parsed.len(),
+            1,
+            "should parse exactly 1 event from envelope"
+        );
         assert!(!parsed[0].id.is_empty(), "event id should be non-empty");
     }
 
@@ -810,7 +973,8 @@ mod tests {
         let tokens: Vec<ClobToken> = serde_json::from_str(
             r#"[{"token_id":"n_tok","outcome":"No","price":0.5,"winner":false},
                {"token_id":"y_tok","outcome":"Yes","price":0.5,"winner":false}]"#,
-        ).unwrap();
+        )
+        .unwrap();
         // No is index 0, Yes is index 1 — label-based should pick correctly
         let (yes, no) = pick_yes_no(&tokens).unwrap();
         assert_eq!(yes, "y_tok");
@@ -822,9 +986,13 @@ mod tests {
         let tokens: Vec<ClobToken> = serde_json::from_str(
             r#"[{"token_id":"spain_tok","outcome":"Spain","price":0.17,"winner":false},
                {"token_id":"not_spain_tok","outcome":"Field","price":0.83,"winner":false}]"#,
-        ).unwrap();
+        )
+        .unwrap();
         let (yes, no) = pick_yes_no(&tokens).unwrap();
-        assert_eq!(yes, "spain_tok", "index 0 is yes for non-Yes/No labelled markets");
+        assert_eq!(
+            yes, "spain_tok",
+            "index 0 is yes for non-Yes/No labelled markets"
+        );
         assert_eq!(no, "not_spain_tok");
     }
 
@@ -837,7 +1005,8 @@ mod tests {
     fn assemble_skips_market_with_missing_tokens() {
         // Market with zero tokens in the CLOB record.
         let ev_zero = make_event("ev_zero", "0xzero", "yt", "nt", false, true);
-        let clob_zero: ClobMarket = serde_json::from_str(r#"{
+        let clob_zero: ClobMarket = serde_json::from_str(
+            r#"{
             "condition_id": "0xzero",
             "minimum_tick_size": 0.01,
             "neg_risk": false,
@@ -846,11 +1015,14 @@ mod tests {
             "maker_base_fee": 0,
             "taker_base_fee": 0,
             "tokens": []
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
         // Market with only one token in the CLOB record.
         let ev_one = make_event("ev_one", "0xone", "yt", "nt", false, true);
-        let clob_one: ClobMarket = serde_json::from_str(r#"{
+        let clob_one: ClobMarket = serde_json::from_str(
+            r#"{
             "condition_id": "0xone",
             "minimum_tick_size": 0.01,
             "neg_risk": false,
@@ -859,20 +1031,22 @@ mod tests {
             "maker_base_fee": 0,
             "taker_base_fee": 0,
             "tokens": [{"token_id": "only_tok", "outcome": "Yes", "price": 1.0, "winner": false}]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
         let mut clob = HashMap::new();
         clob.insert("0xzero".to_string(), clob_zero);
         clob.insert("0xone".to_string(), clob_one);
 
-        let universe = assemble_registry(
-            &[ev_zero, ev_one],
-            &clob,
-            "",
-            &UniverseFilter::default(),
-        ).unwrap();
+        let universe =
+            assemble_registry(&[ev_zero, ev_one], &clob, "", &UniverseFilter::default()).unwrap();
 
-        assert_eq!(universe.registry.markets().len(), 0, "no market should be assembled");
+        assert_eq!(
+            universe.registry.markets().len(),
+            0,
+            "no market should be assembled"
+        );
         assert_eq!(universe.skipped.len(), 2);
         let reasons: Vec<SkippedReason> = universe.skipped.iter().map(|(_, r)| *r).collect();
         assert!(
@@ -886,7 +1060,8 @@ mod tests {
         let tokens: Vec<ClobToken> = serde_json::from_str(
             r#"[{"token_id":"","outcome":"Yes","price":0,"winner":false},
                {"token_id":"","outcome":"No","price":0,"winner":false}]"#,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(pick_yes_no(&tokens).is_none());
     }
 
@@ -894,7 +1069,8 @@ mod tests {
     fn pick_yes_no_returns_none_for_too_few_tokens() {
         let tokens: Vec<ClobToken> = serde_json::from_str(
             r#"[{"token_id":"y","outcome":"Yes","price":0.5,"winner":false}]"#,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(pick_yes_no(&tokens).is_none());
     }
 }

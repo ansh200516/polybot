@@ -45,12 +45,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use pm_core::instrument::TokenId;
 use pm_core::num::TickSize;
 
+use crate::IngestError;
 use crate::livebook::RawChange;
 use crate::rest::ParsedBook;
 use crate::shard::Shard;
 use crate::stats::StatsCell;
-use crate::ws::{parse_frame, subscribe_message, WsEvent, WsTransport};
-use crate::IngestError;
+use crate::ws::{WsEvent, WsTransport, parse_frame, subscribe_message};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -215,7 +215,11 @@ impl<R: RestBookSource> Supervisor<R> {
                 let venue: Box<str> = venue_id.into_boxed_str();
                 by_venue.insert(venue.clone(), id);
                 by_token.insert(id, idx);
-                TokenMeta { id, venue_id: venue, tick }
+                TokenMeta {
+                    id,
+                    venue_id: venue,
+                    tick,
+                }
             })
             .collect();
         Supervisor {
@@ -285,9 +289,8 @@ impl<R: RestBookSource> Supervisor<R> {
             // When stale_count is None (called from handle_frame), reuse the last
             // stale value stored in the cell to avoid an O(books) scan per frame.
             // When Some, the sweep has already iterated stale_tokens so we use that count.
-            let stale = stale_count.unwrap_or_else(|| {
-                cell.stale.load(std::sync::atomic::Ordering::Relaxed) as usize
-            });
+            let stale = stale_count
+                .unwrap_or_else(|| cell.stale.load(std::sync::atomic::Ordering::Relaxed) as usize);
             cell.refresh(&self.stats, books, stale, parse_us, apply_us);
         }
     }
@@ -311,17 +314,13 @@ impl<R: RestBookSource> Supervisor<R> {
     ///
     /// Replay tests call this directly; the outer `run()` wraps it with
     /// backoff+factory.
-    pub async fn run_session<T: WsTransport>(
-        &mut self,
-        transport: &mut T,
-    ) -> SessionEnd {
+    pub async fn run_session<T: WsTransport>(&mut self, transport: &mut T) -> SessionEnd {
         // Reset last_frame at the start of each session so the silence window
         // is relative to session open, not supervisor construction.
         self.last_frame = tokio::time::Instant::now();
 
         // Step 1: subscribe.
-        let venue_ids: Vec<String> =
-            self.tokens.iter().map(|m| m.venue_id.to_string()).collect();
+        let venue_ids: Vec<String> = self.tokens.iter().map(|m| m.venue_id.to_string()).collect();
         let sub_msg = subscribe_message(&venue_ids);
         // Best-effort: if sending fails the session is immediately broken.
         let _ = transport.send_text(&sub_msg).await;
@@ -493,7 +492,11 @@ impl<R: RestBookSource> Supervisor<R> {
                 WsEvent::Book(book_ev) => {
                     // Route by event.asset_id (per-token in book frames).
                     if let Some(&token_id) = self.by_venue.get(book_ev.asset_id.as_str()) {
-                        let tick = match self.by_token.get(&token_id).and_then(|&i| self.tokens.get(i)) {
+                        let tick = match self
+                            .by_token
+                            .get(&token_id)
+                            .and_then(|&i| self.tokens.get(i))
+                        {
                             Some(m) => m.tick,
                             None => {
                                 debug_assert!(false, "routed token missing from meta");
@@ -513,7 +516,10 @@ impl<R: RestBookSource> Supervisor<R> {
                                     &asks,
                                     &book_ev.hash,
                                 );
-                                if matches!(outcome, crate::livebook::ApplyOutcome::NeedsResnapshot(_)) {
+                                if matches!(
+                                    outcome,
+                                    crate::livebook::ApplyOutcome::NeedsResnapshot(_)
+                                ) {
                                     self.resnapshot(token_id).await;
                                 }
                             }
@@ -590,8 +596,9 @@ impl<R: RestBookSource> Supervisor<R> {
         for group in groups {
             let now = Instant::now();
             let hash_ref = group.last_hash.as_deref();
-            let outcome =
-                self.shard.apply_changes(now, group.token_id, &group.changes, hash_ref);
+            let outcome = self
+                .shard
+                .apply_changes(now, group.token_id, &group.changes, hash_ref);
             if matches!(outcome, crate::livebook::ApplyOutcome::NeedsResnapshot(_)) {
                 self.resnapshot(group.token_id).await;
             }
@@ -604,7 +611,11 @@ impl<R: RestBookSource> Supervisor<R> {
 
     /// Fetch a REST snapshot for a single token and apply it to the shard.
     async fn resnapshot(&mut self, token_id: TokenId) {
-        let (venue_id, tick) = match self.by_token.get(&token_id).and_then(|&i| self.tokens.get(i)) {
+        let (venue_id, tick) = match self
+            .by_token
+            .get(&token_id)
+            .and_then(|&i| self.tokens.get(i))
+        {
             Some(m) => (m.venue_id.to_string(), m.tick),
             None => {
                 debug_assert!(false, "routed token missing from meta");
@@ -716,9 +727,7 @@ mod tests {
         let base = Duration::from_secs(1);
         let cap = Duration::from_secs(60);
         // Use a fixed salt (0) so only wall-clock nanos vary across iterations.
-        let delays: Vec<Duration> = (0..32)
-            .map(|_| backoff_delay(base, cap, 1, 0))
-            .collect();
+        let delays: Vec<Duration> = (0..32).map(|_| backoff_delay(base, cap, 1, 0)).collect();
         let distinct = delays
             .iter()
             .collect::<std::collections::HashSet<_>>()

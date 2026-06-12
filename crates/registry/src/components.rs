@@ -12,7 +12,9 @@ pub struct ComponentId(pub u32);
 
 impl Components {
     pub fn build(n_markets: u32, partitions: &[Partition], relationships: &[Relationship]) -> Self {
-        let mut c = Components { parent: (0..n_markets).collect() };
+        let mut c = Components {
+            parent: (0..n_markets).collect(),
+        };
         for p in partitions {
             for w in p.markets.windows(2) {
                 c.union(w[0], w[1]);
@@ -70,7 +72,10 @@ mod tests {
             event: EventId(event),
             markets: members.iter().map(|&i| MarketId(i)).collect(),
             yes_tokens: members.iter().map(|&i| TokenId(u64::from(i) * 2)).collect(),
-            no_tokens: members.iter().map(|&i| TokenId(u64::from(i) * 2 + 1)).collect(),
+            no_tokens: members
+                .iter()
+                .map(|&i| TokenId(u64::from(i) * 2 + 1))
+                .collect(),
             verified_exhaustive: true,
         }
     }
@@ -78,7 +83,10 @@ mod tests {
     #[test]
     fn partitions_and_relationships_union() {
         let parts = vec![part(0, &[0, 1, 2])];
-        let rels = vec![Relationship::Implies { a: MarketId(3), b: MarketId(0) }];
+        let rels = vec![Relationship::Implies {
+            a: MarketId(3),
+            b: MarketId(0),
+        }];
         let c = Components::build(5, &parts, &rels); // markets 0..5
         assert_eq!(c.component_of(MarketId(0)), c.component_of(MarketId(2)));
         assert_eq!(c.component_of(MarketId(3)), c.component_of(MarketId(1)));
@@ -92,15 +100,22 @@ mod tests {
     #[test]
     fn singleton_markets_are_their_own_component() {
         let c = Components::build(3, &[], &[]);
-        let ids: std::collections::HashSet<_> = (0..3).map(|i| c.component_of(MarketId(i))).collect();
+        let ids: std::collections::HashSet<_> =
+            (0..3).map(|i| c.component_of(MarketId(i))).collect();
         assert_eq!(ids.len(), 3);
     }
 
     #[test]
     fn chain_of_relationships_merges_transitively() {
         let rels = vec![
-            Relationship::Implies { a: MarketId(0), b: MarketId(1) },
-            Relationship::Implies { a: MarketId(1), b: MarketId(2) },
+            Relationship::Implies {
+                a: MarketId(0),
+                b: MarketId(1),
+            },
+            Relationship::Implies {
+                a: MarketId(1),
+                b: MarketId(2),
+            },
         ];
         let c = Components::build(4, &[], &rels);
         assert_eq!(c.component_of(MarketId(0)), c.component_of(MarketId(2)));
