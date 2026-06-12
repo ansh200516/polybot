@@ -267,3 +267,71 @@ pty recording" was wrong.
 
 Interactive acceptance (live scrolling, key-binding exercise, visual layout
 verification) is performed by the operator.
+
+## M5: live execution
+
+`arb` can trade real money on the Polymarket CLOB behind a hard ladder of
+gates. Recon ground truth lives in `docs/RECON-M5.md`; the signing and auth
+recipes are vector-verified against `py-clob-client` (fixtures in
+`crates/execution/tests/fixtures/`).
+
+### Mode ladder
+
+| Mode | Flags | What happens |
+|---|---|---|
+| paper | (none) | M3/M4 behavior, byte-identical. Simulated fills. |
+| shadow | `--live --shadow` | Real env secrets, real auth (API key derive), real sized baskets, real EIP-712 signatures — the final submit is logged (`SHADOW: signed, not submitted`), never sent. No confirmation needed; no money can move. Cyan `SHADOW` badge. |
+| live | `--live` | Real orders. Headless: the confirmation phrase must be typed on stdin at startup. TUI: session starts `LIVE·HELD` (yellow); pressing `l` and typing `live` releases dispatch — badge turns red `LIVE`. |
+
+Live is a start-time decision: a session is all paper or all live, never
+mixed. Mid-session, `p`/`k`/kill-file still pause/stop dispatch.
+
+### Env (live/shadow only — never in config, git, logs, or the DB)
+
+| Var | Meaning |
+|---|---|
+| `PM_PRIVATE_KEY` | Wallet key exported from Polymarket settings (hex, `0x` ok) |
+| `PM_PROXY_ADDRESS` | Your Polymarket proxy wallet (profile page) — the order `maker` |
+| `PM_API_KEY` / `PM_API_SECRET` / `PM_API_PASSPHRASE` | Optional; all three or none. Absent → derived at startup via L1 ClobAuth |
+
+### Live gates (`[live]` config; defaults are the canary values)
+
+- `basket_cap_usd = 10.0` — per-basket basis cap; over-cap baskets are
+  rejected whole (`live_rej` counter in the health panel).
+- `min_leg_shares = 5.0` — venue minimum (RECON-pinned); a basket with any
+  leg under it is rejected whole, never resized upward.
+- `session_loss_usd = 25.0` — bid-marked realized+unrealized below −$25
+  trips a latched `SessionLoss` halt (badge `HALT:SessionLoss`); restart to
+  clear. Armed only in real live (not shadow/paper).
+- **Pure-buy-only dispatch**: sell/split classes (e.g. C1Short) are
+  live-rejected (visible counter) until M6's on-chain split path. Unwind
+  sells of tokens we own still work (gasless CLOB orders).
+- Live forces `redeem = hold`: a filled C1Long keeps its complete set
+  (manual redeem via the UI until M6); on-chain merge is never attempted.
+
+### Shadow rehearsal (operator runbook)
+
+```bash
+export PM_PRIVATE_KEY=<exported key>
+export PM_PROXY_ADDRESS=<proxy wallet from profile>
+cargo build --release --bin arb
+./target/release/arb --live --shadow --headless --duration-secs 600 \
+  --max-markets 20 --db /tmp/m5-shadow.sqlite 2>&1 | tee /tmp/m5-shadow.log
+# checks:
+grep -c "live venue armed" /tmp/m5-shadow.log            # 1 — auth derive ok
+grep -c "SHADOW: signed, not submitted" /tmp/m5-shadow.log  # ≥1 if a pure-buy opp passed the gates
+grep "session result" /tmp/m5-shadow.log                 # healthy=true
+sqlite3 /tmp/m5-shadow.sqlite "select count(*) from fills"  # 0 — shadow never fills
+```
+
+(Zero shadow signs in 10 min can be normal — thin-book LP opps are mostly
+risk-rejected at 20 markets; re-run with `--max-markets 100`.)
+
+### Shadow rehearsal results
+
+_Pending operator run._
+
+### Funded canary results
+
+_Pending operator run (≤$10 basket, ~$50 funded; see the M5 plan Task 14
+for the reconciliation checklist)._
