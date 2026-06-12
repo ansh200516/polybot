@@ -136,6 +136,7 @@ pub struct Coordinator {
     max_age: Duration,
     pnl_interval: Duration,
     dispatch_enabled: bool,
+    mid_spread_cap_ticks: u16,
 
     busy: bool,
     in_flight: Option<BasketCheck>,
@@ -185,6 +186,7 @@ impl Coordinator {
             // Paper mode still dispatches (to PaperVenue); flag reserved for a
             // future dry-run toggle. Wired to mode.paper for explicitness.
             dispatch_enabled: cfg.mode.paper,
+            mid_spread_cap_ticks: cfg.risk.mid_spread_cap_ticks,
             busy: false,
             in_flight: None,
             report_closed: false,
@@ -493,10 +495,11 @@ impl Coordinator {
                             .best()
                             .map(|a| a.microusdc(ts))
                             .unwrap_or(bid_micro);
-                        // M5 note: mid is uncapped — a wide/stale ask inflates it and delays the halt.
-                        // Before real money: cap mid (e.g. bid + spread cap) or prefer last-trade
-                        // for the risk feed. Paper-safe: the durable rows stay bid-marked.
-                        let mid_micro = (bid_micro + ask_micro) / 2;
+                        // Wide/stale asks must not delay the halt: mid ≤ bid + mid_spread_cap_ticks.
+                        let cap_micro = u64::from(self.mid_spread_cap_ticks)
+                            .saturating_mul(ts.unit_microusdc());
+                        let mid_micro = ((bid_micro + ask_micro) / 2)
+                            .min(bid_micro.saturating_add(cap_micro));
                         (sell_proceeds(bid_micro, q), sell_proceeds(mid_micro, q))
                     }
                     None => (Usdc(0), Usdc(0)),
@@ -1149,12 +1152,16 @@ mod tests {
         let mut risk_cfg = crate::wiring::risk_config(&Config::default()).unwrap();
         risk_cfg.bankroll = Usdc(100_000_000);
 
-        // Scenario 1: bid 40 / ask 60 (mid 50). 100sh @ .50 basis, cash −$50.
-        //   BID equity = −50 + 40 = −$10  → dd $10 ≥ $2 WOULD halt on bid.
-        //   MID equity = −50 + 50 =   $0  → dd $0  no halt (mid is immune).
+        // Scenario 1: bid 47 / ask 51 (spread 4 ticks ≤ cap 5; mid 49).
+        //   Clamped mid = min(49, 47+5) = 49 ticks.
+        //   BID equity = −50 + 47 = −$3  → dd $3 ≥ $2 WOULD halt on bid.
+        //   MID equity = −50 + 49 = −$1  → dd $1  < $2, no halt (mid is immune).
+        // (Pre-clamp this used bid=40/ask=60/mid=50; after clamping mid to bid+5=45,
+        //  equity_mid became −$5 which tripped the halt — book updated to a spread
+        //  within the cap so the mid-immunity property is preserved.)
         let kill = Arc::new(AtomicBool::new(false));
         let (mut coord, _opp_tx, _exec_rx, _report_tx, mut store_rx, _stats) =
-            build_coord(Arc::clone(&kill), served_fetcher(40, 60), risk_cfg);
+            build_coord(Arc::clone(&kill), served_fetcher(47, 51), risk_cfg);
 
         coord.positions.apply(
             &[(TokenId(1), Qty(100_000_000), Usdc(50_000_000))],
@@ -1166,26 +1173,26 @@ mod tests {
         let status = coord.status_channel();
         coord.snapshot_pnl().await;
 
-        // Durable PnlRow is BID-marked (−$10) and there is NO halt.
+        // Durable PnlRow is BID-marked (−$3) and there is NO halt.
         let mut saw_pnl = false;
         while let Ok(m) = store_rx.try_recv() {
             match m {
                 StoreMsg::PnlSnapshot(row) => {
                     assert_eq!(
-                        row.equity_micro, -10_000_000,
-                        "durable PnlRow must stay bid-marked at −$10"
+                        row.equity_micro, -3_000_000,
+                        "durable PnlRow must stay bid-marked at −$3"
                     );
                     saw_pnl = true;
                 }
-                StoreMsg::Halt(_) => panic!("mid-marked equity $0 must NOT halt"),
+                StoreMsg::Halt(_) => panic!("mid-marked equity −$1 must NOT halt"),
                 _ => {}
             }
         }
         assert!(saw_pnl, "expected a PnlSnapshot row");
 
         let s = status.borrow();
-        assert_eq!(s.equity_micro, -10_000_000, "status bid equity = −$10");
-        assert_eq!(s.equity_mid_micro, 0, "status mid equity = $0");
+        assert_eq!(s.equity_micro, -3_000_000, "status bid equity = −$3");
+        assert_eq!(s.equity_mid_micro, -1_000_000, "status mid equity = −$1");
         drop(s);
 
         // Scenario 2: re-serve bid 30 / ask 34 (mid 32). Same holding.
@@ -1202,5 +1209,41 @@ mod tests {
             }
         }
         assert!(saw_halt, "mid equity −$18 must trip the drawdown halt");
+    }
+
+    #[tokio::test]
+    async fn mid_mark_is_clamped_to_bid_plus_spread_cap() {
+        // Book: best bid 40, best ask 90 (Cent ticks) — raw mid would be 65.
+        // With mid_spread_cap_ticks = 5 (Config::default()) the mid must clamp
+        // to bid + 5 = 45 ticks.  Position: 100 µshares (Qty(100_000_000)).
+        //   bid_mark  = sell_proceeds(40*10_000, 100_000_000) = 400_000 * 100 / 1_000_000 ×1 share
+        //             = 40_000_000 µUSDC  (= $40)
+        //   clamped mid_mark = sell_proceeds(45*10_000, 100_000_000) = 45_000_000 µUSDC (= $45)
+        //   raw (unclamped) mid would be sell_proceeds(65*10_000, 100_000_000) = 65_000_000
+        let kill = Arc::new(AtomicBool::new(false));
+        let (mut coord, _opp_tx, _exec_rx, _report_tx, _store_rx, _stats) = build_coord(
+            Arc::clone(&kill),
+            served_fetcher(40, 90),
+            crate::wiring::risk_config(&Config::default()).unwrap(),
+        );
+
+        coord.positions.apply(
+            &[(TokenId(1), Qty(100_000_000), Usdc(50_000_000))],
+            Usdc(-50_000_000),
+            &token_market(),
+        );
+
+        let (bid_marks, mid_marks) = coord.marks_pair().await;
+        let token = TokenId(1);
+        assert_eq!(
+            bid_marks[&token],
+            Usdc(40_000_000),
+            "bid mark must be 40 ticks ($40) — unchanged"
+        );
+        assert_eq!(
+            mid_marks[&token],
+            Usdc(45_000_000),
+            "mid must clamp to bid + 5 ticks ($45), not raw $65"
+        );
     }
 }
