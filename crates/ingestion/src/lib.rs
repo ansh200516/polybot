@@ -4,6 +4,7 @@ pub mod decimal;
 pub mod livebook;
 pub mod rest;
 pub mod shard;
+pub mod supervisor;
 pub mod ws;
 
 // ---------------------------------------------------------------------------
