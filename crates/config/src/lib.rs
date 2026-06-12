@@ -19,6 +19,7 @@ pub struct Config {
     pub risk: Risk,
     pub store: Store,
     pub tui: Tui,
+    pub live: Live,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
@@ -230,6 +231,8 @@ pub struct Risk {
     pub kill_file: String,
     /// Opportunities older than this at the coordinator are discarded (staleness gate proxy, §15).
     pub max_opportunity_age_ms: u64,
+    /// Drawdown-feed mid-mark clamp: mid ≤ bid + this many ticks (all modes).
+    pub mid_spread_cap_ticks: u16,
 }
 
 impl Default for Risk {
@@ -245,6 +248,7 @@ impl Default for Risk {
             restart_storm_window_s: 300,
             kill_file: "kill.switch".into(),
             max_opportunity_age_ms: 1000,
+            mid_spread_cap_ticks: 5,
         }
     }
 }
@@ -287,16 +291,60 @@ impl Default for Tui {
     }
 }
 
+/// M5 live-trading canary parameters (spec 2026-06-13 §Config & env).
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Live {
+    /// Live per-basket basis cap, USD.
+    pub basket_cap_usd: f64,
+    /// Latched session-loss dispatch halt (bid-marked), USD.
+    pub session_loss_usd: f64,
+    /// Venue minimum order size per leg, SHARES (RECON-pinned: 5; a basket
+    /// with any leg below this is rejected whole — never resized upward).
+    pub min_leg_shares: f64,
+    /// Phrase typed at startup (headless --live) to release dispatch.
+    pub confirm_phrase: String,
+}
+
+impl Default for Live {
+    fn default() -> Self {
+        Live {
+            basket_cap_usd: 10.0,
+            session_loss_usd: 25.0,
+            min_leg_shares: 5.0,
+            confirm_phrase: "I understand this trades real money".into(),
+        }
+    }
+}
+
 impl Config {
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
         let cfg: Self = toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        cfg.validate()?;
+        cfg.validate_base()?;
         Ok(cfg)
     }
 
     /// Sanity checks beyond shape: positive capital, per-market ≤ bankroll,
-    /// percentage domains.
+    /// percentage domains. Includes M5 live-section canary checks.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_base()?;
+        if self.live.basket_cap_usd <= 0.0 {
+            return Err(ConfigError::BadMoney("live.basket_cap_usd must be > 0"));
+        }
+        if self.live.session_loss_usd <= 0.0 {
+            return Err(ConfigError::BadMoney("live.session_loss_usd must be > 0"));
+        }
+        if self.live.min_leg_shares < 0.0 {
+            return Err(ConfigError::BadMoney("live.min_leg_shares must be ≥ 0"));
+        }
+        if self.risk.mid_spread_cap_ticks == 0 {
+            return Err(ConfigError::BadMoney("risk.mid_spread_cap_ticks must be ≥ 1"));
+        }
+        Ok(())
+    }
+
+    /// Core structural checks called by `from_toml_str` and `validate`.
+    fn validate_base(&self) -> Result<(), ConfigError> {
         if self.capital.bankroll_usd <= 0.0 || !self.capital.bankroll_usd.is_finite() {
             return Err(ConfigError::BadMoney("bankroll_usd must be > 0"));
         }
@@ -638,5 +686,36 @@ mod tests {
 
         let c = Config::from_toml_str("[tui]\nrefresh_ms = 250\n").unwrap();
         assert_eq!(c.tui.refresh_ms, 250);
+    }
+
+    #[test]
+    fn live_defaults_are_canary_values() {
+        let c = Config::default();
+        assert!((c.live.basket_cap_usd - 10.0).abs() < 1e-9);
+        assert!((c.live.session_loss_usd - 25.0).abs() < 1e-9);
+        assert!((c.live.min_leg_shares - 5.0).abs() < 1e-9);
+        assert_eq!(c.live.confirm_phrase, "I understand this trades real money");
+        assert_eq!(c.risk.mid_spread_cap_ticks, 5);
+    }
+
+    #[test]
+    fn live_section_parses_and_validates() {
+        let c = Config::from_toml_str(
+            "[live]\nbasket_cap_usd = 12.5\nsession_loss_usd = 30.0\n[risk]\nmid_spread_cap_ticks = 3\n",
+        )
+        .unwrap();
+        assert!((c.live.basket_cap_usd - 12.5).abs() < 1e-9);
+        assert_eq!(c.risk.mid_spread_cap_ticks, 3);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn live_caps_must_be_positive() {
+        let c = Config::from_toml_str("[live]\nbasket_cap_usd = 0.0\n").unwrap();
+        assert!(c.validate().is_err());
+        let c = Config::from_toml_str("[live]\nsession_loss_usd = -1.0\n").unwrap();
+        assert!(c.validate().is_err());
+        let c = Config::from_toml_str("[risk]\nmid_spread_cap_ticks = 0\n").unwrap();
+        assert!(c.validate().is_err());
     }
 }
