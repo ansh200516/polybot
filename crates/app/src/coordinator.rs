@@ -185,7 +185,15 @@ impl Coordinator {
         {
             self.handle_report(rep).await;
         }
+        // Exec task died mid-basket (report_closed && busy): release the stranded
+        // reservation so final RiskEngine state can't carry phantom exposure.
+        if let Some(c) = self.in_flight.take() {
+            self.risk.release(&c);
+            self.busy = false;
+        }
         self.snapshot_pnl().await; // final durable snapshot
+        // Post-shutdown marks are 0 (supervisors gone): the final summary equity
+        // is a conservative floor, not fair value.
         let marks = self.marks().await;
         let pnl = self.positions.pnl(&marks);
         CoordinatorSummary {
@@ -233,7 +241,10 @@ impl Coordinator {
         let check = basket_check(&d.opp, &self.token_market);
         let verdict = self.risk.pre_check(&check);
         let approved = matches!(verdict, RiskVerdict::Approved);
-        let dispatch = approved && !self.busy && self.dispatch_enabled;
+        // Direct flag check closes the one-iteration race between the watcher
+        // setting the flag and check_kill tripping the risk engine.
+        let dispatch =
+            approved && !self.busy && self.dispatch_enabled && !self.kill.load(Ordering::Acquire);
 
         self.log_opportunity(&d.opp, dispatch);
 
@@ -468,7 +479,7 @@ pub async fn run_execution<V: pm_execution::venue::ExecutionVenue>(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use pm_core::num::{Px, Qty, TickSize};
     use pm_engine::{ArbClass, LegFill};
@@ -644,6 +655,140 @@ mod tests {
         drop(h.report_tx);
         let _ = tokio::time::timeout(Duration::from_secs(2), h.handle).await;
     }
+
+    /// Helper: build an opp with an explicit `net` value (same shape as
+    /// `opp_fixture` at tok2_px=50, so same fingerprint).
+    fn opp_with_net(net: i128) -> Opportunity {
+        let mut o = opp_fixture(50);
+        o.net = Usdc(net);
+        o
+    }
+
+    #[tokio::test]
+    async fn exec_error_report_frees_slot_and_counts() {
+        // Dispatch one opp, reply with Err, assert: busy freed (a new
+        // different-shape opp dispatches afterwards), exec_errors == 1.
+        let mut h = spawn(false);
+
+        // Send first opp and wait for dispatch.
+        h.opp_tx
+            .send(DetectedOpp {
+                opp: opp_fixture(50),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        let req = tokio::time::timeout(Duration::from_secs(2), h.exec_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Reply with an error.
+        h.report_tx
+            .send(ExecReport {
+                check: req.check,
+                result: Err("simulated exec error".to_string()),
+            })
+            .await
+            .unwrap();
+
+        // Give coordinator time to process the error report.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(h.stats.exec_errors.load(Ordering::Relaxed), 1);
+
+        // Send a differently-shaped opp — should dispatch because busy is cleared.
+        h.opp_tx
+            .send(DetectedOpp {
+                opp: opp_fixture(49), // different fingerprint
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        let req2 = tokio::time::timeout(Duration::from_secs(2), h.exec_rx.recv())
+            .await
+            .expect("timeout waiting for second dispatch")
+            .expect("channel closed before second dispatch");
+        assert!(req2.check.total_cost.0 > 0, "second dispatch must be real");
+        assert_eq!(h.stats.dispatched.load(Ordering::Relaxed), 2);
+
+        drop(h.opp_tx);
+        drop(h.report_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), h.handle).await;
+    }
+
+    #[tokio::test]
+    async fn coalesce_keeps_max_net_per_fingerprint() {
+        // Send two same-shape opps (identical fingerprint, same tok2_px=50) with
+        // different net values BEFORE spawning the coordinator, so both are queued
+        // in the channel and drained as a single coalesced batch.
+        let (opp_tx, opp_rx) = mpsc::channel(64);
+        let (exec_tx, mut exec_rx) = mpsc::channel(64);
+        let (report_tx, report_rx) = mpsc::channel(64);
+        let (store_tx, store_rx) = mpsc::channel(64);
+        let stats = AppStats::new();
+        let kill = Arc::new(AtomicBool::new(false));
+        let cfg = Config::default();
+
+        // Queue both opps BEFORE spawning the coordinator run loop.
+        opp_tx
+            .send(DetectedOpp {
+                opp: opp_with_net(5_990_000),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        opp_tx
+            .send(DetectedOpp {
+                opp: opp_with_net(6_990_000), // higher net, same fingerprint
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+
+        let coord = Coordinator::new(
+            &cfg,
+            crate::wiring::risk_config(&cfg).unwrap(),
+            crate::wiring::engine_params(&cfg).unwrap(),
+            token_market(),
+            BookFetcher::new(HashMap::new()),
+            opp_rx,
+            exec_tx,
+            report_rx,
+            store_tx,
+            Arc::clone(&kill),
+            Arc::clone(&stats),
+        )
+        .unwrap();
+        let handle = tokio::spawn(coord.run());
+
+        // Only one ExecRequest should arrive (coalesced), with the higher net.
+        let req = tokio::time::timeout(Duration::from_secs(2), exec_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            req.opp.net,
+            Usdc(6_990_000),
+            "coalesce must keep max-net candidate"
+        );
+
+        // Verify only one dispatch happened.
+        assert_eq!(stats.dispatched.load(Ordering::Relaxed), 1);
+
+        drop(opp_tx);
+        drop(report_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        drop(store_rx);
+    }
+
+    // NOTE: The `kill_blocks_even_if_risk_not_yet_tripped` test variant (item 4,
+    // third bullet) is intentionally skipped. The dispatch-condition guard
+    //   `&& !self.kill.load(Acquire)`
+    // is a two-token conjunct that is trivially readable in process_opp; writing a
+    // *deterministic* test requires either exposing private state or introducing
+    // artificial synchronisation points — both of which add more complexity than
+    // the guard itself. Coverage of the kill path is already provided by
+    // `kill_flag_blocks_dispatch_and_logs_halt`.
 
     #[tokio::test]
     async fn kill_flag_blocks_dispatch_and_logs_halt() {

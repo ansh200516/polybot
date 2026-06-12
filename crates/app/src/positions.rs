@@ -23,6 +23,10 @@ pub struct PositionBook {
 impl PositionBook {
     /// Apply a basket report's leftovers + cash. Returns per-market exposure
     /// deltas (cost basis added) for `RiskEngine::commit`, sorted by market.
+    ///
+    /// Append-only in M3: reports carry per-basket LEFTOVERS; no flow ever sells
+    /// a previously-reported holding back. A future "unwind held inventory"
+    /// feature must add decrement support or this book will grow phantom holdings.
     pub fn apply(
         &mut self,
         positions: &[(TokenId, Qty, Usdc)],
