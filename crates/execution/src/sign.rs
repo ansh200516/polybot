@@ -151,6 +151,9 @@ pub fn sign_order(
 /// matches the engine's own cash math AND the reference client (vectors).
 pub fn clob_amounts(action: Action, ts: TickSize, limit_px: Px, qty: Qty) -> (u64, u64) {
     let px_micro = limit_px.microusdc(ts);
+    // Cast safety: cost/proceeds = px_micro·qty/1e6 with px_micro < 1e6
+    // (px ≤ $1 by tick construction), so the i128 result is non-negative and
+    // ≤ qty.0 ≤ u64::MAX — the i128→u64 cast cannot wrap.
     match action {
         // BUY: pay µUSDC (rounded UP, against us), receive µshares.
         Action::Buy => (buy_cost(px_micro, qty).0 as u64, qty.0),
@@ -170,7 +173,11 @@ mod tests {
     fn reproduces_py_clob_client_signatures() {
         let raw = include_str!("../tests/fixtures/sign_vectors.json");
         let vectors: Vec<serde_json::Value> = serde_json::from_str(raw).unwrap();
-        assert_eq!(vectors.len(), 3, "Task 1 produced 3 vectors");
+        assert_eq!(
+            vectors.len(),
+            4,
+            "3 Task-1 vectors + 1 nonzero-feeRateBps hardening vector"
+        );
         for v in &vectors {
             let signer: PrivateKeySigner = v["private_key"].as_str().unwrap().parse().unwrap();
             let o = &v["order"];

@@ -82,5 +82,34 @@
       "signatureType": "1"
     },
     "signature": "0x0809d22daf2e8b0855a4774f53cc8ca5feb876e72d0d1560e91ad9f84cf26c446b5b2c3eadadd6ff7988d14313e970c97f2199ae33104cf6f66ccb825b399c2d1c"
+  },
+  {
+    "name": "buy_cent_regular_fee1000",
+    "private_key": "0xadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad",
+    "neg_risk": false,
+    "inputs": {
+      "token_id": "123456789",
+      "price": 0.5,
+      "size": 10.0,
+      "side": "BUY",
+      "tick_size": "0.01",
+      "funder": "0x1111111111111111111111111111111111111111",
+      "fee_rate_bps": 1000
+    },
+    "order": {
+      "salt": "614445682",
+      "maker": "0x1111111111111111111111111111111111111111",
+      "signer": "0x45C4Ef602bC5EB4493070d69B4F3b6a74f952216",
+      "taker": "0x0000000000000000000000000000000000000000",
+      "tokenId": "123456789",
+      "makerAmount": "5000000",
+      "takerAmount": "10000000",
+      "expiration": "0",
+      "nonce": "0",
+      "feeRateBps": "1000",
+      "side": "BUY",
+      "signatureType": "1"
+    },
+    "signature": "0xc3bcbedd7db738c72368ab51c96b84c655d2515663aca5a2735b16028adab4fa61282199bdf205b60cfcf88f6fb783cc59104d78dd3991f48c83a2b94e47f7681b"
   }
 ]
