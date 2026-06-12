@@ -239,6 +239,14 @@ async fn main() {
     )
     .unwrap_or_else(|e| fatal(format!("SyncTask init: {e}")));
 
+    // In TUI mode tracing already goes to the ring buffer, so without this
+    // line the user stares at a silent blank terminal for the whole sync
+    // (rate-limited CLOB lookups — typically seconds, minutes if degraded).
+    // The alternate screen is not entered yet, so plain stdout is safe.
+    if tui_active {
+        println!("arb: assembling market universe (rate-limited CLOB sync) ...");
+        println!("arb: the dashboard will start when the sync completes.");
+    }
     info!("running sync_once to assemble universe ...");
     let universe: AssembledUniverse = sync_task
         .sync_once()

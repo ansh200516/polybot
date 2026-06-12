@@ -224,30 +224,46 @@ Pass `--headless` to suppress the TUI and fall back to M3-style structured
 automatically (pipe, file redirect, cron), so no flag is needed in CI or
 scheduled jobs.
 
-### pty smoke (Apple Silicon dev machine, 2026-06-13)
+### Startup
+
+In TUI mode tracing goes to the in-screen log ring, so before the dashboard
+appears `arb` prints a plain stdout notice while the universe sync runs:
+
+    arb: assembling market universe (rate-limited CLOB sync) ...
+    arb: the dashboard will start when the sync completes.
+
+The CLOB metadata fetch is bounded: markets are visited in registry order and
+fetching stops once `max_markets` would-be-accepted markets are in hand
+(`fetch_clob_bounded`; the accept/skip gate is shared with
+`assemble_registry`, so the assembled registry is identical to one built from
+an exhaustive fetch). Before this bound, every member market on the fetched
+gamma keyset page (~1,100 on page one) was fetched at the rate-limited
+5 req/s — ~4 minutes of silent black screen before the dashboard. Now
+`--max-markets 20` starts in roughly 7 s.
+
+### pty smoke (Apple Silicon dev machine, 2026-06-13, post fetch-bound fix)
 
     script -q /tmp/m4-tui-smoke.out \
-      ./target/release/arb --duration-secs 45 --max-markets 20 \
-                           --db /tmp/m4-tui-smoke.sqlite
+      sh -c 'stty rows 40 cols 140; exec ./target/release/arb \
+        --duration-secs 20 --max-markets 20 --db /tmp/m4-tui-smoke.sqlite'
+
+The `stty` matters: a non-interactive `script` pty reports a 0×0 window and
+Ratatui renders nothing into a zero-area terminal. The earlier smoke (12 KB
+capture, no panel titles) verified only the alt-screen lifecycle, not actual
+rendering — its claim that missing panel titles are "expected for any Ratatui
+pty recording" was wrong.
 
 | Check | Result |
 |---|---|
 | exit code | 0 |
-| capture size | 12,334 bytes |
-| `session` lines in capture (grep -c) | 4 |
+| total wall time (20 s session) | 31 s (≈7 s sync + session + shutdown) |
+| capture size | 44,792 bytes |
+| startup notice lines on stdout | yes |
+| alt-screen enter / leave (`[?1049h` / `[?1049l`) | both present |
+| panel titles (Opportunities, Positions, Fills, Health) | all present |
+| header (PAPER badge, equity) | present |
 | `arb session result: healthy=true` | 1 |
-| opportunities detected | 75 |
-| LP solves | 141 |
-| detect latency p50 / p99 | 8 µs / 60 µs |
-| session duration | 47 s |
 | SQLite DB created | yes |
 
-Panel-title strings (`Opportunities`, `Health`, `PAPER`) are embedded inside
-raw ANSI cursor-positioning escape sequences in the pty stream and do not form
-standalone text lines; `grep -c` on the capture returns 0 for those strings,
-which is expected for any Ratatui TUI pty recording. The `[?1049h` (enter
-alternate screen) and `[?1049l` (leave alternate screen) sequences are both
-present in the capture, confirming the TUI lifecycle ran end-to-end through
-the pty and restored the terminal before the final report. Interactive
-acceptance (live scrolling, key-binding exercise, visual layout verification)
-is performed by the operator.
+Interactive acceptance (live scrolling, key-binding exercise, visual layout
+verification) is performed by the operator.
