@@ -27,7 +27,7 @@
 
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -95,6 +95,16 @@ pub struct StatsCell {
     pub unknown_token_changes: AtomicU64,
     pub feed_silence_reconnects: AtomicU64,
 
+    // Connection liveness (set/cleared by the supervisor on connect/disconnect).
+    /// `true` while the WS session is live (transport connected); `false`
+    /// before the first connect and during reconnect backoff.
+    pub connected: AtomicBool,
+    /// Unix epoch milliseconds of the last successfully applied frame.
+    /// `0` until the first frame is applied (never connected, or just connected
+    /// but no frame received yet). Treated as age 0 by the publisher so a
+    /// brand-new session doesn't inflate the oldest-frame gauge.
+    pub last_frame_ms: AtomicI64,
+
     // Current gauges (overwritten on every refresh).
     pub books: AtomicU64,
     pub stale: AtomicU64,
@@ -123,6 +133,8 @@ impl StatsCell {
             resnapshot_errors: AtomicU64::new(0),
             unknown_token_changes: AtomicU64::new(0),
             feed_silence_reconnects: AtomicU64::new(0),
+            connected: AtomicBool::new(false),
+            last_frame_ms: AtomicI64::new(0),
             books: AtomicU64::new(0),
             stale: AtomicU64::new(0),
             recv_to_parsed_us: Mutex::new(h1),

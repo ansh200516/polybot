@@ -286,13 +286,16 @@ fn draw_health(f: &mut Frame, s: &AppState, area: Rect) {
     let h = &s.health;
     let ws_label = if h.ws_connected { "WS up" } else { "WS DOWN" };
     let text = format!(
-        "{ws_label}  books {books}  stale {stale}  reconnects {reconnects}\n\
+        "{ws_label}  feeds {feeds_up}/{feeds_total}  oldest {oldest}s  books {books}  stale {stale}  reconnects {reconnects}\n\
          frames {frames}  {fps:.1}/s  parse_err {parse_err}\n\
          detect µs p50/p99 {dp50}/{dp99}\n\
          dispatch µs p50/p99 {disp50}/{disp99}\n\
          opps {opps}  admitted {admitted}  dispatched {dispatched}\n\
          baskets clean {clean} repaired {repaired} unwound {unwound}\n\
          solver queue {queue}  solved {solved}",
+        feeds_up = h.feeds_up,
+        feeds_total = h.feeds_total,
+        oldest = h.oldest_frame_age_s,
         books = h.books,
         stale = h.stale,
         reconnects = h.reconnects,
@@ -624,6 +627,9 @@ mod tests {
             }],
             health: crate::state::Health {
                 ws_connected: true,
+                feeds_up: 2,
+                feeds_total: 2,
+                oldest_frame_age_s: 0,
                 books: 400,
                 stale: 0,
                 frames: 255_800,
@@ -737,6 +743,20 @@ mod tests {
         ui.log_scroll = 500;
         let text = render_to_text(&s, &ui, 160, 45);
         assert!(text.contains("line-00"));
+    }
+
+    #[test]
+    fn health_line_shows_feed_counts_and_oldest_age() {
+        let mut s = AppState {
+            mode_paper: true,
+            ..Default::default()
+        };
+        s.health.feeds_up = 1;
+        s.health.feeds_total = 2;
+        s.health.oldest_frame_age_s = 30;
+        let text = render_to_text(&s, &UiState::default(), 140, 40);
+        assert!(text.contains("feeds 1/2"), "feeds count missing:\n{text}");
+        assert!(text.contains("oldest 30s"), "oldest frame age missing:\n{text}");
     }
 
     #[test]

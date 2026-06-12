@@ -43,6 +43,14 @@ pub struct OrderLine {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Health {
     pub ws_connected: bool,
+    /// Number of WS feeds currently connected (supervisor sessions live).
+    pub feeds_up: u64,
+    /// Total number of WS feeds configured (supervisor count).
+    pub feeds_total: u64,
+    /// Age in seconds of the oldest applied frame across all feeds.
+    /// Feeds that have never received a frame (last_frame_ms == 0) contribute
+    /// age 0 so a brand-new session doesn't inflate this gauge.
+    pub oldest_frame_age_s: u64,
     pub books: u64,
     pub stale: u64,
     pub frames: u64,

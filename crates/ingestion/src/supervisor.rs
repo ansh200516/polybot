@@ -402,6 +402,12 @@ impl<R: RestBookSource> Supervisor<R> {
         // Reset last_frame at the start of each session so the silence window
         // is relative to session open, not supervisor construction.
         self.last_frame = tokio::time::Instant::now();
+        // Mark the session as live so the publisher/probe can show a real
+        // connection-up flag rather than relying on frame-count deltas (M5 heartbeat).
+        if let Some(ref cell) = self.stats_mirror {
+            cell.connected
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // Take the command receiver out of self so the select loop can hold it
         // as a local without conflicting with &mut self in arm bodies.
@@ -438,6 +444,10 @@ impl<R: RestBookSource> Supervisor<R> {
                         None | Some(Err(_)) => {
                             self.shard.mark_all_stale();
                             self.stats.reconnects += 1;
+                            if let Some(ref cell) = self.stats_mirror {
+                                cell.connected
+                                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                            }
                             self.cmd_rx = cmd_rx;
                             return SessionEnd::TransportLost;
                         }
@@ -466,6 +476,10 @@ impl<R: RestBookSource> Supervisor<R> {
                         let invalid_count = self.shard.invalid_tokens().len();
                         // Refresh mirror so the probe sees the new stale count.
                         self.refresh_mirror(Some(invalid_count), None, None);
+                        if let Some(ref cell) = self.stats_mirror {
+                            cell.connected
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
                         self.cmd_rx = cmd_rx;
                         return SessionEnd::FeedSilent;
                     }
@@ -575,6 +589,16 @@ impl<R: RestBookSource> Supervisor<R> {
     async fn handle_frame(&mut self, text: &str) {
         let parse_start = Instant::now();
         self.stats.frames += 1;
+        // Stamp last_frame_ms on every received frame (even parse failures prove
+        // the socket is alive).  Uses SystemTime for epoch ms to match now_ms().
+        if let Some(ref cell) = self.stats_mirror {
+            let ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            cell.last_frame_ms
+                .store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
         let events = match parse_frame(text) {
             Ok(ev) => ev,
             Err(_) => {
@@ -815,6 +839,7 @@ mod tests {
     use pm_core::instrument::TokenId;
     use pm_core::num::TickSize;
     use std::sync::{Arc, Mutex};
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     /// Transport that plays scripted frames then parks until released.
@@ -979,6 +1004,105 @@ mod tests {
         // the SupStats field exists and defaults to zero.
         let stats = SupStats::default();
         assert_eq!(stats.unknown_token_changes, 0);
+    }
+
+    /// Layer 1 requirement: StatsCell.connected reflects WS session liveness;
+    /// StatsCell.last_frame_ms is stamped (epoch ms > 0) once a frame is applied;
+    /// connected is cleared when the session ends / before reconnect.
+    #[tokio::test]
+    async fn stats_cell_tracks_connection_and_last_frame() {
+        let mut sup = Supervisor::new(
+            vec![(TokenId(5), "tok1".to_string(), TickSize::Cent)],
+            OneBookRest,
+            SupervisorConfig::default(),
+        );
+        let cell = sup.share_stats();
+
+        // Before any session, both fields default to false/0.
+        assert!(
+            !cell.connected.load(Ordering::Relaxed),
+            "connected must be false before a session starts"
+        );
+        assert_eq!(
+            cell.last_frame_ms.load(Ordering::Relaxed),
+            0,
+            "last_frame_ms must be 0 before any frame"
+        );
+
+        // Run a session: snapshot applied (from resnapshot_all) + one delta frame.
+        // Session ends with TransportLost (SeqTransport delivers frames then None).
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        release.notify_one(); // pre-release: frames drain immediately, then None
+        let mut t = SeqTransport {
+            frames: [PC_FRAME.to_string()].into(),
+            release,
+        };
+        let end = sup.run_session(&mut t).await;
+        assert_eq!(end, SessionEnd::TransportLost);
+
+        // After TransportLost: connected must be cleared (false).
+        assert!(
+            !cell.connected.load(Ordering::Relaxed),
+            "connected must be false after TransportLost"
+        );
+        // last_frame_ms must have been stamped (delta frame was applied).
+        assert!(
+            cell.last_frame_ms.load(Ordering::Relaxed) > 0,
+            "last_frame_ms must be > 0 after a frame was applied"
+        );
+    }
+
+    /// Separate test: connected is set true once the session is live (transport
+    /// connected and resnapshot_all done), then cleared when the connection drops.
+    /// We verify the "true during session" window by checking right after
+    /// resnapshot_all via a command-channel round-trip (the session is live while
+    /// the task is running and we can interact with it).
+    #[tokio::test]
+    async fn stats_cell_connected_true_while_session_live() {
+        let mut sup = Supervisor::new(
+            vec![(TokenId(5), "tok1".to_string(), TickSize::Cent)],
+            OneBookRest,
+            SupervisorConfig::default(),
+        );
+        let cell = sup.share_stats();
+        let cmd_tx = sup.command_channel(8);
+
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release2 = std::sync::Arc::clone(&release);
+        let task = tokio::spawn(async move {
+            let mut t = SeqTransport {
+                frames: [].into(),
+                release: release2,
+            };
+            sup.run_session(&mut t).await
+        });
+
+        // Probe the session: send a BookSnapshot command. This round-trip
+        // can only complete once resnapshot_all has run and the session loop
+        // is active — at that point connected must be true.
+        let (otx, orx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(SupervisorCommand::BookSnapshot {
+                token: TokenId(5),
+                reply: otx,
+            })
+            .await
+            .unwrap();
+        let _ = orx.await.unwrap(); // wait for reply (session is live)
+
+        assert!(
+            cell.connected.load(Ordering::Relaxed),
+            "connected must be true while session is running"
+        );
+
+        release.notify_one(); // end the session
+        let end = task.await.unwrap();
+        assert_eq!(end, SessionEnd::TransportLost);
+
+        assert!(
+            !cell.connected.load(Ordering::Relaxed),
+            "connected must be false after session ends"
+        );
     }
 
     /// REST source that returns a crossed book (bid 0.60 ≥ ask 0.40), which

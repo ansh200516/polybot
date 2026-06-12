@@ -179,26 +179,39 @@ pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
     let mut frames = 0u64;
     let mut reconnects = 0u64;
     let mut parse_errors = 0u64;
+    let mut feeds_up: u64 = 0;
+    let mut oldest_frame_age_s: u64 = 0;
     for cell in &ctx.cells {
         books += cell.books.load(Ordering::Relaxed);
         stale += cell.stale.load(Ordering::Relaxed);
         frames += cell.frames.load(Ordering::Relaxed);
         reconnects += cell.reconnects.load(Ordering::Relaxed);
         parse_errors += cell.parse_errors.load(Ordering::Relaxed);
+
+        if cell.connected.load(Ordering::Relaxed) {
+            feeds_up += 1;
+        }
+
+        // Cells that have never received a frame (last_frame_ms == 0) are
+        // treated as age 0 — a brand-new session should not inflate the gauge.
+        let last_ms = cell.last_frame_ms.load(Ordering::Relaxed);
+        if last_ms > 0 {
+            let age_s = ((now - last_ms).max(0) / 1000) as u64;
+            if age_s > oldest_frame_age_s {
+                oldest_frame_age_s = age_s;
+            }
+        }
     }
+    let feeds_total = ctx.cells.len() as u64;
+    // ws_connected: any feed is live, or no feeds are configured (dev/unit setup).
+    let ws_connected = feeds_up > 0 || ctx.cells.is_empty();
+
     let dt = ctx.last_at.elapsed().as_secs_f64();
     let frames_per_s = if dt > 0.0 {
         (frames.saturating_sub(ctx.last_frames)) as f64 / dt
     } else {
         0.0
     };
-    // Quiet-universe flicker limitation: on a live-but-silent delta feed no new
-    // frames arrive, so `frames > last_frames` reads false and ws_connected
-    // flickers off even though the socket is healthy. We accept this for M4 —
-    // the empty-cells case (no ingestion wired) reports connected so unit/dev
-    // setups don't show a spurious disconnect. A heartbeat-based liveness signal
-    // is the proper fix (M5).
-    let ws_connected = frames > ctx.last_frames || ctx.cells.is_empty();
     ctx.last_frames = frames;
     ctx.last_at = Instant::now();
 
@@ -216,6 +229,9 @@ pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
     let lp_solved = ctx.stats.lp_solved.load(Ordering::Relaxed);
     let health = Health {
         ws_connected,
+        feeds_up,
+        feeds_total,
+        oldest_frame_age_s,
         books,
         stale,
         frames,
@@ -333,6 +349,79 @@ mod tests {
     fn usd_conversion_is_display_only_micro_over_1e6() {
         assert_eq!(usd(5_990_000), 5.99);
         assert_eq!(usd(-44_000_000), -44.0);
+    }
+
+    /// Layer 2 requirement: ws_connected, feeds_up, feeds_total, and
+    /// oldest_frame_age_s must come from StatsCell.connected / last_frame_ms,
+    /// not from the old frame-count-delta heuristic.
+    #[tokio::test]
+    async fn health_ws_flag_and_staleness_come_from_cells() {
+        use pm_ingestion::stats::StatsCell;
+        use std::sync::atomic::Ordering;
+
+        // Cell 0: connected, last_frame_ms = now (age ≈ 0 s).
+        let cell0 = StatsCell::new();
+        cell0
+            .connected
+            .store(true, Ordering::Relaxed);
+        cell0.last_frame_ms.store(
+            crate::coordinator::now_ms(),
+            Ordering::Relaxed,
+        );
+
+        // Cell 1: disconnected, last_frame_ms = now - 30_000 ms (age ≈ 30 s).
+        let cell1 = StatsCell::new();
+        cell1
+            .connected
+            .store(false, Ordering::Relaxed);
+        cell1.last_frame_ms.store(
+            crate::coordinator::now_ms() - 30_000,
+            Ordering::Relaxed,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.sqlite");
+        // ReadStore requires the file to exist; create it via Store::open first.
+        let _ = pm_store::Store::open(&path).unwrap();
+        let read = pm_store::read::ReadStore::open(&path).unwrap();
+
+        let stats = crate::stats::AppStats::new();
+        let logbuf = crate::logbuf::LogBuffer::new(10);
+        let (_status_tx, status_rx) =
+            tokio::sync::watch::channel(crate::coordinator::CoordStatus::default());
+        let r = reg();
+        let fetcher =
+            crate::wiring::BookFetcher::new(std::collections::HashMap::new());
+
+        let mut ctx = PublisherCtx {
+            read,
+            stats,
+            cells: vec![cell0, cell1],
+            status_rx,
+            registry: r,
+            logbuf,
+            fetcher,
+            feed_rows: 10,
+            fills_rows: 10,
+            log_lines: 10,
+            mode_paper: true,
+            start: std::time::Instant::now(),
+            last_frames: 0,
+            last_at: std::time::Instant::now(),
+        };
+
+        let state = assemble(&mut ctx).await;
+
+        assert!(state.health.ws_connected, "any live feed → ws_connected true");
+        assert_eq!(state.health.feeds_up, 1, "only cell0 is connected");
+        assert_eq!(state.health.feeds_total, 2, "two cells total");
+        // Cell1 has last_frame_ms = now - 30_000, so oldest age >= 30 s.
+        assert!(
+            state.health.oldest_frame_age_s >= 30,
+            "oldest frame age must be >= 30 s, got {}",
+            state.health.oldest_frame_age_s
+        );
+        drop(_status_tx);
     }
 
     #[tokio::test]
