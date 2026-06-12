@@ -14,6 +14,25 @@
 //! `sweep_once` there.  `sweep_once` stays `pub` so replay tests can invoke it
 //! directly without a transport.
 //!
+//! # Feed-level silence model (delta-only WS)
+//! Polymarket's WS feed is delta-only: a quiet market sends NO frames because
+//! its book is UNCHANGED — silence means "current", not "stale".  The correct
+//! model therefore distinguishes two independent health signals:
+//!
+//! * **Book integrity** (`valid == false`): the book was crossed, accumulated
+//!   too many off-tick prices, or lost the feed.  These books must be
+//!   resnapshotted regardless of feed liveness — handled inline by `handle_frame`
+//!   and backstopped by `sweep_once` (which iterates `invalid_tokens()`).
+//!
+//! * **Feed silence** (`now - last_frame > feed_silence`): the entire connection
+//!   has gone quiet beyond the configured window, indicating a dead socket.
+//!   The supervisor detects this in the sweep arm and returns
+//!   [`SessionEnd::FeedSilent`], triggering an immediate reconnect.
+//!
+//! Per-book age (`last_update` / `is_stale`) is preserved for M3 detection
+//! logic but is NOT used as a sweep trigger in the running session — a book
+//! that is quiet because the market is quiet is not stale.
+//!
 //! # Jitter RNG
 //! A tiny xorshift64 seeded from wall-clock nanos XOR per-instance address
 //! gives real entropy and per-supervisor decorrelation to avoid thundering herds
@@ -40,20 +59,25 @@ use crate::IngestError;
 /// Configuration knobs for a [`Supervisor`].
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
-    /// Books older than this are considered stale and trigger a resnapshot.
+    /// Books older than this are considered stale — kept as an M3 detection knob.
+    /// NOT used as a sweep trigger in the running session (see module doc).
     pub staleness: Duration,
+    /// Feed-level silence window: if no text frame is received for this long the
+    /// supervisor treats the connection as dead and returns [`SessionEnd::FeedSilent`].
+    pub feed_silence: Duration,
     /// Base duration for exponential reconnect backoff.
     pub backoff_base: Duration,
     /// Maximum delay cap for reconnect backoff.
     pub backoff_cap: Duration,
-    /// How often the staleness sweep runs in `run_session`.
+    /// How often the sweep arm runs in `run_session`.
     pub sweep_interval: Duration,
 }
 
 impl Default for SupervisorConfig {
     fn default() -> Self {
         SupervisorConfig {
-            staleness: Duration::from_millis(30_000),
+            staleness: Duration::from_millis(1_500),
+            feed_silence: Duration::from_millis(15_000),
             backoff_base: Duration::from_millis(250),
             backoff_cap: Duration::from_secs(30),
             sweep_interval: Duration::from_secs(1),
@@ -100,6 +124,8 @@ pub struct SupStats {
     pub resnapshot_errors: u64,
     /// Price-change entries whose asset_id is not in our token universe.
     pub unknown_token_changes: u64,
+    /// Sessions ended because the feed went silent beyond `feed_silence`.
+    pub feed_silence_reconnects: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +148,9 @@ struct TokenMeta {
 pub enum SessionEnd {
     /// Transport returned `None` or an error — outer loop should reconnect.
     TransportLost,
+    /// No text frame received for longer than `feed_silence` — outer loop
+    /// should reconnect exactly as for `TransportLost`.
+    FeedSilent,
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +183,13 @@ pub struct Supervisor<R: RestBookSource> {
     rest: R,
     cfg: SupervisorConfig,
     stats: SupStats,
+    /// Tracks when the last text frame was received on the current session.
+    ///
+    /// Initialized to `tokio::time::Instant::now()` at the start of each
+    /// `run_session` call and updated on every received Ok text frame.
+    /// Using `tokio::time::Instant` (not `std::time::Instant`) so that
+    /// `tokio::time::pause()` in tests can control time deterministically.
+    last_frame: tokio::time::Instant,
     /// Optional shared-stats mirror for the probe; set via [`share_stats`].
     ///
     /// When `Some`, [`refresh_mirror`] is called at the end of every
@@ -190,6 +226,7 @@ impl<R: RestBookSource> Supervisor<R> {
             rest,
             cfg,
             stats: SupStats::default(),
+            last_frame: tokio::time::Instant::now(),
             stats_mirror: None,
         }
     }
@@ -201,6 +238,15 @@ impl<R: RestBookSource> Supervisor<R> {
     /// Read-only access to supervisor stats.
     pub fn stats(&self) -> &SupStats {
         &self.stats
+    }
+
+    /// Test-only: override `last_frame` to simulate feed silence without wall time.
+    ///
+    /// This allows deterministic testing of the feed-silence detection logic
+    /// without requiring real elapsed time or `tokio::time::pause`.
+    #[cfg(test)]
+    pub fn set_last_frame_for_test(&mut self, t: tokio::time::Instant) {
+        self.last_frame = t;
     }
 
     /// Read-only access to the underlying shard.
@@ -250,7 +296,7 @@ impl<R: RestBookSource> Supervisor<R> {
     // Single session — called by run() and by replay tests directly
     // -----------------------------------------------------------------------
 
-    /// Drive one WS session until the transport ends.
+    /// Drive one WS session until the transport ends or feed goes silent.
     ///
     /// Steps:
     /// 1. Send a subscribe message for all owned venue ids.
@@ -258,9 +304,10 @@ impl<R: RestBookSource> Supervisor<R> {
     /// 3. Inner loop: select! between incoming frames and the sweep timer.
     ///    - Frame `None` or `Some(Err(_))` → `mark_all_stale`, `reconnects += 1`,
     ///      return `SessionEnd::TransportLost`.
-    ///    - Frame text → `handle_frame`.
-    ///    - Sweep tick → inline sweep (same logic as `sweep_once` but avoids
-    ///      double-borrow of `&mut self`; see module doc).
+    ///    - Frame text → update `last_frame`, call `handle_frame`.
+    ///    - Sweep tick → check feed silence first; if silent: `mark_all_stale`,
+    ///      `feed_silence_reconnects += 1`, return `SessionEnd::FeedSilent`.
+    ///      Otherwise resnapshot INVALID books only (`invalid_tokens()`).
     ///
     /// Replay tests call this directly; the outer `run()` wraps it with
     /// backoff+factory.
@@ -268,6 +315,10 @@ impl<R: RestBookSource> Supervisor<R> {
         &mut self,
         transport: &mut T,
     ) -> SessionEnd {
+        // Reset last_frame at the start of each session so the silence window
+        // is relative to session open, not supervisor construction.
+        self.last_frame = tokio::time::Instant::now();
+
         // Step 1: subscribe.
         let venue_ids: Vec<String> =
             self.tokens.iter().map(|m| m.venue_id.to_string()).collect();
@@ -289,7 +340,7 @@ impl<R: RestBookSource> Supervisor<R> {
             tokio::select! {
                 // biased: drain frames first. Under continuous frame flow the sweep arm can
                 // starve — acceptable: busy books are fresh by definition and integrity
-                // failures resnapshot inline; the sweep only backstops SILENT books.
+                // failures resnapshot inline; the sweep only backstops INVALID books.
                 biased;
                 frame = transport.next_frame() => {
                     match frame {
@@ -299,22 +350,37 @@ impl<R: RestBookSource> Supervisor<R> {
                             return SessionEnd::TransportLost;
                         }
                         Some(Ok(text)) => {
+                            // Update feed-liveness timestamp on every successfully
+                            // received text frame (valid or not — even a parse failure
+                            // proves the socket is alive).
+                            self.last_frame = tokio::time::Instant::now();
                             self.handle_frame(&text).await;
                         }
                     }
                 }
                 _ = sweep.tick() => {
-                    // Inline sweep to avoid double-borrow of &mut self.
-                    // serial REST during mass-stale events blocks frames for N×RTT — acceptable M2 probe limitation; M3 wiring fans out.
-                    let now = Instant::now();
-                    let stale = self.shard.stale_tokens(now, self.cfg.staleness);
-                    // stale_tokens iterates a HashMap — keys are already unique; no HashSet dedup needed.
-                    let stale_count = stale.len();
-                    for token_id in stale {
+                    // Feed-silence check: if the connection has been quiet for longer
+                    // than the configured window, treat it as a dead socket and reconnect.
+                    let now_tokio = tokio::time::Instant::now();
+                    if now_tokio.duration_since(self.last_frame) > self.cfg.feed_silence {
+                        self.shard.mark_all_stale();
+                        self.stats.feed_silence_reconnects += 1;
+                        let invalid_count = self.shard.invalid_tokens().len();
+                        // Refresh mirror so the probe sees the new stale count.
+                        self.refresh_mirror(Some(invalid_count), None, None);
+                        return SessionEnd::FeedSilent;
+                    }
+
+                    // Inline sweep: resnapshot only integrity-invalid books.
+                    // Delta-only model: a quiet book on a live connection is current —
+                    // only crossed/off-tick/feed-lost books need REST resnapshot.
+                    let invalid = self.shard.invalid_tokens();
+                    let invalid_count = invalid.len();
+                    for token_id in invalid {
                         self.resnapshot(token_id).await;
                     }
-                    // Refresh mirror after sweep with pre-computed stale count (no latency args — sweep is timer-driven).
-                    self.refresh_mirror(Some(stale_count), None, None);
+                    // Refresh mirror after sweep with pre-computed invalid count.
+                    self.refresh_mirror(Some(invalid_count), None, None);
                 }
             }
         }
@@ -324,20 +390,28 @@ impl<R: RestBookSource> Supervisor<R> {
     // Sweep
     // -----------------------------------------------------------------------
 
-    /// Resnapshot all tokens whose books are stale at `now`.
+    /// Resnapshot all tokens whose books are integrity-invalid.
+    ///
+    /// Uses `shard.invalid_tokens()` (books where `valid() == false`) rather
+    /// than age-based staleness.  Per the delta-only feed model, a quiet book
+    /// on a live connection is current; only crossed/off-tick/feed-lost books
+    /// need REST resnapshot.
+    ///
+    /// The `now` parameter is retained for API stability (M3 may add age-based
+    /// detection on top) but is not used in the sweep logic here.
     ///
     /// Exposed as `pub` so replay tests can drive it directly without running
     /// through a live `tokio::time::interval`.
-    pub async fn sweep_once(&mut self, now: Instant) {
-        let stale = self.shard.stale_tokens(now, self.cfg.staleness);
-        // stale_tokens iterates a HashMap — keys are already unique; no HashSet dedup needed.
-        // serial REST during mass-stale events blocks frames for N×RTT — acceptable M2 probe limitation; M3 wiring fans out.
-        let stale_count = stale.len();
-        for token_id in stale {
+    pub async fn sweep_once(&mut self, _now: Instant) {
+        let invalid = self.shard.invalid_tokens();
+        // invalid_tokens iterates a HashMap — keys are already unique; no dedup needed.
+        // Serial REST during mass-invalid events blocks frames for N×RTT — acceptable M2 probe limitation; M3 wiring fans out.
+        let invalid_count = invalid.len();
+        for token_id in invalid {
             self.resnapshot(token_id).await;
         }
         // Honor the mirror contract: refresh after sweep so the probe sees the post-sweep state.
-        self.refresh_mirror(Some(stale_count), None, None);
+        self.refresh_mirror(Some(invalid_count), None, None);
     }
 
     // -----------------------------------------------------------------------
@@ -385,7 +459,11 @@ impl<R: RestBookSource> Supervisor<R> {
                 Ok(FactoryDecision::Connect(mut transport)) => {
                     attempt = 0;
                     self.run_session(&mut transport).await;
-                    // SessionEnd::TransportLost → loop and reconnect.
+                    // Both SessionEnd::TransportLost and SessionEnd::FeedSilent
+                    // should reconnect — the run() loop does not pattern-match on
+                    // the return value, so both variants fall through here and
+                    // loop back to call factory() again, which is the correct
+                    // behavior for both transport errors and feed silence.
                 }
             }
         }

@@ -124,6 +124,19 @@ impl Shard {
             .collect()
     }
 
+    /// Tokens whose books are currently invalid (`valid() == false`).
+    ///
+    /// This is the sweep target for the delta-only feed model: a quiet book on a
+    /// live connection is current (no frame = no change); only integrity-invalid
+    /// books (crossed / off-tick / feed-lost) need resnapshot.
+    pub fn invalid_tokens(&self) -> Vec<TokenId> {
+        self.books
+            .iter()
+            .filter(|(_, b)| !b.valid())
+            .map(|(&t, _)| t)
+            .collect()
+    }
+
     /// Mark every book as stale (used on WS reconnect).
     /// Clears `last_update` by invalidating each book's staleness — we
     /// accomplish this by setting `valid = false` via a forced apply_changes

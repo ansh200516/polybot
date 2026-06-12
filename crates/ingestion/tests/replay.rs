@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use pm_ingestion::livebook::RawLevel;
 use pm_ingestion::rest::ParsedBook;
 use pm_ingestion::supervisor::{
-    FactoryDecision, RestBookSource, Supervisor, SupervisorConfig,
+    FactoryDecision, RestBookSource, SessionEnd, Supervisor, SupervisorConfig,
 };
 use pm_ingestion::ws::WsTransport;
 use pm_ingestion::IngestError;
@@ -48,6 +48,40 @@ impl WsTransport for FakeTransport {
 
     async fn send_text(&mut self, text: &str) -> Result<(), IngestError> {
         self.sent.lock().unwrap().push(text.to_owned());
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeTransportBlocking — delivers scripted frames then blocks forever
+// ---------------------------------------------------------------------------
+
+/// A transport that delivers frames from a script then returns a future that
+/// never resolves. Used to test feed-silence detection: with tokio time paused,
+/// the sweep interval fires while next_frame is pending-forever, allowing the
+/// silence detection logic to run without requiring real elapsed time.
+struct FakeTransportBlocking {
+    incoming: VecDeque<Result<String, IngestError>>,
+}
+
+impl FakeTransportBlocking {
+    fn new(frames: Vec<Result<String, IngestError>>) -> Self {
+        FakeTransportBlocking { incoming: frames.into_iter().collect() }
+    }
+}
+
+impl WsTransport for FakeTransportBlocking {
+    async fn next_frame(&mut self) -> Option<Result<String, IngestError>> {
+        if let Some(f) = self.incoming.pop_front() {
+            return Some(f);
+        }
+        // After the script is exhausted, block forever — simulates a live but
+        // silent socket. With tokio::time::pause(), the sweep interval can fire
+        // while this future is pending, allowing silence detection.
+        std::future::pending().await
+    }
+
+    async fn send_text(&mut self, _text: &str) -> Result<(), IngestError> {
         Ok(())
     }
 }
@@ -201,6 +235,7 @@ fn two_token_fake_rest() -> (FakeRest, Arc<Mutex<Vec<String>>>) {
 fn default_cfg() -> SupervisorConfig {
     SupervisorConfig {
         staleness: Duration::from_millis(1500),
+        feed_silence: Duration::from_millis(15_000),
         backoff_base: Duration::from_millis(250),
         backoff_cap: Duration::from_secs(30),
         // Large sweep interval so the timer never fires in run_session during
@@ -571,57 +606,127 @@ async fn transport_end_marks_stale_and_reconnects_with_resubscribe() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5: silent_feed_goes_stale_and_sweep_resnapshots
+// Test 5: invalid_books_resnapshot_via_sweep
 // ---------------------------------------------------------------------------
 
+/// After a session ends (TransportLost → mark_all_stale), all books are invalid.
+/// sweep_once uses invalid_tokens() (not age-based stale_tokens) and resnaps them.
 #[tokio::test]
-async fn silent_feed_goes_stale_and_sweep_resnapshots() {
+async fn invalid_books_resnapshot_via_sweep() {
     // Script:
-    //   1. run_session with a snapshot frame for token_a, then silence (transport ends).
-    //   2. After run_session returns, call sweep_once(now + 2s).
-    //   3. Assert: stale token was resnapshotted via FakeRest.
+    //   1. run_session with a snapshot frame for token_a, then transport ends.
+    //      mark_all_stale() is called → book is invalid (valid=false).
+    //   2. Call sweep_once(Instant::now()).
+    //      sweep_once now uses invalid_tokens() → finds token_a → resnapshots.
+    //   3. Assert: book is valid, resnapshots count increased.
 
     let (rest, call_log) = two_token_fake_rest();
 
     let mut sup = Supervisor::new(
         vec![(TokenId(0), "token_a".to_owned(), TickSize::Cent)],
         rest,
-        // staleness = 1500ms — a 2s advance will make the book stale.
-        SupervisorConfig {
-            staleness: Duration::from_millis(1500),
-            ..default_cfg()
-        },
+        default_cfg(),
     );
 
-    // Session with one book frame, then transport ends.
+    // Session with one book frame, then transport ends (TransportLost → mark_all_stale).
     let f1 = book_frame("token_a", "0.44", "100", "0.56", "100", "ws-hash-a");
     let mut transport = FakeTransport::new(vec![Ok(f1)]);
     sup.run_session(&mut transport).await;
 
-    // Snapshot was applied; REST was called once for initial resnapshot_all,
-    // then the WS book frame arrived.  The book was last-updated at "now".
-    // We can't advance Instant in stable Rust without tokio::time::pause, so
-    // instead we call sweep_once with a synthetic "now" 2 seconds ahead.
-    let future_now = Instant::now() + Duration::from_secs(2);
+    // After session ends, book is invalid (mark_all_stale called by TransportLost path).
+    assert!(
+        !sup.shard().book(TokenId(0)).unwrap().valid(),
+        "book should be invalid after TransportLost (mark_all_stale was called)"
+    );
+
     let resnapshots_before = sup.stats().resnapshots;
     let calls_before = call_log.lock().unwrap().len();
 
-    sup.sweep_once(future_now).await;
+    // sweep_once uses invalid_tokens() — finds the invalid book and resnapshots it.
+    // The `now` parameter is kept for API stability (M3) but not used in sweep logic.
+    sup.sweep_once(Instant::now()).await;
 
     let calls_after = call_log.lock().unwrap().len();
     let resnapshots_after = sup.stats().resnapshots;
     assert!(
         calls_after > calls_before,
-        "sweep_once should have triggered a REST call for the stale book; calls before={calls_before}, after={calls_after}"
+        "sweep_once should have triggered a REST call for the invalid book; calls before={calls_before}, after={calls_after}"
     );
     assert!(
         resnapshots_after > resnapshots_before,
         "resnapshots stat should have increased; before={resnapshots_before}, after={resnapshots_after}"
     );
 
-    // Book should be valid after the sweep resnapshot (sweep_once doesn't mark stale).
+    // Book should be valid after the sweep resnapshot.
     assert!(
         sup.shard().book(TokenId(0)).unwrap().valid(),
-        "book should be valid after sweep resnapshot"
+        "book should be valid after sweep resnapshot of invalid book"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: feed_silence_forces_reconnect
+// ---------------------------------------------------------------------------
+
+/// When the feed is alive but silent (no frames for feed_silence duration),
+/// the supervisor must detect this in the sweep arm and return FeedSilent,
+/// triggering a reconnect. All books are marked stale.
+///
+/// Uses `tokio::time::pause()` (start_paused) + `tokio::time::advance()` so
+/// the sweep interval fires deterministically while next_frame is pending.
+/// Uses `FakeTransportBlocking` which returns Pending after exhausting its script.
+#[tokio::test(start_paused = true)]
+async fn feed_silence_forces_reconnect() {
+    // Configuration: tiny silence window and fast sweep for this test.
+    let cfg = SupervisorConfig {
+        feed_silence: Duration::from_millis(5_000),   // 5s silence window
+        sweep_interval: Duration::from_millis(500),   // sweep every 500ms
+        ..default_cfg()
+    };
+
+    let (rest, _call_log) = two_token_fake_rest();
+    let mut sup = Supervisor::new(
+        vec![(TokenId(0), "token_a".to_owned(), TickSize::Cent)],
+        rest,
+        cfg,
+    );
+
+    // FakeTransportBlocking: delivers one good snapshot frame, then blocks forever.
+    let f1 = book_frame("token_a", "0.44", "100", "0.56", "100", "snap-1");
+    let mut transport = FakeTransportBlocking::new(vec![Ok(f1)]);
+
+    // Drive run_session concurrently with a time-advance arm.
+    //
+    // The biased select! inside run_session checks the frame arm first.
+    // After the script exhausts, next_frame returns Pending forever.
+    // The sweep interval is paused (start_paused = true).
+    // We advance time past sweep_interval + feed_silence, which causes the
+    // interval to fire. The sweep arm detects silence and returns FeedSilent.
+    //
+    // The outer tokio::select! here ensures we get the SessionEnd result back:
+    // - If run_session completes (FeedSilent detected) → first arm wins.
+    // - The second arm advances time then stays pending forever → never wins.
+    let result = tokio::select! {
+        r = sup.run_session(&mut transport) => r,
+        _ = async {
+            // Yield once to let run_session process the initial frame and reach
+            // the pending-forever state in next_frame.
+            tokio::task::yield_now().await;
+            // Advance time past sweep_interval + feed_silence so the interval fires.
+            tokio::time::advance(Duration::from_millis(10_000)).await;
+            // Never resolve this arm — run_session must win when it detects silence.
+            std::future::pending::<()>().await
+        } => unreachable!("time-advance arm should never complete"),
+    };
+
+    assert_eq!(result, SessionEnd::FeedSilent, "expected FeedSilent when feed is silent");
+    assert_eq!(
+        sup.stats().feed_silence_reconnects, 1,
+        "feed_silence_reconnects should be 1 after one silent session"
+    );
+    // All books should be invalid after mark_all_stale (called by FeedSilent path).
+    assert!(
+        !sup.shard().book(TokenId(0)).map(|b| b.valid()).unwrap_or(true),
+        "book should be invalid after feed-silence mark_all_stale"
     );
 }

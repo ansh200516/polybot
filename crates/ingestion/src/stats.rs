@@ -90,6 +90,7 @@ pub struct StatsCell {
     pub resnapshots: AtomicU64,
     pub resnapshot_errors: AtomicU64,
     pub unknown_token_changes: AtomicU64,
+    pub feed_silence_reconnects: AtomicU64,
 
     // Current gauges (overwritten on every refresh).
     pub books: AtomicU64,
@@ -118,6 +119,7 @@ impl StatsCell {
             resnapshots: AtomicU64::new(0),
             resnapshot_errors: AtomicU64::new(0),
             unknown_token_changes: AtomicU64::new(0),
+            feed_silence_reconnects: AtomicU64::new(0),
             books: AtomicU64::new(0),
             stale: AtomicU64::new(0),
             recv_to_parsed_us: Mutex::new(h1),
@@ -149,6 +151,8 @@ impl StatsCell {
         self.resnapshot_errors.store(sup_stats.resnapshot_errors, Ordering::Relaxed);
         self.unknown_token_changes
             .store(sup_stats.unknown_token_changes, Ordering::Relaxed);
+        self.feed_silence_reconnects
+            .store(sup_stats.feed_silence_reconnects, Ordering::Relaxed);
         self.books.store(books as u64, Ordering::Relaxed);
         self.stale.store(stale as u64, Ordering::Relaxed);
 
@@ -174,6 +178,7 @@ impl StatsCell {
             resnapshots: self.resnapshots.load(Ordering::Relaxed),
             resnapshot_errors: self.resnapshot_errors.load(Ordering::Relaxed),
             unknown_token_changes: self.unknown_token_changes.load(Ordering::Relaxed),
+            feed_silence_reconnects: self.feed_silence_reconnects.load(Ordering::Relaxed),
         }
     }
 }
@@ -458,6 +463,7 @@ mod tests {
             resnapshots: 50,
             resnapshot_errors: 2,
             unknown_token_changes: 3,
+            feed_silence_reconnects: 0,
         };
         let sup2 = SupStats {
             frames: 500,
@@ -467,6 +473,7 @@ mod tests {
             resnapshots: 20,
             resnapshot_errors: 0,
             unknown_token_changes: 1,
+            feed_silence_reconnects: 0,
         };
 
         // First print cycle
@@ -509,6 +516,7 @@ mod tests {
             resnapshots: 3,
             resnapshot_errors: 0,
             unknown_token_changes: 2,
+            feed_silence_reconnects: 0,
         };
         cell.refresh(&stats, 100, 5, Some(10), Some(3));
 

@@ -93,6 +93,11 @@ impl LiveBook {
     }
 
     /// True if the book is stale: invalid, never stamped, or stamp age ≥ window.
+    ///
+    /// NOTE (delta-only feed): per-book age staleness is meaningful only when the
+    /// feed itself is alive and pushing deltas; the supervisor gates staleness at
+    /// FEED level — a quiet book on a live connection is current. M3's detection
+    /// gate must combine `valid` with feed liveness, not raw book age.
     pub fn is_stale(&self, now: Instant, window: Duration) -> bool {
         !self.valid
             || self

@@ -256,6 +256,7 @@ async fn main() {
     let rest_rate_capacity = config.ingestion.rest_rate_capacity;
     let rest_rate_per_sec = config.ingestion.rest_rate_per_sec;
     let staleness = Duration::from_millis(config.ingestion.staleness_ms);
+    let feed_silence = Duration::from_millis(config.ingestion.feed_silence_ms);
     let backoff_base = Duration::from_millis(config.ingestion.backoff_base_ms);
     let backoff_cap = Duration::from_millis(config.ingestion.backoff_cap_ms);
     let sweep_interval = Duration::from_millis(config.ingestion.sweep_interval_ms);
@@ -291,6 +292,7 @@ async fn main() {
 
         let sup_cfg = SupervisorConfig {
             staleness,
+            feed_silence,
             backoff_base,
             backoff_cap,
             sweep_interval,

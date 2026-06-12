@@ -79,6 +79,7 @@ pub struct Universe {
 #[serde(deny_unknown_fields, default)]
 pub struct Ingestion {
     pub staleness_ms: u64,
+    pub feed_silence_ms: u64,
     pub ws_chunk_size: usize,
     pub resync_interval_s: u64,
     pub sweep_interval_ms: u64,
@@ -170,7 +171,8 @@ impl Default for Universe {
 impl Default for Ingestion {
     fn default() -> Self {
         Ingestion {
-            staleness_ms: 30_000,
+            staleness_ms: 1_500,
+            feed_silence_ms: 15_000,
             ws_chunk_size: 50,
             resync_interval_s: 300,
             sweep_interval_ms: 1000,
@@ -212,6 +214,9 @@ impl Config {
         // Ingestion validation
         if self.ingestion.staleness_ms < 100 {
             return Err(ConfigError::BadMoney("staleness_ms must be ≥ 100"));
+        }
+        if self.ingestion.feed_silence_ms < 1000 {
+            return Err(ConfigError::BadMoney("feed_silence_ms must be ≥ 1000"));
         }
         if self.ingestion.ws_chunk_size < 1 {
             return Err(ConfigError::BadMoney("ws_chunk_size must be ≥ 1"));
@@ -286,7 +291,8 @@ mod tests {
         assert_eq!(c.endpoints.ws_market_url, "wss://ws-subscriptions-clob.polymarket.com/ws/market");
         assert_eq!(c.universe.max_markets, 200);
         assert!(c.universe.require_active);
-        assert_eq!(c.ingestion.staleness_ms, 30_000);
+        assert_eq!(c.ingestion.staleness_ms, 1_500);
+        assert_eq!(c.ingestion.feed_silence_ms, 15_000);
         assert_eq!(c.ingestion.ws_chunk_size, 50);
         assert_eq!(c.ingestion.resync_interval_s, 300);
         assert_eq!(c.ingestion.sweep_interval_ms, 1000);
@@ -358,6 +364,8 @@ mod tests {
     fn validate_rejects_bad_ingestion_values() {
         // staleness_ms < 100
         assert!(Config::from_toml_str("[ingestion]\nstaleness_ms = 50\n").is_err());
+        // feed_silence_ms < 1000
+        assert!(Config::from_toml_str("[ingestion]\nfeed_silence_ms = 500\n").is_err());
         // ws_chunk_size < 1
         assert!(Config::from_toml_str("[ingestion]\nws_chunk_size = 0\n").is_err());
         // rest_rate_per_sec <= 0.0

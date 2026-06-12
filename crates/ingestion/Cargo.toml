@@ -22,3 +22,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 proptest.workspace = true
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
