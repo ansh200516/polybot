@@ -1298,6 +1298,7 @@ dependencies = [
 name = "pm-app"
 version = "0.1.0"
 dependencies = [
+ "crossterm",
  "hdrhistogram",
  "pm-config",
  "pm-core",
@@ -1308,6 +1309,7 @@ dependencies = [
  "pm-risk",
  "pm-store",
  "pm-tui",
+ "ratatui",
  "serde_json",
  "tempfile",
  "tokio",

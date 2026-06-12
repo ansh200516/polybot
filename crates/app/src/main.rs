@@ -1,7 +1,13 @@
-//! arb — headless paper-trading session (M3, spec §22).
+//! arb — paper-trading session (M3 engine + M4 live TUI dashboard, spec §22/§17).
 //! Usage: arb [--config <path>] [--duration-secs N] [--max-markets N]
-//!            [--relationships <path>] [--db <path>]
+//!            [--relationships <path>] [--db <path>] [--headless]
 //! duration-secs 0 (default) = run until SIGINT/kill switch.
+//!
+//! TUI: by default arb launches the interactive dashboard when stdout is a
+//! terminal. `--headless` forces M3-style fmt logging to stdout. The TUI is
+//! ALSO skipped automatically when stdout is not a terminal (piped/redirected),
+//! so cron/CI invocations stay headless without the flag.
+//!
 //! Exit codes: 0 healthy session, 1 startup error, 2 unhealthy.
 
 #![allow(clippy::unwrap_used)]
@@ -49,6 +55,7 @@ struct Args {
     max_markets: Option<usize>,
     relationships_path: Option<PathBuf>,
     db: Option<PathBuf>,
+    headless: bool,
 }
 
 impl Args {
@@ -59,6 +66,7 @@ impl Args {
         let mut max_markets: Option<usize> = None;
         let mut relationships_path: Option<PathBuf> = None;
         let mut db: Option<PathBuf> = None;
+        let mut headless = false;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -97,6 +105,9 @@ impl Args {
                         .ok_or_else(|| "--db requires a value".to_string())?;
                     db = Some(PathBuf::from(v));
                 }
+                "--headless" => {
+                    headless = true;
+                }
                 other => return Err(format!("unknown argument: {other}")),
             }
         }
@@ -107,6 +118,7 @@ impl Args {
             max_markets,
             relationships_path,
             db,
+            headless,
         })
     }
 }
@@ -122,17 +134,36 @@ fn fatal(msg: impl std::fmt::Display) -> ! {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let args = match Args::parse() {
         Ok(a) => a,
         Err(e) => fatal(e),
     };
+
+    // Mode decision: the TUI engages only when not forced headless AND stdout is
+    // an actual terminal. A piped/redirected stdout (cron/CI) reports false here,
+    // so the dashboard is skipped automatically without --headless.
+    use std::io::IsTerminal;
+    let tui_active = !args.headless && std::io::stdout().is_terminal();
+
+    // Tracing init — the EnvFilter MUST be the FIRST layer so debug/trace events
+    // are discarded before they ever reach the ring buffer's lock. In TUI mode
+    // the fmt (stdout) layer is replaced by the ring layer: stdout writes would
+    // corrupt the alternate screen.
+    let logbuf = pm_app::logbuf::LogBuffer::new(512);
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    if tui_active {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(pm_app::logbuf::RingLayer::new(std::sync::Arc::clone(
+                &logbuf,
+            )))
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
 
     // ---- config load + validate + CLI overrides ----------------------------
     let mut config = match &args.config_path {
@@ -427,6 +458,14 @@ async fn main() {
         exec_params,
     ));
 
+    // Clone the fetcher for the publisher BEFORE the coordinator consumes it
+    // (the publisher marks open positions at the live bid). None in headless.
+    let fetcher_pub = if tui_active {
+        Some(fetcher.clone())
+    } else {
+        None
+    };
+
     // ---- coordinator --------------------------------------------------------
     let mut coord = Coordinator::new(
         &config,
@@ -443,6 +482,12 @@ async fn main() {
     )
     .unwrap_or_else(|e| fatal(format!("Coordinator::new: {e}")));
     coord.note_session_starts(starts);
+    // Wire the dashboard channels BEFORE spawning coord.run() (both take &mut).
+    // ctl_tx translates TuiCommands into coordinator control; status_rx feeds the
+    // publisher. Held even in headless mode (cheap; keeps the spawn ordering one
+    // shape), though only the TUI path uses them.
+    let ctl_tx = coord.control_channel(8);
+    let status_rx = coord.status_channel();
     let coord_handle = tokio::spawn(coord.run());
 
     // ---- kill watch ---------------------------------------------------------
@@ -460,6 +505,62 @@ async fn main() {
             "restart storm detected at startup"
         );
     }
+
+    // ---- publisher + TUI startup -------------------------------------------
+    // Built only when the TUI is active. Owns terminal lifecycle: raw mode +
+    // alternate screen on enter; a panic hook restores the terminal BEFORE the
+    // default hook prints so a panic stays readable; run_tui's task tears the
+    // screen down on its own exit so the final report prints on the normal
+    // screen even if the TUI exits first (q / Ctrl-C-as-key).
+    let (mut tui_cmd_rx, tui_task) = if tui_active {
+        let read = pm_store::read::ReadStore::open(Path::new(&config.store.path))
+            .unwrap_or_else(|e| fatal(format!("ReadStore::open: {e}")));
+        let ctx = pm_app::publisher::PublisherCtx {
+            read,
+            stats: Arc::clone(&stats),
+            cells: stat_cells.clone(),
+            status_rx: status_rx.clone(),
+            registry: Arc::clone(&reg),
+            logbuf: Arc::clone(&logbuf),
+            fetcher: fetcher_pub.expect("fetcher_pub is Some when tui_active"),
+            feed_rows: config.tui.feed_rows,
+            fills_rows: config.tui.fills_rows,
+            log_lines: config.tui.log_lines,
+            mode_paper: config.mode.paper,
+            start: Instant::now(),
+            last_frames: 0,
+            last_at: Instant::now(),
+        };
+        let (state_rx, _pub_handle) =
+            pm_app::publisher::spawn_publisher(ctx, Duration::from_millis(config.tui.refresh_ms));
+
+        crossterm::terminal::enable_raw_mode().unwrap_or_else(|e| fatal(format!("raw mode: {e}")));
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ =
+                crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+            default_hook(info);
+        }));
+        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+        let mut terminal =
+            ratatui::Terminal::new(backend).unwrap_or_else(|e| fatal(format!("terminal: {e}")));
+
+        let key_rx = pm_tui::run::spawn_input_thread();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<pm_tui::state::TuiCommand>(8);
+        let task = tokio::spawn(async move {
+            let _ = pm_tui::run::run_tui(&mut terminal, state_rx, key_rx, cmd_tx).await;
+            // Teardown here so the final report prints on the normal screen even
+            // when the TUI exits first (q / Ctrl-C-as-key).
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ =
+                crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        });
+        (Some(cmd_rx), Some(task))
+    } else {
+        (None, None)
+    };
 
     // ---- main loop ----------------------------------------------------------
     // Two independent intervals:
@@ -494,6 +595,19 @@ async fn main() {
                 trigger = "ctrl_c";
                 break;
             }
+            cmd = recv_tui(&mut tui_cmd_rx) => match cmd {
+                pm_tui::state::TuiCommand::SetPaused(p) => {
+                    let _ = ctl_tx.send(pm_app::coordinator::CtlCommand::SetPaused(p)).await;
+                }
+                pm_tui::state::TuiCommand::Kill => kill.store(true, Ordering::Release),
+                pm_tui::state::TuiCommand::GoLive => {
+                    warn!("live venue unavailable until M5 — staying in paper")
+                }
+                pm_tui::state::TuiCommand::Quit => {
+                    trigger = "quit";
+                    break;
+                }
+            },
         }
     }
     info!(
@@ -536,6 +650,17 @@ async fn main() {
         Err(e) => fatal(format!("writer task join: {e}")),
     };
 
+    // Await the TUI task LAST so its terminal teardown is ordered before the
+    // final report hits the (now normal) screen. The coordinator was awaited
+    // above; dropping its status_tx closed the publisher's watch → the publisher
+    // exits → its state_tx drops → run_tui's state_rx closes → run_tui returns →
+    // the task runs disable_raw_mode + LeaveAlternateScreen. So a session ending
+    // for NON-TUI reasons (duration/kill/sentinel/ctrl_c) still tears the screen
+    // down here.
+    if let Some(t) = tui_task {
+        let _ = t.await;
+    }
+
     // ---- final report -------------------------------------------------------
     let realized = store.realized_total().unwrap_or(0);
     let opportunities = store.count_opportunities().unwrap_or(0);
@@ -543,29 +668,56 @@ async fn main() {
     let halts = store.count_halts().unwrap_or(0);
     let write_errors = store.write_errors;
 
+    // The summary must reach stdout in BOTH modes: in TUI mode tracing went to
+    // the ring buffer (now gone with the torn-down screen), so println! is the
+    // only path to the human. One info! mirror is kept for headless log capture.
     match &coord_summary {
-        Some(summary) => info!(
-            cash_micro = summary.cash.0,
-            equity_micro = summary.equity.0,
-            open_positions = summary.open_positions,
-            "session summary"
-        ),
-        None => info!("session summary: coordinator panicked — no position data available"),
+        Some(summary) => {
+            println!(
+                "session summary: cash_micro={} equity_micro={} open_positions={}",
+                summary.cash.0, summary.equity.0, summary.open_positions
+            );
+            info!(
+                cash_micro = summary.cash.0,
+                equity_micro = summary.equity.0,
+                open_positions = summary.open_positions,
+                "session summary"
+            );
+        }
+        None => {
+            println!("session summary: coordinator panicked — no position data available");
+            info!("session summary: coordinator panicked — no position data available");
+        }
     }
-    info!(
-        realized_micro = realized,
-        opportunities, fills, halts, write_errors, "session counts"
+    println!(
+        "session counts: realized_micro={realized} opportunities={opportunities} fills={fills} halts={halts} write_errors={write_errors}"
     );
-    info!("FINAL stats: {}", stats.line());
-    info!(duration_s = start.elapsed().as_secs(), "session ended");
+    println!("FINAL stats: {}", stats.line());
+    println!("session ended: duration_s={}", start.elapsed().as_secs());
 
     let coord_panicked = coord_summary.is_none();
     let healthy = write_errors == 0 && !restart_storm && supervisors_started > 0 && !coord_panicked;
-    info!(healthy, "arb session result");
+    println!("arb session result: healthy={healthy}");
     if healthy {
         std::process::exit(0);
     } else {
         std::process::exit(2);
+    }
+}
+
+/// Receive the next TUI command, or pend forever when no TUI is wired
+/// (headless) or the channel is closed (TUI gone). Closed-channel `recv()`
+/// returns None immediately, so this costs one wasted poll per loop wake before
+/// pending — acceptable; the arm is only re-armed when another arm fires.
+async fn recv_tui(
+    rx: &mut Option<mpsc::Receiver<pm_tui::state::TuiCommand>>,
+) -> pm_tui::state::TuiCommand {
+    match rx.as_mut() {
+        Some(r) => match r.recv().await {
+            Some(c) => c,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
     }
 }
 

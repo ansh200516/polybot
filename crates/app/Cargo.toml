@@ -13,6 +13,8 @@ pm-store = { workspace = true }
 pm-risk = { workspace = true }
 pm-execution = { workspace = true }
 pm-tui = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
