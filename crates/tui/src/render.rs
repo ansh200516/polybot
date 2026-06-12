@@ -67,6 +67,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 fn draw_header(f: &mut Frame, s: &AppState, area: Rect) {
     let (mode_badge, badge_bg) = if s.mode_paper {
         (" PAPER ", Color::Yellow)
+    } else if s.shadow {
+        // Shadow signs but never submits — harmless. It takes precedence over
+        // LIVE and LIVE·HELD (shadow sessions are always released; never HELD).
+        // Cyan = the retired pre-M5 LIVE color; red stays RESERVED for
+        // armed-and-released real money so the two are never confused.
+        (" SHADOW ", Color::Cyan)
     } else if !s.live_released {
         // Armed but held: latch not yet released — yellow warning chrome.
         (" LIVE\u{00b7}HELD ", Color::Yellow)
@@ -455,6 +461,41 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    /// Background color of the first cell of `label` in the rendered header.
+    /// Returns None if the label isn't found. Used to assert badge styling
+    /// (e.g. SHADOW must not be red).
+    pub(crate) fn badge_bg_color(
+        state: &AppState,
+        label: &str,
+        w: u16,
+        h: u16,
+    ) -> Option<Color> {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, state, &UiState::default())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let area = *buf.area();
+        let first = label.chars().next()?;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if buf[(x, y)].symbol() != first.to_string() {
+                    continue;
+                }
+                // Candidate start: does the run of cells from here spell `label`?
+                let mut run = String::new();
+                let mut xx = x;
+                while xx < area.width && run.len() < label.len() {
+                    run.push_str(buf[(xx, y)].symbol());
+                    xx += 1;
+                }
+                if run.starts_with(label) {
+                    return Some(buf[(x, y)].style().bg.unwrap_or(Color::Reset));
+                }
+            }
+        }
+        None
+    }
+
     /// Flatten the test buffer into one searchable string (lossy join).
     pub(crate) fn render_to_text(state: &AppState, ui: &UiState, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
@@ -789,6 +830,34 @@ mod tests {
         s.live_released = true;
         let text = render_to_text(&s, &UiState::default(), 140, 40);
         assert!(text.contains("LIVE") && !text.contains("LIVE·HELD"));
+    }
+
+    #[test]
+    fn shadow_badge_is_distinct_and_not_red() {
+        // --live --shadow: signs but never submits. Must NOT wear the red LIVE
+        // badge of a funded session, and must take precedence over LIVE·HELD
+        // (shadow sessions are always released — never render HELD).
+        let s = AppState {
+            mode_paper: false,
+            shadow: true,
+            live_released: true,
+            ..Default::default()
+        };
+        let text = render_to_text(&s, &UiState::default(), 140, 40);
+        assert!(text.contains("SHADOW"), "shadow badge missing:\n{text}");
+        // "SHADOW" does not contain "LIVE", so this also rules out standalone
+        // LIVE and LIVE·HELD bleeding through.
+        assert!(!text.contains("LIVE"), "shadow must not render any LIVE badge:\n{text}");
+        // The SHADOW glyph cells must not be painted red (red is reserved for
+        // armed-and-released real money).
+        let bg = badge_bg_color(&s, "SHADOW", 140, 40);
+        assert_ne!(bg, Some(Color::Red), "SHADOW badge must not use a red background");
+
+        // Even pre-release (held latch) a shadow session shows SHADOW, never HELD.
+        let s_held = AppState { live_released: false, ..s };
+        let text = render_to_text(&s_held, &UiState::default(), 140, 40);
+        assert!(text.contains("SHADOW"), "shadow precedence over HELD:\n{text}");
+        assert!(!text.contains("LIVE"), "no LIVE·HELD under shadow:\n{text}");
     }
 
     #[test]

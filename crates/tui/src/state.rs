@@ -83,6 +83,10 @@ pub struct AppState {
     /// True once the operator has typed-confirmed the live toggle (TUI `l`).
     /// In live mode, controls whether the header badge shows LIVE·HELD or LIVE.
     pub live_released: bool,
+    /// True in `--live --shadow`: the venue signs but never submits. Display
+    /// only — drives the distinct SHADOW badge so a harmless shadow session is
+    /// never mistaken for armed-and-released real money.
+    pub shadow: bool,
     pub paused: bool,
     pub halted: Option<String>,
     pub killed: bool,

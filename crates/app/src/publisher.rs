@@ -91,6 +91,9 @@ pub struct PublisherCtx {
     pub fills_rows: usize,
     pub log_lines: usize,
     pub mode_paper: bool,
+    /// `--live --shadow`: signs but never submits. Display only — forwarded into
+    /// AppState so the header shows the distinct (non-red) SHADOW badge.
+    pub shadow: bool,
     pub start: Instant,
     pub last_frames: u64,
     pub last_at: Instant,
@@ -258,6 +261,7 @@ pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
     AppState {
         uptime_s: ctx.start.elapsed().as_secs(),
         mode_paper: ctx.mode_paper,
+        shadow: ctx.shadow,
         live_released: status.live_released,
         paused: status.paused,
         halted: status.halted,
@@ -409,6 +413,7 @@ mod tests {
             fills_rows: 10,
             log_lines: 10,
             mode_paper: true,
+            shadow: false,
             start: std::time::Instant::now(),
             last_frames: 0,
             last_at: std::time::Instant::now(),
@@ -534,6 +539,7 @@ mod tests {
             fills_rows: 20,
             log_lines: 50,
             mode_paper: true,
+            shadow: false,
             start: std::time::Instant::now(),
             last_frames: 0,
             last_at: std::time::Instant::now(),
@@ -593,6 +599,7 @@ mod tests {
             fills_rows: 10,
             log_lines: 10,
             mode_paper: false,
+            shadow: true,
             start: std::time::Instant::now(),
             last_frames: 0,
             last_at: std::time::Instant::now(),
@@ -600,6 +607,7 @@ mod tests {
 
         let state = assemble(&mut ctx).await;
         assert!(state.live_released, "live_released must come from CoordStatus");
+        assert!(state.shadow, "shadow must map from PublisherCtx into AppState");
         assert_eq!(state.health.live_rej, 5, "live_rej from AppStats");
         assert_eq!(state.health.live_held, 3, "live_held from AppStats");
         drop(_status_tx);
