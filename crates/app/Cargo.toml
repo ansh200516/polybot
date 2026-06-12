@@ -1,0 +1,28 @@
+[package]
+name = "pm-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pm-core = { workspace = true }
+pm-engine = { workspace = true }
+pm-config = { workspace = true }
+pm-registry = { workspace = true }
+pm-ingestion = { workspace = true }
+pm-store = { workspace = true }
+pm-risk = { workspace = true }
+pm-execution = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hdrhistogram = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "arb"
+path = "src/main.rs"
+
+[lints]
+workspace = true

@@ -78,3 +78,83 @@ trade).
 Deployment note: co-location dominates language-level speed — measure RTT
 to Polymarket endpoints from candidate regions before choosing a host
 (full guidance lands with M6).
+
+## M3: paper execution (coordinator + risk + store)
+
+`pm-execution` simulates fills against live books with configurable latency
+and fill-window; `pm-risk` / `pm-store` enforce daily-drawdown halts and
+persist FIFO-lot P&L to SQLite. The binary connects to Polymarket's public
+WS/REST endpoints (read-only), detects arb opportunities, dispatches baskets
+to the paper-fill engine, and records every order, fill, P&L snapshot, halt,
+and session boundary. No orders are ever sent to the venue.
+
+### Config defaults (locked for M3)
+
+| Section | Key | Default |
+|---|---|---|
+| `[execution]` | `paper_latency_ms` | 200 |
+| `[execution]` | `fill_window_ms` | 500 |
+| `[execution]` | `redeem_strategy` | `"merge"` |
+| `[risk]` | `max_unhedged_usd` | 200.0 |
+| `[risk]` | `max_open_orders` | 32 |
+| `[risk]` | `max_basket_legs` | 16 |
+| `[risk]` | `daily_drawdown_pct` | 2.0 |
+| `[risk]` | `kill_file` | `"kill.switch"` |
+| `[store]` | `path` | `"pm.sqlite"` |
+
+### Kill switch
+
+Two mechanisms stop the session cleanly (no positions left dangling):
+
+- **File sentinel**: `touch kill.switch` (path resolved relative to cwd at
+  launch; overridable via `[risk] kill_file`). The watcher polls every ~1 s;
+  shutdown completes within ~2 s of the file appearing.
+- **Signal**: `kill -USR1 <pid>`.
+
+Both produce `trigger="kill"` in the log and exit 0. The DailyDrawdown risk
+halt freezes new basket dispatch but does not stop the session — the session
+keeps running until a kill or natural end.
+
+### Acceptance run (Apple Silicon dev machine, 2026-06-12)
+
+    cargo run -p pm-app --bin arb --release -- --db /tmp/m3-acceptance.sqlite
+
+30-minute paper session (400 markets / 800 tokens, kill-switch test at
+minute 27):
+
+| Metric | Value |
+|---|---|
+| active session duration | 1620 s (27 min) |
+| markets / tokens / supervisors | 400 / 800 / 14 |
+| WS frames processed | 255,800 |
+| reconnects | 0 |
+| opportunities admitted to LP | 7,845 |
+| baskets dispatched | 8 |
+| baskets clean / unwound / nofill | 6 / 1 / 1 |
+| paper fills | 100 |
+| realized P&L | +$65.40 (paper) |
+| DailyDrawdown halt | 1 (coordinator froze dispatch; session continued) |
+| KillSwitch halt | 1 (clean stop at elapsed_s=1618) |
+| write errors | 0 |
+| detect latency p50 / p99 | 34 µs / 377 µs |
+| dispatch latency p50 / p99 | 1,976 µs / 6,583 µs |
+| verdict / exit | healthy / 0 |
+
+Kill-switch response: sentinel file written at wall 22:30:14 IST;
+`trigger="kill"` log line at elapsed_s=1618; process exited within ~4 s.
+
+### Operational notes
+
+**Starting a session**: binary is self-contained — it runs registry sync
+(REST, rate-limited 5 req/s), assembles the market universe, spawns WS
+supervisors, then begins detection. Sync for 400 markets takes ~4 min.
+
+**Restart reconciliation**: on startup the binary reads the existing SQLite
+store, reconciles any open positions from the previous session (counting
+prior session starts in the restart-storm window), then resumes. Cold start
+on a fresh DB shows `reconciled=0`.
+
+**Drawdown halt**: when cumulative paper losses exceed `daily_drawdown_pct`
+of deployed capital, the coordinator stops dispatching new baskets for the
+remainder of the session. Ingestion and book-keeping continue normally.
+Reset on next session start (new calendar day tracked in the store).

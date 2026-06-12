@@ -15,6 +15,9 @@ pub struct Config {
     pub endpoints: Endpoints,
     pub universe: Universe,
     pub ingestion: Ingestion,
+    pub execution: Execution,
+    pub risk: Risk,
+    pub store: Store,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
@@ -45,6 +48,8 @@ pub struct Gas {
 #[serde(deny_unknown_fields, default)]
 pub struct Lp {
     pub max_worlds: usize,
+    pub min_resolve_interval_ms: u64,
+    pub solver_concurrency: usize,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
@@ -135,7 +140,11 @@ impl Default for Gas {
 }
 impl Default for Lp {
     fn default() -> Self {
-        Lp { max_worlds: 4096 }
+        Lp {
+            max_worlds: 4096,
+            min_resolve_interval_ms: 500,
+            solver_concurrency: 2,
+        }
     }
 }
 impl Default for Dedup {
@@ -181,6 +190,74 @@ impl Default for Ingestion {
             backoff_base_ms: 250,
             backoff_cap_ms: 30_000,
             relationships_path: "relationships.toml".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Execution {
+    /// Simulated venue latency before a paper fill re-reads the book (spec §14).
+    pub paper_latency_ms: u64,
+    /// Basket fill window: legs not resolved within this are treated as expired.
+    pub fill_window_ms: u64,
+    /// Class-1 long redemption: "merge" (default) or "hold" (spec §6).
+    pub redeem_strategy: String,
+}
+
+impl Default for Execution {
+    fn default() -> Self {
+        Execution {
+            paper_latency_ms: 200,
+            fill_window_ms: 500,
+            redeem_strategy: "merge".into(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Risk {
+    pub max_unhedged_usd: f64,
+    pub max_open_orders: usize,
+    pub max_basket_legs: usize,
+    pub daily_drawdown_pct: f64,
+    pub error_halt_count: u32,
+    pub error_halt_window_s: u64,
+    pub restart_storm_count: u32,
+    pub restart_storm_window_s: u64,
+    pub kill_file: String,
+    /// Opportunities older than this at the coordinator are discarded (staleness gate proxy, §15).
+    pub max_opportunity_age_ms: u64,
+}
+
+impl Default for Risk {
+    fn default() -> Self {
+        Risk {
+            max_unhedged_usd: 200.0,
+            max_open_orders: 32,
+            max_basket_legs: 16,
+            daily_drawdown_pct: 2.0,
+            error_halt_count: 5,
+            error_halt_window_s: 60,
+            restart_storm_count: 5,
+            restart_storm_window_s: 300,
+            kill_file: "kill.switch".into(),
+            max_opportunity_age_ms: 1000,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Store {
+    pub path: String,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Store {
+            path: "pm.sqlite".into(),
         }
     }
 }
@@ -257,6 +334,35 @@ impl Config {
             return Err(ConfigError::BadMoney(
                 "relationships_path must be non-empty",
             ));
+        }
+        if !matches!(self.execution.redeem_strategy.as_str(), "merge" | "hold") {
+            return Err(ConfigError::BadMoney(
+                "execution.redeem_strategy must be \"merge\" or \"hold\"",
+            ));
+        }
+        if self.execution.fill_window_ms < self.execution.paper_latency_ms {
+            return Err(ConfigError::BadMoney(
+                "execution.fill_window_ms must be >= paper_latency_ms",
+            ));
+        }
+        if !(self.risk.daily_drawdown_pct > 0.0 && self.risk.daily_drawdown_pct <= 100.0) {
+            return Err(ConfigError::BadMoney(
+                "risk.daily_drawdown_pct must be in (0, 100]",
+            ));
+        }
+        if self.risk.max_basket_legs < 2 {
+            return Err(ConfigError::BadMoney("risk.max_basket_legs must be >= 2"));
+        }
+        if self.risk.max_unhedged_usd < 0.0 || !self.risk.max_unhedged_usd.is_finite() {
+            return Err(ConfigError::BadMoney(
+                "risk.max_unhedged_usd must be finite and >= 0",
+            ));
+        }
+        if self.lp.solver_concurrency == 0 {
+            return Err(ConfigError::BadMoney("lp.solver_concurrency must be >= 1"));
+        }
+        if self.store.path.is_empty() {
+            return Err(ConfigError::BadMoney("store.path must not be empty"));
         }
         Ok(())
     }
@@ -411,5 +517,74 @@ mod tests {
     #[test]
     fn validate_rejects_empty_relationships_path() {
         assert!(Config::from_toml_str("[ingestion]\nrelationships_path = \"\"\n").is_err());
+    }
+
+    #[test]
+    fn m3_sections_default_to_spec_values() {
+        let c = Config::default();
+        assert_eq!(c.execution.paper_latency_ms, 200);
+        assert_eq!(c.execution.fill_window_ms, 500);
+        assert_eq!(c.execution.redeem_strategy, "merge");
+        assert_eq!(c.risk.max_unhedged_usd, 200.0);
+        assert_eq!(c.risk.max_open_orders, 32);
+        assert_eq!(c.risk.max_basket_legs, 16);
+        assert_eq!(c.risk.daily_drawdown_pct, 2.0);
+        assert_eq!(c.risk.error_halt_count, 5);
+        assert_eq!(c.risk.error_halt_window_s, 60);
+        assert_eq!(c.risk.restart_storm_count, 5);
+        assert_eq!(c.risk.restart_storm_window_s, 300);
+        assert_eq!(c.risk.kill_file, "kill.switch");
+        assert_eq!(c.risk.max_opportunity_age_ms, 1000);
+        assert_eq!(c.store.path, "pm.sqlite");
+        assert_eq!(c.lp.min_resolve_interval_ms, 500);
+        assert_eq!(c.lp.solver_concurrency, 2);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn m3_validation_rejects_bad_values() {
+        let mut c = Config::default();
+        c.execution.redeem_strategy = "yolo".into();
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.execution.fill_window_ms = 100; // < paper_latency_ms (200)
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.risk.daily_drawdown_pct = 0.0;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.risk.max_basket_legs = 1;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.lp.solver_concurrency = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.store.path = String::new();
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.risk.max_unhedged_usd = f64::NAN;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.risk.max_unhedged_usd = f64::INFINITY;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn m3_sections_parse_from_toml() {
+        let c = Config::from_toml_str(
+            "[execution]\npaper_latency_ms = 50\n[risk]\nmax_open_orders = 8\n[store]\npath = \"x.sqlite\"\n[lp]\nsolver_concurrency = 1\n",
+        )
+        .unwrap();
+        assert_eq!(c.execution.paper_latency_ms, 50);
+        assert_eq!(c.risk.max_open_orders, 8);
+        assert_eq!(c.store.path, "x.sqlite");
+        assert_eq!(c.lp.solver_concurrency, 1);
     }
 }

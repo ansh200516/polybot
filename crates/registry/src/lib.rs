@@ -147,6 +147,11 @@ impl Registry {
         self.interner.find_token(venue_id)
     }
 
+    /// Venue condition-id string for a market (reverse of market_by_condition).
+    pub fn market_condition(&self, id: MarketId) -> Option<&str> {
+        self.interner.market_str(id)
+    }
+
     /// Log of (event, reason) pairs explaining why an event's partition was
     /// excluded from `verified_exhaustive`.
     pub fn exclusion_log(&self) -> &[(EventId, ExclusionReason)] {
@@ -512,5 +517,12 @@ mod tests {
         let m = r.market_by_condition("0xbbb").unwrap();
         let venue = r.token_venue_id(m.yes).unwrap();
         assert_eq!(venue, "tokyes_b");
+    }
+
+    #[test]
+    fn market_condition_round_trips() {
+        let r = sample();
+        let m = r.market_by_condition("0xbbb").unwrap();
+        assert_eq!(r.market_condition(m.id), Some("0xbbb"));
     }
 }

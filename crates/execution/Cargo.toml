@@ -1,0 +1,18 @@
+[package]
+name = "pm-execution"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pm-core = { workspace = true }
+pm-engine = { workspace = true }
+pm-store = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
+
+[lints]
+workspace = true
