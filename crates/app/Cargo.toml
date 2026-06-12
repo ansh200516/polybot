@@ -1,0 +1,13 @@
+[package]
+name = "pm-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[[bin]]
+name = "arb"
+path = "src/main.rs"
+
+[lints]
+workspace = true

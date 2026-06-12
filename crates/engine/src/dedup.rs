@@ -21,6 +21,13 @@ fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Fingerprint(u64);
 
+impl Fingerprint {
+    /// Stable u64 for persistence/logging (FNV-1a value, pinned in M1).
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
 impl Opportunity {
     /// Price-shape identity: class + sorted (token, action, limit px).
     /// Size deliberately excluded (spec §11). Stable across processes and
@@ -253,5 +260,13 @@ mod tests {
         assert_eq!(fp, op(2_000_000, 46, 999).fingerprint());
         let crate::dedup::Fingerprint(raw) = fp;
         assert_eq!(raw, 0x43f68069009a5663_u64);
+    }
+
+    #[test]
+    fn fingerprint_exposes_stable_u64() {
+        let a = op(1_000_000, 46, 100);
+        let f = a.fingerprint();
+        assert_eq!(f.as_u64(), a.fingerprint().as_u64());
+        assert_ne!(f.as_u64(), 0);
     }
 }

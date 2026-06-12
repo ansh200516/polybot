@@ -1,0 +1,9 @@
+[package]
+name = "pm-risk"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
