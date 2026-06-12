@@ -27,6 +27,8 @@ pub enum ResnapshotReason {
     PersistentOffTick,
     /// Changes arrived for a token not yet known to the shard.
     UnknownToken,
+    /// Connection loss / forced staleness — not an integrity failure.
+    FeedLost,
 }
 
 /// Outcome of applying a snapshot or a set of changes.
@@ -103,7 +105,7 @@ impl LiveBook {
     pub fn force_stale(&mut self) {
         self.valid = false;
         self.last_update = None;
-        self.invalid_reason = Some(ResnapshotReason::CrossedBook); // arbitrary; caller must resnapshot
+        self.invalid_reason = Some(ResnapshotReason::FeedLost);
     }
 
     /// Convert a raw micro-USDC price to a valid `Px`, or None if off-tick.

@@ -15,6 +15,10 @@ pub struct ShardStats {
     pub deltas: u64,
     pub off_tick: u64,
     pub resnapshots_requested: u64,
+    pub resnap_crossed: u64,
+    pub resnap_off_tick: u64,
+    pub resnap_unknown: u64,
+    pub resnap_feed_lost: u64,
 }
 
 /// Owns an exclusive HashMap<TokenId, LiveBook>. Never shared across threads
@@ -47,8 +51,14 @@ impl Shard {
         self.stats.snapshots += 1;
         let book = self.books.entry(token).or_insert_with(|| LiveBook::new(tick));
         let outcome = book.apply_snapshot(now, bids, asks, hash);
-        if matches!(outcome, ApplyOutcome::NeedsResnapshot(_)) {
+        if let ApplyOutcome::NeedsResnapshot(reason) = outcome {
             self.stats.resnapshots_requested += 1;
+            match reason {
+                ResnapshotReason::CrossedBook => self.stats.resnap_crossed += 1,
+                ResnapshotReason::PersistentOffTick => self.stats.resnap_off_tick += 1,
+                ResnapshotReason::UnknownToken => self.stats.resnap_unknown += 1,
+                ResnapshotReason::FeedLost => self.stats.resnap_feed_lost += 1,
+            }
         }
         outcome
     }
@@ -70,6 +80,7 @@ impl Shard {
     ) -> ApplyOutcome {
         let Some(book) = self.books.get_mut(&token) else {
             self.stats.resnapshots_requested += 1;
+            self.stats.resnap_unknown += 1;
             return ApplyOutcome::NeedsResnapshot(ResnapshotReason::UnknownToken);
         };
 
@@ -85,8 +96,14 @@ impl Shard {
             self.stats.off_tick += u64::from(off_tick_after - off_tick_before);
         }
 
-        if matches!(outcome, ApplyOutcome::NeedsResnapshot(_)) {
+        if let ApplyOutcome::NeedsResnapshot(reason) = outcome {
             self.stats.resnapshots_requested += 1;
+            match reason {
+                ResnapshotReason::CrossedBook => self.stats.resnap_crossed += 1,
+                ResnapshotReason::PersistentOffTick => self.stats.resnap_off_tick += 1,
+                ResnapshotReason::UnknownToken => self.stats.resnap_unknown += 1,
+                ResnapshotReason::FeedLost => self.stats.resnap_feed_lost += 1,
+            }
         }
         outcome
     }
@@ -121,6 +138,11 @@ impl Shard {
     /// Read-only access to a book by token.
     pub fn book(&self, token: TokenId) -> Option<&LiveBook> {
         self.books.get(&token)
+    }
+
+    /// Total number of books in this shard.
+    pub fn book_count(&self) -> usize {
+        self.books.len()
     }
 
     /// Current stats snapshot.
@@ -224,6 +246,23 @@ mod tests {
         let stale = shard.stale_tokens(t0, window);
         assert!(stale.contains(&tok_a));
         assert!(stale.contains(&tok_b));
+
+        // Verify that post-mark deltas report FeedLost reason
+        let out_a = shard.apply_changes(
+            t0 + Duration::from_millis(100),
+            tok_a,
+            &[RawChange { side_buy: true, price_micro: 440_000, size_micro: 0 }],
+            None,
+        );
+        assert_eq!(out_a, ApplyOutcome::NeedsResnapshot(ResnapshotReason::FeedLost));
+
+        let out_b = shard.apply_changes(
+            t0 + Duration::from_millis(100),
+            tok_b,
+            &[RawChange { side_buy: true, price_micro: 440_000, size_micro: 0 }],
+            None,
+        );
+        assert_eq!(out_b, ApplyOutcome::NeedsResnapshot(ResnapshotReason::FeedLost));
     }
 
     #[test]
@@ -272,6 +311,7 @@ mod tests {
         );
         assert_eq!(out, ApplyOutcome::NeedsResnapshot(ResnapshotReason::CrossedBook));
         assert_eq!(shard.stats().resnapshots_requested, 1);
+        assert_eq!(shard.stats().resnap_crossed, 1);
     }
 
     #[test]
@@ -288,5 +328,6 @@ mod tests {
         );
         assert_eq!(out, ApplyOutcome::NeedsResnapshot(ResnapshotReason::UnknownToken));
         assert_eq!(shard.stats().resnapshots_requested, 1);
+        assert_eq!(shard.stats().resnap_unknown, 1);
     }
 }
