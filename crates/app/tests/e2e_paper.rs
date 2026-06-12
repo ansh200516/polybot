@@ -65,8 +65,9 @@ impl WsTransport for ScriptedWs {
 }
 
 /// REST source seeding the four books. The arb market (ya/na) carries a C1Long:
-/// YES ask .44 + NO ask .50 → 6¢ gross/share on 100sh depth. The quiet market
-/// (yq/nq) has no arb.
+/// YES ask .44 + NO ask .50 → asks sum 0.94 < 1 (C1Long); bids .40+.45 = 0.85 < 1 (no C1Short).
+/// The quiet market (yq/nq) is truly arb-free:
+/// asks 0.60+0.55 = 1.15 > 1 (no C1Long); bids 0.40+0.35 = 0.75 < 1 (no C1Short).
 #[derive(Clone)]
 struct ScriptedRest;
 
@@ -75,8 +76,8 @@ impl RestBookSource for ScriptedRest {
         let (bid, ask) = match venue_token_id {
             "ya" => (400_000, 440_000),
             "na" => (450_000, 500_000),
-            "yq" => (550_000, 600_000),
-            "nq" => (500_000, 550_000),
+            "yq" => (400_000, 600_000), // bid 0.40, ask 0.60
+            "nq" => (350_000, 550_000), // bid 0.35, ask 0.55
             other => panic!("unexpected token {other}"),
         };
         Ok(ParsedBook {
@@ -304,7 +305,10 @@ async fn run_e2e() {
     assert_eq!(summary.equity, Usdc(5_990_000));
     assert_eq!(summary.open_positions, 0);
     assert_eq!(store.realized_total().unwrap(), 5_990_000);
-    assert!(store.count_opportunities().unwrap() >= 1);
+    // Exactly one opportunity row: the C1Long on 0xarb. The WS-frame re-detection
+    // of the same fingerprint is cooldown-suppressed (no net improvement), so it
+    // does not produce a second row.
+    assert_eq!(store.count_opportunities().unwrap(), 1);
     assert_eq!(store.count_fills().unwrap(), 2);
     assert!(store.open_orders().unwrap().is_empty());
     let arb = reg.market_by_condition("0xarb").unwrap();
