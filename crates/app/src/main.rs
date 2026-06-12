@@ -567,6 +567,8 @@ async fn main() {
                 .unwrap_or_else(|e| fatal(format!("API key derive/create: {e}")))
             }
         };
+        // No secret fields on this line — keep it that way (creds/signer must
+        // never be interpolated into logs).
         info!(shadow = args.shadow, "live venue armed (api key ready)");
         let mut venue = pm_execution::live::LiveVenue::new(pm_execution::live::LiveVenueCfg {
             base: config.endpoints.clob_base.clone(),

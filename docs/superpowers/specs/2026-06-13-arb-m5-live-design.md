@@ -120,8 +120,8 @@ killed and the basket falls into repair/unwind.
 
 ```toml
 [live]                      # all defaults are the canary values
-basket_cap_usdc   = 10.0    # live per-basket basis cap
-session_loss_usdc = 25.0    # latched dispatch halt, bid-marked
+basket_cap_usd    = 10.0    # live per-basket basis cap
+session_loss_usd  = 25.0    # latched dispatch halt, bid-marked
 confirm_phrase    = "I understand this trades real money"
 
 [risk]                      # addition — applies in ALL modes (the M3
