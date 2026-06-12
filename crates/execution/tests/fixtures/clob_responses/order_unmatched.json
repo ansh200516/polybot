@@ -1,0 +1,10 @@
+{
+  "success": true,
+  "errorMsg": "",
+  "orderID": "0x07aa63e346ed4ceddce9efd6b3af37c8f8f440c92fe7da6b2d0f9e4ccbc50c43",
+  "takingAmount": "",
+  "makingAmount": "",
+  "status": "unmatched",
+  "transactionsHashes": [],
+  "tradeIDs": []
+}

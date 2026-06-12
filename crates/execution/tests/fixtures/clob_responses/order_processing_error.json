@@ -1,0 +1,10 @@
+{
+  "success": false,
+  "errorMsg": "not enough balance / allowance",
+  "orderID": "",
+  "takingAmount": "",
+  "makingAmount": "",
+  "status": "",
+  "transactionsHashes": [],
+  "tradeIDs": []
+}

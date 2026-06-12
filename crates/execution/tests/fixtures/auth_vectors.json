@@ -1,0 +1,29 @@
+{
+  "l1": {
+    "private_key": "0xadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad",
+    "address": "0x45C4Ef602bC5EB4493070d69B4F3b6a74f952216",
+    "timestamp": "1750000000",
+    "nonce": 0,
+    "message": "This message attests that I control the given wallet",
+    "domain_name": "ClobAuthDomain",
+    "signature": "0x26fe665694e32986c8105f572c0c0283799111d36645801cf187b0a3c27f3a0113e91c99e645138c245ab7efe70b651028fae9295c6efde3b37617b214a37eed1c"
+  },
+  "l2": [
+    {
+      "secret": "QQ==",
+      "timestamp": "1750000000",
+      "method": "POST",
+      "path": "/order",
+      "body": "{\"hello\":\"world\"}",
+      "signature": "rL5wbSueMIhsnLDR0rvOx2jaeW5-YHxY5zfKwMrZtQY="
+    },
+    {
+      "secret": "QQ==",
+      "timestamp": "1750000001",
+      "method": "GET",
+      "path": "/data/orders",
+      "body": null,
+      "signature": "IEzUYo5WPp-d04GCy3Etmg9HKOveXSEcmIWB-s_g1R8="
+    }
+  ]
+}

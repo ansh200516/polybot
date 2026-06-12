@@ -1,0 +1,86 @@
+[
+  {
+    "name": "buy_cent_regular",
+    "private_key": "0xadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad",
+    "neg_risk": false,
+    "inputs": {
+      "token_id": "123456789",
+      "price": 0.33,
+      "size": 10.0,
+      "side": "BUY",
+      "tick_size": "0.01",
+      "funder": "0x1111111111111111111111111111111111111111"
+    },
+    "order": {
+      "salt": "1486481740",
+      "maker": "0x1111111111111111111111111111111111111111",
+      "signer": "0x45C4Ef602bC5EB4493070d69B4F3b6a74f952216",
+      "taker": "0x0000000000000000000000000000000000000000",
+      "tokenId": "123456789",
+      "makerAmount": "3300000",
+      "takerAmount": "10000000",
+      "expiration": "0",
+      "nonce": "0",
+      "feeRateBps": "0",
+      "side": "BUY",
+      "signatureType": "1"
+    },
+    "signature": "0xb9d813c2599a8c70eaf4cbc05241d47e0be1f264c2fa756d4a7324811a65fbfb56e17f5e23c005a3a4809d71eb9d07a3237a749cd0d3c16d4da0e98075b406af1b"
+  },
+  {
+    "name": "buy_milli_negrisk",
+    "private_key": "0xadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad",
+    "neg_risk": true,
+    "inputs": {
+      "token_id": "987654321",
+      "price": 0.005,
+      "size": 200.0,
+      "side": "BUY",
+      "tick_size": "0.001",
+      "funder": "0x1111111111111111111111111111111111111111"
+    },
+    "order": {
+      "salt": "487412374",
+      "maker": "0x1111111111111111111111111111111111111111",
+      "signer": "0x45C4Ef602bC5EB4493070d69B4F3b6a74f952216",
+      "taker": "0x0000000000000000000000000000000000000000",
+      "tokenId": "987654321",
+      "makerAmount": "1000000",
+      "takerAmount": "200000000",
+      "expiration": "0",
+      "nonce": "0",
+      "feeRateBps": "0",
+      "side": "BUY",
+      "signatureType": "1"
+    },
+    "signature": "0x63ddbec59e0eda16d2ec8ef428f95b3110c6c18c288a98a9d286118c4223967675d4c9d57225eeea7e959558e508a465b1ee21dbac943f9f6926fe81e2ec836b1b"
+  },
+  {
+    "name": "sell_cent_regular",
+    "private_key": "0xadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad",
+    "neg_risk": false,
+    "inputs": {
+      "token_id": "123456789",
+      "price": 0.67,
+      "size": 15.0,
+      "side": "SELL",
+      "tick_size": "0.01",
+      "funder": "0x1111111111111111111111111111111111111111"
+    },
+    "order": {
+      "salt": "1713410374",
+      "maker": "0x1111111111111111111111111111111111111111",
+      "signer": "0x45C4Ef602bC5EB4493070d69B4F3b6a74f952216",
+      "taker": "0x0000000000000000000000000000000000000000",
+      "tokenId": "123456789",
+      "makerAmount": "15000000",
+      "takerAmount": "10050000",
+      "expiration": "0",
+      "nonce": "0",
+      "feeRateBps": "0",
+      "side": "SELL",
+      "signatureType": "1"
+    },
+    "signature": "0x0809d22daf2e8b0855a4774f53cc8ca5feb876e72d0d1560e91ad9f84cf26c446b5b2c3eadadd6ff7988d14313e970c97f2199ae33104cf6f66ccb825b399c2d1c"
+  }
+]

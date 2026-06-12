@@ -1,0 +1,31 @@
+{
+  "data": [
+    {
+      "id": "28c4d2eb-bbea-40e7-a9f0-b2fdb56b2c2e",
+      "taker_order_id": "0x06bc63e346ed4ceddce9efd6b3af37c8f8f440c92fe7da6b2d0f9e4ccbc50c42",
+      "market": "0xbd31dc8a20211944f6b70f31557f1001557b59905b7738480ca09bd4532f84af",
+      "asset_id": "123456789",
+      "side": "BUY",
+      "size": "10",
+      "price": "0.33",
+      "fee_rate_bps": "0",
+      "status": "MATCHED",
+      "match_time": "1781297313",
+      "outcome": "YES",
+      "trader_side": "TAKER",
+      "maker_orders": [
+        {
+          "asset_id": "123456789",
+          "matched_amount": "10",
+          "price": "0.33",
+          "order_id": "0xff354cd7ca7539dfa9c28d90943ab5779a4eac34b9b37a757d7b32bdfb11790b",
+          "outcome": "YES",
+          "owner": "9180014b-33c8-9240-a14b-bdca11c0a465"
+        }
+      ]
+    }
+  ],
+  "next_cursor": "LTE=",
+  "limit": 100,
+  "count": 1
+}
