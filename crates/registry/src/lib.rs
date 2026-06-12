@@ -56,11 +56,9 @@ impl std::error::Error for RegistryError {
 pub struct Registry {
     /// Dense list of markets, indexed by MarketId.
     markets: Vec<Market>,
-    /// condition-id string → MarketId (via the interner).
-    condition_idx: HashMap<String, MarketId>,
     /// TokenId → MarketId (for quick market lookups by token).
     token_market: HashMap<TokenId, MarketId>,
-    /// The interner — kept for venue-string lookups.
+    /// The interner — kept for venue-string lookups and condition-id resolution.
     interner: Interner,
     /// All partitions (verified or not; the engine gates on the flag).
     partitions: Vec<Partition>,
@@ -93,8 +91,7 @@ impl Registry {
 
     /// Look up a market by its venue condition-id string (e.g. `"0xabc..."`).
     pub fn market_by_condition(&self, condition_id: &str) -> Option<&Market> {
-        let &mid = self.condition_idx.get(condition_id)?;
-        self.markets.get(mid.0 as usize)
+        self.interner.find_market(condition_id).and_then(|mid| self.markets.get(mid.0 as usize))
     }
 
     /// Which market owns this token?
@@ -191,8 +188,6 @@ pub struct RegistryBuilder {
     interner: Interner,
     markets: Vec<Market>,
     meta: Vec<MarketMeta>,
-    /// condition-id string → MarketId (built incrementally in add_market).
-    condition_idx: HashMap<String, MarketId>,
     /// event → list of member MarketIds (in insertion order).
     event_members: HashMap<EventId, Vec<MarketId>>,
 }
@@ -246,8 +241,6 @@ impl RegistryBuilder {
             self.event_members.entry(eid).or_default().push(mid);
         }
 
-        self.condition_idx.insert(condition_id.to_owned(), mid);
-
         self.meta.push(MarketMeta { question, active, closed });
     }
 
@@ -258,7 +251,7 @@ impl RegistryBuilder {
     /// - Builds the union-find components.
     /// - Returns the immutable [`Registry`].
     pub fn finish(self, relationship_toml: &str) -> Result<Registry, RegistryError> {
-        let RegistryBuilder { interner, markets, meta, condition_idx, event_members } = self;
+        let RegistryBuilder { interner, markets, meta, event_members } = self;
 
         // ---- 1. Derive partitions per event --------------------------------
         let mut partitions: Vec<Partition> = Vec::new();
@@ -321,7 +314,6 @@ impl RegistryBuilder {
 
         Ok(Registry {
             markets,
-            condition_idx,
             token_market,
             interner,
             partitions,
