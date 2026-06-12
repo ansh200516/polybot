@@ -170,7 +170,7 @@ impl Default for Universe {
 impl Default for Ingestion {
     fn default() -> Self {
         Ingestion {
-            staleness_ms: 1500,
+            staleness_ms: 30_000,
             ws_chunk_size: 50,
             resync_interval_s: 300,
             sweep_interval_ms: 1000,
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(c.endpoints.ws_market_url, "wss://ws-subscriptions-clob.polymarket.com/ws/market");
         assert_eq!(c.universe.max_markets, 200);
         assert!(c.universe.require_active);
-        assert_eq!(c.ingestion.staleness_ms, 1500);
+        assert_eq!(c.ingestion.staleness_ms, 30_000);
         assert_eq!(c.ingestion.ws_chunk_size, 50);
         assert_eq!(c.ingestion.resync_interval_s, 300);
         assert_eq!(c.ingestion.sweep_interval_ms, 1000);

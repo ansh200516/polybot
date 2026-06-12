@@ -53,7 +53,7 @@ pub struct SupervisorConfig {
 impl Default for SupervisorConfig {
     fn default() -> Self {
         SupervisorConfig {
-            staleness: Duration::from_millis(1500),
+            staleness: Duration::from_millis(30_000),
             backoff_base: Duration::from_millis(250),
             backoff_cap: Duration::from_secs(30),
             sweep_interval: Duration::from_secs(1),
