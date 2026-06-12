@@ -14,6 +14,11 @@
 //! Repair/unwind of partial fills is Task 10 — here `repair_and_unwind` is a
 //! placeholder; no Task-9 path reaches a partial fill except the timeout test,
 //! which short-circuits to `NoFill` before it.
+//!
+//! An `Err` return from `execute_basket` leaves committed partial store rows:
+//! each acked write is its own transaction and there is no basket-level
+//! rollback. Restart/Task-10 reconciliation reads them back from the store;
+//! every acked row is durable and ordered.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -60,6 +65,10 @@ pub struct BasketReport {
     /// Σ of every venue cash flow in this basket (fills, splits, merges).
     pub cash_delta: Usdc,
     /// Leftover holdings: (token, qty, cost basis) — empty when flat. Sorted by token.
+    ///
+    /// Average-cost basis: may differ from the store's FIFO lots by per-lot
+    /// rounding. For position/risk tracking only — the store is the realized-P&L
+    /// truth; never reconcile the two.
     pub positions: Vec<(TokenId, Qty, Usdc)>,
     pub order_errors: u32,
 }

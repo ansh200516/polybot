@@ -64,6 +64,10 @@ pub trait ExecutionVenue: Send {
     /// Submit a whole basket "concurrently": implementations must price all
     /// orders against the same instant in time. Default = sequential calls
     /// (correct for mocks; PaperVenue overrides with single-latency batch).
+    ///
+    /// Returns exactly one result per input order, in the same order —
+    /// implementations must preserve this (the basket coordinator zips results
+    /// against orders).
     async fn submit_all(&mut self, orders: &[Order]) -> Vec<Result<SubmitOutcome, VenueError>> {
         let mut out = Vec::with_capacity(orders.len());
         for o in orders {
