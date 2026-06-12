@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 pm-core.workspace = true
 rusqlite.workspace = true
+tokio = { workspace = true }
 tracing.workspace = true
 
 [dev-dependencies]
