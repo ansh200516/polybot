@@ -8,6 +8,19 @@ pub enum DecimalError {
     Overflow,
 }
 
+impl std::fmt::Display for DecimalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecimalError::Empty => write!(f, "decimal string is empty"),
+            DecimalError::BadChar => write!(f, "decimal string contains invalid characters"),
+            DecimalError::TooManyDecimals => write!(f, "decimal string has more than 6 fractional digits"),
+            DecimalError::Overflow => write!(f, "decimal value overflows u64"),
+        }
+    }
+}
+
+impl std::error::Error for DecimalError {}
+
 /// Parse a non-negative decimal string to µ units (×10⁶), exactly.
 pub fn parse_micro(s: &str) -> Result<u64, DecimalError> {
     let (int_part, frac_part) = match s.split_once('.') {
@@ -41,6 +54,7 @@ pub fn parse_micro(s: &str) -> Result<u64, DecimalError> {
         for b in frac_part.bytes() {
             frac = frac * 10 + u64::from(b - b'0'); // ≤ 6 digits: cannot overflow
         }
+        // Sound: frac_part.len() ≤ 6 is enforced by the TooManyDecimals guard above.
         frac *= 10u64.pow(6 - frac_part.len() as u32);
         value = value.checked_add(frac).ok_or(DecimalError::Overflow)?;
     }
