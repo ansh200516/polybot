@@ -3,6 +3,7 @@
 pub mod class1;
 pub mod class2;
 pub mod class3;
+pub mod dedup;
 pub mod lp;
 pub mod walker;
 
