@@ -6,6 +6,8 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
+pub mod lots;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -337,6 +339,167 @@ impl Store {
             .conn
             .query_row("SELECT COUNT(*) FROM opportunities", [], |r| r.get(0))?)
     }
+
+    /// Insert a fill. Buys create a lot (cost = −cash, which includes fee).
+    /// Sells consume FIFO lots; returns the realized P&L delta in µUSDC
+    /// (sell cash − consumed cost). Oversell rolls the whole fill back.
+    pub fn insert_fill(&mut self, r: &FillRow) -> Result<i64, StoreError> {
+        let tx = self.conn.transaction()?;
+        let realized: i64 = match r.action.as_str() {
+            "Buy" => {
+                lots::insert_lot(&tx, r.token, r.ts_ms, r.qty_micro, -r.cash_micro)?;
+                0
+            }
+            _ => {
+                let consumed = lots::consume_lots(&tx, r.token, r.qty_micro)?;
+                r.cash_micro - consumed
+            }
+        };
+        tx.execute(
+            "INSERT INTO fills (order_id, ts_ms, token, action, px_ticks, tick_levels,
+             qty_micro, cash_micro, fee_micro, realized_micro)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                r.order_id,
+                r.ts_ms,
+                r.token,
+                r.action,
+                r.px_ticks,
+                r.tick_levels,
+                r.qty_micro,
+                r.cash_micro,
+                r.fee_micro,
+                realized
+            ],
+        )?;
+        tx.commit()?;
+        Ok(realized)
+    }
+
+    /// Apply a split (creates two lots, cost split ceil/remainder so the total
+    /// is conserved and YES never under-counts) or a merge (consumes one lot
+    /// quantity from each side; returns realized = proceeds − consumed costs).
+    pub fn apply_conversion(&mut self, r: &ConversionRow) -> Result<i64, StoreError> {
+        let tx = self.conn.transaction()?;
+        let realized: i64 = match r.kind.as_str() {
+            "split" => {
+                let total_cost = -r.cash_micro; // cash is negative for splits
+                let yes_cost = (total_cost + 1) / 2; // ceil(total/2)
+                let no_cost = total_cost - yes_cost;
+                lots::insert_lot(&tx, r.yes_token, r.ts_ms, r.units_micro, yes_cost)?;
+                lots::insert_lot(&tx, r.no_token, r.ts_ms, r.units_micro, no_cost)?;
+                0
+            }
+            _ => {
+                let cost_yes = lots::consume_lots(&tx, r.yes_token, r.units_micro)?;
+                let cost_no = lots::consume_lots(&tx, r.no_token, r.units_micro)?;
+                r.cash_micro - cost_yes - cost_no
+            }
+        };
+        tx.execute(
+            "INSERT INTO conversions (kind, ts_ms, market, yes_token, no_token, units_micro,
+             cash_micro, realized_micro) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                r.kind,
+                r.ts_ms,
+                r.market,
+                r.yes_token,
+                r.no_token,
+                r.units_micro,
+                r.cash_micro,
+                realized
+            ],
+        )?;
+        tx.commit()?;
+        Ok(realized)
+    }
+
+    /// Open position for a token from lots: (remaining µshares, remaining cost µUSDC).
+    pub fn position(&self, token: i64) -> Result<(i64, i64), StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(remaining_micro),0), COALESCE(SUM(cost_remaining_micro),0)
+             FROM lots WHERE token = ?1",
+            [token],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
+    }
+
+    /// Total realized P&L: closing fills + merges.
+    pub fn realized_total(&self) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT (SELECT COALESCE(SUM(realized_micro),0) FROM fills)
+                  + (SELECT COALESCE(SUM(realized_micro),0) FROM conversions)",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn insert_pnl_snapshot(&mut self, r: &PnlRow) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO pnl_snapshots (ts_ms, cash_micro, realized_micro, unrealized_micro, equity_micro)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![r.ts_ms, r.cash_micro, r.realized_micro, r.unrealized_micro, r.equity_micro],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_halt(&mut self, r: &HaltRow) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO halts (ts_ms, reason, detail) VALUES (?1, ?2, ?3)",
+            rusqlite::params![r.ts_ms, r.reason, r.detail],
+        )?;
+        Ok(())
+    }
+
+    pub fn count_fills(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM fills", [], |r| r.get(0))?)
+    }
+
+    pub fn count_halts(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM halts", [], |r| r.get(0))?)
+    }
+
+    /// Record a session start at `now_ms`, prune entries older than `window_ms`,
+    /// and return how many session starts (including this one) fall inside the
+    /// window — the restart-storm input (spec §15).
+    pub fn record_session_start(
+        &mut self,
+        now_ms: i64,
+        window_ms: i64,
+    ) -> Result<usize, StoreError> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'session_starts'",
+                [],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        let mut starts: Vec<i64> = raw
+            .map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect())
+            .unwrap_or_default();
+        starts.push(now_ms);
+        starts.retain(|&t| now_ms - t < window_ms);
+        let joined = starts
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('session_starts', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+            [joined],
+        )?;
+        Ok(starts.len())
+    }
 }
 
 #[cfg(test)]
@@ -443,5 +606,219 @@ mod tests {
         use pm_core::num::Usdc;
         assert_eq!(usdc_to_i64(Usdc(5)).unwrap(), 5);
         assert!(usdc_to_i64(Usdc(i128::from(i64::MAX) + 1)).is_err());
+    }
+
+    #[test]
+    fn buy_fill_creates_lot_and_position() {
+        let mut s = mem();
+        s.insert_order(&order_row("o1")).unwrap();
+        let realized = s
+            .insert_fill(&FillRow {
+                order_id: "o1".into(),
+                ts_ms: 1,
+                token: 7,
+                action: "Buy".into(),
+                px_ticks: 44,
+                tick_levels: 100,
+                qty_micro: 100_000_000,
+                cash_micro: -44_000_000,
+                fee_micro: 0,
+            })
+            .unwrap();
+        assert_eq!(realized, 0);
+        assert_eq!(s.position(7).unwrap(), (100_000_000, 44_000_000));
+    }
+
+    #[test]
+    fn sell_fill_consumes_fifo_and_realizes() {
+        let mut s = mem();
+        s.insert_order(&order_row("o1")).unwrap();
+        s.insert_order(&order_row("o2")).unwrap();
+        // Two buy lots: 100 sh @ .44, 100 sh @ .46
+        s.insert_fill(&FillRow {
+            order_id: "o1".into(),
+            ts_ms: 1,
+            token: 7,
+            action: "Buy".into(),
+            px_ticks: 44,
+            tick_levels: 100,
+            qty_micro: 100_000_000,
+            cash_micro: -44_000_000,
+            fee_micro: 0,
+        })
+        .unwrap();
+        s.insert_fill(&FillRow {
+            order_id: "o1".into(),
+            ts_ms: 2,
+            token: 7,
+            action: "Buy".into(),
+            px_ticks: 46,
+            tick_levels: 100,
+            qty_micro: 100_000_000,
+            cash_micro: -46_000_000,
+            fee_micro: 0,
+        })
+        .unwrap();
+        // Sell 150 sh @ .50 → proceeds 75. FIFO: 100@.44 (44) + 50@.46 (23) → realized 75−67 = 8
+        let realized = s
+            .insert_fill(&FillRow {
+                order_id: "o2".into(),
+                ts_ms: 3,
+                token: 7,
+                action: "Sell".into(),
+                px_ticks: 50,
+                tick_levels: 100,
+                qty_micro: 150_000_000,
+                cash_micro: 75_000_000,
+                fee_micro: 0,
+            })
+            .unwrap();
+        assert_eq!(realized, 8_000_000);
+        assert_eq!(s.position(7).unwrap(), (50_000_000, 23_000_000));
+        assert_eq!(s.realized_total().unwrap(), 8_000_000);
+    }
+
+    #[test]
+    fn partial_lot_consumption_rounds_cost_up() {
+        let mut s = mem();
+        s.insert_order(&order_row("o1")).unwrap();
+        // 3 µshares costing 10 µUSDC total; sell 1 µshare for 4 µUSDC.
+        s.insert_fill(&FillRow {
+            order_id: "o1".into(),
+            ts_ms: 1,
+            token: 9,
+            action: "Buy".into(),
+            px_ticks: 1,
+            tick_levels: 100,
+            qty_micro: 3,
+            cash_micro: -10,
+            fee_micro: 0,
+        })
+        .unwrap();
+        // consumed = ceil(10·1/3) = 4 → realized = 4 − 4 = 0 (NOT 4 − 3 = 1)
+        let realized = s
+            .insert_fill(&FillRow {
+                order_id: "o1".into(),
+                ts_ms: 2,
+                token: 9,
+                action: "Sell".into(),
+                px_ticks: 4,
+                tick_levels: 100,
+                qty_micro: 1,
+                cash_micro: 4,
+                fee_micro: 0,
+            })
+            .unwrap();
+        assert_eq!(realized, 0);
+        assert_eq!(s.position(9).unwrap(), (2, 6)); // cost conserved: 10 − 4
+    }
+
+    #[test]
+    fn oversell_is_an_error_and_rolls_back() {
+        let mut s = mem();
+        s.insert_order(&order_row("o1")).unwrap();
+        let err = s.insert_fill(&FillRow {
+            order_id: "o1".into(),
+            ts_ms: 1,
+            token: 7,
+            action: "Sell".into(),
+            px_ticks: 50,
+            tick_levels: 100,
+            qty_micro: 1_000_000,
+            cash_micro: 500_000,
+            fee_micro: 0,
+        });
+        assert!(matches!(err, Err(StoreError::Oversell { token: 7, .. })));
+        // The fill row must NOT exist (tx rollback).
+        assert_eq!(s.count_fills().unwrap(), 0);
+    }
+
+    #[test]
+    fn split_creates_two_lots_with_against_us_cost_allocation() {
+        let mut s = mem();
+        // Split 100 units, cost 100_010_000 (collateral 100 + gas .01): yes ceil(half)=50_005_000, no remainder
+        s.apply_conversion(&ConversionRow {
+            kind: "split".into(),
+            ts_ms: 1,
+            market: 0,
+            yes_token: 7,
+            no_token: 8,
+            units_micro: 100_000_000,
+            cash_micro: -100_010_000,
+        })
+        .unwrap();
+        assert_eq!(s.position(7).unwrap(), (100_000_000, 50_005_000));
+        assert_eq!(s.position(8).unwrap(), (100_000_000, 50_005_000));
+    }
+
+    #[test]
+    fn merge_consumes_both_lots_and_realizes() {
+        let mut s = mem();
+        s.insert_order(&order_row("o1")).unwrap();
+        s.insert_order(&order_row("o2")).unwrap();
+        // Buy 100 YES @ .44 and 100 NO @ .50 (complete set for 94), merge for 99.99 (gas .01)
+        s.insert_fill(&FillRow {
+            order_id: "o1".into(),
+            ts_ms: 1,
+            token: 7,
+            action: "Buy".into(),
+            px_ticks: 44,
+            tick_levels: 100,
+            qty_micro: 100_000_000,
+            cash_micro: -44_000_000,
+            fee_micro: 0,
+        })
+        .unwrap();
+        s.insert_fill(&FillRow {
+            order_id: "o2".into(),
+            ts_ms: 1,
+            token: 8,
+            action: "Buy".into(),
+            px_ticks: 50,
+            tick_levels: 100,
+            qty_micro: 100_000_000,
+            cash_micro: -50_000_000,
+            fee_micro: 0,
+        })
+        .unwrap();
+        let realized = s
+            .apply_conversion(&ConversionRow {
+                kind: "merge".into(),
+                ts_ms: 2,
+                market: 0,
+                yes_token: 7,
+                no_token: 8,
+                units_micro: 100_000_000,
+                cash_micro: 99_990_000,
+            })
+            .unwrap();
+        assert_eq!(realized, 5_990_000);
+        assert_eq!(s.position(7).unwrap(), (0, 0));
+        assert_eq!(s.position(8).unwrap(), (0, 0));
+        assert_eq!(s.realized_total().unwrap(), 5_990_000);
+    }
+
+    #[test]
+    fn pnl_snapshot_halt_and_session_history() {
+        let mut s = mem();
+        s.insert_pnl_snapshot(&PnlRow {
+            ts_ms: 1,
+            cash_micro: -10,
+            realized_micro: 0,
+            unrealized_micro: 5,
+            equity_micro: -5,
+        })
+        .unwrap();
+        s.insert_halt(&HaltRow {
+            ts_ms: 2,
+            reason: "DailyDrawdown".into(),
+            detail: "dd".into(),
+        })
+        .unwrap();
+        assert_eq!(s.count_halts().unwrap(), 1);
+        // session-start history: record at t=1000, 2000, 3000 with window 1500 → last call sees 2 in window
+        assert_eq!(s.record_session_start(1000, 1500).unwrap(), 1);
+        assert_eq!(s.record_session_start(2000, 1500).unwrap(), 2);
+        assert_eq!(s.record_session_start(3000, 1500).unwrap(), 2); // 1000 pruned
     }
 }
