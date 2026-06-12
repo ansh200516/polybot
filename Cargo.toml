@@ -34,6 +34,10 @@ pm-tui = { path = "crates/tui" }
 ratatui = "0.29"
 crossterm = "0.28"
 tracing = "0.1"
+alloy-primitives = "1"
+alloy-sol-types = "1"
+alloy-signer = "1"
+alloy-signer-local = "1"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

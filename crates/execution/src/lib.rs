@@ -22,6 +22,7 @@
 
 pub mod basket;
 pub mod secrets;
+pub mod sign;
 pub mod venue;
 
 use pm_core::instrument::TokenId;
