@@ -11,5 +11,8 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
+
 [lints]
 workspace = true

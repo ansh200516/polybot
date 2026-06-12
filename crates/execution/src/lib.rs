@@ -20,8 +20,7 @@
 //! Tasks 8–10 call `Order::new`, `order.to_row(ts_ms)`, `persist_transition`,
 //! `can_transition`, `OrderState`, and `ExecError` exactly as declared below.
 
-// NOTE: `pub mod basket;` / `pub mod venue;` are added by Tasks 8–9 — do NOT
-// declare them now.
+pub mod venue;
 
 use pm_core::instrument::TokenId;
 use pm_core::num::{Bps, Px, Qty, TickSize};
