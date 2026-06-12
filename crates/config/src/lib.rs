@@ -426,14 +426,17 @@ impl Config {
             return Err(ConfigError::BadMoney("tui row/line counts must be >= 1"));
         }
         // Live / risk canary checks (M5)
-        if self.live.basket_cap_usd <= 0.0 {
+        if self.live.basket_cap_usd <= 0.0 || !self.live.basket_cap_usd.is_finite() {
             return Err(ConfigError::BadMoney("live.basket_cap_usd must be > 0"));
         }
-        if self.live.session_loss_usd <= 0.0 {
+        if self.live.session_loss_usd <= 0.0 || !self.live.session_loss_usd.is_finite() {
             return Err(ConfigError::BadMoney("live.session_loss_usd must be > 0"));
         }
-        if self.live.min_leg_shares < 0.0 {
+        if self.live.min_leg_shares < 0.0 || !self.live.min_leg_shares.is_finite() {
             return Err(ConfigError::BadMoney("live.min_leg_shares must be ≥ 0"));
+        }
+        if self.live.confirm_phrase.is_empty() {
+            return Err(ConfigError::BadMoney("live.confirm_phrase must not be empty"));
         }
         if self.risk.mid_spread_cap_ticks == 0 {
             return Err(ConfigError::BadMoney("risk.mid_spread_cap_ticks must be ≥ 1"));
@@ -609,6 +612,7 @@ mod tests {
         assert_eq!(c.risk.restart_storm_window_s, 300);
         assert_eq!(c.risk.kill_file, "kill.switch");
         assert_eq!(c.risk.max_opportunity_age_ms, 1000);
+        assert_eq!(c.risk.mid_spread_cap_ticks, 5);
         assert_eq!(c.store.path, "pm.sqlite");
         assert_eq!(c.lp.min_resolve_interval_ms, 500);
         assert_eq!(c.lp.solver_concurrency, 2);
@@ -690,7 +694,6 @@ mod tests {
         assert!((c.live.session_loss_usd - 25.0).abs() < 1e-9);
         assert!((c.live.min_leg_shares - 5.0).abs() < 1e-9);
         assert_eq!(c.live.confirm_phrase, "I understand this trades real money");
-        assert_eq!(c.risk.mid_spread_cap_ticks, 5);
     }
 
     #[test]
@@ -701,7 +704,6 @@ mod tests {
         .unwrap();
         assert!((c.live.basket_cap_usd - 12.5).abs() < 1e-9);
         assert_eq!(c.risk.mid_spread_cap_ticks, 3);
-        assert!(c.validate().is_ok());
     }
 
     #[test]
@@ -710,5 +712,22 @@ mod tests {
         assert!(Config::from_toml_str("[live]\nsession_loss_usd = -1.0\n").is_err());
         assert!(Config::from_toml_str("[live]\nmin_leg_shares = -1.0\n").is_err());
         assert!(Config::from_toml_str("[risk]\nmid_spread_cap_ticks = 0\n").is_err());
+        // empty confirm_phrase must be rejected
+        assert!(Config::from_toml_str("[live]\nconfirm_phrase = \"\"\n").is_err());
+    }
+
+    #[test]
+    fn live_floats_must_be_finite() {
+        let mut c = Config::default();
+        c.live.basket_cap_usd = f64::NAN;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.live.session_loss_usd = f64::NAN;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.live.min_leg_shares = f64::NAN;
+        assert!(c.validate().is_err());
     }
 }
