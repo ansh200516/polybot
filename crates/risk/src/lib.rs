@@ -90,7 +90,8 @@ impl RiskEngine {
     }
 
     /// Synchronous pre-submit check (spec §15). Order matters: kill/halt/pause
-    /// dominate; structural caps next; money caps last.
+    /// dominate; structural caps (MaxBasketLegs, MaxOpenOrders, Unhedged) next;
+    /// money caps (Bankroll, PerMarketCap) last.
     pub fn pre_check(&self, b: &BasketCheck) -> RiskVerdict {
         use RejectReason as R;
         if self.killed {
@@ -105,9 +106,7 @@ impl RiskEngine {
         if b.legs > self.cfg.max_basket_legs {
             return RiskVerdict::Rejected(R::MaxBasketLegs);
         }
-        // Single-leg baskets are exempt from the open-orders accumulation check;
-        // the limit applies when a new multi-leg basket would push total legs over cap.
-        if b.legs > 1 && self.open_orders + b.legs > self.cfg.max_open_orders {
+        if self.open_orders + b.legs > self.cfg.max_open_orders {
             return RiskVerdict::Rejected(R::MaxOpenOrders);
         }
         if b.max_leg_cost.0 > self.cfg.max_unhedged.0 {
@@ -211,7 +210,9 @@ mod tests {
 
     #[test]
     fn bankroll_cap_is_global() {
-        let mut r = RiskEngine::new(cfg());
+        let mut c = cfg();
+        c.max_open_orders = 100; // isolate the bankroll cap from the order-count cap
+        let mut r = RiskEngine::new(c);
         for m in 0..9u32 {
             let b = basket(1_000_000_000, 100_000_000, &[(m, 1_000_000_000)]);
             assert_eq!(r.pre_check(&b), RiskVerdict::Approved, "market {m}");
@@ -253,6 +254,24 @@ mod tests {
             r.pre_check(&b3),
             RiskVerdict::Rejected(RejectReason::MaxOpenOrders)
         ); // 2+3 > 4
+    }
+
+    #[test]
+    fn single_leg_baskets_also_count_against_open_orders() {
+        let mut r = RiskEngine::new(cfg()); // max_open_orders: 4
+        for m in 0..4u32 {
+            let b = basket(10_000_000, 10_000_000, &[(m, 10_000_000)]);
+            assert_eq!(r.pre_check(&b), RiskVerdict::Approved);
+            r.reserve(&b);
+        }
+        let b = basket(10_000_000, 10_000_000, &[(9, 10_000_000)]);
+        assert_eq!(
+            r.pre_check(&b),
+            RiskVerdict::Rejected(RejectReason::MaxOpenOrders)
+        );
+        // releasing frees the slots again
+        r.release(&basket(10_000_000, 10_000_000, &[(0, 10_000_000)]));
+        assert_eq!(r.pre_check(&b), RiskVerdict::Approved);
     }
 
     #[test]
