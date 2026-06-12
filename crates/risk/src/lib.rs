@@ -15,6 +15,7 @@ pub struct RiskConfig {
     pub max_open_orders: usize,
     pub max_basket_legs: usize,
     /// Drawdown halt threshold in bps of bankroll (200 = 2%), peak-to-trough on session equity.
+    /// Must be > 0 — a zero threshold halts on the first equity update (config validation enforces drawdown_pct > 0 upstream).
     pub daily_drawdown_bps: i128,
     pub error_halt_count: u32,
     pub error_halt_window: Duration,
@@ -164,6 +165,7 @@ impl RiskEngine {
         self.killed
     }
 
+    /// Sticky: no clear path exists — restart the session to clear a halt (spec §15).
     pub fn halted(&self) -> Option<HaltReason> {
         self.halted
     }
@@ -171,6 +173,10 @@ impl RiskEngine {
     /// Record an order error. Consecutive errors (no intervening success)
     /// within the window trip the halt.
     pub fn record_error(&mut self, now: Instant) -> Option<HaltReason> {
+        debug_assert!(
+            self.errors.back().is_none_or(|&last| now >= last),
+            "record_error: now must be monotonically non-decreasing"
+        );
         self.errors.push_back(now);
         while let Some(&front) = self.errors.front() {
             if now.duration_since(front) > self.cfg.error_halt_window {
@@ -401,6 +407,15 @@ mod tests {
             r.record_error(t0 + Duration::from_secs(40)),
             Some(HaltReason::ConsecutiveErrors)
         );
+        assert_eq!(r.halted(), Some(HaltReason::ConsecutiveErrors));
+        // the halt gates pre_check — the actual coordinator integration path
+        let b = basket(1_000_000, 1_000_000, &[(0, 1_000_000)]);
+        assert_eq!(
+            r.pre_check(&b),
+            RiskVerdict::Rejected(RejectReason::Halted(HaltReason::ConsecutiveErrors))
+        );
+        // halts are sticky: success does not clear them
+        r.record_success();
         assert_eq!(r.halted(), Some(HaltReason::ConsecutiveErrors));
     }
 
