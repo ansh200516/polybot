@@ -19,7 +19,7 @@
 //! gives real entropy and per-supervisor decorrelation to avoid thundering herds
 //! without pulling in the `rand` crate.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -223,14 +223,26 @@ impl<R: RestBookSource> Supervisor<R> {
 
     /// Push current stats + book health into the shared mirror (if installed).
     ///
-    /// Called by [`handle_frame`] (with latency µs) and by the sweep arm
-    /// (with `None` latencies). The mirror stores relaxed-atomic snapshots that
-    /// the probe reads periodically without any lock on this supervisor.
-    fn refresh_mirror(&self, parse_us: Option<u64>, apply_us: Option<u64>) {
+    /// `stale_count` is the pre-computed stale token count (from the sweep scan
+    /// that already iterated the shard). Pass `Some(n)` from the sweep arm (which
+    /// already iterated stale_tokens) and `None` from handle_frame (which avoids
+    /// the O(books) scan on every frame — the mirror keeps the last stale value).
+    /// The books gauge uses `book_count()` which is O(1) and is always refreshed.
+    fn refresh_mirror(
+        &self,
+        stale_count: Option<usize>,
+        parse_us: Option<u64>,
+        apply_us: Option<u64>,
+    ) {
         if let Some(ref cell) = self.stats_mirror {
-            let now = Instant::now();
-            let stale = self.shard.stale_tokens(now, self.cfg.staleness).len();
-            cell.refresh(&self.stats, self.shard.book_count(), stale, parse_us, apply_us);
+            let books = self.shard.book_count();
+            // When stale_count is None (called from handle_frame), reuse the last
+            // stale value stored in the cell to avoid an O(books) scan per frame.
+            // When Some, the sweep has already iterated stale_tokens so we use that count.
+            let stale = stale_count.unwrap_or_else(|| {
+                cell.stale.load(std::sync::atomic::Ordering::Relaxed) as usize
+            });
+            cell.refresh(&self.stats, books, stale, parse_us, apply_us);
         }
     }
 
@@ -293,16 +305,16 @@ impl<R: RestBookSource> Supervisor<R> {
                 }
                 _ = sweep.tick() => {
                     // Inline sweep to avoid double-borrow of &mut self.
+                    // serial REST during mass-stale events blocks frames for N×RTT — acceptable M2 probe limitation; M3 wiring fans out.
                     let now = Instant::now();
                     let stale = self.shard.stale_tokens(now, self.cfg.staleness);
-                    let mut seen: HashSet<TokenId> = HashSet::new();
+                    // stale_tokens iterates a HashMap — keys are already unique; no HashSet dedup needed.
+                    let stale_count = stale.len();
                     for token_id in stale {
-                        if seen.insert(token_id) {
-                            self.resnapshot(token_id).await;
-                        }
+                        self.resnapshot(token_id).await;
                     }
-                    // Refresh mirror after sweep (no latency args — sweep is timer-driven).
-                    self.refresh_mirror(None, None);
+                    // Refresh mirror after sweep with pre-computed stale count (no latency args — sweep is timer-driven).
+                    self.refresh_mirror(Some(stale_count), None, None);
                 }
             }
         }
@@ -318,12 +330,14 @@ impl<R: RestBookSource> Supervisor<R> {
     /// through a live `tokio::time::interval`.
     pub async fn sweep_once(&mut self, now: Instant) {
         let stale = self.shard.stale_tokens(now, self.cfg.staleness);
-        let mut seen: HashSet<TokenId> = HashSet::new();
+        // stale_tokens iterates a HashMap — keys are already unique; no HashSet dedup needed.
+        // serial REST during mass-stale events blocks frames for N×RTT — acceptable M2 probe limitation; M3 wiring fans out.
+        let stale_count = stale.len();
         for token_id in stale {
-            if seen.insert(token_id) {
-                self.resnapshot(token_id).await;
-            }
+            self.resnapshot(token_id).await;
         }
+        // Honor the mirror contract: refresh after sweep so the probe sees the post-sweep state.
+        self.refresh_mirror(Some(stale_count), None, None);
     }
 
     // -----------------------------------------------------------------------
@@ -388,7 +402,7 @@ impl<R: RestBookSource> Supervisor<R> {
             Ok(ev) => ev,
             Err(_) => {
                 self.stats.parse_errors += 1;
-                self.refresh_mirror(None, None);
+                self.refresh_mirror(None, None, None);
                 return;
             }
         };
@@ -444,7 +458,7 @@ impl<R: RestBookSource> Supervisor<R> {
             }
         }
         let apply_us = apply_start.elapsed().as_micros() as u64;
-        self.refresh_mirror(Some(parse_us), Some(apply_us));
+        self.refresh_mirror(None, Some(parse_us), Some(apply_us));
     }
 
     async fn handle_price_change(&mut self, pc: crate::ws::PriceChangeEvent) {

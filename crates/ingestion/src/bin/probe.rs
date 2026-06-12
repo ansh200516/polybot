@@ -306,7 +306,7 @@ async fn main() {
         let handle = tokio::spawn(async move {
             sup.run(move || {
                 let url = ws_url_clone.clone();
-                let is_shutdown = shutdown_clone.load(Ordering::Relaxed);
+                let is_shutdown = shutdown_clone.load(Ordering::Acquire);
                 async move {
                     if is_shutdown {
                         return Ok(FactoryDecision::Stop);
@@ -380,7 +380,7 @@ async fn main() {
     }
 
     // ---- shutdown -------------------------------------------------------
-    shutdown.store(true, Ordering::Relaxed);
+    shutdown.store(true, Ordering::Release);
 
     // Grace period: give supervisors 2s to notice the shutdown flag on next
     // reconnect, then abort.
@@ -390,6 +390,38 @@ async fn main() {
     }
 
     // ---- final summary --------------------------------------------------
+    // One final reset_gauges+absorb+histogram-drain cycle so the verdict reflects
+    // the post-shutdown state rather than the last mid-run snapshot.
+    {
+        // Drain histograms.
+        for cell in &stat_cells {
+            if let Ok(mut h) = cell.recv_to_parsed_us.lock() {
+                for v in h.iter_recorded() {
+                    for _ in 0..v.count_at_value() {
+                        probe_stats.record_recv_to_parsed_us(v.value_iterated_to());
+                    }
+                }
+                h.reset();
+            }
+            if let Ok(mut h) = cell.parsed_to_applied_us.lock() {
+                for v in h.iter_recorded() {
+                    for _ in 0..v.count_at_value() {
+                        probe_stats.record_parsed_to_applied_us(v.value_iterated_to());
+                    }
+                }
+                h.reset();
+            }
+        }
+        // Re-absorb gauges from the final cell state.
+        probe_stats.reset_gauges();
+        for cell in &stat_cells {
+            let sup_snap = cell.snapshot_stats();
+            let books = cell.books.load(Ordering::Acquire) as usize;
+            let stale = cell.stale.load(Ordering::Acquire) as usize;
+            probe_stats.absorb_supervisor(&sup_snap, books, stale);
+        }
+    }
+
     let final_line = probe_stats.line(start.elapsed());
     info!("FINAL: {final_line}");
     let healthy = probe_stats.healthy();

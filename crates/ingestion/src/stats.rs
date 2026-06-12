@@ -381,7 +381,7 @@ mod tests {
         ps.record_parsed_to_applied_us(2);
 
         let s = ps.line(Duration::from_secs(120));
-        assert!(s.contains("books="), "missing books= in: {s}");
+        assert!(s.contains("books=400"), "missing books=400 in: {s}");
         assert!(s.contains("stale="), "missing stale= in: {s}");
         assert!(s.contains("p50"), "missing p50 in: {s}");
         assert!(s.contains("up=120s"), "missing up= in: {s}");
@@ -520,7 +520,10 @@ mod tests {
         assert_eq!(cell.stale.load(Ordering::Relaxed), 5);
 
         // Check histogram entries
-        let p50 = cell.recv_to_parsed_us.lock().unwrap().value_at_quantile(0.50);
-        assert_eq!(p50, 10);
+        let p50_parse = cell.recv_to_parsed_us.lock().unwrap().value_at_quantile(0.50);
+        assert_eq!(p50_parse, 10, "p50 of recv_to_parsed_us should be 10µs");
+
+        let p50_apply = cell.parsed_to_applied_us.lock().unwrap().value_at_quantile(0.50);
+        assert_eq!(p50_apply, 3, "p50 of parsed_to_applied_us should be 3µs");
     }
 }
