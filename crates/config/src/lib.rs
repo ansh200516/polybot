@@ -320,31 +320,13 @@ impl Default for Live {
 impl Config {
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
         let cfg: Self = toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        cfg.validate_base()?;
+        cfg.validate()?;
         Ok(cfg)
     }
 
     /// Sanity checks beyond shape: positive capital, per-market ≤ bankroll,
     /// percentage domains. Includes M5 live-section canary checks.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.validate_base()?;
-        if self.live.basket_cap_usd <= 0.0 {
-            return Err(ConfigError::BadMoney("live.basket_cap_usd must be > 0"));
-        }
-        if self.live.session_loss_usd <= 0.0 {
-            return Err(ConfigError::BadMoney("live.session_loss_usd must be > 0"));
-        }
-        if self.live.min_leg_shares < 0.0 {
-            return Err(ConfigError::BadMoney("live.min_leg_shares must be ≥ 0"));
-        }
-        if self.risk.mid_spread_cap_ticks == 0 {
-            return Err(ConfigError::BadMoney("risk.mid_spread_cap_ticks must be ≥ 1"));
-        }
-        Ok(())
-    }
-
-    /// Core structural checks called by `from_toml_str` and `validate`.
-    fn validate_base(&self) -> Result<(), ConfigError> {
         if self.capital.bankroll_usd <= 0.0 || !self.capital.bankroll_usd.is_finite() {
             return Err(ConfigError::BadMoney("bankroll_usd must be > 0"));
         }
@@ -442,6 +424,19 @@ impl Config {
         }
         if self.tui.feed_rows == 0 || self.tui.fills_rows == 0 || self.tui.log_lines == 0 {
             return Err(ConfigError::BadMoney("tui row/line counts must be >= 1"));
+        }
+        // Live / risk canary checks (M5)
+        if self.live.basket_cap_usd <= 0.0 {
+            return Err(ConfigError::BadMoney("live.basket_cap_usd must be > 0"));
+        }
+        if self.live.session_loss_usd <= 0.0 {
+            return Err(ConfigError::BadMoney("live.session_loss_usd must be > 0"));
+        }
+        if self.live.min_leg_shares < 0.0 {
+            return Err(ConfigError::BadMoney("live.min_leg_shares must be ≥ 0"));
+        }
+        if self.risk.mid_spread_cap_ticks == 0 {
+            return Err(ConfigError::BadMoney("risk.mid_spread_cap_ticks must be ≥ 1"));
         }
         Ok(())
     }
@@ -711,11 +706,9 @@ mod tests {
 
     #[test]
     fn live_caps_must_be_positive() {
-        let c = Config::from_toml_str("[live]\nbasket_cap_usd = 0.0\n").unwrap();
-        assert!(c.validate().is_err());
-        let c = Config::from_toml_str("[live]\nsession_loss_usd = -1.0\n").unwrap();
-        assert!(c.validate().is_err());
-        let c = Config::from_toml_str("[risk]\nmid_spread_cap_ticks = 0\n").unwrap();
-        assert!(c.validate().is_err());
+        assert!(Config::from_toml_str("[live]\nbasket_cap_usd = 0.0\n").is_err());
+        assert!(Config::from_toml_str("[live]\nsession_loss_usd = -1.0\n").is_err());
+        assert!(Config::from_toml_str("[live]\nmin_leg_shares = -1.0\n").is_err());
+        assert!(Config::from_toml_str("[risk]\nmid_spread_cap_ticks = 0\n").is_err());
     }
 }
