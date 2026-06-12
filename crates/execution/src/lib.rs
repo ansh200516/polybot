@@ -64,6 +64,12 @@ impl OrderState {
     }
 }
 
+impl std::fmt::Display for OrderState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Transition table
 // ---------------------------------------------------------------------------
@@ -109,7 +115,7 @@ pub enum ExecError {
 impl std::fmt::Display for ExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExecError::BadTransition(a, b) => write!(f, "illegal transition {a:?} -> {b:?}"),
+            ExecError::BadTransition(a, b) => write!(f, "illegal transition {a} -> {b}"),
             ExecError::StoreClosed => write!(f, "store writer unavailable"),
             ExecError::Venue(e) => write!(f, "venue error: {e}"),
         }
@@ -174,6 +180,7 @@ impl Order {
     /// - `token.0` is a dense intern index that fits comfortably in `i64`.
     pub fn to_row(&self, ts_ms: i64) -> OrderRow {
         debug_assert!(self.qty.0 <= i64::MAX as u64, "qty exceeds i64::MAX");
+        debug_assert!(self.token.0 <= i64::MAX as u64, "token id exceeds i64::MAX");
         OrderRow {
             id: self.id.to_string(),
             ts_ms,
@@ -334,5 +341,26 @@ mod tests {
             store.open_orders().unwrap(),
             vec![(o.id.to_string(), "Signed".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn failed_store_write_returns_store_closed_and_leaves_state() {
+        use pm_store::writer::run_writer;
+        let store = pm_store::Store::open_in_memory().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let writer = tokio::spawn(run_writer(store, rx));
+
+        // No OrderInsert: the OrderEvent hits a foreign-key violation in the store,
+        // the writer drops the ack, and persist_transition must surface StoreClosed
+        // while leaving in-memory state untouched.
+        let mut o = order();
+        let err = persist_transition(&tx, &mut o, OrderState::Signed, "", 1).await;
+        assert!(matches!(err, Err(ExecError::StoreClosed)));
+        assert_eq!(o.state, OrderState::Draft);
+
+        drop(tx);
+        let store = writer.await.unwrap();
+        assert_eq!(store.write_errors, 1);
+        assert!(store.open_orders().unwrap().is_empty());
     }
 }
