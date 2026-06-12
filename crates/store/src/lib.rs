@@ -7,6 +7,7 @@ use std::path::Path;
 use rusqlite::Connection;
 
 pub mod lots;
+pub mod read;
 pub mod writer;
 
 // ---------------------------------------------------------------------------

@@ -17,8 +17,8 @@ use pm_risk::{BasketCheck, RiskConfig, RiskEngine, RiskVerdict};
 use pm_store::usdc_to_i64;
 use pm_store::writer::StoreMsg;
 use pm_store::{HaltRow, OppRow, PnlRow};
-use tokio::sync::mpsc;
-use tracing::warn;
+use tokio::sync::{mpsc, watch};
+use tracing::{info, warn};
 
 use crate::detector::DetectedOpp;
 use crate::stats::AppStats;
@@ -42,6 +42,40 @@ pub struct CoordinatorSummary {
     pub cash: Usdc,
     pub equity: Usdc,
     pub open_positions: usize,
+}
+
+/// Control commands from the TUI (translated by main.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtlCommand {
+    SetPaused(bool),
+}
+
+/// Coordinator-owned state the dashboard needs, published on every change
+/// and every P&L snapshot. Money in µUSDC (display conversion is the TUI's).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CoordStatus {
+    pub paused: bool,
+    pub halted: Option<String>,
+    pub killed: bool,
+    pub busy: bool,
+    pub cash_micro: i64,
+    pub equity_micro: i64,     // bid-marked (reporting)
+    pub equity_mid_micro: i64, // mid-marked (risk/halt feed)
+    pub realized_micro: i64,
+    pub unrealized_micro: i64,
+    pub open_positions: usize,
+}
+
+/// Receive the next control command, or pend forever when no channel is wired
+/// (same Option-pending idiom as the supervisor's `recv_cmd`).
+async fn recv_ctl(rx: &mut Option<mpsc::Receiver<CtlCommand>>) -> CtlCommand {
+    match rx.as_mut() {
+        Some(r) => match r.recv().await {
+            Some(c) => c,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
 }
 
 /// Wall-clock milliseconds since the Unix epoch (0 on clock error).
@@ -108,6 +142,11 @@ pub struct Coordinator {
     report_closed: bool,
     kill_logged: bool,
     halt_logged: bool,
+
+    ctl_rx: Option<mpsc::Receiver<CtlCommand>>,
+    status_tx: Option<watch::Sender<CoordStatus>>,
+    paused: bool,
+    last_status: CoordStatus,
 }
 
 impl Coordinator {
@@ -151,7 +190,25 @@ impl Coordinator {
             report_closed: false,
             kill_logged: false,
             halt_logged: false,
+            ctl_rx: None,
+            status_tx: None,
+            paused: false,
+            last_status: CoordStatus::default(),
         })
+    }
+
+    /// Create the TUI control channel; the coordinator owns the receiver.
+    pub fn control_channel(&mut self, capacity: usize) -> mpsc::Sender<CtlCommand> {
+        let (tx, rx) = mpsc::channel(capacity);
+        self.ctl_rx = Some(rx);
+        tx
+    }
+
+    /// Create the dashboard status watch; the coordinator owns the sender.
+    pub fn status_channel(&mut self) -> watch::Receiver<CoordStatus> {
+        let (tx, rx) = watch::channel(CoordStatus::default());
+        self.status_tx = Some(tx);
+        rx
     }
 
     pub fn note_session_starts(&mut self, n: usize) {
@@ -160,10 +217,39 @@ impl Coordinator {
         }
     }
 
+    /// Apply a TUI control command and republish status.
+    fn handle_ctl(&mut self, cmd: CtlCommand) {
+        match cmd {
+            CtlCommand::SetPaused(p) => {
+                // Resume tail: opps seen while paused consumed their cooldown admit slot —
+                // identical shapes stay suppressed up to cooldown_ms (2s) after resume.
+                self.paused = p;
+                self.risk.set_paused(p);
+                info!("control: paused={p}");
+            }
+        }
+        self.publish_status();
+    }
+
+    /// Refresh the volatile status fields (money fields persist between
+    /// publishes — see `snapshot_pnl`) and send a clone if a watch is wired.
+    fn publish_status(&mut self) {
+        self.last_status.paused = self.paused;
+        self.last_status.halted = self.risk.halted().map(|h| format!("{h:?}"));
+        self.last_status.killed = self.risk.is_killed();
+        self.last_status.busy = self.busy;
+        self.last_status.open_positions = self.positions.holdings().len();
+        if let Some(tx) = &self.status_tx {
+            let _ = tx.send(self.last_status.clone());
+        }
+    }
+
     pub async fn run(mut self) -> CoordinatorSummary {
         let mut pnl_tick = tokio::time::interval(self.pnl_interval);
         pnl_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         pnl_tick.tick().await; // consume immediate tick
+        // run consumes self, so the receiver need not be restored.
+        let mut ctl_rx = self.ctl_rx.take();
         loop {
             self.check_kill().await;
             tokio::select! {
@@ -176,6 +262,7 @@ impl Coordinator {
                     None => self.report_closed = true,
                 },
                 _ = pnl_tick.tick() => self.snapshot_pnl().await,
+                cmd = recv_ctl(&mut ctl_rx) => self.handle_ctl(cmd),
             }
         }
         // Drain: one in-flight basket may still report.
@@ -194,7 +281,7 @@ impl Coordinator {
         self.snapshot_pnl().await; // final durable snapshot
         // Post-shutdown marks are 0 (supervisors gone): the final summary equity
         // is a conservative floor, not fair value.
-        let marks = self.marks().await;
+        let marks = self.marks_pair().await.0;
         let pnl = self.positions.pnl(&marks);
         CoordinatorSummary {
             cash: pnl.cash,
@@ -275,6 +362,8 @@ impl Coordinator {
                 self.risk.release(&c);
             }
             self.busy = false;
+        } else {
+            self.publish_status();
         }
     }
 
@@ -336,6 +425,7 @@ impl Coordinator {
             }
         }
         self.maybe_log_halt().await;
+        self.publish_status();
     }
 
     async fn check_kill(&mut self) {
@@ -349,6 +439,7 @@ impl Coordinator {
                 detail: String::new(),
             };
             let _ = self.store_tx.send(StoreMsg::Halt(row)).await;
+            self.publish_status();
         }
     }
 
@@ -364,6 +455,7 @@ impl Coordinator {
                 detail: String::new(),
             };
             let _ = self.store_tx.send(StoreMsg::Halt(row)).await;
+            self.publish_status();
         }
     }
 
@@ -383,27 +475,47 @@ impl Coordinator {
         }
     }
 
-    /// Conservative bid-side marks for every held token; missing/invalid → 0.
-    async fn marks(&self) -> HashMap<TokenId, Usdc> {
-        let mut out = HashMap::new();
+    /// (bid marks, mid marks) per held token. Bid: conservative reporting.
+    /// Mid: (bid+ask)/2 floor — the drawdown-halt feed, immune to the
+    /// open-basket spread artifact (M3 live-run finding). Missing ask → bid;
+    /// missing book/bid → 0 for both.
+    async fn marks_pair(&self) -> (HashMap<TokenId, Usdc>, HashMap<TokenId, Usdc>) {
+        let mut bid_marks = HashMap::new();
+        let mut mid_marks = HashMap::new();
         for (t, q, _) in self.positions.holdings() {
-            let mark = match self.fetcher.fetch(t).await {
-                Some((book, true)) => book
-                    .bids
-                    .best()
-                    .map(|bid| sell_proceeds(bid.microusdc(book.ts()), q))
-                    .unwrap_or(Usdc(0)),
-                _ => Usdc(0),
+            let (bid_mark, mid_mark) = match self.fetcher.fetch(t).await {
+                Some((book, true)) => match book.bids.best() {
+                    Some(bid) => {
+                        let ts = book.ts();
+                        let bid_micro = bid.microusdc(ts);
+                        let ask_micro = book
+                            .asks
+                            .best()
+                            .map(|a| a.microusdc(ts))
+                            .unwrap_or(bid_micro);
+                        // M5 note: mid is uncapped — a wide/stale ask inflates it and delays the halt.
+                        // Before real money: cap mid (e.g. bid + spread cap) or prefer last-trade
+                        // for the risk feed. Paper-safe: the durable rows stay bid-marked.
+                        let mid_micro = (bid_micro + ask_micro) / 2;
+                        (sell_proceeds(bid_micro, q), sell_proceeds(mid_micro, q))
+                    }
+                    None => (Usdc(0), Usdc(0)),
+                },
+                _ => (Usdc(0), Usdc(0)),
             };
-            out.insert(t, mark);
+            bid_marks.insert(t, bid_mark);
+            mid_marks.insert(t, mid_mark);
         }
-        out
+        (bid_marks, mid_marks)
     }
 
     async fn snapshot_pnl(&mut self) {
-        let marks = self.marks().await;
-        let pnl = self.positions.pnl(&marks);
-        if self.risk.update_equity(pnl.equity).is_some() {
+        let (bid_marks, mid_marks) = self.marks_pair().await;
+        let pnl = self.positions.pnl(&bid_marks);
+        let pnl_mid = self.positions.pnl(&mid_marks);
+        // Risk/halt feed is MID-marked (immune to the open-basket spread artifact);
+        // the durable PnlRow below stays BID-marked (conservative reporting).
+        if self.risk.update_equity(pnl_mid.equity).is_some() {
             self.maybe_log_halt().await;
         }
         let row = PnlRow {
@@ -414,6 +526,14 @@ impl Coordinator {
             equity_micro: usdc_to_i64(pnl.equity).unwrap_or(i64::MAX),
         };
         let _ = self.store_tx.send(StoreMsg::PnlSnapshot(row)).await;
+        // Persist the money fields on last_status (they survive pause/kill
+        // publishes that don't recompute marks), then publish.
+        self.last_status.cash_micro = usdc_to_i64(pnl.cash).unwrap_or(i64::MAX);
+        self.last_status.equity_micro = usdc_to_i64(pnl.equity).unwrap_or(i64::MAX);
+        self.last_status.equity_mid_micro = usdc_to_i64(pnl_mid.equity).unwrap_or(i64::MAX);
+        self.last_status.realized_micro = usdc_to_i64(pnl.realized).unwrap_or(i64::MAX);
+        self.last_status.unrealized_micro = usdc_to_i64(pnl.unrealized).unwrap_or(i64::MAX);
+        self.publish_status();
     }
 }
 
@@ -812,5 +932,275 @@ mod tests {
 
         let (_, _, halts) = drain_store(&mut h.store_rx);
         assert_eq!(halts, 1, "expected exactly 1 halt row, got {halts}");
+    }
+
+    use pm_core::book::{Book, Side};
+    use pm_ingestion::supervisor::SupervisorCommand;
+
+    /// Build a coordinator + its channels, leaving the control/status channels
+    /// for the caller to install before spawning `run`.
+    #[allow(clippy::type_complexity)]
+    fn build_coord(
+        kill: Arc<AtomicBool>,
+        fetcher: BookFetcher,
+        risk_cfg: RiskConfig,
+    ) -> (
+        Coordinator,
+        mpsc::Sender<DetectedOpp>,
+        mpsc::Receiver<ExecRequest>,
+        mpsc::Sender<ExecReport>,
+        mpsc::Receiver<StoreMsg>,
+        Arc<AppStats>,
+    ) {
+        let (opp_tx, opp_rx) = mpsc::channel(64);
+        let (exec_tx, exec_rx) = mpsc::channel(64);
+        let (report_tx, report_rx) = mpsc::channel(64);
+        let (store_tx, store_rx) = mpsc::channel(64);
+        let stats = AppStats::new();
+        let cfg = Config::default();
+        let coord = Coordinator::new(
+            &cfg,
+            risk_cfg,
+            crate::wiring::engine_params(&cfg).unwrap(),
+            token_market(),
+            fetcher,
+            opp_rx,
+            exec_tx,
+            report_rx,
+            store_tx,
+            kill,
+            Arc::clone(&stats),
+        )
+        .unwrap();
+        (coord, opp_tx, exec_rx, report_tx, store_rx, stats)
+    }
+
+    #[tokio::test]
+    async fn control_channel_pauses_and_resumes_dispatch() {
+        let kill = Arc::new(AtomicBool::new(false));
+        let (mut coord, opp_tx, mut exec_rx, _report_tx, _store_rx, stats) = build_coord(
+            Arc::clone(&kill),
+            BookFetcher::new(HashMap::new()),
+            crate::wiring::risk_config(&Config::default()).unwrap(),
+        );
+        let ctl = coord.control_channel(4);
+        let handle = tokio::spawn(coord.run());
+
+        // Pause, then send an otherwise-approvable opp → must be rejected by risk.
+        ctl.send(CtlCommand::SetPaused(true)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        opp_tx
+            .send(DetectedOpp {
+                opp: opp_fixture(50),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            exec_rx.try_recv().is_err(),
+            "paused coordinator must not dispatch"
+        );
+        assert!(
+            stats.rejected_risk.load(Ordering::Relaxed) >= 1,
+            "paused opp must count as a risk rejection"
+        );
+
+        // Resume; let the unpause land before the next opp so the select can't
+        // race the opp arm ahead of the control arm (both would be ready).
+        ctl.send(CtlCommand::SetPaused(false)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        opp_tx
+            .send(DetectedOpp {
+                opp: opp_fixture(49),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        let req = tokio::time::timeout(Duration::from_secs(2), exec_rx.recv())
+            .await
+            .expect("timeout waiting for dispatch after resume")
+            .expect("channel closed before resume dispatch");
+        assert!(req.check.total_cost.0 > 0);
+
+        drop(ctl);
+        drop(opp_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn status_watch_reflects_pause_kill_and_busy() {
+        let kill = Arc::new(AtomicBool::new(false));
+        let (mut coord, opp_tx, exec_rx, _report_tx, _store_rx, _stats) = build_coord(
+            Arc::clone(&kill),
+            BookFetcher::new(HashMap::new()),
+            crate::wiring::risk_config(&Config::default()).unwrap(),
+        );
+        let ctl = coord.control_channel(4);
+        let mut status = coord.status_channel();
+        let handle = tokio::spawn(coord.run());
+
+        // Pause → status reflects paused.
+        ctl.send(CtlCommand::SetPaused(true)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), status.changed())
+            .await
+            .expect("timeout waiting for pause status")
+            .unwrap();
+        assert!(status.borrow().paused, "status must reflect paused=true");
+
+        // Resume → status reflects unpaused.
+        ctl.send(CtlCommand::SetPaused(false)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), status.changed())
+            .await
+            .expect("timeout waiting for resume status")
+            .unwrap();
+        assert!(!status.borrow().paused, "status must reflect paused=false");
+
+        // Kill: set the flag and send an opp so check_kill trips at loop top.
+        kill.store(true, Ordering::Release);
+        opp_tx
+            .send(DetectedOpp {
+                opp: opp_fixture(50),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), status.changed())
+            .await
+            .expect("timeout waiting for kill status")
+            .unwrap();
+        assert!(status.borrow().killed, "status must reflect killed=true");
+
+        drop(ctl);
+        drop(opp_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        drop(exec_rx);
+    }
+
+    #[tokio::test]
+    async fn status_watch_reflects_busy_during_in_flight() {
+        let kill = Arc::new(AtomicBool::new(false));
+        let (mut coord, opp_tx, mut exec_rx, _report_tx, _store_rx, _stats) = build_coord(
+            Arc::clone(&kill),
+            BookFetcher::new(HashMap::new()),
+            crate::wiring::risk_config(&Config::default()).unwrap(),
+        );
+        let ctl = coord.control_channel(4);
+        let mut status = coord.status_channel();
+        let handle = tokio::spawn(coord.run());
+
+        // Dispatch an approvable opp; the harness exec_rx receives it (but does
+        // not reply), leaving the coordinator in the busy=true in-flight window.
+        opp_tx
+            .send(DetectedOpp {
+                opp: opp_fixture(50),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+
+        // The exec_rx must receive the request (confirms dispatch happened).
+        let _req = tokio::time::timeout(Duration::from_secs(2), exec_rx.recv())
+            .await
+            .expect("timeout waiting for exec dispatch")
+            .expect("exec channel closed before dispatch");
+
+        // publish_status() was called on the success path — status must now show busy.
+        tokio::time::timeout(Duration::from_secs(2), status.changed())
+            .await
+            .expect("timeout waiting for busy status")
+            .unwrap();
+        assert!(
+            status.borrow().busy,
+            "status must reflect busy=true during in-flight"
+        );
+
+        drop(ctl);
+        drop(opp_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// A served fetcher answering BookSnapshot with a single Cent book
+    /// (bid_tick / ask_tick), valid=true — mirrors wiring.rs's test server.
+    fn served_fetcher(bid_tick: u16, ask_tick: u16) -> BookFetcher {
+        let (tx, mut rx) = mpsc::channel::<SupervisorCommand>(8);
+        tokio::spawn(async move {
+            while let Some(SupervisorCommand::BookSnapshot { reply, .. }) = rx.recv().await {
+                let mut book = Book::new(TickSize::Cent);
+                book.apply(
+                    Side::Bid,
+                    Px::new(bid_tick, TickSize::Cent).unwrap(),
+                    Qty(100_000_000),
+                );
+                book.apply(
+                    Side::Ask,
+                    Px::new(ask_tick, TickSize::Cent).unwrap(),
+                    Qty(100_000_000),
+                );
+                let _ = reply.send(Some((book, true)));
+            }
+        });
+        BookFetcher::new(HashMap::from([(TokenId(1), tx)]))
+    }
+
+    #[tokio::test]
+    async fn drawdown_halt_uses_mid_marks_not_bid_marks() {
+        // bankroll $100, 2% → $2 drawdown trip.
+        let mut risk_cfg = crate::wiring::risk_config(&Config::default()).unwrap();
+        risk_cfg.bankroll = Usdc(100_000_000);
+
+        // Scenario 1: bid 40 / ask 60 (mid 50). 100sh @ .50 basis, cash −$50.
+        //   BID equity = −50 + 40 = −$10  → dd $10 ≥ $2 WOULD halt on bid.
+        //   MID equity = −50 + 50 =   $0  → dd $0  no halt (mid is immune).
+        let kill = Arc::new(AtomicBool::new(false));
+        let (mut coord, _opp_tx, _exec_rx, _report_tx, mut store_rx, _stats) =
+            build_coord(Arc::clone(&kill), served_fetcher(40, 60), risk_cfg);
+
+        coord.positions.apply(
+            &[(TokenId(1), Qty(100_000_000), Usdc(50_000_000))],
+            Usdc(-50_000_000),
+            &token_market(),
+        );
+
+        // Install the watch BEFORE snapshot so its publish lands in the watch.
+        let status = coord.status_channel();
+        coord.snapshot_pnl().await;
+
+        // Durable PnlRow is BID-marked (−$10) and there is NO halt.
+        let mut saw_pnl = false;
+        while let Ok(m) = store_rx.try_recv() {
+            match m {
+                StoreMsg::PnlSnapshot(row) => {
+                    assert_eq!(
+                        row.equity_micro, -10_000_000,
+                        "durable PnlRow must stay bid-marked at −$10"
+                    );
+                    saw_pnl = true;
+                }
+                StoreMsg::Halt(_) => panic!("mid-marked equity $0 must NOT halt"),
+                _ => {}
+            }
+        }
+        assert!(saw_pnl, "expected a PnlSnapshot row");
+
+        let s = status.borrow();
+        assert_eq!(s.equity_micro, -10_000_000, "status bid equity = −$10");
+        assert_eq!(s.equity_mid_micro, 0, "status mid equity = $0");
+        drop(s);
+
+        // Scenario 2: re-serve bid 30 / ask 34 (mid 32). Same holding.
+        //   MID equity = −50 + 32 = −$18 → dd $18 ≥ $2 → halt DOES fire,
+        //   proving the mid feed is live, not merely disabled.
+        coord.fetcher = served_fetcher(30, 34);
+        coord.snapshot_pnl().await;
+
+        let mut saw_halt = false;
+        while let Ok(m) = store_rx.try_recv() {
+            if let StoreMsg::Halt(row) = m {
+                assert_eq!(row.reason, "DailyDrawdown");
+                saw_halt = true;
+            }
+        }
+        assert!(saw_halt, "mid equity −$18 must trip the drawdown halt");
     }
 }

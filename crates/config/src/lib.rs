@@ -18,6 +18,7 @@ pub struct Config {
     pub execution: Execution,
     pub risk: Risk,
     pub store: Store,
+    pub tui: Tui,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
@@ -262,6 +263,30 @@ impl Default for Store {
     }
 }
 
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Tui {
+    /// AppState publish + redraw cadence (spec §17 "~10 Hz").
+    pub refresh_ms: u64,
+    /// Rows kept in the opportunity feed panel.
+    pub feed_rows: usize,
+    /// Rows in the fills/orders panel.
+    pub fills_rows: usize,
+    /// Ring-buffer capacity for the scrolling log panel.
+    pub log_lines: usize,
+}
+
+impl Default for Tui {
+    fn default() -> Self {
+        Tui {
+            refresh_ms: 100,
+            feed_rows: 50,
+            fills_rows: 20,
+            log_lines: 200,
+        }
+    }
+}
+
 impl Config {
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
         let cfg: Self = toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
@@ -363,6 +388,12 @@ impl Config {
         }
         if self.store.path.is_empty() {
             return Err(ConfigError::BadMoney("store.path must not be empty"));
+        }
+        if self.tui.refresh_ms < 50 {
+            return Err(ConfigError::BadMoney("tui.refresh_ms must be >= 50"));
+        }
+        if self.tui.feed_rows == 0 || self.tui.fills_rows == 0 || self.tui.log_lines == 0 {
+            return Err(ConfigError::BadMoney("tui row/line counts must be >= 1"));
         }
         Ok(())
     }
@@ -586,5 +617,26 @@ mod tests {
         assert_eq!(c.risk.max_open_orders, 8);
         assert_eq!(c.store.path, "x.sqlite");
         assert_eq!(c.lp.solver_concurrency, 1);
+    }
+
+    #[test]
+    fn m4_tui_section_defaults_and_validation() {
+        let c = Config::default();
+        assert_eq!(c.tui.refresh_ms, 100);
+        assert_eq!(c.tui.feed_rows, 50);
+        assert_eq!(c.tui.fills_rows, 20);
+        assert_eq!(c.tui.log_lines, 200);
+        c.validate().unwrap();
+
+        let mut c = Config::default();
+        c.tui.refresh_ms = 20; // < 50 floor: would melt the read connection
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.tui.log_lines = 0;
+        assert!(c.validate().is_err());
+
+        let c = Config::from_toml_str("[tui]\nrefresh_ms = 250\n").unwrap();
+        assert_eq!(c.tui.refresh_ms, 250);
     }
 }

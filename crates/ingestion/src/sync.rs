@@ -140,6 +140,25 @@ fn pick_yes_no(tokens: &[pm_registry::gamma::ClobToken]) -> Option<(String, Stri
     Some((yes_id, no_id))
 }
 
+/// Per-market acceptance gate shared by [`assemble_registry`] and
+/// [`fetch_clob_bounded`], so fetch bounding and assembly cannot drift.
+///
+/// `Ok` carries the parsed (tick, yes-token, no-token) triple assembly needs;
+/// `Err` is the skip reason. [`SkippedReason::EmptyConditionId`] and
+/// [`SkippedReason::ClobLookupFailed`] are decided by the callers — they
+/// concern the gamma record and the lookup itself, not the CLOB data.
+fn gate_market(
+    clob: &ClobMarket,
+    filter: &UniverseFilter,
+) -> Result<(TickSize, String, String), SkippedReason> {
+    if filter.require_active && (!clob.active || clob.closed) {
+        return Err(SkippedReason::InactiveOrClosed);
+    }
+    let tick = classify_tick(clob.minimum_tick_size).ok_or(SkippedReason::UnsupportedTick)?;
+    let (yes_id, no_id) = pick_yes_no(&clob.tokens).ok_or(SkippedReason::MissingTokens)?;
+    Ok((tick, yes_id, no_id))
+}
+
 /// Assemble a [`Registry`] from gamma event groupings joined with CLOB market
 /// metadata.
 ///
@@ -185,27 +204,11 @@ pub fn assemble_registry(
                 }
             };
 
-            // ---- active/closed check ----------------------------------------
-            // skip if require_active is set and the market is either inactive or already closed
-            if filter.require_active && (!clob.active || clob.closed) {
-                skipped.push((gm.condition_id.clone(), SkippedReason::InactiveOrClosed));
-                continue;
-            }
-
-            // ---- tick size --------------------------------------------------
-            let tick = match classify_tick(clob.minimum_tick_size) {
-                Some(t) => t,
-                None => {
-                    skipped.push((gm.condition_id.clone(), SkippedReason::UnsupportedTick));
-                    continue;
-                }
-            };
-
-            // ---- tokens / yes-no ----------------------------------------
-            let (yes_id, no_id) = match pick_yes_no(&clob.tokens) {
-                Some(ids) => ids,
-                None => {
-                    skipped.push((gm.condition_id.clone(), SkippedReason::MissingTokens));
+            // ---- shared gate: active/closed, tick size, tokens ---------------
+            let (tick, yes_id, no_id) = match gate_market(clob, filter) {
+                Ok(parsed) => parsed,
+                Err(reason) => {
+                    skipped.push((gm.condition_id.clone(), reason));
                     continue;
                 }
             };
@@ -389,41 +392,15 @@ impl SyncTask {
         Ok(all_events)
     }
 
-    /// Issue a single-market CLOB lookup for every condition id found in
-    /// `events`, returning a map of condition id → [`ClobMarket`] plus any
-    /// failures as `ClobLookupFailed` skip entries.
+    /// Issue single-market CLOB lookups for the markets in `events`, bounded
+    /// by `filter.max_markets` would-be-accepted markets (see
+    /// [`fetch_clob_bounded`]), returning a map of condition id →
+    /// [`ClobMarket`] plus any failures as `ClobLookupFailed` skip entries.
     pub async fn fetch_clob_for(
         &mut self,
         events: &[GammaEvent],
     ) -> (HashMap<String, ClobMarket>, Vec<(String, SkippedReason)>) {
-        let mut by_condition: HashMap<String, ClobMarket> = HashMap::new();
-        let mut failures: Vec<(String, SkippedReason)> = Vec::new();
-
-        for event in events {
-            for gm in &event.markets {
-                if gm.condition_id.is_empty() {
-                    continue; // assembly will handle EmptyConditionId
-                }
-                if by_condition.contains_key(&gm.condition_id) {
-                    continue; // already fetched (same market in multiple events?)
-                }
-                match self.clob.market(&gm.condition_id).await {
-                    Ok(cm) => {
-                        by_condition.insert(gm.condition_id.clone(), cm);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            condition_id = %gm.condition_id,
-                            error = %e,
-                            "CLOB single-market lookup failed; skipping"
-                        );
-                        failures.push((gm.condition_id.clone(), SkippedReason::ClobLookupFailed));
-                    }
-                }
-            }
-        }
-
-        (by_condition, failures)
+        fetch_clob_bounded(&mut self.clob, events, &self.filter).await
     }
 
     /// Check whether the relationships file's mtime has changed and, if so,
@@ -495,6 +472,86 @@ impl SyncTask {
         let _ = self.tx.send(Arc::clone(&universe.registry));
         Ok(universe)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded CLOB fetch
+// ---------------------------------------------------------------------------
+
+/// Fetch seam over the single-market CLOB lookup so the bounded fetch loop is
+/// testable without a network client.
+pub trait ClobFetch {
+    /// Fetch a single CLOB market by condition id.
+    fn market(
+        &mut self,
+        condition_id: &str,
+    ) -> impl std::future::Future<Output = Result<ClobMarket, IngestError>>;
+}
+
+impl ClobFetch for ClobRest {
+    async fn market(&mut self, condition_id: &str) -> Result<ClobMarket, IngestError> {
+        ClobRest::market(self, condition_id).await
+    }
+}
+
+/// Fetch CLOB metadata for the markets in `events`, visiting them in exactly
+/// the order [`assemble_registry`] does and stopping once
+/// `filter.max_markets` markets *would be accepted* by assembly.
+///
+/// Acceptance mirrors `assemble_registry`'s per-market gating (shared via
+/// [`gate_market`]), so assembling from the bounded map yields a registry
+/// identical to one assembled from an exhaustive fetch: assembly never visits
+/// markets past its cap, and every market it does visit is fetched here.
+///
+/// This bound matters for startup latency: a single gamma keyset page can
+/// carry 1000+ member markets, and the CLOB client is rate-limited — an
+/// unbounded per-market fetch takes minutes when only `max_markets` (default
+/// 200, smoke runs 20) are kept.
+pub async fn fetch_clob_bounded<F: ClobFetch>(
+    fetch: &mut F,
+    events: &[GammaEvent],
+    filter: &UniverseFilter,
+) -> (HashMap<String, ClobMarket>, Vec<(String, SkippedReason)>) {
+    let mut by_condition: HashMap<String, ClobMarket> = HashMap::new();
+    let mut failures: Vec<(String, SkippedReason)> = Vec::new();
+    let mut accepted = 0usize;
+
+    'outer: for event in events {
+        for gm in &event.markets {
+            // Mirror assemble_registry's cap check: it breaks at the TOP of
+            // the loop for the market AFTER the last accepted one, so nothing
+            // past this point is ever visited by assembly either.
+            if accepted >= filter.max_markets {
+                break 'outer;
+            }
+            if gm.condition_id.is_empty() {
+                continue; // assembly will record EmptyConditionId
+            }
+            if !by_condition.contains_key(&gm.condition_id) {
+                match fetch.market(&gm.condition_id).await {
+                    Ok(cm) => {
+                        by_condition.insert(gm.condition_id.clone(), cm);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            condition_id = %gm.condition_id,
+                            error = %e,
+                            "CLOB single-market lookup failed; skipping"
+                        );
+                        failures.push((gm.condition_id.clone(), SkippedReason::ClobLookupFailed));
+                        continue;
+                    }
+                }
+            }
+            // Count every visit assembly would accept — including a repeated
+            // condition id (assembly does not dedup), which costs no refetch.
+            if gate_market(&by_condition[&gm.condition_id], filter).is_ok() {
+                accepted += 1;
+            }
+        }
+    }
+
+    (by_condition, failures)
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,5 +1129,232 @@ mod tests {
         )
         .unwrap();
         assert!(pick_yes_no(&tokens).is_none());
+    }
+
+    // ---- bounded CLOB fetch --------------------------------------------------
+
+    /// In-memory [`ClobFetch`] recording every lookup; condition ids absent
+    /// from `responses` fail like an HTTP error.
+    struct StubClob {
+        responses: HashMap<String, ClobMarket>,
+        calls: Vec<String>,
+    }
+
+    impl StubClob {
+        fn new(markets: Vec<ClobMarket>) -> Self {
+            StubClob {
+                responses: markets
+                    .into_iter()
+                    .map(|m| (m.condition_id.clone(), m))
+                    .collect(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl ClobFetch for StubClob {
+        async fn market(&mut self, condition_id: &str) -> Result<ClobMarket, IngestError> {
+            self.calls.push(condition_id.to_string());
+            self.responses
+                .get(condition_id)
+                .cloned()
+                .ok_or_else(|| IngestError::Http("stub: lookup failed".into()))
+        }
+    }
+
+    /// An acceptable (active, cent-tick, two-token) CLOB record.
+    fn ok_clob(cid: &str, yes: &str, no: &str) -> ClobMarket {
+        make_clob(ClobSpec {
+            condition_id: cid,
+            tick: 0.01,
+            taker_fee: 0,
+            active: true,
+            closed: false,
+            neg_risk: false,
+            yes_token: yes,
+            no_token: no,
+        })
+    }
+
+    #[tokio::test]
+    async fn bounded_fetch_stops_at_max_markets() {
+        let events = vec![
+            make_event_multi("e1", false, &[("c1", "y1", "n1"), ("c2", "y2", "n2")]),
+            make_event_multi("e2", false, &[("c3", "y3", "n3"), ("c4", "y4", "n4")]),
+        ];
+        let mut stub = StubClob::new(vec![
+            ok_clob("c1", "y1", "n1"),
+            ok_clob("c2", "y2", "n2"),
+            ok_clob("c3", "y3", "n3"),
+            ok_clob("c4", "y4", "n4"),
+        ]);
+        let filter = UniverseFilter {
+            max_markets: 2,
+            require_active: true,
+        };
+
+        let (map, failures) = fetch_clob_bounded(&mut stub, &events, &filter).await;
+
+        assert_eq!(
+            stub.calls,
+            vec!["c1", "c2"],
+            "must stop fetching once max_markets acceptable markets are in hand"
+        );
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("c1") && map.contains_key("c2"));
+        assert!(failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_fetch_gated_out_markets_do_not_count() {
+        // c1 is inactive: fetched, but must not count toward the cap.
+        let inactive = make_clob(ClobSpec {
+            condition_id: "c1",
+            tick: 0.01,
+            taker_fee: 0,
+            active: false,
+            closed: false,
+            neg_risk: false,
+            yes_token: "y1",
+            no_token: "n1",
+        });
+        let events = vec![make_event_multi(
+            "e1",
+            false,
+            &[
+                ("c1", "y1", "n1"),
+                ("c2", "y2", "n2"),
+                ("c3", "y3", "n3"),
+                ("c4", "y4", "n4"),
+            ],
+        )];
+        let mut stub = StubClob::new(vec![
+            inactive,
+            ok_clob("c2", "y2", "n2"),
+            ok_clob("c3", "y3", "n3"),
+            ok_clob("c4", "y4", "n4"),
+        ]);
+        let filter = UniverseFilter {
+            max_markets: 2,
+            require_active: true,
+        };
+
+        let (map, _failures) = fetch_clob_bounded(&mut stub, &events, &filter).await;
+
+        assert_eq!(
+            stub.calls,
+            vec!["c1", "c2", "c3"],
+            "inactive c1 must not count; c4 must never be fetched"
+        );
+        assert_eq!(map.len(), 3, "fetched records are kept even when gated out");
+    }
+
+    #[tokio::test]
+    async fn bounded_fetch_failed_lookups_do_not_count() {
+        // c1 is missing from the stub → lookup fails → must not count.
+        let events = vec![make_event_multi(
+            "e1",
+            false,
+            &[("c1", "y1", "n1"), ("c2", "y2", "n2"), ("c3", "y3", "n3")],
+        )];
+        let mut stub = StubClob::new(vec![
+            ok_clob("c2", "y2", "n2"),
+            ok_clob("c3", "y3", "n3"),
+        ]);
+        let filter = UniverseFilter {
+            max_markets: 1,
+            require_active: true,
+        };
+
+        let (map, failures) = fetch_clob_bounded(&mut stub, &events, &filter).await;
+
+        assert_eq!(stub.calls, vec!["c1", "c2"]);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("c2"));
+        assert_eq!(
+            failures,
+            vec![("c1".to_string(), SkippedReason::ClobLookupFailed)]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_fetch_duplicate_condition_counts_without_refetch() {
+        // The same condition id in two events: assemble_registry would accept
+        // it twice (it does not dedup), so the bounded fetch must count both
+        // visits — without issuing a second HTTP lookup — and stop before c2.
+        let events = vec![
+            make_event("e1", "c1", "y1", "n1", false, true),
+            make_event_multi("e2", false, &[("c1", "y1", "n1"), ("c2", "y2", "n2")]),
+        ];
+        let mut stub = StubClob::new(vec![
+            ok_clob("c1", "y1", "n1"),
+            ok_clob("c2", "y2", "n2"),
+        ]);
+        let filter = UniverseFilter {
+            max_markets: 2,
+            require_active: true,
+        };
+
+        let (map, _failures) = fetch_clob_bounded(&mut stub, &events, &filter).await;
+
+        assert_eq!(stub.calls, vec!["c1"], "duplicate visit must not refetch");
+        assert_eq!(map.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_fetch_assembles_identical_registry_to_exhaustive_fetch() {
+        // c1 has an unsupported tick (gated out), c2..c4 acceptable, cap 2:
+        // assembly from the bounded map must equal assembly from the full map.
+        let bad_tick = make_clob(ClobSpec {
+            condition_id: "c1",
+            tick: 0.05,
+            taker_fee: 0,
+            active: true,
+            closed: false,
+            neg_risk: false,
+            yes_token: "y1",
+            no_token: "n1",
+        });
+        let events = vec![make_event_multi(
+            "e1",
+            false,
+            &[
+                ("c1", "y1", "n1"),
+                ("c2", "y2", "n2"),
+                ("c3", "y3", "n3"),
+                ("c4", "y4", "n4"),
+            ],
+        )];
+        let full: Vec<ClobMarket> = vec![
+            bad_tick,
+            ok_clob("c2", "y2", "n2"),
+            ok_clob("c3", "y3", "n3"),
+            ok_clob("c4", "y4", "n4"),
+        ];
+        let filter = UniverseFilter {
+            max_markets: 2,
+            require_active: true,
+        };
+
+        let full_map: HashMap<String, ClobMarket> = full
+            .iter()
+            .map(|m| (m.condition_id.clone(), m.clone()))
+            .collect();
+        let mut stub = StubClob::new(full);
+        let (bounded_map, _) = fetch_clob_bounded(&mut stub, &events, &filter).await;
+
+        let from_full = assemble_registry(&events, &full_map, "", &filter).unwrap();
+        let from_bounded = assemble_registry(&events, &bounded_map, "", &filter).unwrap();
+
+        let conditions = |u: &AssembledUniverse| -> Vec<String> {
+            u.registry
+                .markets()
+                .iter()
+                .map(|m| u.registry.market_condition(m.id).unwrap_or("").to_string())
+                .collect()
+        };
+        assert_eq!(conditions(&from_full), vec!["c2", "c3"]);
+        assert_eq!(conditions(&from_bounded), conditions(&from_full));
+        assert_eq!(from_bounded.skipped, from_full.skipped);
     }
 }

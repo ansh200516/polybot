@@ -2,7 +2,9 @@
 pub mod coordinator;
 pub mod detector;
 pub mod kill;
+pub mod logbuf;
 pub mod lp_pool;
 pub mod positions;
+pub mod publisher;
 pub mod stats;
 pub mod wiring;

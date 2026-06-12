@@ -158,3 +158,112 @@ on a fresh DB shows `reconciled=0`.
 of deployed capital, the coordinator stops dispatching new baskets for the
 remainder of the session. Ingestion and book-keeping continue normally.
 Reset on next session start (new calendar day tracked in the store).
+
+## M4: TUI dashboard
+
+`pm-tui` adds a full-screen Ratatui dashboard to the `arb` binary. The TUI
+is active whenever stdout is a real terminal and `--headless` is not given;
+piped/cron invocations stay headless automatically.
+
+### Dashboard layout
+
+The screen is divided into a header bar and five panels:
+
+- **Opportunities** (upper-left, 62%) — rolling feed of detected arb
+  opportunities: age, class (1–4), market name, edge bps, size, estimated
+  dollar value, and a `*` marker when the basket was dispatched.
+- **Positions** (upper-right, 38%) — open positions marked to the current
+  live bid: market, quantity, basis cost, and live mark value.
+- **Fills & Orders** (lower-left, 62%) — two sub-tables: recent fills (age,
+  market, side, price, quantity, cash) and recent orders (age, order ID,
+  state, detail).
+- **Health** (lower-right, 38%) — live gauges (markets tracked, books live,
+  supervisors, WS frames, reconnects, opportunities, baskets dispatched) and
+  detect/dispatch latency percentiles (p50/p99 in µs).
+- **Log** (bottom strip) — scrolling ring-buffer of structured log lines from
+  the session; ↑/↓ to scroll, auto-follows tail at offset 0.
+
+The header bar shows: mode badge (`PAPER` / `LIVE`), session uptime, optional
+status badge (`PAUSED` / `HALT:<reason>` / `KILLED`), and two equity figures:
+
+- **`equity(bid)`** — cash + open positions marked at the best live bid.
+  Conservative and durable: used for the human-readable P&L report.
+- **`risk-equity(mid)`** — cash + positions marked at mid. This is the feed
+  the drawdown-halt logic watches. The M3 live-run artifact fix (spread of an
+  open basket no longer trips the halt) applies here: mid-marking an
+  open-basket spread was causing false daily-drawdown halts; the fix ensures
+  quiet books on a live delta feed count as current before computing the
+  mid-mark.
+
+A footer line repeats the key hints at all times.
+
+### Key bindings
+
+| Key | Action |
+|---|---|
+| `p` | Toggle pause dispatch (coordinator stops admitting new baskets; ingestion continues) |
+| `l` | Go-live modal — type `live` and press Enter to confirm; answers "live venue unavailable until M5 — staying in paper" (M5 stub) |
+| `k` | Kill switch — y/N confirm modal; `y` trips the kill flag cleanly |
+| `q` | Quit the dashboard and end the session |
+| `↑` / `↓` | Scroll the log panel (↑ = back in history; auto-follow resumes at offset 0) |
+| `Ctrl-C` | Quit (works in any modal state) |
+
+### Config defaults (`[tui]` section)
+
+| Key | Default | Minimum |
+|---|---|---|
+| `refresh_ms` | 100 | 50 |
+| `feed_rows` | 50 | 1 |
+| `fills_rows` | 20 | 1 |
+| `log_lines` | 200 | 1 |
+
+### `--headless` flag
+
+Pass `--headless` to suppress the TUI and fall back to M3-style structured
+`tracing` output to stdout. The binary also detects a non-tty stdout
+automatically (pipe, file redirect, cron), so no flag is needed in CI or
+scheduled jobs.
+
+### Startup
+
+In TUI mode tracing goes to the in-screen log ring, so before the dashboard
+appears `arb` prints a plain stdout notice while the universe sync runs:
+
+    arb: assembling market universe (rate-limited CLOB sync) ...
+    arb: the dashboard will start when the sync completes.
+
+The CLOB metadata fetch is bounded: markets are visited in registry order and
+fetching stops once `max_markets` would-be-accepted markets are in hand
+(`fetch_clob_bounded`; the accept/skip gate is shared with
+`assemble_registry`, so the assembled registry is identical to one built from
+an exhaustive fetch). Before this bound, every member market on the fetched
+gamma keyset page (~1,100 on page one) was fetched at the rate-limited
+5 req/s — ~4 minutes of silent black screen before the dashboard. Now
+`--max-markets 20` starts in roughly 7 s.
+
+### pty smoke (Apple Silicon dev machine, 2026-06-13, post fetch-bound fix)
+
+    script -q /tmp/m4-tui-smoke.out \
+      sh -c 'stty rows 40 cols 140; exec ./target/release/arb \
+        --duration-secs 20 --max-markets 20 --db /tmp/m4-tui-smoke.sqlite'
+
+The `stty` matters: a non-interactive `script` pty reports a 0×0 window and
+Ratatui renders nothing into a zero-area terminal. The earlier smoke (12 KB
+capture, no panel titles) verified only the alt-screen lifecycle, not actual
+rendering — its claim that missing panel titles are "expected for any Ratatui
+pty recording" was wrong.
+
+| Check | Result |
+|---|---|
+| exit code | 0 |
+| total wall time (20 s session) | 31 s (≈7 s sync + session + shutdown) |
+| capture size | 44,792 bytes |
+| startup notice lines on stdout | yes |
+| alt-screen enter / leave (`[?1049h` / `[?1049l`) | both present |
+| panel titles (Opportunities, Positions, Fills, Health) | all present |
+| header (PAPER badge, equity) | present |
+| `arb session result: healthy=true` | 1 |
+| SQLite DB created | yes |
+
+Interactive acceptance (live scrolling, key-binding exercise, visual layout
+verification) is performed by the operator.

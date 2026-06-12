@@ -1,0 +1,14 @@
+[package]
+name = "pm-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pm-core = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

@@ -19,6 +19,7 @@ pub struct AppStats {
     pub opps_emitted: AtomicU64,
     pub opps_dropped: AtomicU64,
     pub lp_jobs: AtomicU64,
+    pub lp_solved: AtomicU64,
     pub lp_skips: AtomicU64,
     pub lp_dropped_full: AtomicU64,
     pub admitted: AtomicU64,
@@ -42,6 +43,7 @@ impl AppStats {
             opps_emitted: AtomicU64::new(0),
             opps_dropped: AtomicU64::new(0),
             lp_jobs: AtomicU64::new(0),
+            lp_solved: AtomicU64::new(0),
             lp_skips: AtomicU64::new(0),
             lp_dropped_full: AtomicU64::new(0),
             admitted: AtomicU64::new(0),
@@ -84,7 +86,8 @@ impl AppStats {
             (0, 0)
         };
         format!(
-            "opps={opps} dropped={dropped} lp_jobs={lp_jobs} lp_skips={lp_skips} \
+            "opps={opps} dropped={dropped} lp_jobs={lp_jobs} lp_solved={lp_solved} \
+             lp_skips={lp_skips} \
              lp_dropped_full={lp_dropped_full} \
              admitted={admitted} cool={cool} busy={busy} expired={expired} \
              risk_rej={risk_rej} dispatched={dispatched} \
@@ -95,6 +98,7 @@ impl AppStats {
             opps = self.opps_emitted.load(Ordering::Relaxed),
             dropped = self.opps_dropped.load(Ordering::Relaxed),
             lp_jobs = self.lp_jobs.load(Ordering::Relaxed),
+            lp_solved = self.lp_solved.load(Ordering::Relaxed),
             lp_skips = self.lp_skips.load(Ordering::Relaxed),
             lp_dropped_full = self.lp_dropped_full.load(Ordering::Relaxed),
             admitted = self.admitted.load(Ordering::Relaxed),
@@ -123,6 +127,7 @@ impl Default for AppStats {
             opps_emitted: AtomicU64::new(0),
             opps_dropped: AtomicU64::new(0),
             lp_jobs: AtomicU64::new(0),
+            lp_solved: AtomicU64::new(0),
             lp_skips: AtomicU64::new(0),
             lp_dropped_full: AtomicU64::new(0),
             admitted: AtomicU64::new(0),
