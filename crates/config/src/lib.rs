@@ -566,6 +566,14 @@ mod tests {
         let mut c = Config::default();
         c.store.path = String::new();
         assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.risk.max_unhedged_usd = f64::NAN;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.risk.max_unhedged_usd = f64::INFINITY;
+        assert!(c.validate().is_err());
     }
 
     #[test]
