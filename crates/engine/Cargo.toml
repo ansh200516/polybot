@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 pm-core.workspace = true
+highs.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
