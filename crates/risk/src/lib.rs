@@ -202,11 +202,13 @@ impl RiskEngine {
     }
 
     /// Update session equity (µUSDC, relative to session start = 0). Trips the
-    /// drawdown halt when peak − equity ≥ bankroll · dd_bps / 10⁴.
+    /// drawdown halt when peak − equity ≥ bankroll · dd_bps / 10⁴. First halt
+    /// wins: an existing halt reason is never rewritten.
     pub fn update_equity(&mut self, equity: Usdc) -> Option<HaltReason> {
         self.peak_equity = self.peak_equity.max(equity.0);
         let dd = self.peak_equity - equity.0;
-        if dd >= self.cfg.bankroll.0 * self.cfg.daily_drawdown_bps / 10_000 {
+        if self.halted.is_none() && dd >= self.cfg.bankroll.0 * self.cfg.daily_drawdown_bps / 10_000
+        {
             self.halted = Some(HaltReason::DailyDrawdown);
         }
         self.halted
@@ -510,6 +512,25 @@ mod tests {
             r.update_session_pnl(Usdc(-30_000_000)),
             Some(HaltReason::DailyDrawdown),
             "first halt wins; reason is not rewritten"
+        );
+    }
+
+    #[test]
+    fn drawdown_does_not_overwrite_existing_halt() {
+        // Symmetry with update_session_pnl: first halt wins on every path.
+        let mut cfg = test_cfg();
+        cfg.session_loss_cap = Some(Usdc(25_000_000));
+        cfg.daily_drawdown_bps = 1;
+        let mut r = RiskEngine::new(cfg);
+        assert_eq!(
+            r.update_session_pnl(Usdc(-25_000_000)),
+            Some(HaltReason::SessionLoss)
+        );
+        r.update_equity(Usdc(10_000_000));
+        assert_eq!(
+            r.update_equity(Usdc(-10_000_000)),
+            Some(HaltReason::SessionLoss),
+            "drawdown breach must not rewrite an existing halt"
         );
     }
 
