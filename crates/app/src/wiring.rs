@@ -85,7 +85,10 @@ pub fn build_component_index(reg: &Registry) -> ComponentIndex {
         if let Some(&first) = p.markets.first() {
             let cid = reg.component_of(first);
             // Registry construction guarantees it.
-            debug_assert!(entries.contains_key(&cid), "partition member missing from market entries");
+            debug_assert!(
+                entries.contains_key(&cid),
+                "partition member missing from market entries"
+            );
             if let Some(e) = entries.get_mut(&cid) {
                 e.partitions.push(p.clone());
             }

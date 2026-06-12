@@ -100,6 +100,7 @@ impl Detector {
             }
 
             for part in &entry.partitions {
+                // Cheap pre-check before detect; class2 also guards internally — kept to skip the iteration on incomplete books.
                 let complete = part
                     .yes_tokens
                     .iter()
@@ -147,14 +148,17 @@ impl Detector {
                         }
                         Err(_) => {
                             self.stats
-                                .lp_skips
+                                .lp_dropped_full
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // Treat a full pool as "attempted": debounce the component for the interval instead of re-cloning books on every subsequent apply.
+                            self.lp_last.insert(cid, t0);
                         }
                     }
                 }
             }
         }
 
+        // Spans the whole hook incl. scratch/LP cloning; the gated class-1 path is the singleton case where this equals pure detection.
         self.stats.record_detect_us(t0.elapsed().as_micros() as u64);
     }
 
@@ -595,6 +599,143 @@ mod tests {
         assert!(
             lp_rx.try_recv().is_err(),
             "second immediate on_apply must not bypass debounce"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test: class-2 partition detected through scratch path
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn class2_partition_detected_through_scratch_path() {
+        // 2-market NegRisk event → verified-exhaustive partition (registry derives it).
+        let mut b = RegistryBuilder::default();
+        b.add_market(
+            "0xb",
+            "yb",
+            "nb",
+            TickSize::Cent,
+            0,
+            true,
+            Some("B?".into()),
+            true,
+            false,
+            Some("ev1"),
+        );
+        b.add_market(
+            "0xc",
+            "yc",
+            "nc",
+            TickSize::Cent,
+            0,
+            true,
+            Some("C?".into()),
+            true,
+            false,
+            Some("ev1"),
+        );
+        let reg = b.finish("").unwrap();
+        assert!(
+            reg.partitions()[0].verified_exhaustive,
+            "fixture must be verified"
+        );
+        let mb = *reg.market_by_condition("0xb").unwrap();
+        let mc = *reg.market_by_condition("0xc").unwrap();
+
+        // Both markets in the same component (NegRisk partition links them).
+        let cid = reg.component_of(mb.id);
+        assert_eq!(reg.component_of(mc.id), cid);
+
+        let mut by_token = HashMap::new();
+        for t in [mb.yes, mb.no, mc.yes, mc.no] {
+            by_token.insert(t, cid);
+        }
+        let mut entries = HashMap::new();
+        entries.insert(
+            cid,
+            ComponentEntry {
+                markets: vec![mb, mc],
+                partitions: reg.partitions().to_vec(),
+                relationships: vec![],
+                tokens: vec![mb.yes, mb.no, mc.yes, mc.no],
+            },
+        );
+        let index = Arc::new(ComponentIndex { by_token, entries });
+
+        // Use zero-gas params + min_profit=0 so the edge is never filtered.
+        let params = EngineParams {
+            gas: pm_engine::GasTable {
+                split: 0,
+                merge: 0,
+                redeem: 0,
+                negrisk_convert: 0,
+            },
+            min_profit: pm_core::num::Usdc(0),
+            ..EngineParams::default()
+        };
+
+        let (opp_tx, mut opp_rx, lp_tx, mut lp_rx, stats) = make_channels();
+        let mut det = Detector::new(
+            index,
+            params,
+            opp_tx,
+            lp_tx,
+            Duration::from_millis(500),
+            stats,
+        );
+
+        // Σ YES asks = 0.45 + 0.45 = 0.90 < 1 → C2Long
+        // seed: bid=40¢/ask=45¢ for both YES legs; NO legs present so all_valid is true.
+        let mut shard = Shard::default();
+        let now = Instant::now();
+        shard.apply_snapshot(
+            now,
+            mb.yes,
+            TickSize::Cent,
+            &[raw(40 * 10_000, 100_000_000)],
+            &[raw(45 * 10_000, 100_000_000)],
+            "h_yb",
+        );
+        shard.apply_snapshot(
+            now,
+            mb.no,
+            TickSize::Cent,
+            &[raw(50 * 10_000, 100_000_000)],
+            &[raw(56 * 10_000, 100_000_000)],
+            "h_nb",
+        );
+        shard.apply_snapshot(
+            now,
+            mc.yes,
+            TickSize::Cent,
+            &[raw(40 * 10_000, 100_000_000)],
+            &[raw(45 * 10_000, 100_000_000)],
+            "h_yc",
+        );
+        shard.apply_snapshot(
+            now,
+            mc.no,
+            TickSize::Cent,
+            &[raw(50 * 10_000, 100_000_000)],
+            &[raw(56 * 10_000, 100_000_000)],
+            "h_nc",
+        );
+
+        det.on_apply(mb.yes, &shard);
+
+        let got = opp_rx.try_recv().unwrap();
+        assert_eq!(
+            got.opp.class,
+            ArbClass::C2Long,
+            "expected C2Long; got {:?}",
+            got.opp.class
+        );
+        assert!(got.opp.net.0 > 0, "net must be positive");
+
+        // Multi-market component with all books valid → LP job too
+        assert!(
+            lp_rx.try_recv().is_ok(),
+            "expected LP job for multi-market component"
         );
     }
 }

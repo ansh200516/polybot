@@ -12,8 +12,7 @@ use crate::stats::AppStats;
 
 /// Drain SolveJobs, solve each with bounded concurrency, emit Found opps.
 ///
-/// Completed task handles accumulate in `handles` until the pool's receiver
-/// closes — bounded by total job count, acceptable for M3 paper sessions.
+// spawn_blocking tasks are detached: they complete on the blocking pool even after this loop exits on channel close.
 pub async fn run_lp_pool(
     mut rx: mpsc::Receiver<SolveJob>,
     opp_tx: mpsc::Sender<DetectedOpp>,
@@ -22,14 +21,13 @@ pub async fn run_lp_pool(
     stats: Arc<AppStats>,
 ) {
     let sem = Arc::new(Semaphore::new(concurrency.max(1)));
-    let mut handles = Vec::new();
     while let Some(job) = rx.recv().await {
         let Ok(permit) = Arc::clone(&sem).acquire_owned().await else {
             break;
         };
         let tx = opp_tx.clone();
         let stats = Arc::clone(&stats);
-        handles.push(tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let books = job.books;
             let spec = ComponentSpec {
                 markets: job.markets,
@@ -49,10 +47,7 @@ pub async fn run_lp_pool(
                 }
             }
             drop(permit);
-        }));
-    }
-    for h in handles {
-        let _ = h.await;
+        });
     }
 }
 
