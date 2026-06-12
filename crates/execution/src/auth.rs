@@ -82,7 +82,9 @@ pub fn l1_signature(
 
 /// L2: `base64url-with-padding(HMAC-SHA256(base64url-decode(secret),
 /// ts + METHOD + path + body))`. For GET requests `path` must EXCLUDE query
-/// params (RECON-M5.md: the HMAC signs the request path only).
+/// params (RECON-M5.md: the HMAC signs the request path only). `body` must be
+/// the EXACT serialized string sent on the wire — canonical double-quoted
+/// JSON (the reference client normalizes single quotes; we never emit them).
 pub fn l2_signature(
     secret_b64url: &str,
     timestamp: &str,
