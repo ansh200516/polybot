@@ -371,6 +371,10 @@ impl Coordinator {
         // store row, exactly like a cooldown-suppressed opp.
         if self.live {
             if !self.live_released {
+                // Held is expected steady-state pre-release: counted (live_held
+                // gauge), deliberately not per-event logged. Like a pause, a
+                // held opp consumed its cooldown admit slot — identical shapes
+                // stay suppressed up to cooldown_ms after release.
                 self.stats.live_held.fetch_add(1, Relaxed);
                 return; // held, not rejected: dispatch released later via the modal
             }
