@@ -671,8 +671,10 @@ mod tests {
         assert!(text.contains("line-29"));
         // scrolled back 5: tail hidden, earlier lines visible
         // At 160×45 the log panel inner_h = 13. scroll=5 → end=25, start=12 → lines 12..24.
-        let mut ui = UiState::default();
-        ui.log_scroll = 5;
+        let mut ui = UiState {
+            log_scroll: 5,
+            ..Default::default()
+        };
         let text = render_to_text(&s, &ui, 160, 45);
         assert!(
             !text.contains("line-29"),

@@ -4,5 +4,6 @@
 //! zero µUSDC accounting.
 
 pub mod render;
+pub mod run;
 pub mod state;
 pub mod ui;
