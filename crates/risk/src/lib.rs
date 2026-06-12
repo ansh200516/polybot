@@ -18,6 +18,8 @@ pub struct RiskConfig {
     pub daily_drawdown_bps: i128,
     pub error_halt_count: u32,
     pub error_halt_window: Duration,
+    /// Threshold only — the storm WINDOW is applied by the store's session-start
+    /// query; see note_session_starts_in_window.
     pub restart_storm_count: u32,
 }
 
@@ -66,11 +68,7 @@ pub struct RiskEngine {
     paused: bool,
     halted: Option<HaltReason>,
     killed: bool,
-    // consumed in Task 6 (halts)
-    #[allow(dead_code)]
     peak_equity: i128,
-    // consumed in Task 6 (halts)
-    #[allow(dead_code)]
     errors: VecDeque<Instant>,
 }
 
@@ -148,6 +146,71 @@ impl RiskEngine {
         self.global_exposure += delta.0;
         *self.per_market.entry(market).or_insert(0) += delta.0;
     }
+
+    pub fn set_paused(&mut self, p: bool) {
+        self.paused = p;
+    }
+
+    /// Kill switch (spec §15): trips dispatch off; requires manual clear.
+    pub fn trip_kill(&mut self) {
+        self.killed = true;
+    }
+
+    pub fn clear_kill(&mut self) {
+        self.killed = false;
+    }
+
+    pub fn is_killed(&self) -> bool {
+        self.killed
+    }
+
+    pub fn halted(&self) -> Option<HaltReason> {
+        self.halted
+    }
+
+    /// Record an order error. Consecutive errors (no intervening success)
+    /// within the window trip the halt.
+    pub fn record_error(&mut self, now: Instant) -> Option<HaltReason> {
+        self.errors.push_back(now);
+        while let Some(&front) = self.errors.front() {
+            if now.duration_since(front) > self.cfg.error_halt_window {
+                self.errors.pop_front();
+            } else {
+                break;
+            }
+        }
+        if u32::try_from(self.errors.len()).unwrap_or(u32::MAX) >= self.cfg.error_halt_count {
+            self.halted = Some(HaltReason::ConsecutiveErrors);
+        }
+        self.halted
+    }
+
+    /// A successful basket resets the consecutive-error chain.
+    pub fn record_success(&mut self) {
+        self.errors.clear();
+    }
+
+    /// Update session equity (µUSDC, relative to session start = 0). Trips the
+    /// drawdown halt when peak − equity ≥ bankroll · dd_bps / 10⁴.
+    pub fn update_equity(&mut self, equity: Usdc) -> Option<HaltReason> {
+        self.peak_equity = self.peak_equity.max(equity.0);
+        let dd = self.peak_equity - equity.0;
+        if dd >= self.cfg.bankroll.0 * self.cfg.daily_drawdown_bps / 10_000 {
+            self.halted = Some(HaltReason::DailyDrawdown);
+        }
+        self.halted
+    }
+
+    /// Feed the store-derived count of session starts inside the storm window
+    /// (spec §15 restart-storm detector → trips at startup). The window itself
+    /// is applied by the store's session-start query (`record_session_start`);
+    /// only the count threshold lives in RiskConfig.
+    pub fn note_session_starts_in_window(&mut self, count: usize) -> Option<HaltReason> {
+        if u32::try_from(count).unwrap_or(u32::MAX) >= self.cfg.restart_storm_count {
+            self.halted = Some(HaltReason::RestartStorm);
+        }
+        self.halted
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +220,7 @@ mod tests {
     use pm_core::instrument::MarketId;
     use pm_core::num::Usdc;
     use std::time::Duration;
+    use std::time::Instant;
 
     fn cfg() -> RiskConfig {
         RiskConfig {
@@ -302,5 +366,97 @@ mod tests {
         // commit can also reduce exposure (positions closed)
         r.commit(MarketId(0), Usdc(-300_000_000));
         assert_eq!(r.pre_check(&b3), RiskVerdict::Approved);
+    }
+
+    // ── Task 6: halts, kill switch, pause ─────────────────────────────────────
+
+    #[test]
+    fn pause_and_kill_dominate() {
+        let mut r = RiskEngine::new(cfg());
+        let b = basket(1_000_000, 1_000_000, &[(0, 1_000_000)]);
+        r.set_paused(true);
+        assert_eq!(r.pre_check(&b), RiskVerdict::Rejected(RejectReason::Paused));
+        r.set_paused(false);
+        r.trip_kill();
+        assert!(r.is_killed());
+        assert_eq!(
+            r.pre_check(&b),
+            RiskVerdict::Rejected(RejectReason::KillSwitch)
+        );
+        r.clear_kill(); // manual clear (spec §15)
+        assert_eq!(r.pre_check(&b), RiskVerdict::Approved);
+    }
+
+    #[test]
+    fn consecutive_errors_within_window_halt() {
+        let mut r = RiskEngine::new(cfg()); // 3 errors / 60s
+        let t0 = Instant::now();
+        assert_eq!(r.record_error(t0), None);
+        assert_eq!(r.record_error(t0 + Duration::from_secs(10)), None);
+        // a success resets the consecutive count
+        r.record_success();
+        assert_eq!(r.record_error(t0 + Duration::from_secs(20)), None);
+        assert_eq!(r.record_error(t0 + Duration::from_secs(30)), None);
+        assert_eq!(
+            r.record_error(t0 + Duration::from_secs(40)),
+            Some(HaltReason::ConsecutiveErrors)
+        );
+        assert_eq!(r.halted(), Some(HaltReason::ConsecutiveErrors));
+    }
+
+    #[test]
+    fn errors_outside_window_do_not_halt() {
+        let mut r = RiskEngine::new(cfg());
+        let t0 = Instant::now();
+        assert_eq!(r.record_error(t0), None);
+        assert_eq!(r.record_error(t0 + Duration::from_secs(61)), None);
+        assert_eq!(r.record_error(t0 + Duration::from_secs(122)), None);
+        assert_eq!(r.halted(), None);
+    }
+
+    #[test]
+    fn drawdown_halt_is_peak_to_trough() {
+        let mut r = RiskEngine::new(cfg()); // 200 bps of $10k = $200
+        assert_eq!(r.update_equity(Usdc(150_000_000)), None); // peak $150
+        assert_eq!(r.update_equity(Usdc(0)), None); // dd $150 < $200
+        assert_eq!(
+            r.update_equity(Usdc(-60_000_000)),
+            Some(HaltReason::DailyDrawdown)
+        ); // dd $210
+    }
+
+    #[test]
+    fn restart_storm_halts() {
+        let mut r = RiskEngine::new(cfg()); // mut: note_session_starts_in_window takes &mut self
+        assert_eq!(r.note_session_starts_in_window(4), None);
+        assert_eq!(
+            r.note_session_starts_in_window(5),
+            Some(HaltReason::RestartStorm)
+        );
+    }
+
+    #[test]
+    fn caps_are_inclusive_at_exact_boundary() {
+        let r = RiskEngine::new(cfg());
+        // exactly at per-market cap: approved; one µUSDC over: rejected
+        let at = basket(1_000_000_000, 100_000_000, &[(0, 1_000_000_000)]);
+        assert_eq!(r.pre_check(&at), RiskVerdict::Approved);
+        let over = basket(1_000_000_001, 100_000_000, &[(0, 1_000_000_001)]);
+        assert!(matches!(r.pre_check(&over), RiskVerdict::Rejected(_)));
+        // fill to exactly the bankroll across markets: approved at boundary
+        let mut c = cfg();
+        c.max_open_orders = 100;
+        let mut r = RiskEngine::new(c);
+        for m in 0..10u32 {
+            let b = basket(1_000_000_000, 100_000_000, &[(m, 1_000_000_000)]);
+            assert_eq!(r.pre_check(&b), RiskVerdict::Approved, "market {m}");
+            r.reserve(&b);
+        }
+        // bankroll fully consumed: even $1 more is rejected globally
+        let one = basket(1_000_000, 1_000_000, &[(10, 1_000_000)]);
+        assert_eq!(
+            r.pre_check(&one),
+            RiskVerdict::Rejected(RejectReason::Bankroll)
+        );
     }
 }
