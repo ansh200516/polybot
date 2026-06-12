@@ -1,0 +1,19 @@
+[package]
+name = "pm-engine"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pm-core.workspace = true
+highs.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "hot_path"
+harness = false

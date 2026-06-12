@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/engine", "crates/config"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+pm-core = { path = "crates/core" }
+highs = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+proptest = "1"
+criterion = "0.5"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[profile.release]
+overflow-checks = true

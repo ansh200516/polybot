@@ -1,0 +1,3 @@
+    Checking pm-core v0.1.0 (/Users/ansh.singh/test/crates/core)
+    Checking pm-engine v0.1.0 (/Users/ansh.singh/test/crates/engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.46s

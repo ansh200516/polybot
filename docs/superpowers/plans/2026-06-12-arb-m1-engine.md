@@ -988,6 +988,14 @@ git add -A && git commit -m "feat(engine): opportunity types and engine params"
 
 ### Task 7: `pm-engine::walker` — the sizing core
 
+> **AS-BUILT NOTE (2026-06-12, post-review):** the committed walker differs from
+> the code blocks below in four reviewed ways — ceil basis-cap accumulation
+> (the floor version below had a cap-blowthrough bug on fee-bearing tail
+> chunks, fixed in `ca98a7f`), an explicit `constrained` flag replacing the
+> `u64::MAX` sentinel, a 1 µUSDC sawtooth tolerance in the optimality
+> proptest, and an added fee-bearing cap test. `crates/engine/src/walker.rs`
+> is authoritative.
+
 **Files:**
 - Modify: `crates/engine/src/walker.rs`
 
@@ -1799,7 +1807,7 @@ pub fn detect(
     p: &EngineParams,
 ) -> Vec<Opportunity> {
     let mut out = Vec::new();
-    if !part.verified_exhaustive || part.yes_tokens.len() < 2 {
+    if !part.verified_exhaustive || !part.is_well_formed() {
         return out;
     }
     let n = part.yes_tokens.len() as u64;
@@ -2393,6 +2401,7 @@ fn consistent(spec: &ComponentSpec, yes_true: &[bool]) -> bool {
 /// Enumerate relationship-consistent worlds. None ⇒ pre-prune product
 /// exceeds `max_worlds` (caller skips the component).
 pub fn enumerate_worlds(spec: &ComponentSpec, max_worlds: usize) -> Option<Vec<World>> {
+    debug_assert!(spec.partitions.iter().all(Partition::is_well_formed));
     let m = spec.markets.len();
     // Which markets belong to a partition (index into partitions) vs free.
     let mut owner: Vec<Option<usize>> = vec![None; m];
