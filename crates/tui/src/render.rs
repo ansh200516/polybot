@@ -88,18 +88,16 @@ fn draw_header(f: &mut Frame, s: &AppState, area: Rect) {
         spans.push(Span::styled(
             " KILLED ",
             Style::default()
-                .fg(Color::White)
-                .bg(Color::Red)
-                .add_modifier(Modifier::REVERSED),
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw("  "));
     } else if let Some(ref reason) = s.halted {
         spans.push(Span::styled(
             format!(" HALT:{reason} "),
             Style::default()
-                .fg(Color::White)
-                .bg(Color::Red)
-                .add_modifier(Modifier::REVERSED),
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw("  "));
     } else if s.paused {
