@@ -1,1 +1,3 @@
-// modules land in later M2 tasks
+//! Read-only Polymarket ingestion: REST/WS clients, live books, registry sync.
+
+pub mod decimal;
