@@ -54,6 +54,8 @@ pub trait BookSource: Send {
 
 /// Venue abstraction (spec §14). LiveVenue arrives in M5 with identical
 /// semantics to the caller.
+///
+/// M5 notes: LiveVenue will need order-id correlation in SubmitOutcome, async fill reporting collapsed to a terminal outcome for FAK, and failure variants for split/merge.
 #[allow(async_fn_in_trait)]
 pub trait ExecutionVenue: Send {
     /// Fill-and-kill at the order's limit. Never blocks beyond venue latency.
@@ -156,6 +158,7 @@ impl<B: BookSource> ExecutionVenue for PaperVenue<B> {
         out
     }
 
+    // Complete-set collateral is always $1/share by construction; the market id is retained for the M5 LiveVenue trait shape.
     async fn split(&mut self, _market: MarketId, units: Qty) -> Result<Usdc, VenueError> {
         // $1 collateral per whole share; ceil for safety on sub-share dust.
         let collateral = buy_cost(ONE_SHARE_MICRO, units);
@@ -323,5 +326,47 @@ mod tests {
         assert_eq!(outs.len(), 2);
         assert_eq!(outs[0].as_ref().unwrap().filled, Qty(100_000_000));
         assert_eq!(outs[1].as_ref().unwrap().filled, Qty(100_000_000));
+    }
+
+    #[tokio::test]
+    async fn ask_exactly_at_limit_fills() {
+        let books = MapBooks(HashMap::from([(
+            TokenId(1),
+            cent_book(&[(46, 50_000_000)], &[(40, 1)]),
+        )]));
+        let mut v = PaperVenue::new(books, std::time::Duration::ZERO, gas());
+        let out = v.submit_fak(&buy(1, 46, 50_000_000)).await.unwrap();
+        assert_eq!(out.filled, Qty(50_000_000)); // <= is inclusive: exactly-at-limit fills
+    }
+
+    #[tokio::test]
+    async fn empty_side_book_fills_nothing_without_error() {
+        // book with bids only; buying finds no asks → zero fill, not an error
+        let books = MapBooks(HashMap::from([(
+            TokenId(1),
+            cent_book(&[], &[(40, 1_000_000)]),
+        )]));
+        let mut v = PaperVenue::new(books, std::time::Duration::ZERO, gas());
+        let out = v.submit_fak(&buy(1, 50, 1_000_000)).await.unwrap();
+        assert_eq!(out.filled, Qty(0));
+        assert!(out.fills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dust_sell_with_fee_can_have_negative_cash() {
+        // Honest venue: sell 1 µshare @ tick 1, fee 200 bps → proceeds floor 0,
+        // fee ceil 1 → cash = −1. Downstream ledgers must accept negative sell cash.
+        let books = MapBooks(HashMap::from([(
+            TokenId(1),
+            cent_book(&[(60, 1)], &[(1, 1_000_000)]),
+        )]));
+        let mut v = PaperVenue::new(books, std::time::Duration::ZERO, gas());
+        let mut o = buy(1, 1, 1);
+        o.action = Action::Sell;
+        o.fee_bps = Bps(200);
+        let out = v.submit_fak(&o).await.unwrap();
+        assert_eq!(out.filled, Qty(1));
+        assert_eq!(out.fills[0].cash.0, -1);
+        assert_eq!(out.fills[0].fee.0, 1);
     }
 }
