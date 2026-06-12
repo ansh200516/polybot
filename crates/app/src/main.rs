@@ -544,8 +544,17 @@ async fn main() {
             default_hook(info);
         }));
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
-        let mut terminal =
-            ratatui::Terminal::new(backend).unwrap_or_else(|e| fatal(format!("terminal: {e}")));
+        let mut terminal = match ratatui::Terminal::new(backend) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = crossterm::terminal::disable_raw_mode();
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::terminal::LeaveAlternateScreen
+                );
+                fatal(format!("terminal: {e}"));
+            }
+        };
 
         let key_rx = pm_tui::run::spawn_input_thread();
         let (cmd_tx, cmd_rx) = mpsc::channel::<pm_tui::state::TuiCommand>(8);
