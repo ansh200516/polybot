@@ -104,9 +104,8 @@ fn draw_header(f: &mut Frame, s: &AppState, area: Rect) {
         spans.push(Span::styled(
             " PAUSED ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::REVERSED),
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw("  "));
     }
@@ -246,9 +245,7 @@ pub fn draw(f: &mut Frame, s: &AppState, ui: &UiState) {
     draw_footer(f, footer_area);
 
     // Modal overlay (rendered last so it appears on top).
-    if ui.modal != Modal::None {
-        draw_modal(f, &ui.modal, full);
-    }
+    draw_modal(f, &ui.modal, full);
 }
 
 // ---------------------------------------------------------------------------

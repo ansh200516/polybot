@@ -71,6 +71,7 @@ pub struct AppState {
     pub paused: bool,
     pub halted: Option<String>,
     pub killed: bool,
+    /// Rendered by Task 5's busy indicator if needed; field published for completeness.
     pub busy: bool,
     pub cash_usd: f64,
     pub equity_usd: f64,     // bid-marked (conservative, durable)
