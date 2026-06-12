@@ -362,4 +362,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(ReadStore::open(&dir.path().join("absent.sqlite")).is_err());
     }
+
+    #[test]
+    fn recent_orders_serves_current_state_newest_first() {
+        let (_dir, path) = seeded();
+        // a second, newer order with NO events: must appear first, state Draft
+        let mut w = Store::open(&path).unwrap();
+        w.insert_order(&OrderRow {
+            id: "o2".into(),
+            ts_ms: 999,
+            fingerprint: "fp".into(),
+            token: 8,
+            action: "Sell".into(),
+            limit_ticks: 50,
+            tick_levels: 100,
+            qty_micro: 1_000_000,
+        })
+        .unwrap();
+        let r = ReadStore::open(&path).unwrap();
+        let orders = r.recent_orders(10).unwrap();
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[0].order_id, "o2");
+        assert_eq!(orders[0].state, "Draft"); // present immediately, before any events
+        assert_eq!(orders[1].order_id, "o1");
+        assert_eq!(orders[1].state, "Signed"); // current state, not the event history
+    }
 }
