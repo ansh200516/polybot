@@ -811,6 +811,7 @@ mod tests {
                 fee: Usdc(0),
             }],
             filled: qty,
+            venue_order_id: None,
         }
     }
 

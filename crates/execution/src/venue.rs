@@ -15,12 +15,20 @@ use crate::Order;
 #[derive(Debug)]
 pub enum VenueError {
     BookUnavailable(TokenId),
+    /// A live CLOB request failed: HTTP error (status + body) or a 200 response
+    /// with `success:false` (the venue's `errorMsg`). Live-only.
+    Live(String),
+    /// An operation the live venue does not support in this milestone
+    /// (split/merge on-chain ops are deferred). Live-only.
+    NotSupportedLive(&'static str),
 }
 
 impl std::fmt::Display for VenueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VenueError::BookUnavailable(t) => write!(f, "no live book for token {}", t.0),
+            VenueError::Live(e) => write!(f, "live venue error: {e}"),
+            VenueError::NotSupportedLive(op) => write!(f, "operation not supported live: {op}"),
         }
     }
 }
@@ -42,6 +50,8 @@ pub struct Fill {
 pub struct SubmitOutcome {
     pub fills: Vec<Fill>,
     pub filled: Qty,
+    /// Venue-assigned order id (CLOB `orderID`). Live only; `None` in paper.
+    pub venue_order_id: Option<String>,
 }
 
 /// Read access to current books. The app adapts the supervisor command
@@ -142,6 +152,7 @@ impl<B: BookSource> PaperVenue<B> {
         Ok(SubmitOutcome {
             filled: Qty(order.qty.0 - remaining),
             fills,
+            venue_order_id: None,
         })
     }
 }
