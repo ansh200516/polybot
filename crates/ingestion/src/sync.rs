@@ -261,12 +261,25 @@ pub fn events_keyset_envelope(body: &str) -> Result<Vec<GammaEvent>, IngestError
 
 /// Thin async wrapper that drives gamma keyset pagination, per-condition CLOB
 /// lookups, file-mtime-aware relationship reloads, and `watch::Sender` publication.
+///
+/// # Relationship file caching
+///
+/// The file contents are cached in `relationship_toml`.  [`sync_once`] calls
+/// [`maybe_reload_relationships`] on every cycle: if the mtime has changed (or
+/// this is the first call) the file is re-read and the cache is updated.  This
+/// avoids redundant disk reads on cycles where the file has not changed.
+///
+/// [`sync_once`]: SyncTask::sync_once
+/// [`maybe_reload_relationships`]: SyncTask::maybe_reload_relationships
 pub struct SyncTask {
     clob: ClobRest,
     gamma_base: String,
     http: reqwest::Client,
     relationships_path: PathBuf,
     last_mtime: Option<SystemTime>,
+    /// Cached contents of the relationships TOML file.  Populated on first call
+    /// to `sync_once` and refreshed whenever the file's mtime changes.
+    relationship_toml: String,
     filter: UniverseFilter,
     tx: tokio::sync::watch::Sender<Arc<pm_registry::Registry>>,
 }
@@ -290,6 +303,7 @@ impl SyncTask {
             http,
             relationships_path,
             last_mtime: None,
+            relationship_toml: String::new(),
             filter,
             tx,
         })
@@ -395,44 +409,65 @@ impl SyncTask {
         (by_condition, failures)
     }
 
-    /// Check whether the relationships file's mtime has changed.  Returns
-    /// `true` if the file was modified since the last call.
+    /// Check whether the relationships file's mtime has changed and, if so,
+    /// reload the file contents into `self.relationship_toml`.
+    ///
+    /// Returns `true` if the cache was refreshed (mtime changed or first call),
+    /// `false` if the file is unchanged.
+    ///
+    /// On the first call `last_mtime` is `None`, so the file is always read
+    /// regardless of its mtime.  On subsequent calls a re-read only occurs when
+    /// the OS-reported mtime differs from the value stored in `last_mtime`.
+    ///
+    /// I/O errors during the re-read are logged at `info` level and the cached
+    /// contents are reset to an empty string (equivalent to "no relationships").
     pub fn maybe_reload_relationships(&mut self) -> bool {
         let mtime = std::fs::metadata(&self.relationships_path)
             .and_then(|m| m.modified())
             .ok();
         if mtime != self.last_mtime {
             self.last_mtime = mtime;
+            self.relationship_toml = match std::fs::read_to_string(&self.relationships_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::info!(
+                        path = %self.relationships_path.display(),
+                        error = %e,
+                        "relationships file missing or unreadable; proceeding without relationships"
+                    );
+                    String::new()
+                }
+            };
             true
         } else {
             false
         }
     }
 
-    /// Read the current relationships file, returning `""` on any I/O error
-    /// (with a tracing info log).
-    fn read_relationships(&self) -> String {
-        match std::fs::read_to_string(&self.relationships_path) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::info!(
-                    path = %self.relationships_path.display(),
-                    error = %e,
-                    "relationships file missing or unreadable; proceeding without relationships"
-                );
-                String::new()
-            }
-        }
-    }
-
-    /// Full sync cycle: fetch gamma events, fetch CLOB metadata, read
-    /// relationships, assemble the registry, and publish via the watch sender.
+    /// Full sync cycle: fetch gamma events, fetch CLOB metadata, reload
+    /// relationships if the file's mtime changed, assemble the registry, and
+    /// publish via the watch sender.
+    ///
+    /// # Skip deduplication
+    ///
+    /// `fetch_clob_for` records a `ClobLookupFailed` entry for every condition
+    /// id whose CLOB HTTP request fails.  Those conditions are simply absent from
+    /// the resulting `clob_by_condition` map.  `assemble_registry` then
+    /// independently emits its own `ClobLookupFailed` entry for every condition
+    /// that is missing from that map.  The two sets are therefore identical: each
+    /// failed condition appears exactly once in `universe.skipped` because
+    /// `assemble_registry` is the sole recorder.  The failures vec returned by
+    /// `fetch_clob_for` is intentionally discarded here to avoid double-counting.
     pub async fn sync_once(&mut self) -> Result<AssembledUniverse, IngestError> {
         let events = self.fetch_gamma_events(50).await?;
+        // CLOB failures are dropped: assemble_registry will emit ClobLookupFailed
+        // for each condition absent from the map, covering the same set exactly.
         let (clob_by_condition, _clob_failures) = self.fetch_clob_for(&events).await;
-        let relationship_toml = self.read_relationships();
 
-        let universe = assemble_registry(&events, &clob_by_condition, &relationship_toml, &self.filter)
+        // Reload relationships from disk only when mtime has changed (or first call).
+        self.maybe_reload_relationships();
+
+        let universe = assemble_registry(&events, &clob_by_condition, &self.relationship_toml, &self.filter)
             .map_err(|e| IngestError::Parse(e.to_string()))?;
 
         let _ = self.tx.send(Arc::clone(&universe.registry));
@@ -453,17 +488,21 @@ mod tests {
 
     // ---- helpers ------------------------------------------------------------
 
-    /// Build a minimal ClobMarket via serde for a binary market.
-    fn make_clob(
-        condition_id: &str,
+    /// Parameters for [`make_clob`].
+    struct ClobSpec<'a> {
+        condition_id: &'a str,
         tick: f64,
         taker_fee: i64,
         active: bool,
         closed: bool,
         neg_risk: bool,
-        yes_token: &str,
-        no_token: &str,
-    ) -> ClobMarket {
+        yes_token: &'a str,
+        no_token: &'a str,
+    }
+
+    /// Build a minimal ClobMarket via serde for a binary market.
+    fn make_clob(spec: ClobSpec<'_>) -> ClobMarket {
+        let ClobSpec { condition_id, tick, taker_fee, active, closed, neg_risk, yes_token, no_token } = spec;
         let json = format!(
             r#"{{
                 "condition_id": {cid:?},
@@ -562,9 +601,9 @@ mod tests {
         ]);
 
         let mut clob = HashMap::new();
-        clob.insert("0xaaa".into(), make_clob("0xaaa", 0.01, 0, true, false, false, "ya", "na"));
-        clob.insert("0xbbb".into(), make_clob("0xbbb", 0.001, 200, true, false, true, "yb", "nb"));
-        clob.insert("0xccc".into(), make_clob("0xccc", 0.001, 0, true, false, true, "yc", "nc"));
+        clob.insert("0xaaa".into(), make_clob(ClobSpec { condition_id: "0xaaa", tick: 0.01, taker_fee: 0, active: true, closed: false, neg_risk: false, yes_token: "ya", no_token: "na" }));
+        clob.insert("0xbbb".into(), make_clob(ClobSpec { condition_id: "0xbbb", tick: 0.001, taker_fee: 200, active: true, closed: false, neg_risk: true, yes_token: "yb", no_token: "nb" }));
+        clob.insert("0xccc".into(), make_clob(ClobSpec { condition_id: "0xccc", tick: 0.001, taker_fee: 0, active: true, closed: false, neg_risk: true, yes_token: "yc", no_token: "nc" }));
 
         let events = vec![ev1, ev2];
         let universe = assemble_registry(&events, &clob, "", &UniverseFilter::default()).unwrap();
@@ -599,7 +638,7 @@ mod tests {
     fn skips_unsupported_tick_with_reason() {
         let ev = make_event("ev1", "0xbad", "y1", "n1", false, true);
         let mut clob = HashMap::new();
-        clob.insert("0xbad".into(), make_clob("0xbad", 0.04, 0, true, false, false, "y1", "n1"));
+        clob.insert("0xbad".into(), make_clob(ClobSpec { condition_id: "0xbad", tick: 0.04, taker_fee: 0, active: true, closed: false, neg_risk: false, yes_token: "y1", no_token: "n1" }));
 
         let universe =
             assemble_registry(&[ev], &clob, "", &UniverseFilter::default()).unwrap();
@@ -644,9 +683,9 @@ mod tests {
         let ev2 = make_event("ev2", "0xc", "yc", "nc", false, true);
 
         let mut clob = HashMap::new();
-        clob.insert("0xa".into(), make_clob("0xa", 0.01, 0, true, false, false, "ya", "na"));
-        clob.insert("0xb".into(), make_clob("0xb", 0.01, 0, true, false, false, "yb", "nb"));
-        clob.insert("0xc".into(), make_clob("0xc", 0.01, 0, true, false, false, "yc", "nc"));
+        clob.insert("0xa".into(), make_clob(ClobSpec { condition_id: "0xa", tick: 0.01, taker_fee: 0, active: true, closed: false, neg_risk: false, yes_token: "ya", no_token: "na" }));
+        clob.insert("0xb".into(), make_clob(ClobSpec { condition_id: "0xb", tick: 0.01, taker_fee: 0, active: true, closed: false, neg_risk: false, yes_token: "yb", no_token: "nb" }));
+        clob.insert("0xc".into(), make_clob(ClobSpec { condition_id: "0xc", tick: 0.01, taker_fee: 0, active: true, closed: false, neg_risk: false, yes_token: "yc", no_token: "nc" }));
 
         let filter = UniverseFilter { max_markets: 2, require_active: true };
         let universe = assemble_registry(&[ev1, ev2], &clob, "", &filter).unwrap();
@@ -664,11 +703,11 @@ mod tests {
         let ev = make_event("ev1", "0xclosed", "y", "n", false, true);
         let mut clob = HashMap::new();
         // closed=true → inactive under require_active
-        clob.insert("0xclosed".into(), make_clob("0xclosed", 0.01, 0, true, true, false, "y", "n"));
+        clob.insert("0xclosed".into(), make_clob(ClobSpec { condition_id: "0xclosed", tick: 0.01, taker_fee: 0, active: true, closed: true, neg_risk: false, yes_token: "y", no_token: "n" }));
 
         // require_active = true → skip
         let filter_strict = UniverseFilter { max_markets: 200, require_active: true };
-        let strict = assemble_registry(&[ev.clone()], &clob, "", &filter_strict).unwrap();
+        let strict = assemble_registry(std::slice::from_ref(&ev), &clob, "", &filter_strict).unwrap();
         assert_eq!(strict.registry.markets().len(), 0);
         assert_eq!(strict.skipped.len(), 1);
         assert_eq!(strict.skipped[0].1, SkippedReason::InactiveOrClosed);
@@ -707,7 +746,7 @@ mod tests {
                 };
                 clob_by_condition.insert(
                     gm.condition_id.clone(),
-                    make_clob(&gm.condition_id, 0.001, 0, true, false, gm.neg_risk, &yes_tok, &no_tok),
+                    make_clob(ClobSpec { condition_id: &gm.condition_id, tick: 0.001, taker_fee: 0, active: true, closed: false, neg_risk: gm.neg_risk, yes_token: &yes_tok, no_token: &no_tok }),
                 );
             }
         }
@@ -720,7 +759,7 @@ mod tests {
         ).unwrap();
 
         // At least some markets should have been assembled.
-        assert!(universe.registry.markets().len() > 0, "must have assembled at least one market");
+        assert!(!universe.registry.markets().is_empty(), "must have assembled at least one market");
 
         // The fixture contains negRisk events with only 1 member market each.
         // The partition derivation will record TooFewMembers exclusions.
@@ -787,6 +826,59 @@ mod tests {
         let (yes, no) = pick_yes_no(&tokens).unwrap();
         assert_eq!(yes, "spain_tok", "index 0 is yes for non-Yes/No labelled markets");
         assert_eq!(no, "not_spain_tok");
+    }
+
+    // ---- Test N: MissingTokens skipped at assemble level --------------------
+
+    /// A market whose CLOB tokens list has fewer than 2 entries (or empty
+    /// token_ids) must be recorded as [`SkippedReason::MissingTokens`] by
+    /// [`assemble_registry`], which delegates to [`pick_yes_no`].
+    #[test]
+    fn assemble_skips_market_with_missing_tokens() {
+        // Market with zero tokens in the CLOB record.
+        let ev_zero = make_event("ev_zero", "0xzero", "yt", "nt", false, true);
+        let clob_zero: ClobMarket = serde_json::from_str(r#"{
+            "condition_id": "0xzero",
+            "minimum_tick_size": 0.01,
+            "neg_risk": false,
+            "active": true,
+            "closed": false,
+            "maker_base_fee": 0,
+            "taker_base_fee": 0,
+            "tokens": []
+        }"#).unwrap();
+
+        // Market with only one token in the CLOB record.
+        let ev_one = make_event("ev_one", "0xone", "yt", "nt", false, true);
+        let clob_one: ClobMarket = serde_json::from_str(r#"{
+            "condition_id": "0xone",
+            "minimum_tick_size": 0.01,
+            "neg_risk": false,
+            "active": true,
+            "closed": false,
+            "maker_base_fee": 0,
+            "taker_base_fee": 0,
+            "tokens": [{"token_id": "only_tok", "outcome": "Yes", "price": 1.0, "winner": false}]
+        }"#).unwrap();
+
+        let mut clob = HashMap::new();
+        clob.insert("0xzero".to_string(), clob_zero);
+        clob.insert("0xone".to_string(), clob_one);
+
+        let universe = assemble_registry(
+            &[ev_zero, ev_one],
+            &clob,
+            "",
+            &UniverseFilter::default(),
+        ).unwrap();
+
+        assert_eq!(universe.registry.markets().len(), 0, "no market should be assembled");
+        assert_eq!(universe.skipped.len(), 2);
+        let reasons: Vec<SkippedReason> = universe.skipped.iter().map(|(_, r)| *r).collect();
+        assert!(
+            reasons.iter().all(|r| *r == SkippedReason::MissingTokens),
+            "both markets must be skipped as MissingTokens; got {reasons:?}"
+        );
     }
 
     #[test]
