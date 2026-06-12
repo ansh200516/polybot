@@ -478,9 +478,10 @@ impl Coordinator {
     }
 
     /// (bid marks, mid marks) per held token. Bid: conservative reporting.
-    /// Mid: (bid+ask)/2 floor — the drawdown-halt feed, immune to the
-    /// open-basket spread artifact (M3 live-run finding). Missing ask → bid;
-    /// missing book/bid → 0 for both.
+    /// Mid: (bid+ask)/2 floor, capped at bid + mid_spread_cap_ticks — the
+    /// drawdown-halt feed, immune to the open-basket spread artifact (M3
+    /// live-run finding) and to wide/stale asks delaying the halt. Missing
+    /// ask → bid; missing book/bid → 0 for both.
     async fn marks_pair(&self) -> (HashMap<TokenId, Usdc>, HashMap<TokenId, Usdc>) {
         let mut bid_marks = HashMap::new();
         let mut mid_marks = HashMap::new();
