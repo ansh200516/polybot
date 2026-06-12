@@ -81,12 +81,15 @@ pub struct ParsedChange {
     pub size_micro: u64,
 }
 
-/// Parsed `price_change` event. `asset_id` is the market (condition) identifier
-/// from the top-level `market` field; individual token IDs are on each `change`.
+/// Parsed `price_change` event.
+///
+/// `market_condition_id` is the market (condition) identifier from the top-level
+/// `market` field — it is **NEVER** a routing key. Route by `ParsedChange.asset_id`.
 #[derive(Debug)]
 pub struct PriceChangeEvent {
-    /// The market (condition) ID from the `market` field.
-    pub asset_id: String,
+    /// Market (condition) id from the frame's `market` field — NEVER a routing key;
+    /// route by `ParsedChange.asset_id`.
+    pub market_condition_id: String,
     /// Optional top-level hash (absent in observed fixtures).
     pub hash: Option<String>,
     /// One entry per changed price level, across all tokens in the market.
@@ -212,7 +215,7 @@ fn parse_one(v: &serde_json::Value) -> Result<WsEvent, IngestError> {
                 });
             }
 
-            Ok(WsEvent::PriceChange(PriceChangeEvent { asset_id, hash, changes }))
+            Ok(WsEvent::PriceChange(PriceChangeEvent { market_condition_id: asset_id, hash, changes }))
         }
         "tick_size_change" => {
             let asset_id = v
@@ -356,12 +359,29 @@ mod tests {
     fn parses_price_change_fixture() {
         let evs = parse_frame(&fixture("ws_price_change.json")).unwrap();
         let WsEvent::PriceChange(pc) = &evs[0] else { panic!("expected PriceChange") };
-        assert!(!pc.asset_id.is_empty());
+        // market field from the fixture is the condition id, not a token asset_id
+        assert_eq!(pc.market_condition_id, "0x7976b8dbacf9077eb1453a62bcefd6ab2df199acd28aad276ff0d920d6992892",
+            "market_condition_id must match the fixture's 'market' field exactly");
         assert!(!pc.changes.is_empty());
         for c in &pc.changes {
             assert!(c.price_micro > 0 && c.price_micro < 1_000_000);
         }
         assert!(pc.changes.iter().any(|c| c.side_buy) || pc.changes.iter().any(|c| !c.side_buy));
+    }
+
+    #[test]
+    fn unknown_side_fails() {
+        let frame = r#"{"event_type":"price_change","market":"mkt","price_changes":[{"asset_id":"1","price":"0.50","size":"100","side":"LEFT"}]}"#;
+        assert!(parse_frame(frame).is_err(), "unknown side value must return Err");
+    }
+
+    #[test]
+    fn size_zero_change_is_preserved() {
+        let frame = r#"{"event_type":"price_change","market":"mkt","price_changes":[{"asset_id":"1","price":"0.50","size":"0","side":"BUY"}]}"#;
+        let evs = parse_frame(frame).unwrap();
+        let WsEvent::PriceChange(pc) = &evs[0] else { panic!("expected PriceChange") };
+        assert_eq!(pc.changes.len(), 1);
+        assert_eq!(pc.changes[0].size_micro, 0, "size 0 must be preserved in ParsedChange (it signals level removal)");
     }
 
     #[test]
