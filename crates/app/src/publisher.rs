@@ -251,11 +251,14 @@ pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
         baskets_unwound: ctx.stats.baskets_unwound.load(Ordering::Relaxed),
         solver_queue: lp_jobs.saturating_sub(lp_solved),
         lp_solved,
+        live_rej: ctx.stats.live_rej.load(Ordering::Relaxed),
+        live_held: ctx.stats.live_held.load(Ordering::Relaxed),
     };
 
     AppState {
         uptime_s: ctx.start.elapsed().as_secs(),
         mode_paper: ctx.mode_paper,
+        live_released: status.live_released,
         paused: status.paused,
         halted: status.halted,
         killed: status.killed,
@@ -548,6 +551,57 @@ mod tests {
         assert_eq!(state.orders[0].order_id_short, "0192abcd");
         assert!(state.log.iter().any(|(_, l)| l.contains("hello dashboard")));
         // _status_tx must outlive assemble (watch borrow); keep the binding.
+        drop(_status_tx);
+    }
+
+    /// live_released comes from CoordStatus; live_rej and live_held come from
+    /// AppStats — verify the publisher maps both correctly.
+    #[tokio::test]
+    async fn live_fields_map_from_status_and_stats() {
+        use pm_ingestion::stats::StatsCell;
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.sqlite");
+        let _ = pm_store::Store::open(&path).unwrap();
+        let read = pm_store::read::ReadStore::open(&path).unwrap();
+
+        let stats = crate::stats::AppStats::new();
+        stats.live_rej.store(5, Ordering::Relaxed);
+        stats.live_held.store(3, Ordering::Relaxed);
+
+        let logbuf = crate::logbuf::LogBuffer::new(10);
+        let r = reg();
+        let fetcher = crate::wiring::BookFetcher::new(std::collections::HashMap::new());
+
+        let (_status_tx, status_rx) =
+            tokio::sync::watch::channel(crate::coordinator::CoordStatus {
+                live: true,
+                live_released: true,
+                ..Default::default()
+            });
+
+        let mut ctx = PublisherCtx {
+            read,
+            stats,
+            cells: vec![StatsCell::new()],
+            status_rx,
+            registry: r,
+            logbuf,
+            fetcher,
+            feed_rows: 10,
+            fills_rows: 10,
+            log_lines: 10,
+            mode_paper: false,
+            start: std::time::Instant::now(),
+            last_frames: 0,
+            last_at: std::time::Instant::now(),
+        };
+
+        let state = assemble(&mut ctx).await;
+        assert!(state.live_released, "live_released must come from CoordStatus");
+        assert_eq!(state.health.live_rej, 5, "live_rej from AppStats");
+        assert_eq!(state.health.live_held, 3, "live_held from AppStats");
         drop(_status_tx);
     }
 }

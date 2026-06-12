@@ -69,6 +69,10 @@ pub struct Health {
     pub baskets_unwound: u64,
     pub solver_queue: u64,
     pub lp_solved: u64,
+    /// Baskets rejected by the live-mode gates (cap, min-leg, class filter).
+    pub live_rej: u64,
+    /// Baskets held because live_released is still false (pre-release shadow).
+    pub live_held: u64,
 }
 
 /// The full dashboard snapshot. Publisher assembles ~10 Hz.
@@ -76,6 +80,9 @@ pub struct Health {
 pub struct AppState {
     pub uptime_s: u64,
     pub mode_paper: bool,
+    /// True once the operator has typed-confirmed the live toggle (TUI `l`).
+    /// In live mode, controls whether the header badge shows LIVE·HELD or LIVE.
+    pub live_released: bool,
     pub paused: bool,
     pub halted: Option<String>,
     pub killed: bool,

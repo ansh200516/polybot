@@ -65,19 +65,23 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 // ---------------------------------------------------------------------------
 
 fn draw_header(f: &mut Frame, s: &AppState, area: Rect) {
-    let mode_badge = if s.mode_paper { "PAPER" } else { "LIVE" };
+    let (mode_badge, badge_bg) = if s.mode_paper {
+        (" PAPER ", Color::Yellow)
+    } else if !s.live_released {
+        // Armed but held: latch not yet released — yellow warning chrome.
+        (" LIVE\u{00b7}HELD ", Color::Yellow)
+    } else {
+        // Release confirmed — this is the genuinely dangerous live state.
+        (" LIVE ", Color::Red)
+    };
     let uptime_str = fmt_uptime(s.uptime_s);
 
     let mut spans: Vec<Span> = vec![
         Span::styled(
-            format!(" {mode_badge} "),
+            mode_badge,
             Style::default()
                 .fg(Color::Black)
-                .bg(if s.mode_paper {
-                    Color::Yellow
-                } else {
-                    Color::Cyan
-                })
+                .bg(badge_bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!("  up {uptime_str}  ")),
@@ -285,7 +289,7 @@ fn draw_fills_orders(f: &mut Frame, s: &AppState, area: Rect) {
 fn draw_health(f: &mut Frame, s: &AppState, area: Rect) {
     let h = &s.health;
     let ws_label = if h.ws_connected { "WS up" } else { "WS DOWN" };
-    let text = format!(
+    let mut text = format!(
         "{ws_label}  feeds {feeds_up}/{feeds_total}  oldest {oldest}s  books {books}  stale {stale}  reconnects {reconnects}\n\
          frames {frames}  {fps:.1}/s  parse_err {parse_err}\n\
          detect µs p50/p99 {dp50}/{dp99}\n\
@@ -315,6 +319,9 @@ fn draw_health(f: &mut Frame, s: &AppState, area: Rect) {
         queue = h.solver_queue,
         solved = h.lp_solved,
     );
+    if !s.mode_paper {
+        text.push_str(&format!("\nlive_rej {}  held {}", h.live_rej, h.live_held));
+    }
     let block = Block::default().borders(Borders::ALL).title(" Health ");
     let para = Paragraph::new(text).block(block);
     f.render_widget(para, area);
@@ -648,6 +655,8 @@ mod tests {
                 baskets_unwound: 1,
                 solver_queue: 2,
                 lp_solved: 311,
+                live_rej: 0,
+                live_held: 0,
             },
             log: vec![
                 (2, "WARN risk halt: DailyDrawdown".into()),
@@ -770,5 +779,35 @@ mod tests {
     #[test]
     fn standard_80x24_renders_without_panic() {
         let _ = render_to_text(&sample_state(), &UiState::default(), 80, 24);
+    }
+
+    #[test]
+    fn live_badge_shows_held_until_released() {
+        let mut s = AppState { mode_paper: false, live_released: false, ..Default::default() };
+        let text = render_to_text(&s, &UiState::default(), 140, 40);
+        assert!(text.contains("LIVE·HELD"), "armed-but-held badge:\n{text}");
+        s.live_released = true;
+        let text = render_to_text(&s, &UiState::default(), 140, 40);
+        assert!(text.contains("LIVE") && !text.contains("LIVE·HELD"));
+    }
+
+    #[test]
+    fn health_panel_shows_live_counters_in_live_mode() {
+        let mut s = AppState { mode_paper: false, ..Default::default() };
+        s.health.live_rej = 3;
+        s.health.live_held = 2;
+        let text = render_to_text(&s, &UiState::default(), 140, 40);
+        assert!(text.contains("live_rej 3"), "{text}");
+        assert!(text.contains("held 2"), "{text}");
+        let p = AppState { mode_paper: true, ..Default::default() };
+        let text = render_to_text(&p, &UiState::default(), 140, 40);
+        assert!(!text.contains("live_rej"), "no dead chrome in paper mode");
+    }
+
+    #[test]
+    fn session_loss_halt_badge_renders() {
+        let s = AppState { mode_paper: false, live_released: true, halted: Some("SessionLoss".into()), ..Default::default() };
+        let text = render_to_text(&s, &UiState::default(), 140, 40);
+        assert!(text.contains("SessionLoss"), "{text}");
     }
 }
