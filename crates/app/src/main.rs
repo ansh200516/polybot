@@ -16,7 +16,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use pm_app::coordinator::{Coordinator, now_ms, run_execution};
 use pm_app::detector::Detector;
@@ -137,9 +137,11 @@ async fn main() {
     // ---- config load + validate + CLI overrides ----------------------------
     let mut config = match &args.config_path {
         Some(path) => {
-            let src = std::fs::read_to_string(path)
-                .unwrap_or_else(|e| fatal(format!("failed to read config {}: {e}", path.display())));
-            Config::from_toml_str(&src).unwrap_or_else(|e| fatal(format!("config parse failed: {e}")))
+            let src = std::fs::read_to_string(path).unwrap_or_else(|e| {
+                fatal(format!("failed to read config {}: {e}", path.display()))
+            });
+            Config::from_toml_str(&src)
+                .unwrap_or_else(|e| fatal(format!("config parse failed: {e}")))
         }
         None => Config::default(),
     };
@@ -164,10 +166,7 @@ async fn main() {
     let starts = store
         .record_session_start(now_ms(), session_window_ms)
         .unwrap_or_else(|e| fatal(format!("record_session_start: {e}")));
-    info!(
-        session_starts_in_window = starts,
-        "session start recorded"
-    );
+    info!(session_starts_in_window = starts, "session start recorded");
 
     // Reconcile any orders left open by a previous crashed session.
     let open = store
@@ -219,8 +218,11 @@ async fn main() {
     // the supervisors / detectors that capture it.
     let reg = Arc::clone(&universe.registry);
 
-    let component_ids: std::collections::HashSet<_> =
-        reg.markets().iter().map(|m| reg.component_of(m.id)).collect();
+    let component_ids: std::collections::HashSet<_> = reg
+        .markets()
+        .iter()
+        .map(|m| reg.component_of(m.id))
+        .collect();
     info!(
         markets = reg.markets().len(),
         tokens = reg.all_tokens().len(),
@@ -445,6 +447,7 @@ async fn main() {
 
     // ---- kill watch ---------------------------------------------------------
     let kill_handle = spawn_kill_watch(PathBuf::from(&config.risk.kill_file), Arc::clone(&kill));
+    info!(kill_file = %config.risk.kill_file, "kill switch sentinel path (resolved relative to cwd)");
 
     // RestartStorm at startup: a halt was logged synchronously by
     // note_session_starts. Detect by re-checking the restart count vs config.
@@ -459,24 +462,33 @@ async fn main() {
     }
 
     // ---- main loop ----------------------------------------------------------
+    // Two independent intervals:
+    //   * 1s arm — checks kill flag and duration-elapsed; effective resolution
+    //     is ~1s (1s watcher poll + 1s loop poll), so --duration-secs values as
+    //     small as 1s are honoured correctly in smoke tests.
+    //   * 10s arm — purely for periodic status logging; no kill/duration logic.
     let start = Instant::now();
     let duration = Duration::from_secs(args.duration_secs);
     let run_forever = args.duration_secs == 0;
     let mut ticker = tokio::time::interval(Duration::from_secs(10));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut poll = tokio::time::interval(Duration::from_secs(1));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let trigger;
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
-                log_stats(&stats, &stat_cells, start.elapsed());
-                if !run_forever && start.elapsed() >= duration {
-                    trigger = "duration";
-                    break;
-                }
+            _ = poll.tick() => {
                 if kill.load(Ordering::Acquire) {
                     trigger = "kill";
                     break;
                 }
+                if !run_forever && start.elapsed() >= duration {
+                    trigger = "duration";
+                    break;
+                }
+            }
+            _ = ticker.tick() => {
+                log_stats(&stats, &stat_cells, start.elapsed());
             }
             _ = tokio::signal::ctrl_c() => {
                 trigger = "ctrl_c";
@@ -484,7 +496,11 @@ async fn main() {
             }
         }
     }
-    info!(trigger, elapsed_s = start.elapsed().as_secs(), "shutdown initiated");
+    info!(
+        trigger,
+        elapsed_s = start.elapsed().as_secs(),
+        "shutdown initiated"
+    );
 
     // ---- shutdown cascade ---------------------------------------------------
     shutdown.store(true, Ordering::Release);
@@ -499,9 +515,15 @@ async fn main() {
     // Supervisors dropped → detectors dropped → opp/lp senders close → LP pool
     // exits → its opp_tx clone drops → coordinator's opp_rx closes → drains.
     let _ = lp_handle.await;
-    let summary = match coord_handle.await {
-        Ok(s) => s,
-        Err(e) => fatal(format!("coordinator task join: {e}")),
+    // On coordinator panic: log the error but do NOT exit immediately — continue
+    // the shutdown sequence so the writer flushes and the store is cleanly closed.
+    // Treat coordinator panic as unhealthy (exit 2 at the end).
+    let coord_summary = match coord_handle.await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            error!(error = %e, "coordinator task panicked; continuing shutdown to flush writer");
+            None
+        }
     };
     // Coordinator dropped exec_tx → execution task's rx closes → it ends.
     let _ = exec_handle.await;
@@ -521,12 +543,15 @@ async fn main() {
     let halts = store.count_halts().unwrap_or(0);
     let write_errors = store.write_errors;
 
-    info!(
-        cash_micro = summary.cash.0,
-        equity_micro = summary.equity.0,
-        open_positions = summary.open_positions,
-        "session summary"
-    );
+    match &coord_summary {
+        Some(summary) => info!(
+            cash_micro = summary.cash.0,
+            equity_micro = summary.equity.0,
+            open_positions = summary.open_positions,
+            "session summary"
+        ),
+        None => info!("session summary: coordinator panicked — no position data available"),
+    }
     info!(
         realized_micro = realized,
         opportunities, fills, halts, write_errors, "session counts"
@@ -534,7 +559,8 @@ async fn main() {
     info!("FINAL stats: {}", stats.line());
     info!(duration_s = start.elapsed().as_secs(), "session ended");
 
-    let healthy = write_errors == 0 && !restart_storm && supervisors_started > 0;
+    let coord_panicked = coord_summary.is_none();
+    let healthy = write_errors == 0 && !restart_storm && supervisors_started > 0 && !coord_panicked;
     info!(healthy, "arb session result");
     if healthy {
         std::process::exit(0);
@@ -555,7 +581,10 @@ fn log_stats(stats: &AppStats, cells: &[Arc<StatsCell>], elapsed: Duration) {
     }
     info!(
         elapsed_s = elapsed.as_secs(),
-        books, frames, reconnects, "{}",
+        books,
+        frames,
+        reconnects,
+        "{}",
         stats.line()
     );
 }
