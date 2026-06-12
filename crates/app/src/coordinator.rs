@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pm_config::{Config, ConfigError};
 use pm_core::instrument::{MarketId, TokenId};
-use pm_core::num::{Bps, Usdc, sell_proceeds};
+use pm_core::num::{Bps, Qty, Usdc, sell_proceeds};
 use pm_engine::dedup::Cooldown;
 use pm_engine::{Action, EngineParams, Opportunity};
 use pm_execution::basket::{BasketOutcome, BasketReport, ExecParams};
@@ -48,6 +48,9 @@ pub struct CoordinatorSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CtlCommand {
     SetPaused(bool),
+    /// Release the live-dispatch latch (TUI `l` modal, post typed-confirm).
+    /// Idempotent and one-way: real orders flow from here on.
+    ReleaseLive,
 }
 
 /// Coordinator-owned state the dashboard needs, published on every change
@@ -58,6 +61,8 @@ pub struct CoordStatus {
     pub halted: Option<String>,
     pub killed: bool,
     pub busy: bool,
+    pub live: bool,
+    pub live_released: bool,
     pub cash_micro: i64,
     pub equity_micro: i64,     // bid-marked (reporting)
     pub equity_mid_micro: i64, // mid-marked (risk/halt feed)
@@ -118,6 +123,19 @@ pub fn basket_check(opp: &Opportunity, token_market: &HashMap<TokenId, MarketId>
     }
 }
 
+/// Live-mode dispatch parameters (spec 2026-06-13 §Mode ladder & live gates).
+#[derive(Debug, Clone, Copy)]
+pub struct LiveParams {
+    pub live: bool,
+    /// Headless live (post typed-confirm) and shadow start released; TUI live
+    /// starts held until the `l` modal's typed confirmation.
+    pub released_at_start: bool,
+    /// Canary per-basket basis cap, µUSDC.
+    pub basket_cap: Usdc,
+    /// Venue minimum per leg, µshares (RECON: 5 shares).
+    pub min_leg: Qty,
+}
+
 pub struct Coordinator {
     risk: RiskEngine,
     cooldown: Cooldown,
@@ -137,6 +155,11 @@ pub struct Coordinator {
     pnl_interval: Duration,
     dispatch_enabled: bool,
     mid_spread_cap_ticks: u16,
+
+    live: bool,
+    live_released: bool,
+    live_basket_cap: Usdc,
+    live_min_leg: Qty,
 
     busy: bool,
     in_flight: Option<BasketCheck>,
@@ -164,6 +187,7 @@ impl Coordinator {
         store_tx: mpsc::Sender<StoreMsg>,
         kill: Arc<AtomicBool>,
         stats: Arc<AppStats>,
+        live: LiveParams,
     ) -> Result<Self, ConfigError> {
         let cooldown = Cooldown::new(
             Duration::from_millis(params.cooldown_ms),
@@ -183,10 +207,14 @@ impl Coordinator {
             stats,
             max_age: Duration::from_millis(cfg.risk.max_opportunity_age_ms),
             pnl_interval: Duration::from_secs(10),
-            // Paper mode still dispatches (to PaperVenue); flag reserved for a
-            // future dry-run toggle. Wired to mode.paper for explicitness.
-            dispatch_enabled: cfg.mode.paper,
+            // Both modes dispatch; pause/halt/kill and the live release latch are
+            // the gates (mode.paper here silently disabled live dispatch).
+            dispatch_enabled: true,
             mid_spread_cap_ticks: cfg.risk.mid_spread_cap_ticks,
+            live: live.live,
+            live_released: live.released_at_start,
+            live_basket_cap: live.basket_cap,
+            live_min_leg: live.min_leg,
             busy: false,
             in_flight: None,
             report_closed: false,
@@ -229,6 +257,12 @@ impl Coordinator {
                 self.risk.set_paused(p);
                 info!("control: paused={p}");
             }
+            CtlCommand::ReleaseLive => {
+                if self.live && !self.live_released {
+                    self.live_released = true;
+                    warn!("LIVE DISPATCH RELEASED — real orders from here on");
+                }
+            }
         }
         self.publish_status();
     }
@@ -240,6 +274,8 @@ impl Coordinator {
         self.last_status.halted = self.risk.halted().map(|h| format!("{h:?}"));
         self.last_status.killed = self.risk.is_killed();
         self.last_status.busy = self.busy;
+        self.last_status.live = self.live;
+        self.last_status.live_released = self.live_released;
         self.last_status.open_positions = self.positions.holdings().len();
         if let Some(tx) = &self.status_tx {
             let _ = tx.send(self.last_status.clone());
@@ -328,6 +364,37 @@ impl Coordinator {
         self.stats.admitted.fetch_add(1, Relaxed);
 
         let check = basket_check(&d.opp, &self.token_market);
+
+        // Live-mode gates (spec §Mode ladder & live gates): run after cooldown
+        // admit and before the risk pre-check, mirroring the cooldown reject's
+        // early return — a gated basket is filtered before risk and writes no
+        // store row, exactly like a cooldown-suppressed opp.
+        if self.live {
+            if !self.live_released {
+                self.stats.live_held.fetch_add(1, Relaxed);
+                return; // held, not rejected: dispatch released later via the modal
+            }
+            let pure_buy =
+                d.opp.fills.iter().all(|f| f.action == Action::Buy) && d.opp.splits.is_empty();
+            if !pure_buy {
+                self.stats.live_rej.fetch_add(1, Relaxed);
+                info!(class = ?d.opp.class, "live: rejected non-pure-buy basket (sell/split classes are M6)");
+                return;
+            }
+            if check.total_cost.0 > self.live_basket_cap.0 {
+                self.stats.live_rej.fetch_add(1, Relaxed);
+                info!(cost = check.total_cost.0, cap = self.live_basket_cap.0, "live: basket over canary cap");
+                return;
+            }
+            // Venue minimum per leg (RECON-pinned 5 SHARES): a leg the venue would
+            // reject kills the whole basket — never resize upward.
+            if d.opp.fills.iter().any(|f| f.qty.0 < self.live_min_leg.0) {
+                self.stats.live_rej.fetch_add(1, Relaxed);
+                info!("live: basket has a leg under the venue minimum");
+                return;
+            }
+        }
+
         let verdict = self.risk.pre_check(&check);
         let approved = matches!(verdict, RiskVerdict::Approved);
         // Direct flag check closes the one-iteration race between the watcher
@@ -522,6 +589,11 @@ impl Coordinator {
         if self.risk.update_equity(pnl_mid.equity).is_some() {
             self.maybe_log_halt().await;
         }
+        // Session-loss cap is BID-marked (conservative — trips sooner than mid);
+        // the drawdown halt above stays mid-marked.
+        if self.risk.update_session_pnl(pnl.equity).is_some() {
+            self.maybe_log_halt().await;
+        }
         let row = PnlRow {
             ts_ms: now_ms(),
             cash_micro: usdc_to_i64(pnl.cash).unwrap_or(i64::MAX),
@@ -622,6 +694,17 @@ mod tests {
         HashMap::from([(TokenId(1), MarketId(0)), (TokenId(2), MarketId(0))])
     }
 
+    /// Paper-inert live params: live disabled, all gates dormant. Mirrors the
+    /// value main.rs passes pre-Task-11.
+    fn inert_live() -> LiveParams {
+        LiveParams {
+            live: false,
+            released_at_start: true,
+            basket_cap: Usdc(0),
+            min_leg: Qty(0),
+        }
+    }
+
     /// C1Long: buy tok1@44¢ + buy tok2@50¢, 100 µshares, net 5_990_000,
     /// basis 94_000_000. Optionally nudge tok2's price for a distinct fingerprint.
     fn opp_fixture(tok2_px: u16) -> Opportunity {
@@ -662,7 +745,7 @@ mod tests {
         let cfg = Config::default();
         let coord = Coordinator::new(
             &cfg,
-            crate::wiring::risk_config(&cfg).unwrap(),
+            crate::wiring::risk_config(&cfg, None).unwrap(),
             crate::wiring::engine_params(&cfg).unwrap(),
             token_market(),
             BookFetcher::new(HashMap::new()),
@@ -672,6 +755,7 @@ mod tests {
             store_tx,
             Arc::clone(&kill),
             Arc::clone(&stats),
+            inert_live(),
         )
         .unwrap();
         let handle = tokio::spawn(coord.run());
@@ -871,7 +955,7 @@ mod tests {
 
         let coord = Coordinator::new(
             &cfg,
-            crate::wiring::risk_config(&cfg).unwrap(),
+            crate::wiring::risk_config(&cfg, None).unwrap(),
             crate::wiring::engine_params(&cfg).unwrap(),
             token_market(),
             BookFetcher::new(HashMap::new()),
@@ -881,6 +965,7 @@ mod tests {
             store_tx,
             Arc::clone(&kill),
             Arc::clone(&stats),
+            inert_live(),
         )
         .unwrap();
         let handle = tokio::spawn(coord.run());
@@ -974,6 +1059,7 @@ mod tests {
             store_tx,
             kill,
             Arc::clone(&stats),
+            inert_live(),
         )
         .unwrap();
         (coord, opp_tx, exec_rx, report_tx, store_rx, stats)
@@ -985,7 +1071,7 @@ mod tests {
         let (mut coord, opp_tx, mut exec_rx, _report_tx, _store_rx, stats) = build_coord(
             Arc::clone(&kill),
             BookFetcher::new(HashMap::new()),
-            crate::wiring::risk_config(&Config::default()).unwrap(),
+            crate::wiring::risk_config(&Config::default(), None).unwrap(),
         );
         let ctl = coord.control_channel(4);
         let handle = tokio::spawn(coord.run());
@@ -1038,7 +1124,7 @@ mod tests {
         let (mut coord, opp_tx, exec_rx, _report_tx, _store_rx, _stats) = build_coord(
             Arc::clone(&kill),
             BookFetcher::new(HashMap::new()),
-            crate::wiring::risk_config(&Config::default()).unwrap(),
+            crate::wiring::risk_config(&Config::default(), None).unwrap(),
         );
         let ctl = coord.control_channel(4);
         let mut status = coord.status_channel();
@@ -1087,7 +1173,7 @@ mod tests {
         let (mut coord, opp_tx, mut exec_rx, _report_tx, _store_rx, _stats) = build_coord(
             Arc::clone(&kill),
             BookFetcher::new(HashMap::new()),
-            crate::wiring::risk_config(&Config::default()).unwrap(),
+            crate::wiring::risk_config(&Config::default(), None).unwrap(),
         );
         let ctl = coord.control_channel(4);
         let mut status = coord.status_channel();
@@ -1150,7 +1236,7 @@ mod tests {
     #[tokio::test]
     async fn drawdown_halt_uses_mid_marks_not_bid_marks() {
         // bankroll $100, 2% → $2 drawdown trip.
-        let mut risk_cfg = crate::wiring::risk_config(&Config::default()).unwrap();
+        let mut risk_cfg = crate::wiring::risk_config(&Config::default(), None).unwrap();
         risk_cfg.bankroll = Usdc(100_000_000);
 
         // Scenario 1: bid 47 / ask 51 (spread 4 ticks ≤ cap 5; mid 49).
@@ -1212,6 +1298,345 @@ mod tests {
         assert!(saw_halt, "mid equity −$18 must trip the drawdown halt");
     }
 
+    // ---- M5 Task 10: live-mode dispatch gates ------------------------------
+
+    /// Build a live-configured coordinator, leaving ctl/status for the caller.
+    /// `mode_paper` lets a test exercise the latent-bug regression (mode.paper
+    /// = false must still dispatch).
+    #[allow(clippy::type_complexity)]
+    fn build_coord_live(
+        kill: Arc<AtomicBool>,
+        fetcher: BookFetcher,
+        risk_cfg: RiskConfig,
+        live: LiveParams,
+        mode_paper: bool,
+    ) -> (
+        Coordinator,
+        mpsc::Sender<DetectedOpp>,
+        mpsc::Receiver<ExecRequest>,
+        mpsc::Sender<ExecReport>,
+        mpsc::Receiver<StoreMsg>,
+        Arc<AppStats>,
+    ) {
+        let (opp_tx, opp_rx) = mpsc::channel(64);
+        let (exec_tx, exec_rx) = mpsc::channel(64);
+        let (report_tx, report_rx) = mpsc::channel(64);
+        let (store_tx, store_rx) = mpsc::channel(64);
+        let stats = AppStats::new();
+        let mut cfg = Config::default();
+        cfg.mode.paper = mode_paper;
+        let coord = Coordinator::new(
+            &cfg,
+            risk_cfg,
+            crate::wiring::engine_params(&cfg).unwrap(),
+            token_market(),
+            fetcher,
+            opp_rx,
+            exec_tx,
+            report_rx,
+            store_tx,
+            kill,
+            Arc::clone(&stats),
+            live,
+        )
+        .unwrap();
+        (coord, opp_tx, exec_rx, report_tx, store_rx, stats)
+    }
+
+    /// An all-buy opp with explicit per-leg ($) costs and qtys (µshares). Two
+    /// legs on the same market (MarketId(0)); total cost = leg0 + leg1.
+    fn buy_opp(leg0_cash: i128, q0: u64, leg1_cash: i128, q1: u64, tok2_px: u16) -> Opportunity {
+        let f1 = LegFill {
+            token: TokenId(1),
+            action: Action::Buy,
+            ts: TickSize::Cent,
+            limit_px: Px::new(44, TickSize::Cent).unwrap(),
+            qty: Qty(q0),
+            cash: Usdc(leg0_cash),
+        };
+        let f2 = LegFill {
+            token: TokenId(2),
+            action: Action::Buy,
+            ts: TickSize::Cent,
+            limit_px: Px::new(tok2_px, TickSize::Cent).unwrap(),
+            qty: Qty(q1),
+            cash: Usdc(leg1_cash),
+        };
+        Opportunity {
+            class: ArbClass::C1Long,
+            fills: vec![f1, f2],
+            units: Qty(q0.min(q1)),
+            net: Usdc(1_000_000),
+            basis: Usdc((leg0_cash.abs()) + (leg1_cash.abs())),
+            edge: Bps(637),
+            splits: vec![],
+        }
+    }
+
+    /// $8 all-buy basket (leg0 $5 / leg1 $3), both legs 20 shares — under the
+    /// $10 canary cap and over the 5-share venue minimum. `tok2_px` distinguishes
+    /// fingerprints across re-feeds (cooldown suppresses identical shapes).
+    fn buy_opp_8usd(tok2_px: u16) -> Opportunity {
+        buy_opp(-5_000_000, 20_000_000, -3_000_000, 20_000_000, tok2_px)
+    }
+
+    /// Standard canary LiveParams: $10 cap, 5-share minimum.
+    fn live_params(live: bool, released_at_start: bool) -> LiveParams {
+        LiveParams {
+            live,
+            released_at_start,
+            basket_cap: Usdc(10_000_000),
+            min_leg: Qty(5_000_000),
+        }
+    }
+
+    #[tokio::test]
+    async fn live_rejects_non_pure_buy_baskets() {
+        let kill = Arc::new(AtomicBool::new(false));
+        let (coord, opp_tx, mut exec_rx, _report_tx, _store_rx, stats) = build_coord_live(
+            Arc::clone(&kill),
+            BookFetcher::new(HashMap::new()),
+            crate::wiring::risk_config(&Config::default(), None).unwrap(),
+            live_params(true, true),
+            false,
+        );
+        let handle = tokio::spawn(coord.run());
+
+        // $8 basket but one leg is a Sell → not pure-buy → rejected.
+        let mut opp = buy_opp_8usd(50);
+        opp.fills[1].action = Action::Sell;
+        opp_tx
+            .send(DetectedOpp {
+                opp,
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            exec_rx.try_recv().is_err(),
+            "non-pure-buy basket must not dispatch in live mode"
+        );
+        assert_eq!(stats.live_rej.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.live_held.load(Ordering::Relaxed), 0);
+
+        drop(opp_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn live_rejects_baskets_over_canary_cap() {
+        let kill = Arc::new(AtomicBool::new(false));
+        let (coord, opp_tx, mut exec_rx, _report_tx, _store_rx, stats) = build_coord_live(
+            Arc::clone(&kill),
+            BookFetcher::new(HashMap::new()),
+            crate::wiring::risk_config(&Config::default(), None).unwrap(),
+            live_params(true, true),
+            false,
+        );
+        let handle = tokio::spawn(coord.run());
+
+        // $12 all-buy basket (leg0 $6 / leg1 $6) > $10 cap → rejected.
+        opp_tx
+            .send(DetectedOpp {
+                opp: buy_opp(-6_000_000, 20_000_000, -6_000_000, 20_000_000, 50),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            exec_rx.try_recv().is_err(),
+            "$12 basket over the $10 canary cap must not dispatch"
+        );
+        assert_eq!(stats.live_rej.load(Ordering::Relaxed), 1);
+
+        // $8 all-buy basket (distinct fingerprint) ≤ $10 cap → dispatched.
+        opp_tx
+            .send(DetectedOpp {
+                opp: buy_opp_8usd(49),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        let req = tokio::time::timeout(Duration::from_secs(2), exec_rx.recv())
+            .await
+            .expect("timeout waiting for $8 dispatch")
+            .expect("exec channel closed before dispatch");
+        assert_eq!(req.check.total_cost, Usdc(8_000_000));
+        assert_eq!(stats.dispatched.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.live_rej.load(Ordering::Relaxed), 1, "no extra reject");
+
+        drop(opp_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn live_rejects_baskets_with_a_leg_under_venue_minimum() {
+        let kill = Arc::new(AtomicBool::new(false));
+        let (coord, opp_tx, mut exec_rx, _report_tx, _store_rx, stats) = build_coord_live(
+            Arc::clone(&kill),
+            BookFetcher::new(HashMap::new()),
+            crate::wiring::risk_config(&Config::default(), None).unwrap(),
+            live_params(true, true), // min_leg = 5 shares
+            false,
+        );
+        let handle = tokio::spawn(coord.run());
+
+        // Leg qtys [3 sh, 20 sh]: 3 < 5-share minimum → whole basket rejected.
+        opp_tx
+            .send(DetectedOpp {
+                opp: buy_opp(-1_500_000, 3_000_000, -3_000_000, 20_000_000, 50),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            exec_rx.try_recv().is_err(),
+            "a leg under the venue minimum must kill the basket"
+        );
+        assert_eq!(stats.live_rej.load(Ordering::Relaxed), 1);
+
+        // Leg qtys [6 sh, 20 sh] (distinct fingerprint): both ≥ 5 → dispatched.
+        opp_tx
+            .send(DetectedOpp {
+                opp: buy_opp(-3_000_000, 6_000_000, -3_000_000, 20_000_000, 49),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        let req = tokio::time::timeout(Duration::from_secs(2), exec_rx.recv())
+            .await
+            .expect("timeout waiting for [6sh,20sh] dispatch")
+            .expect("exec channel closed before dispatch");
+        assert!(req.check.total_cost.0 > 0);
+        assert_eq!(stats.dispatched.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.live_rej.load(Ordering::Relaxed), 1, "no extra reject");
+
+        drop(opp_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn live_holds_dispatch_until_released() {
+        let kill = Arc::new(AtomicBool::new(false));
+        let (mut coord, opp_tx, mut exec_rx, _report_tx, _store_rx, stats) = build_coord_live(
+            Arc::clone(&kill),
+            BookFetcher::new(HashMap::new()),
+            crate::wiring::risk_config(&Config::default(), None).unwrap(),
+            live_params(true, false), // held at start
+            false,
+        );
+        let ctl = coord.control_channel(4);
+        let handle = tokio::spawn(coord.run());
+
+        // Held: an otherwise-dispatchable $8 basket is not dispatched, and it
+        // counts as held (NOT a reject).
+        opp_tx
+            .send(DetectedOpp {
+                opp: buy_opp_8usd(50),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            exec_rx.try_recv().is_err(),
+            "held live dispatch must not send before release"
+        );
+        assert_eq!(stats.live_held.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.live_rej.load(Ordering::Relaxed), 0, "held is not a reject");
+
+        // Release, then re-feed a FRESH-fingerprint equivalent opp → dispatched.
+        ctl.send(CtlCommand::ReleaseLive).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        opp_tx
+            .send(DetectedOpp {
+                opp: buy_opp_8usd(49),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        let req = tokio::time::timeout(Duration::from_secs(2), exec_rx.recv())
+            .await
+            .expect("timeout waiting for post-release dispatch")
+            .expect("exec channel closed before dispatch");
+        assert_eq!(req.check.total_cost, Usdc(8_000_000));
+        assert_eq!(stats.dispatched.load(Ordering::Relaxed), 1);
+
+        drop(ctl);
+        drop(opp_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn live_mode_still_dispatches_with_mode_paper_false() {
+        // Regression for the latent M4 bug: dispatch_enabled was wired to
+        // cfg.mode.paper, so live mode (mode.paper=false) never dispatched.
+        let kill = Arc::new(AtomicBool::new(false));
+        let (coord, opp_tx, mut exec_rx, _report_tx, _store_rx, stats) = build_coord_live(
+            Arc::clone(&kill),
+            BookFetcher::new(HashMap::new()),
+            crate::wiring::risk_config(&Config::default(), None).unwrap(),
+            live_params(true, true), // live + released
+            false,                   // mode.paper = false
+        );
+        let handle = tokio::spawn(coord.run());
+
+        opp_tx
+            .send(DetectedOpp {
+                opp: buy_opp_8usd(50),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        let req = tokio::time::timeout(Duration::from_secs(2), exec_rx.recv())
+            .await
+            .expect("timeout: live dispatch must work with mode.paper=false")
+            .expect("exec channel closed before dispatch");
+        assert_eq!(req.check.total_cost, Usdc(8_000_000));
+        assert_eq!(stats.dispatched.load(Ordering::Relaxed), 1);
+
+        drop(opp_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn session_loss_halt_reaches_status_string() {
+        // session_loss_cap $25, BID-marked. Position cost $50, bid mark $20 →
+        // bid equity −$30 ≤ −$25 → SessionLoss halt, visible on the status watch.
+        let mut risk_cfg = crate::wiring::risk_config(&Config::default(), None).unwrap();
+        risk_cfg.session_loss_cap = Some(Usdc(25_000_000));
+        // Loosen drawdown so SessionLoss is unambiguously the latched reason:
+        // bankroll huge → drawdown trip needs a far deeper loss than $30.
+        risk_cfg.bankroll = Usdc(1_000_000_000_000);
+
+        let kill = Arc::new(AtomicBool::new(false));
+        // bid 20 / ask 24 (Cent); 100 µshares held at $50 cost.
+        let (mut coord, _opp_tx, _exec_rx, _report_tx, _store_rx, _stats) = build_coord_live(
+            Arc::clone(&kill),
+            served_fetcher(20, 24),
+            risk_cfg,
+            live_params(false, true),
+            true,
+        );
+        coord.positions.apply(
+            &[(TokenId(1), Qty(100_000_000), Usdc(50_000_000))],
+            Usdc(-50_000_000),
+            &token_market(),
+        );
+
+        let status = coord.status_channel();
+        coord.snapshot_pnl().await;
+
+        assert_eq!(
+            status.borrow().halted,
+            Some("SessionLoss".to_string()),
+            "bid equity −$30 ≤ −$25 cap must latch SessionLoss into the status string"
+        );
+    }
+
     #[tokio::test]
     async fn mid_mark_is_clamped_to_bid_plus_spread_cap() {
         // Book: best bid 40, best ask 90 (Cent ticks) — raw mid would be 65.
@@ -1225,7 +1650,7 @@ mod tests {
         let (mut coord, _opp_tx, _exec_rx, _report_tx, _store_rx, _stats) = build_coord(
             Arc::clone(&kill),
             served_fetcher(40, 90),
-            crate::wiring::risk_config(&Config::default()).unwrap(),
+            crate::wiring::risk_config(&Config::default(), None).unwrap(),
         );
 
         coord.positions.apply(

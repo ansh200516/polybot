@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use pm_app::coordinator::{Coordinator, now_ms, run_execution};
+use pm_app::coordinator::{Coordinator, LiveParams, now_ms, run_execution};
 use pm_app::detector::Detector;
 use pm_app::kill::spawn_kill_watch;
 use pm_app::lp_pool::run_lp_pool;
@@ -310,7 +310,7 @@ async fn main() {
 
     // ---- wiring -------------------------------------------------------------
     let params = engine_params(&config).unwrap_or_else(|e| fatal(format!("engine_params: {e}")));
-    let risk_cfg = risk_config(&config).unwrap_or_else(|e| fatal(format!("risk_config: {e}")));
+    let risk_cfg = risk_config(&config, None).unwrap_or_else(|e| fatal(format!("risk_config: {e}")));
     let (token_market, market_tokens) = token_maps(&reg);
     let token_fee = fee_map(&reg);
     let index = Arc::new(build_component_index(&reg));
@@ -487,6 +487,13 @@ async fn main() {
         store_tx.clone(),
         Arc::clone(&kill),
         Arc::clone(&stats),
+        // Paper-inert until Task 11 wires the real live params from config.
+        LiveParams {
+            live: false,
+            released_at_start: true,
+            basket_cap: pm_core::num::Usdc(0),
+            min_leg: pm_core::num::Qty(0),
+        },
     )
     .unwrap_or_else(|e| fatal(format!("Coordinator::new: {e}")));
     coord.note_session_starts(starts);

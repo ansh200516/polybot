@@ -37,7 +37,10 @@ pub fn engine_params(cfg: &Config) -> Result<EngineParams, ConfigError> {
     })
 }
 
-pub fn risk_config(cfg: &Config) -> Result<RiskConfig, ConfigError> {
+pub fn risk_config(
+    cfg: &Config,
+    session_loss_cap: Option<Usdc>,
+) -> Result<RiskConfig, ConfigError> {
     Ok(RiskConfig {
         bankroll: Usdc(usd_to_microusdc(cfg.capital.bankroll_usd)?),
         per_market_cap: Usdc(usd_to_microusdc(cfg.capital.per_market_usd)?),
@@ -48,7 +51,7 @@ pub fn risk_config(cfg: &Config) -> Result<RiskConfig, ConfigError> {
         error_halt_count: cfg.risk.error_halt_count,
         error_halt_window: std::time::Duration::from_secs(cfg.risk.error_halt_window_s),
         restart_storm_count: cfg.risk.restart_storm_count,
-        session_loss_cap: None,
+        session_loss_cap,
     })
 }
 
@@ -269,7 +272,7 @@ mod tests {
     #[test]
     fn risk_config_reflects_locked_config() {
         let cfg = pm_config::Config::default();
-        let r = risk_config(&cfg).unwrap();
+        let r = risk_config(&cfg, None).unwrap();
         assert_eq!(r.bankroll, Usdc(10_000_000_000));
         assert_eq!(r.per_market_cap, Usdc(1_000_000_000));
         assert_eq!(r.max_unhedged, Usdc(200_000_000));

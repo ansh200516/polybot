@@ -27,6 +27,8 @@ pub struct AppStats {
     pub suppressed_busy: AtomicU64,
     pub expired_age: AtomicU64,
     pub rejected_risk: AtomicU64,
+    pub live_rej: AtomicU64,
+    pub live_held: AtomicU64,
     pub dispatched: AtomicU64,
     pub baskets_clean: AtomicU64,
     pub baskets_repaired: AtomicU64,
@@ -51,6 +53,8 @@ impl AppStats {
             suppressed_busy: AtomicU64::new(0),
             expired_age: AtomicU64::new(0),
             rejected_risk: AtomicU64::new(0),
+            live_rej: AtomicU64::new(0),
+            live_held: AtomicU64::new(0),
             dispatched: AtomicU64::new(0),
             baskets_clean: AtomicU64::new(0),
             baskets_repaired: AtomicU64::new(0),
@@ -90,7 +94,7 @@ impl AppStats {
              lp_skips={lp_skips} \
              lp_dropped_full={lp_dropped_full} \
              admitted={admitted} cool={cool} busy={busy} expired={expired} \
-             risk_rej={risk_rej} dispatched={dispatched} \
+             risk_rej={risk_rej} live_rej={live_rej} live_held={live_held} dispatched={dispatched} \
              baskets_clean={b_clean} repaired={b_rep} unwound={b_unw} nofill={b_nof} \
              exec_err={exec_err} \
              detect_p50={d_p50}µs detect_p99={d_p99}µs \
@@ -106,6 +110,8 @@ impl AppStats {
             busy = self.suppressed_busy.load(Ordering::Relaxed),
             expired = self.expired_age.load(Ordering::Relaxed),
             risk_rej = self.rejected_risk.load(Ordering::Relaxed),
+            live_rej = self.live_rej.load(Ordering::Relaxed),
+            live_held = self.live_held.load(Ordering::Relaxed),
             dispatched = self.dispatched.load(Ordering::Relaxed),
             b_clean = self.baskets_clean.load(Ordering::Relaxed),
             b_rep = self.baskets_repaired.load(Ordering::Relaxed),
@@ -135,6 +141,8 @@ impl Default for AppStats {
             suppressed_busy: AtomicU64::new(0),
             expired_age: AtomicU64::new(0),
             rejected_risk: AtomicU64::new(0),
+            live_rej: AtomicU64::new(0),
+            live_held: AtomicU64::new(0),
             dispatched: AtomicU64::new(0),
             baskets_clean: AtomicU64::new(0),
             baskets_repaired: AtomicU64::new(0),

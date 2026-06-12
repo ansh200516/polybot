@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use pm_app::coordinator::{Coordinator, run_execution};
+use pm_app::coordinator::{Coordinator, LiveParams, run_execution};
 use pm_app::detector::Detector;
 use pm_app::lp_pool::run_lp_pool;
 use pm_app::stats::AppStats;
@@ -142,7 +142,7 @@ async fn run_e2e() {
 
     // ---- 3. Wiring derivations --------------------------------------------
     let params = engine_params(&cfg).expect("engine_params");
-    let risk_cfg = risk_config(&cfg).expect("risk_config");
+    let risk_cfg = risk_config(&cfg, None).expect("risk_config");
     let (token_market, market_tokens) = token_maps(&reg);
     let token_fee = fee_map(&reg);
     let index = Arc::new(build_component_index(&reg));
@@ -273,6 +273,12 @@ async fn run_e2e() {
         store_tx.clone(),
         Arc::clone(&kill),
         Arc::clone(&stats),
+        LiveParams {
+            live: false,
+            released_at_start: true,
+            basket_cap: Usdc(0),
+            min_leg: pm_core::num::Qty(0),
+        },
     )
     .expect("coordinator new");
     let coord_handle = tokio::spawn(coord.run());
