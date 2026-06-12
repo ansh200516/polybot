@@ -22,6 +22,10 @@ pub struct RiskConfig {
     /// Threshold only — the storm WINDOW is applied by the store's session-start
     /// query; see note_session_starts_in_window.
     pub restart_storm_count: u32,
+    /// Live canary: latched dispatch halt when bid-marked session P&L
+    /// (realized + unrealized, µUSDC) drops to −cap or lower. `None` disables
+    /// (paper sessions). Spec 2026-06-13 §Mode ladder & live gates.
+    pub session_loss_cap: Option<Usdc>,
 }
 
 /// Plain-data view of a basket for risk checks.
@@ -41,6 +45,7 @@ pub enum HaltReason {
     DailyDrawdown,
     ConsecutiveErrors,
     RestartStorm,
+    SessionLoss,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +212,19 @@ impl RiskEngine {
         self.halted
     }
 
+    /// Update bid-marked session P&L (µUSDC, 0 at session start). Trips the
+    /// latched SessionLoss halt at −cap. First halt wins: an existing halt
+    /// reason is never rewritten (halts are sticky, spec §15).
+    pub fn update_session_pnl(&mut self, pnl: Usdc) -> Option<HaltReason> {
+        if let Some(cap) = self.cfg.session_loss_cap
+            && self.halted.is_none()
+            && pnl.0 <= -cap.0
+        {
+            self.halted = Some(HaltReason::SessionLoss);
+        }
+        self.halted
+    }
+
     /// Feed the store-derived count of session starts inside the storm window
     /// (spec §15 restart-storm detector → trips at startup). The window itself
     /// is applied by the store's session-start query (`record_session_start`);
@@ -239,7 +257,12 @@ mod tests {
             error_halt_count: 3,
             error_halt_window: Duration::from_secs(60),
             restart_storm_count: 5,
+            session_loss_cap: None,
         }
+    }
+
+    fn test_cfg() -> RiskConfig {
+        cfg()
     }
 
     fn basket(total: i128, max_leg: i128, markets: &[(u32, i128)]) -> BasketCheck {
@@ -447,6 +470,46 @@ mod tests {
         assert_eq!(
             r.note_session_starts_in_window(5),
             Some(HaltReason::RestartStorm)
+        );
+    }
+
+    #[test]
+    fn session_loss_halts_at_cap_and_latches() {
+        let mut cfg = test_cfg();
+        cfg.session_loss_cap = Some(Usdc(25_000_000)); // $25
+        let mut r = RiskEngine::new(cfg);
+        assert_eq!(r.update_session_pnl(Usdc(-24_999_999)), None);
+        assert_eq!(
+            r.update_session_pnl(Usdc(-25_000_000)),
+            Some(HaltReason::SessionLoss)
+        );
+        // Latched: recovery does not clear it (sticky like every other halt).
+        assert_eq!(
+            r.update_session_pnl(Usdc(0)),
+            Some(HaltReason::SessionLoss)
+        );
+        assert_eq!(r.halted(), Some(HaltReason::SessionLoss));
+    }
+
+    #[test]
+    fn session_loss_disabled_when_cap_none() {
+        let mut r = RiskEngine::new(test_cfg()); // session_loss_cap: None
+        assert_eq!(r.update_session_pnl(Usdc(-1_000_000_000)), None);
+        assert_eq!(r.halted(), None);
+    }
+
+    #[test]
+    fn session_loss_does_not_overwrite_existing_halt() {
+        let mut cfg = test_cfg();
+        cfg.session_loss_cap = Some(Usdc(25_000_000));
+        cfg.daily_drawdown_bps = 1; // trip drawdown first
+        let mut r = RiskEngine::new(cfg);
+        r.update_equity(Usdc(10_000_000));
+        assert_eq!(r.update_equity(Usdc(-10_000_000)), Some(HaltReason::DailyDrawdown));
+        assert_eq!(
+            r.update_session_pnl(Usdc(-30_000_000)),
+            Some(HaltReason::DailyDrawdown),
+            "first halt wins; reason is not rewritten"
         );
     }
 

@@ -48,6 +48,7 @@ pub fn risk_config(cfg: &Config) -> Result<RiskConfig, ConfigError> {
         error_halt_count: cfg.risk.error_halt_count,
         error_halt_window: std::time::Duration::from_secs(cfg.risk.error_halt_window_s),
         restart_storm_count: cfg.risk.restart_storm_count,
+        session_loss_cap: None,
     })
 }
 
