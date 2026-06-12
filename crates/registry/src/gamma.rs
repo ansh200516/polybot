@@ -38,6 +38,7 @@ pub enum GammaError {
 #[serde(rename_all = "camelCase")]
 pub struct GammaMarket {
     #[serde(default)]
+    /// May be "" for legacy markets (real entries in the committed fixture). Sync must not key a map on it without filtering empties.
     pub condition_id: String,
     /// Raw stringified JSON array, e.g. `"[\"1234\", \"5678\"]"`.
     /// Use [`clob_token_ids()`] to parse it.
@@ -46,6 +47,7 @@ pub struct GammaMarket {
     #[serde(default)]
     pub neg_risk: bool,
     #[serde(default)]
+    // default false → a market missing this field is treated as inactive and excluded by sync (safe direction: missed market, never a wrongly-included one)
     pub active: bool,
     #[serde(default)]
     pub closed: bool,
@@ -87,6 +89,7 @@ impl GammaMarket {
 #[serde(rename_all = "camelCase")]
 pub struct GammaEvent {
     #[serde(default)]
+    /// May deserialize to "" if absent; sync treats empty as "no event grouping".
     pub id: String,
     #[serde(default)]
     pub neg_risk: bool,
@@ -137,6 +140,7 @@ pub struct ClobMarket {
     #[serde(default)]
     pub tokens: Vec<ClobToken>,
     #[serde(default)]
+    // default false → a market missing this field is treated as inactive and excluded by sync (safe direction: missed market, never a wrongly-included one)
     pub active: bool,
     #[serde(default)]
     pub closed: bool,
@@ -159,6 +163,7 @@ pub struct ClobToken {
     #[serde(default)]
     pub outcome: String,
     /// Settlement price (0 or 1 for resolved; float for active). RECON §4.
+    // informational settlement/last price — never used in arithmetic
     #[serde(default)]
     pub price: f64,
     #[serde(default)]
@@ -287,7 +292,7 @@ mod tests {
     #[test]
     fn parses_clob_time_fixture() {
         let t: u64 =
-            serde_json::from_str(&fixture("clob_time.json").trim().to_string()).unwrap();
+            serde_json::from_str(&fixture("clob_time.json")).unwrap();
         assert!(t > 1_700_000_000);
     }
 
@@ -312,5 +317,11 @@ mod tests {
         let m: GammaMarket =
             serde_json::from_str(r#"{"conditionId":"0xa","clobTokenIds":"not json"}"#).unwrap();
         assert_eq!(m.clob_token_ids(), Err(GammaError::MalformedTokenIds));
+    }
+
+    #[test]
+    fn missing_active_defaults_to_excluded() {
+        let m: GammaMarket = serde_json::from_str(r#"{"conditionId":"0xa"}"#).unwrap();
+        assert!(!m.active);
     }
 }
