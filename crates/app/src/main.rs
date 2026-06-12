@@ -56,17 +56,31 @@ struct Args {
     relationships_path: Option<PathBuf>,
     db: Option<PathBuf>,
     headless: bool,
+    /// Live trading (real money). A START-TIME decision — paper and live fills
+    /// never mix in one session. Forces `mode.paper = false`.
+    live: bool,
+    /// Dry-run live: sign every order but never submit (no network, no money).
+    /// Requires `--live`.
+    shadow: bool,
 }
 
 impl Args {
     fn parse() -> Result<Self, String> {
-        let mut args = std::env::args().skip(1).peekable();
+        Self::from_iter(std::env::args().skip(1))
+    }
+
+    /// Parse from an explicit argument iterator (testable core; `parse()` feeds
+    /// it `std::env::args().skip(1)`).
+    fn from_iter(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut args = args.peekable();
         let mut config_path: Option<PathBuf> = None;
         let mut duration_secs: u64 = 0;
         let mut max_markets: Option<usize> = None;
         let mut relationships_path: Option<PathBuf> = None;
         let mut db: Option<PathBuf> = None;
         let mut headless = false;
+        let mut live = false;
+        let mut shadow = false;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -108,8 +122,21 @@ impl Args {
                 "--headless" => {
                     headless = true;
                 }
+                "--live" => {
+                    live = true;
+                }
+                "--shadow" => {
+                    shadow = true;
+                }
                 other => return Err(format!("unknown argument: {other}")),
             }
+        }
+
+        // --shadow is a modifier on --live (sign-but-don't-submit); on its own it
+        // is meaningless and almost certainly a mistake — refuse rather than
+        // silently run paper.
+        if shadow && !live {
+            return Err("--shadow requires --live".to_string());
         }
 
         Ok(Args {
@@ -119,6 +146,8 @@ impl Args {
             relationships_path,
             db,
             headless,
+            live,
+            shadow,
         })
     }
 }
@@ -188,6 +217,51 @@ async fn main() {
     if let Err(e) = config.validate() {
         fatal(format!("config validation failed: {e}"));
     }
+
+    // ---- live arming (spec 2026-06-13 §Mode ladder) -------------------------
+    // Live is a START-TIME decision: paper and live fills never mix in a
+    // session. --shadow signs but never submits (no confirm: no money moves).
+    // This block runs BEFORE the alternate screen (started much later) and
+    // eprintln/stdin go to the controlling terminal, so the typed-confirm
+    // prompt is safe here even on the TUI path (where it is skipped anyway).
+    if args.live {
+        config.mode.paper = false;
+    }
+    let live_rt = if args.live {
+        let secrets = pm_execution::secrets::LiveSecrets::from_env()
+            .unwrap_or_else(|e| fatal(format!("live secrets: {e}")));
+        let signer: alloy_signer_local::PrivateKeySigner = secrets
+            .private_key
+            .expose_key_hex()
+            .parse()
+            .unwrap_or_else(|e| fatal(format!("PM_PRIVATE_KEY invalid: {e}")));
+        let proxy: alloy_primitives::Address = match secrets.proxy_address.as_deref() {
+            Some(p) => p
+                .parse()
+                .unwrap_or_else(|e| fatal(format!("PM_PROXY_ADDRESS invalid: {e}"))),
+            None => fatal(
+                "PM_PROXY_ADDRESS not set — copy your Polymarket proxy wallet \
+                 address from the profile page (docs/RECON-M5.md §Magic/email)",
+            ),
+        };
+        // Headless live trades real money on startup: demand the typed phrase.
+        // The TUI path confirms via the `l` modal instead (release latch).
+        if !args.shadow && !tui_active {
+            eprintln!(
+                "LIVE MODE — type the confirmation phrase to continue:\n  {}",
+                config.live.confirm_phrase
+            );
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err()
+                || line.trim() != config.live.confirm_phrase
+            {
+                fatal("confirmation phrase mismatch — refusing to trade live");
+            }
+        }
+        Some((secrets, signer, proxy))
+    } else {
+        None
+    };
 
     // ---- store open + reconciliation (BEFORE anything else) ----------------
     let mut store = Store::open(Path::new(&config.store.path))
@@ -310,7 +384,18 @@ async fn main() {
 
     // ---- wiring -------------------------------------------------------------
     let params = engine_params(&config).unwrap_or_else(|e| fatal(format!("engine_params: {e}")));
-    let risk_cfg = risk_config(&config, None).unwrap_or_else(|e| fatal(format!("risk_config: {e}")));
+    // Session-loss cap arms ONLY for real-money live (not shadow, not paper):
+    // a hard daily-loss circuit-breaker has no meaning when no money moves.
+    let session_loss_cap = if args.live && !args.shadow {
+        Some(pm_core::num::Usdc(
+            pm_config::usd_to_microusdc(config.live.session_loss_usd)
+                .unwrap_or_else(|e| fatal(format!("live.session_loss_usd: {e}"))),
+        ))
+    } else {
+        None
+    };
+    let risk_cfg = risk_config(&config, session_loss_cap)
+        .unwrap_or_else(|e| fatal(format!("risk_config: {e}")));
     let (token_market, market_tokens) = token_maps(&reg);
     let token_fee = fee_map(&reg);
     let index = Arc::new(build_component_index(&reg));
@@ -445,26 +530,101 @@ async fn main() {
     ));
 
     // ---- execution task -----------------------------------------------------
-    let venue = PaperVenue::new(
-        fetcher.clone(),
-        Duration::from_millis(config.execution.paper_latency_ms),
-        params.gas,
-    );
     let exec_params = ExecParams {
         fill_window: Duration::from_millis(config.execution.fill_window_ms),
         max_unhedged: risk_cfg.max_unhedged,
         redeem: params.redeem,
     };
-    let exec_handle = tokio::spawn(run_execution(
-        venue,
-        exec_rx,
-        report_tx,
-        store_tx.clone(),
-        token_market.clone(),
-        market_tokens,
-        token_fee,
-        exec_params,
-    ));
+    // The live arm needs market_tokens for BOTH venue registration and
+    // run_execution (which moves it); clone before either arm takes ownership.
+    let market_tokens_for_registration = market_tokens.clone();
+    // Both arms produce the same JoinHandle<()> so the binding unifies.
+    let exec_handle = if let Some((secrets, signer, proxy)) = live_rt {
+        // Server time for the L1 timestamp comes from the venue clock; reuse the
+        // ingestion REST client (token-bucket limited, same base).
+        let mut rest = ClobRest::new(
+            &config.endpoints.clob_base,
+            config.ingestion.rest_rate_capacity,
+            config.ingestion.rest_rate_per_sec,
+        )
+        .unwrap_or_else(|e| fatal(format!("ClobRest for server time: {e}")));
+        // Pre-derived PM_API_* win; otherwise derive/create against the venue.
+        let creds = match secrets.api {
+            Some(c) => c,
+            None => {
+                let t = rest
+                    .server_time()
+                    .await
+                    .unwrap_or_else(|e| fatal(format!("server_time: {e}")));
+                let http = reqwest::Client::new();
+                pm_execution::auth::derive_or_create_api_key(
+                    &http,
+                    &config.endpoints.clob_base,
+                    &signer,
+                    t,
+                )
+                .await
+                .unwrap_or_else(|e| fatal(format!("API key derive/create: {e}")))
+            }
+        };
+        info!(shadow = args.shadow, "live venue armed (api key ready)");
+        let mut venue = pm_execution::live::LiveVenue::new(pm_execution::live::LiveVenueCfg {
+            base: config.endpoints.clob_base.clone(),
+            creds,
+            signer,
+            proxy,
+            fill_window: Duration::from_millis(config.execution.fill_window_ms),
+            rate_per_sec: config.ingestion.rest_rate_per_sec,
+            rate_capacity: config.ingestion.rest_rate_capacity,
+            shadow: args.shadow,
+        })
+        .unwrap_or_else(|e| fatal(format!("LiveVenue: {e}")));
+        // Startup reconciliation, venue side (spec §Errors): FAK leaves nothing
+        // resting, so any open order is an anomaly worth a warning.
+        match venue.open_orders().await {
+            Ok(open) if !open.is_empty() => {
+                warn!(count = open.len(), "venue reports open orders at startup (unexpected under FAK)")
+            }
+            Ok(_) => {}
+            Err(e) => warn!("venue open-orders check failed at startup: {e}"),
+        }
+        // Register every universe token (venue id + market neg_risk).
+        for m in reg.markets() {
+            if let Some(&(yes, no)) = market_tokens_for_registration.get(&m.id) {
+                for tok in [yes, no] {
+                    if let Some(vid) = reg.token_venue_id(tok) {
+                        venue.register_token(tok, vid.to_owned(), m.neg_risk);
+                    }
+                }
+            }
+        }
+        tokio::spawn(run_execution(
+            venue,
+            exec_rx,
+            report_tx,
+            store_tx.clone(),
+            token_market.clone(),
+            market_tokens,
+            token_fee,
+            exec_params,
+        ))
+    } else {
+        let venue = PaperVenue::new(
+            fetcher.clone(),
+            Duration::from_millis(config.execution.paper_latency_ms),
+            params.gas,
+        );
+        tokio::spawn(run_execution(
+            venue,
+            exec_rx,
+            report_tx,
+            store_tx.clone(),
+            token_market.clone(),
+            market_tokens,
+            token_fee,
+            exec_params,
+        ))
+    };
 
     // Clone the fetcher for the publisher BEFORE the coordinator consumes it
     // (the publisher marks open positions at the live bid). None in headless.
@@ -487,12 +647,18 @@ async fn main() {
         store_tx.clone(),
         Arc::clone(&kill),
         Arc::clone(&stats),
-        // Paper-inert until Task 11 wires the real live params from config.
+        // Live dispatch params (spec §Mode ladder). released_at_start is true
+        // for paper (inert — no live venue), shadow (signs but no money moves),
+        // and headless live (the typed phrase was demanded at startup); it is
+        // HELD only for TUI live, where the `l` modal releases the latch.
         LiveParams {
-            live: false,
-            released_at_start: true,
-            basket_cap: pm_core::num::Usdc(0),
-            min_leg: pm_core::num::Qty(0),
+            live: args.live,
+            released_at_start: !args.live || args.shadow || !tui_active,
+            basket_cap: pm_core::num::Usdc(
+                pm_config::usd_to_microusdc(config.live.basket_cap_usd)
+                    .unwrap_or_else(|e| fatal(format!("live.basket_cap_usd: {e}"))),
+            ),
+            min_leg: pm_core::num::Qty((config.live.min_leg_shares * 1e6).round() as u64),
         },
     )
     .unwrap_or_else(|e| fatal(format!("Coordinator::new: {e}")));
@@ -625,7 +791,13 @@ async fn main() {
                 }
                 pm_tui::state::TuiCommand::Kill => kill.store(true, Ordering::Release),
                 pm_tui::state::TuiCommand::GoLive => {
-                    warn!("live venue unavailable until M5 — staying in paper")
+                    if args.live {
+                        let _ = ctl_tx
+                            .send(pm_app::coordinator::CtlCommand::ReleaseLive)
+                            .await;
+                    } else {
+                        warn!("live not armed — restart with --live to trade real money");
+                    }
                 }
                 pm_tui::state::TuiCommand::Quit => {
                     trigger = "quit";
@@ -763,4 +935,19 @@ fn log_stats(stats: &AppStats, cells: &[Arc<StatsCell>], elapsed: Duration) {
         "{}",
         stats.line()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn live_and_shadow_flags_parse() {
+        let a = Args::from_iter(["--live".to_string()].into_iter()).unwrap();
+        assert!(a.live && !a.shadow);
+        let a = Args::from_iter(["--live".into(), "--shadow".into()].into_iter()).unwrap();
+        assert!(a.live && a.shadow);
+        assert!(Args::from_iter(["--shadow".into()].into_iter()).is_err());
+    }
 }

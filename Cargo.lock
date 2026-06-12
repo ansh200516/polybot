@@ -2651,6 +2651,8 @@ dependencies = [
 name = "pm-app"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
+ "alloy-signer-local",
  "crossterm",
  "hdrhistogram",
  "pm-config",
@@ -2663,6 +2665,7 @@ dependencies = [
  "pm-store",
  "pm-tui",
  "ratatui",
+ "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
