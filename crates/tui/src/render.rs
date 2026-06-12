@@ -324,7 +324,7 @@ fn draw_log(f: &mut Frame, s: &AppState, ui: &UiState, area: Rect) {
     // Tail-follow with scroll: visible window = last inner_h lines offset back by log_scroll.
     let total = s.log.len();
     // scroll offset (from the tail): clamped so we can't scroll past the top
-    let scroll = (ui.log_scroll as usize).min(total.saturating_sub(1));
+    let scroll = (ui.log_scroll as usize).min(total.saturating_sub(inner_h));
     // end index = total - scroll (exclusive upper bound)
     let end = total.saturating_sub(scroll);
     // start index = end - visible lines (clamped to 0)
@@ -658,5 +658,43 @@ mod tests {
         let text = render_to_text(&sample_state(), &ui, 120, 35);
         assert!(text.contains("Type 'live'"));
         assert!(text.contains("> li"));
+    }
+
+    #[test]
+    fn log_scroll_shows_earlier_lines_with_full_window() {
+        let mut s = sample_state();
+        s.log = (0..30)
+            .map(|i| (3u8, format!("INFO line-{i:02}")))
+            .collect();
+        // unscrolled: tail visible
+        let text = render_to_text(&s, &UiState::default(), 160, 45);
+        assert!(text.contains("line-29"));
+        // scrolled back 5: tail hidden, earlier lines visible
+        // At 160×45 the log panel inner_h = 13. scroll=5 → end=25, start=12 → lines 12..24.
+        let mut ui = UiState::default();
+        ui.log_scroll = 5;
+        let text = render_to_text(&s, &ui, 160, 45);
+        assert!(
+            !text.contains("line-29"),
+            "scrolled view must hide the tail"
+        );
+        assert!(text.contains("line-24"));
+        // scroll far beyond the top: clamps, still renders the earliest lines, no panic
+        ui.log_scroll = 500;
+        let text = render_to_text(&s, &ui, 160, 45);
+        assert!(text.contains("line-00"));
+    }
+
+    #[test]
+    fn ws_down_renders() {
+        let mut s = sample_state();
+        s.health.ws_connected = false;
+        let text = render_to_text(&s, &UiState::default(), 160, 45);
+        assert!(text.contains("WS DOWN"));
+    }
+
+    #[test]
+    fn standard_80x24_renders_without_panic() {
+        let _ = render_to_text(&sample_state(), &UiState::default(), 80, 24);
     }
 }
