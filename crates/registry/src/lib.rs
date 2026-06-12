@@ -72,6 +72,8 @@ pub struct Registry {
     unresolved_relationships: Vec<(String, String, String)>,
     /// Number of pending (not yet approved or rejected) relationships.
     pending_relationship_count: usize,
+    /// Display question text per market (Gamma `question`), indexed by MarketId.
+    questions: Vec<Option<String>>,
 }
 
 // Compile-time Send + Sync assertion.
@@ -167,6 +169,11 @@ impl Registry {
     /// Number of `status = "pending"` entries in the relationship TOML.
     pub fn pending_relationship_count(&self) -> usize {
         self.pending_relationship_count
+    }
+
+    /// Display question text for a market (None if Gamma had none).
+    pub fn question(&self, id: MarketId) -> Option<&str> {
+        self.questions.get(id.0 as usize)?.as_deref()
     }
 }
 
@@ -266,6 +273,9 @@ impl RegistryBuilder {
             event_members,
         } = self;
 
+        // ---- 0. Capture question texts before meta is consumed -------------
+        let questions: Vec<Option<String>> = meta.iter().map(|m| m.question.clone()).collect();
+
         // ---- 1. Derive partitions per event --------------------------------
         let mut partitions: Vec<Partition> = Vec::new();
         let mut exclusion_log: Vec<(EventId, ExclusionReason)> = Vec::new();
@@ -335,6 +345,7 @@ impl RegistryBuilder {
             exclusion_log,
             unresolved_relationships,
             pending_relationship_count,
+            questions,
         })
     }
 }
@@ -524,5 +535,29 @@ mod tests {
         let r = sample();
         let m = r.market_by_condition("0xbbb").unwrap();
         assert_eq!(r.market_condition(m.id), Some("0xbbb"));
+    }
+
+    #[test]
+    fn question_text_is_retained_and_accessible() {
+        let r = sample();
+        let a = r.market_by_condition("0xaaa").unwrap().id;
+        assert_eq!(r.question(a), Some("Will A win?"));
+        // markets built without a question return None
+        let mut b = RegistryBuilder::default();
+        b.add_market(
+            "0xq",
+            "yq",
+            "nq",
+            TickSize::Cent,
+            0,
+            false,
+            None,
+            true,
+            false,
+            None,
+        );
+        let r = b.finish("").unwrap();
+        let q = r.market_by_condition("0xq").unwrap().id;
+        assert_eq!(r.question(q), None);
     }
 }
