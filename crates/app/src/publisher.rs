@@ -203,8 +203,9 @@ pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
         }
     }
     let feeds_total = ctx.cells.len() as u64;
-    // ws_connected: any feed is live, or no feeds are configured (dev/unit setup).
-    let ws_connected = feeds_up > 0 || ctx.cells.is_empty();
+    // Truthful liveness only: zero supervisors is never "up" (main exits at
+    // startup when no supervisors spawn, so cells are non-empty in production).
+    let ws_connected = feeds_up > 0;
 
     let dt = ctx.last_at.elapsed().as_secs_f64();
     let frames_per_s = if dt > 0.0 {

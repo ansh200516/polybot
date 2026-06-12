@@ -99,10 +99,11 @@ pub struct StatsCell {
     /// `true` while the WS session is live (transport connected); `false`
     /// before the first connect and during reconnect backoff.
     pub connected: AtomicBool,
-    /// Unix epoch milliseconds of the last successfully applied frame.
-    /// `0` until the first frame is applied (never connected, or just connected
-    /// but no frame received yet). Treated as age 0 by the publisher so a
-    /// brand-new session doesn't inflate the oldest-frame gauge.
+    /// Unix epoch milliseconds of the last RECEIVED frame — stamped before
+    /// parsing, so even a parse failure proves the socket is alive. `0` until
+    /// the first frame arrives (never connected, or just connected but no
+    /// frame yet); treated as age 0 by the publisher so a brand-new session
+    /// doesn't inflate the oldest-frame gauge.
     pub last_frame_ms: AtomicI64,
 
     // Current gauges (overwritten on every refresh).
