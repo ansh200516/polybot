@@ -26,10 +26,9 @@ pub fn engine_params(cfg: &Config) -> Result<EngineParams, ConfigError> {
             redeem: cfg.gas.redeem_microusdc,
             negrisk_convert: cfg.gas.negrisk_convert_microusdc,
         },
-        redeem: if cfg.execution.redeem_strategy == "hold" {
-            RedeemStrategy::Hold
-        } else {
-            RedeemStrategy::Merge
+        redeem: match cfg.execution.redeem_strategy.as_str() {
+            "hold" => RedeemStrategy::Hold,
+            _ => RedeemStrategy::Merge,
         },
         max_basis: Usdc(usd_to_microusdc(cfg.capital.per_market_usd)?),
         max_worlds: cfg.lp.max_worlds,
@@ -85,6 +84,8 @@ pub fn build_component_index(reg: &Registry) -> ComponentIndex {
     for p in reg.partitions() {
         if let Some(&first) = p.markets.first() {
             let cid = reg.component_of(first);
+            // Registry construction guarantees it.
+            debug_assert!(entries.contains_key(&cid), "partition member missing from market entries");
             if let Some(e) = entries.get_mut(&cid) {
                 e.partitions.push(p.clone());
             }
@@ -164,6 +165,7 @@ impl BookFetcher {
     }
 
     /// Raw fetch: (book, valid) or None (unknown token / dead supervisor).
+    // M4: distinguish dead-supervisor from unknown-token if metrics require it.
     pub async fn fetch(&self, token: TokenId) -> Option<(Book, bool)> {
         let tx = self.routes.get(&token)?;
         let (otx, orx) = oneshot::channel();
