@@ -61,7 +61,6 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use pm_core::book::{Book, Side};
-    use pm_core::instrument::TokenId;
     use pm_core::num::{Px, Qty, TickSize, Usdc};
     use pm_engine::{ArbClass, GasTable};
     use pm_registry::RegistryBuilder;

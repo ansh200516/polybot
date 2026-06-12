@@ -79,11 +79,10 @@ impl Detector {
             .markets
             .iter()
             .find(|m| m.yes == token || m.no == token)
+            && let (Some(yes), Some(no)) = (valid_book(shard, m.yes), valid_book(shard, m.no))
         {
-            if let (Some(yes), Some(no)) = (valid_book(shard, m.yes), valid_book(shard, m.no)) {
-                for opp in pm_engine::class1::detect(m, yes, no, &self.params) {
-                    self.emit(opp, t0);
-                }
+            for opp in pm_engine::class1::detect(m, yes, no, &self.params) {
+                self.emit(opp, t0);
             }
         }
 
@@ -194,14 +193,16 @@ mod tests {
     // Test fixture helpers
     // ---------------------------------------------------------------------------
 
-    /// Channels + AppStats defaults for test detectors.
-    fn make_channels() -> (
+    type Channels = (
         mpsc::Sender<DetectedOpp>,
         mpsc::Receiver<DetectedOpp>,
         mpsc::Sender<SolveJob>,
         mpsc::Receiver<SolveJob>,
         Arc<AppStats>,
-    ) {
+    );
+
+    /// Channels + AppStats defaults for test detectors.
+    fn make_channels() -> Channels {
         let (opp_tx, opp_rx) = mpsc::channel(64);
         let (lp_tx, lp_rx) = mpsc::channel(64);
         let stats = AppStats::new();
