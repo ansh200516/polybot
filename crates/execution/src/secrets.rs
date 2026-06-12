@@ -117,12 +117,17 @@ mod tests {
         };
         let s = LiveSecrets::from_lookup(lookup).unwrap();
         assert_eq!(s.private_key.expose_key_hex(), "cd".repeat(32));
-        assert_eq!(s.proxy_address.as_deref(), Some(&*("0x".to_string() + &"11".repeat(20))));
+        let expected_proxy = format!("0x{}", "11".repeat(20));
+        assert_eq!(s.proxy_address.as_deref(), Some(expected_proxy.as_str()));
         assert!(s.api.is_none(), "no PM_API_* given → derive at startup");
 
         let none = |_: &str| None::<String>;
         let err = LiveSecrets::from_lookup(none).unwrap_err();
         assert!(err.contains("PM_PRIVATE_KEY"), "error names the missing var: {err}");
+        assert!(
+            err.contains("Polymarket settings"),
+            "error keeps the export-from-settings guidance: {err}"
+        );
     }
 
     #[test]
@@ -134,5 +139,6 @@ mod tests {
         };
         let err = LiveSecrets::from_lookup(partial).unwrap_err();
         assert!(err.contains("PM_API_SECRET"), "{err}");
+        assert!(err.contains("PM_API_PASSPHRASE"), "both missing vars are named: {err}");
     }
 }
