@@ -158,3 +158,96 @@ on a fresh DB shows `reconciled=0`.
 of deployed capital, the coordinator stops dispatching new baskets for the
 remainder of the session. Ingestion and book-keeping continue normally.
 Reset on next session start (new calendar day tracked in the store).
+
+## M4: TUI dashboard
+
+`pm-tui` adds a full-screen Ratatui dashboard to the `arb` binary. The TUI
+is active whenever stdout is a real terminal and `--headless` is not given;
+piped/cron invocations stay headless automatically.
+
+### Dashboard layout
+
+The screen is divided into a header bar and five panels:
+
+- **Opportunities** (upper-left, 62%) — rolling feed of detected arb
+  opportunities: age, class (1–4), market name, edge bps, size, estimated
+  dollar value, and a `*` marker when the basket was dispatched.
+- **Positions** (upper-right, 38%) — open positions marked to the current
+  live bid: market, quantity, basis cost, and live mark value.
+- **Fills & Orders** (lower-left, 62%) — two sub-tables: recent fills (age,
+  market, side, price, quantity, cash) and recent orders (age, order ID,
+  state, detail).
+- **Health** (lower-right, 38%) — live gauges (markets tracked, books live,
+  supervisors, WS frames, reconnects, opportunities, baskets dispatched) and
+  detect/dispatch latency percentiles (p50/p99 in µs).
+- **Log** (bottom strip) — scrolling ring-buffer of structured log lines from
+  the session; ↑/↓ to scroll, auto-follows tail at offset 0.
+
+The header bar shows: mode badge (`PAPER` / `LIVE`), session uptime, optional
+status badge (`PAUSED` / `HALT:<reason>` / `KILLED`), and two equity figures:
+
+- **`equity(bid)`** — cash + open positions marked at the best live bid.
+  Conservative and durable: used for the human-readable P&L report.
+- **`risk-equity(mid)`** — cash + positions marked at mid. This is the feed
+  the drawdown-halt logic watches. The M3 live-run artifact fix (spread of an
+  open basket no longer trips the halt) applies here: mid-marking an
+  open-basket spread was causing false daily-drawdown halts; the fix ensures
+  quiet books on a live delta feed count as current before computing the
+  mid-mark.
+
+A footer line repeats the key hints at all times.
+
+### Key bindings
+
+| Key | Action |
+|---|---|
+| `p` | Toggle pause dispatch (coordinator stops admitting new baskets; ingestion continues) |
+| `l` | Go-live modal — type `live` and press Enter to confirm; answers "live venue unavailable until M5 — staying in paper" (M5 stub) |
+| `k` | Kill switch — y/N confirm modal; `y` trips the kill flag cleanly |
+| `q` | Quit the dashboard and end the session |
+| `↑` / `↓` | Scroll the log panel (↑ = back in history; auto-follow resumes at offset 0) |
+| `Ctrl-C` | Quit (works in any modal state) |
+
+### Config defaults (`[tui]` section)
+
+| Key | Default | Minimum |
+|---|---|---|
+| `refresh_ms` | 100 | 50 |
+| `feed_rows` | 50 | 1 |
+| `fills_rows` | 20 | 1 |
+| `log_lines` | 200 | 1 |
+
+### `--headless` flag
+
+Pass `--headless` to suppress the TUI and fall back to M3-style structured
+`tracing` output to stdout. The binary also detects a non-tty stdout
+automatically (pipe, file redirect, cron), so no flag is needed in CI or
+scheduled jobs.
+
+### pty smoke (Apple Silicon dev machine, 2026-06-13)
+
+    script -q /tmp/m4-tui-smoke.out \
+      ./target/release/arb --duration-secs 45 --max-markets 20 \
+                           --db /tmp/m4-tui-smoke.sqlite
+
+| Check | Result |
+|---|---|
+| exit code | 0 |
+| capture size | 12,334 bytes |
+| `session` lines in capture (grep -c) | 4 |
+| `arb session result: healthy=true` | 1 |
+| opportunities detected | 75 |
+| LP solves | 141 |
+| detect latency p50 / p99 | 8 µs / 60 µs |
+| session duration | 47 s |
+| SQLite DB created | yes |
+
+Panel-title strings (`Opportunities`, `Health`, `PAPER`) are embedded inside
+raw ANSI cursor-positioning escape sequences in the pty stream and do not form
+standalone text lines; `grep -c` on the capture returns 0 for those strings,
+which is expected for any Ratatui TUI pty recording. The `[?1049h` (enter
+alternate screen) and `[?1049l` (leave alternate screen) sequences are both
+present in the capture, confirming the TUI lifecycle ran end-to-end through
+the pty and restored the terminal before the final report. Interactive
+acceptance (live scrolling, key-binding exercise, visual layout verification)
+is performed by the operator.
