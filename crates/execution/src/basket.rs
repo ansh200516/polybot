@@ -384,6 +384,11 @@ fn surpluses(intended: &[Qty], filled: &[Qty]) -> Vec<u64> {
 /// Repair partial fills (one round) then market out / hold any residual
 /// surplus (spec §14, Design decisions 8 & 9).
 ///
+/// Sell legs are trusted to be split-covered (engine invariant: every detector
+/// formulation bounds sells by basket-acquired holdings); a naked sell leg
+/// would credit cash without reducing holdings in the ledger — defense-in-depth
+/// lives in the engine, not here.
+///
 /// # Repair (break-even bump)
 /// The detected `opp.net` is the basket's total slack budget. For each unfilled
 /// remainder `rem_i = intended_i − filled_i > 0` we apportion slack by the
@@ -502,6 +507,10 @@ async fn repair_and_unwind<V: ExecutionVenue>(
                             let f =
                                 close_order(store, ledger, order, result, ts_ms, errors).await?;
                             filled[*idx] = Qty(filled[*idx].0 + f.0);
+                            debug_assert!(
+                                filled[*idx].0 <= opp.fills[*idx].qty.0,
+                                "repair overshot intended"
+                            );
                         }
                     }
                     None => {
@@ -722,7 +731,12 @@ mod tests {
 
     struct MockVenue {
         script: HashMap<TokenId, VecDeque<SubmitOutcome>>,
+        /// Tokens that fail on EVERY submit (persistent). Used by existing tests.
         errors: HashSet<TokenId>,
+        /// Tokens that fail on the FIRST submit only; entry is consumed on first hit.
+        errors_once: HashSet<TokenId>,
+        /// Record of every (token, action, limit_ticks, qty) passed to submit_fak.
+        submitted: Vec<(TokenId, Action, u16, u64)>,
         gas: GasTable,
         merges: Vec<(MarketId, Qty)>,
         splits: Vec<(MarketId, Qty)>,
@@ -733,6 +747,8 @@ mod tests {
             MockVenue {
                 script: HashMap::new(),
                 errors: HashSet::new(),
+                errors_once: HashSet::new(),
+                submitted: Vec::new(),
                 gas: gas(),
                 merges: Vec::new(),
                 splits: Vec::new(),
@@ -742,11 +758,22 @@ mod tests {
         fn script(&mut self, token: TokenId, out: SubmitOutcome) {
             self.script.entry(token).or_default().push_back(out);
         }
+
+        /// Convenience: script a complete fill at `ticks` for `qty` µshares.
+        fn will_fill(&mut self, token: u64, action: Action, ticks: u16, qty: u64) {
+            let out = will_fill(TokenId(token), action, ticks, Qty(qty));
+            self.script(TokenId(token), out);
+        }
     }
 
     impl ExecutionVenue for MockVenue {
         async fn submit_fak(&mut self, order: &Order) -> Result<SubmitOutcome, VenueError> {
+            self.submitted
+                .push((order.token, order.action, order.limit_px.get(), order.qty.0));
             if self.errors.contains(&order.token) {
+                return Err(VenueError::BookUnavailable(order.token));
+            }
+            if self.errors_once.remove(&order.token) {
                 return Err(VenueError::BookUnavailable(order.token));
             }
             Ok(self
@@ -791,6 +818,8 @@ mod tests {
 
     const SH: u64 = 100_000_000; // 100 shares in µshares
     const UNITS: u64 = 100_000_000;
+    const YES: u64 = 1; // token id for YES leg in c1long
+    const NO: u64 = 2; // token id for NO leg in c1long
 
     fn leg(token: u64, action: Action, ticks: u16, qty: u64, cash: i128) -> LegFill {
         LegFill {
@@ -1177,5 +1206,87 @@ mod tests {
         assert_eq!(report.outcome, BasketOutcome::NoFill);
         assert_eq!(report.cash_delta, Usdc(0));
         assert!(store.open_orders().unwrap().is_empty());
+    }
+
+    // ---- New Task-10 edge-case tests -------------------------------------
+
+    /// Repair partially fills the lagging leg, leaving a YES surplus that must
+    /// be unwound: YES 100sh, NO initial 60sh → repair NO only fills 20 of 40
+    /// → post-repair YES surplus 20sh → unwind at floor tick (sold at bid 40)
+    /// → settle merges 80 complete sets.
+    ///
+    /// Cash trace (µUSDC):
+    ///   YES buy  100sh@44 = −44_000_000
+    ///   NO  buy   60sh@50 = −30_000_000
+    ///   NO  repair 20sh@64 = −12_800_000
+    ///   YES unwind 20sh@40 = +8_000_000
+    ///   merge 80sh         = +79_990_000   (80e6 − 10_000 gas)
+    ///   total              = +1_190_000
+    #[tokio::test]
+    async fn partial_repair_fill_then_residual_unwind() {
+        let mut v = MockVenue::new();
+        v.will_fill(YES, Action::Buy, 44, 100_000_000);
+        v.will_fill(NO, Action::Buy, 50, 60_000_000); // initial: 60 of 100
+        v.will_fill(NO, Action::Buy, 64, 20_000_000); // repair (limit 50+14=64) fills only 20 of 40
+        v.will_fill(YES, Action::Sell, 40, 20_000_000); // unwind of recomputed YES surplus (20sh)
+
+        let (report, store) = run(&mut v, &c1long(), params(RedeemStrategy::Merge)).await;
+
+        // post-repair: YES 100, NO 80 → j* = NO, target_YES = 80 → surplus_YES = 20sh
+        assert!(matches!(report.outcome, BasketOutcome::Unwound));
+        assert_eq!(report.cash_delta, Usdc(1_190_000));
+        assert!(report.positions.is_empty()); // 80/80 merged, surplus sold
+        assert_eq!(v.merges, vec![(MarketId(0), Qty(80_000_000))]);
+        // store FIFO realized agrees with the full cash trace
+        assert_eq!(store.realized_total().unwrap(), 1_190_000);
+        assert!(store.open_orders().unwrap().is_empty());
+    }
+
+    /// Both legs need repair; YES was rejected on first submit only (`errors_once`),
+    /// NO partially filled 60/100. Repair apportions the net slack by weight:
+    ///   w_YES = ceil(44e6·100e6/100e6) = 44e6
+    ///   w_NO  = ceil(50e6·40e6/100e6)  = 20e6   Σw = 64e6
+    ///   slack_YES = floor(5_990_000·44/64) = 4_118_125 → bump floor(41_181/10_000)=4 → limit 48
+    ///   slack_NO  = floor(5_990_000·20/64) = 1_871_875 → bump floor(46_796/10_000)=4 → limit 54
+    ///
+    /// Cash trace (µUSDC):
+    ///   YES repair 100sh@48 = −48_000_000
+    ///   NO  initial  60sh@50 = −30_000_000
+    ///   NO  repair   40sh@54 = −21_600_000
+    ///   merge 100sh          = +99_990_000
+    ///   total                = +390_000
+    #[tokio::test]
+    async fn rejected_plus_partial_legs_apportion_slack_by_weight() {
+        let mut v = MockVenue::new();
+        // YES errors on first submit only; clears before repair.
+        v.errors_once.insert(TokenId(YES));
+        v.will_fill(NO, Action::Buy, 50, 60_000_000); // initial NO: 60 of 100
+        // repair fills YES fully at the apportioned limit (48) and NO at 54
+        v.will_fill(YES, Action::Buy, 48, 100_000_000);
+        v.will_fill(NO, Action::Buy, 54, 40_000_000);
+
+        let (report, store) = run(&mut v, &c1long(), params(RedeemStrategy::Merge)).await;
+
+        assert!(matches!(report.outcome, BasketOutcome::Repaired));
+        assert_eq!(report.order_errors, 1);
+        assert_eq!(report.cash_delta, Usdc(390_000));
+        assert!(report.positions.is_empty());
+        assert_eq!(store.realized_total().unwrap(), 390_000);
+
+        // Verify the repair submissions carried exactly the apportioned limit prices.
+        assert!(
+            v.submitted.iter().any(|&(t, a, px, q)| t == TokenId(YES)
+                && a == Action::Buy
+                && px == 48
+                && q == 100_000_000),
+            "expected repair YES @48 × 100sh"
+        );
+        assert!(
+            v.submitted.iter().any(|&(t, a, px, q)| t == TokenId(NO)
+                && a == Action::Buy
+                && px == 54
+                && q == 40_000_000),
+            "expected repair NO @54 × 40sh"
+        );
     }
 }
