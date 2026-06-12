@@ -153,7 +153,13 @@ fn draw_opps(f: &mut Frame, s: &AppState, area: Rect) {
                 Cell::from(o.class.clone()),
                 Cell::from(o.market.clone()),
                 Cell::from(o.edge_bps.to_string()).style(money_style(o.edge_bps as f64)),
-                Cell::from(format!("{:.0}", o.size_shares)),
+                // C4Lp baskets have non-uniform legs: units is Qty(0) by the
+                // engine contract, so a numeric size would be a lie.
+                Cell::from(if o.class == "C4Lp" {
+                    "—".to_string()
+                } else {
+                    format!("{:.0}", o.size_shares)
+                }),
                 Cell::from(fmt_usd(o.est_profit_usd)).style(money_style(o.est_profit_usd)),
                 Cell::from(if o.dispatched { "*" } else { "" }),
             ])
@@ -522,6 +528,52 @@ mod tests {
         ] {
             assert!(text.contains(title), "panel {title} missing:\n{text}");
         }
+    }
+
+    #[test]
+    fn c4lp_size_renders_as_dash_not_zero() {
+        // Engine contract: Opportunity.units is Qty(0) for C4Lp (non-uniform
+        // legs; per-leg qtys are authoritative), so a literal "0" in the size
+        // column is misleading next to a non-zero est $. Render a dash.
+        let s = AppState {
+            mode_paper: true,
+            opportunities: vec![
+                crate::state::OppLine {
+                    age_s: 1,
+                    class: "C4Lp".into(),
+                    market: "Will X win?".into(),
+                    edge_bps: 6695,
+                    size_shares: 0.0,
+                    est_profit_usd: 669.55,
+                    dispatched: false,
+                },
+                crate::state::OppLine {
+                    age_s: 2,
+                    class: "C1Long".into(),
+                    market: "Will Y win?".into(),
+                    edge_bps: 637,
+                    size_shares: 100.0,
+                    est_profit_usd: 5.99,
+                    dispatched: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let text = render_to_text(&s, &UiState::default(), 140, 40);
+        let Some(c4_row) = text.lines().find(|l| l.contains("C4Lp")) else {
+            panic!("C4Lp row missing:\n{text}");
+        };
+        assert!(
+            c4_row.contains('—'),
+            "C4Lp size must render as a dash:\n{c4_row}"
+        );
+        let Some(c1_row) = text.lines().find(|l| l.contains("C1Long")) else {
+            panic!("C1Long row missing:\n{text}");
+        };
+        assert!(
+            c1_row.contains("100"),
+            "uniform-class size must stay numeric:\n{c1_row}"
+        );
     }
 
     #[test]
