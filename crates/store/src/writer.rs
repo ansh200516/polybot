@@ -10,7 +10,7 @@ use crate::{
     Store,
 };
 
-type Ack = Option<oneshot::Sender<()>>;
+pub type Ack = Option<oneshot::Sender<()>>;
 
 pub enum StoreMsg {
     MarketUpsert(MarketRow),
@@ -26,18 +26,28 @@ pub enum StoreMsg {
 
 /// Run until the channel closes; returns the store for final inspection
 /// (session summary, tests).
+///
+/// Blocking note: store calls are synchronous sqlite I/O executed directly on
+/// the runtime worker. This is deliberate for M3: write rates are bounded
+/// (paper trading, bounded channel) and `block_in_place` would panic under the
+/// current-thread test runtimes that pair this writer with `tokio::time::pause`.
+/// Revisit (dedicated thread) if M5 live write rates demand it.
 pub async fn run_writer(mut store: Store, mut rx: mpsc::Receiver<StoreMsg>) -> Store {
     while let Some(msg) = rx.recv().await {
-        let (result, ack): (Result<(), crate::StoreError>, Ack) = match msg {
-            StoreMsg::MarketUpsert(r) => (store.upsert_market(&r), None),
-            StoreMsg::RelationshipUpsert(r) => (store.upsert_relationship(&r), None),
-            StoreMsg::Opportunity(r) => (store.insert_opportunity(&r), None),
-            StoreMsg::OrderInsert(r, ack) => (store.insert_order(&r), ack),
-            StoreMsg::OrderEvent(r, ack) => (store.insert_order_event(&r), ack),
-            StoreMsg::Fill(r, ack) => (store.insert_fill(&r).map(|_| ()), ack),
-            StoreMsg::Conversion(r, ack) => (store.apply_conversion(&r).map(|_| ()), ack),
-            StoreMsg::PnlSnapshot(r) => (store.insert_pnl_snapshot(&r), None),
-            StoreMsg::Halt(r) => (store.insert_halt(&r), None),
+        let (result, ack, op): (Result<(), crate::StoreError>, Ack, &'static str) = match msg {
+            StoreMsg::MarketUpsert(r) => (store.upsert_market(&r), None, "market_upsert"),
+            StoreMsg::RelationshipUpsert(r) => {
+                (store.upsert_relationship(&r), None, "relationship_upsert")
+            }
+            StoreMsg::Opportunity(r) => (store.insert_opportunity(&r), None, "opportunity"),
+            StoreMsg::OrderInsert(r, ack) => (store.insert_order(&r), ack, "order_insert"),
+            StoreMsg::OrderEvent(r, ack) => (store.insert_order_event(&r), ack, "order_event"),
+            StoreMsg::Fill(r, ack) => (store.insert_fill(&r).map(|_| ()), ack, "fill"),
+            StoreMsg::Conversion(r, ack) => {
+                (store.apply_conversion(&r).map(|_| ()), ack, "conversion")
+            }
+            StoreMsg::PnlSnapshot(r) => (store.insert_pnl_snapshot(&r), None, "pnl_snapshot"),
+            StoreMsg::Halt(r) => (store.insert_halt(&r), None, "halt"),
         };
         match result {
             Ok(()) => {
@@ -47,7 +57,7 @@ pub async fn run_writer(mut store: Store, mut rx: mpsc::Receiver<StoreMsg>) -> S
             }
             Err(e) => {
                 store.write_errors += 1;
-                error!("store write failed: {e}");
+                error!(op, "store write failed: {e}");
                 // ack (if any) is dropped here → awaiting side sees RecvError.
                 drop(ack);
             }
