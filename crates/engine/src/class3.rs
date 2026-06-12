@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::walker::{walk, BasketSpec, LegSpec};
+use crate::walker::{BasketSpec, LegSpec, walk};
 use crate::{Action, ArbClass, EngineParams, Opportunity};
 use pm_core::book::Book;
 use pm_core::instrument::{Market, Relationship, TokenId};
@@ -43,31 +43,52 @@ pub fn detect(
     };
     match *rel {
         Relationship::Implies { a, b } => {
-            let (Some(ma), Some(mb)) = (crate::find_market(markets, a), crate::find_market(markets, b)) else { return out };
-            let (Some(no_a), Some(yes_b)) = (leg(ma.no, ma), leg(mb.yes, mb)) else { return out };
+            let (Some(ma), Some(mb)) = (
+                crate::find_market(markets, a),
+                crate::find_market(markets, b),
+            ) else {
+                return out;
+            };
+            let (Some(no_a), Some(yes_b)) = (leg(ma.no, ma), leg(mb.yes, mb)) else {
+                return out;
+            };
             if let Some(op) = pair_basket(ArbClass::C3Implies, no_a, yes_b, p) {
                 out.push(op);
             }
         }
         Relationship::MutuallyExclusive { a, b } => {
-            let (Some(ma), Some(mb)) = (crate::find_market(markets, a), crate::find_market(markets, b)) else { return out };
-            let (Some(no_a), Some(no_b)) = (leg(ma.no, ma), leg(mb.no, mb)) else { return out };
+            let (Some(ma), Some(mb)) = (
+                crate::find_market(markets, a),
+                crate::find_market(markets, b),
+            ) else {
+                return out;
+            };
+            let (Some(no_a), Some(no_b)) = (leg(ma.no, ma), leg(mb.no, mb)) else {
+                return out;
+            };
             if let Some(op) = pair_basket(ArbClass::C3MutEx, no_a, no_b, p) {
                 out.push(op);
             }
         }
         Relationship::Equivalent { a, b } => {
-            let (Some(ma), Some(mb)) = (crate::find_market(markets, a), crate::find_market(markets, b)) else { return out };
+            let (Some(ma), Some(mb)) = (
+                crate::find_market(markets, a),
+                crate::find_market(markets, b),
+            ) else {
+                return out;
+            };
             // a⇒b direction: buy NO_a + YES_b
             if let (Some(no_a), Some(yes_b)) = (leg(ma.no, ma), leg(mb.yes, mb))
-                && let Some(op) = pair_basket(ArbClass::C3Equiv, no_a, yes_b, p) {
-                    out.push(op);
-                }
+                && let Some(op) = pair_basket(ArbClass::C3Equiv, no_a, yes_b, p)
+            {
+                out.push(op);
+            }
             // b⇒a direction: buy NO_b + YES_a (evaluated independently)
             if let (Some(no_b), Some(yes_a)) = (leg(mb.no, mb), leg(ma.yes, ma))
-                && let Some(op) = pair_basket(ArbClass::C3Equiv, no_b, yes_a, p) {
-                    out.push(op);
-                }
+                && let Some(op) = pair_basket(ArbClass::C3Equiv, no_b, yes_a, p)
+            {
+                out.push(op);
+            }
         }
     }
     out
@@ -115,7 +136,12 @@ mod tests {
 
     fn zero_gas_params() -> EngineParams {
         EngineParams {
-            gas: crate::GasTable { split: 0, merge: 0, redeem: 0, negrisk_convert: 0 },
+            gas: crate::GasTable {
+                split: 0,
+                merge: 0,
+                redeem: 0,
+                negrisk_convert: 0,
+            },
             min_profit: Usdc(0),
             ..EngineParams::default()
         }
@@ -126,7 +152,10 @@ mod tests {
         // P(A)≈0.65 (NO_a ask 0.35), YES_b ask 0.55 < P(A): A⇒B violated.
         // Basket NO_a + YES_b = 0.90 → 10¢/unit ≥ 100 bps.
         let (markets, books) = fixture((68, 35), (55, 50));
-        let rel = Relationship::Implies { a: MarketId(0), b: MarketId(1) };
+        let rel = Relationship::Implies {
+            a: MarketId(0),
+            b: MarketId(1),
+        };
         let ops = detect(&rel, &markets, &books, &zero_gas_params());
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].class, ArbClass::C3Implies);
@@ -140,7 +169,10 @@ mod tests {
     fn coherent_implication_is_quiet() {
         // NO_a 0.70 + YES_b 0.75 = 1.45 → no arb.
         let (markets, books) = fixture((32, 70), (75, 27));
-        let rel = Relationship::Implies { a: MarketId(0), b: MarketId(1) };
+        let rel = Relationship::Implies {
+            a: MarketId(0),
+            b: MarketId(1),
+        };
         assert!(detect(&rel, &markets, &books, &zero_gas_params()).is_empty());
     }
 
@@ -148,7 +180,10 @@ mod tests {
     fn mutex_violation_is_tradable() {
         // NO_a 0.55 + NO_b 0.40 = 0.95 → 5¢/unit ≥ 100 bps.
         let (markets, books) = fixture((47, 55), (62, 40));
-        let rel = Relationship::MutuallyExclusive { a: MarketId(0), b: MarketId(1) };
+        let rel = Relationship::MutuallyExclusive {
+            a: MarketId(0),
+            b: MarketId(1),
+        };
         let ops = detect(&rel, &markets, &books, &zero_gas_params());
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].class, ArbClass::C3MutEx);
@@ -157,7 +192,10 @@ mod tests {
 
     #[test]
     fn hundred_bps_floor_bites() {
-        let rel = Relationship::Implies { a: MarketId(0), b: MarketId(1) };
+        let rel = Relationship::Implies {
+            a: MarketId(0),
+            b: MarketId(1),
+        };
         // NO_a 0.50 + YES_b 0.50 = 1.00 → no profit at all.
         let (markets, books) = fixture((68, 50), (50, 51));
         assert!(detect(&rel, &markets, &books, &zero_gas_params()).is_empty());
@@ -171,7 +209,10 @@ mod tests {
         // b⇒a direction: buy NO_b (0.45) + YES_a (0.40) = 0.85 → 15¢/unit.
         // a⇒b direction: NO_a (0.62) + YES_b (0.57) = 1.19 → quiet.
         let (markets, books) = fixture((40, 62), (57, 45));
-        let rel = Relationship::Equivalent { a: MarketId(0), b: MarketId(1) };
+        let rel = Relationship::Equivalent {
+            a: MarketId(0),
+            b: MarketId(1),
+        };
         let ops = detect(&rel, &markets, &books, &zero_gas_params());
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].class, ArbClass::C3Equiv);
@@ -181,9 +222,15 @@ mod tests {
     #[test]
     fn missing_market_or_book_is_quiet() {
         let (markets, mut books) = fixture((68, 35), (55, 50));
-        let rel = Relationship::Implies { a: MarketId(0), b: MarketId(7) }; // unknown market
+        let rel = Relationship::Implies {
+            a: MarketId(0),
+            b: MarketId(7),
+        }; // unknown market
         assert!(detect(&rel, &markets, &books, &zero_gas_params()).is_empty());
-        let rel = Relationship::Implies { a: MarketId(0), b: MarketId(1) };
+        let rel = Relationship::Implies {
+            a: MarketId(0),
+            b: MarketId(1),
+        };
         books.remove(&TokenId(12)); // YES_b book gone
         assert!(detect(&rel, &markets, &books, &zero_gas_params()).is_empty());
     }
@@ -194,7 +241,10 @@ mod tests {
         // a⇒b can't even be evaluated — b⇒a must still fire.
         let (markets, mut books) = fixture((40, 62), (57, 45));
         books.remove(&TokenId(12)); // YES_b
-        let rel = Relationship::Equivalent { a: MarketId(0), b: MarketId(1) };
+        let rel = Relationship::Equivalent {
+            a: MarketId(0),
+            b: MarketId(1),
+        };
         let ops = detect(&rel, &markets, &books, &zero_gas_params());
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].net, Usdc(15_000_000));
@@ -204,7 +254,10 @@ mod tests {
     fn equivalent_both_directions_can_fire() {
         // Degenerate: NO_a+YES_b = 0.35+0.40 = 0.75 AND NO_b+YES_a = 0.45+0.30 = 0.75.
         let (markets, books) = fixture((30, 35), (40, 45));
-        let rel = Relationship::Equivalent { a: MarketId(0), b: MarketId(1) };
+        let rel = Relationship::Equivalent {
+            a: MarketId(0),
+            b: MarketId(1),
+        };
         let ops = detect(&rel, &markets, &books, &zero_gas_params());
         assert_eq!(ops.len(), 2);
         assert!(ops.iter().all(|o| o.class == ArbClass::C3Equiv));
@@ -214,7 +267,10 @@ mod tests {
     fn coherent_mutex_is_quiet() {
         // NO_a 0.60 + NO_b 0.55 = 1.15 → no arb.
         let (markets, books) = fixture((42, 60), (47, 55));
-        let rel = Relationship::MutuallyExclusive { a: MarketId(0), b: MarketId(1) };
+        let rel = Relationship::MutuallyExclusive {
+            a: MarketId(0),
+            b: MarketId(1),
+        };
         assert!(detect(&rel, &markets, &books, &zero_gas_params()).is_empty());
     }
 
@@ -227,7 +283,10 @@ mod tests {
         for m in &mut markets {
             m.fee_bps = Bps(100);
         }
-        let rel = Relationship::Implies { a: MarketId(0), b: MarketId(1) };
+        let rel = Relationship::Implies {
+            a: MarketId(0),
+            b: MarketId(1),
+        };
         let ops = detect(&rel, &markets, &books, &zero_gas_params());
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].net, Usdc(9_200_000));

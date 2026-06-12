@@ -99,7 +99,12 @@ impl Default for EngineParams {
             floor_c12: Bps(30),
             floor_c3: Bps(100),
             min_profit: Usdc(1_000_000), // $1 dust filter (1_000_000 µUSDC = $1)
-            gas: GasTable { split: 10_000, merge: 10_000, redeem: 15_000, negrisk_convert: 20_000 },
+            gas: GasTable {
+                split: 10_000,
+                merge: 10_000,
+                redeem: 15_000,
+                negrisk_convert: 20_000,
+            },
             redeem: RedeemStrategy::Merge,
             max_basis: Usdc(1_000_000_000), // $1k per-market cap, in µUSDC
             max_worlds: 4096,

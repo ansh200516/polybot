@@ -71,7 +71,10 @@ const fn div_ceil_i128(n: i128, d: i128) -> i128 {
 /// Callers must pass px_micro ≤ 1_000_000 (the only intended producer is Px::microusdc).
 pub fn buy_cost(px_micro: u64, qty: Qty) -> Usdc {
     debug_assert!(px_micro <= ONE_USDC_MICRO);
-    Usdc(div_ceil_i128(px_micro as i128 * qty.0 as i128, ONE_SHARE_MICRO as i128))
+    Usdc(div_ceil_i128(
+        px_micro as i128 * qty.0 as i128,
+        ONE_SHARE_MICRO as i128,
+    ))
 }
 
 /// Cash received SELLING `qty` micro-shares at `px_micro`. Rounds DOWN (against us).
@@ -87,7 +90,9 @@ pub fn edge_bps(net: Usdc, basis: Usdc) -> Option<Bps> {
         return None;
     }
     let bps = (net.0 * 10_000).div_euclid(basis.0);
-    Some(Bps(bps.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32))
+    Some(Bps(
+        bps.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32
+    ))
 }
 
 #[cfg(test)]
@@ -117,9 +122,19 @@ mod tests {
     #[test]
     fn px_microusdc_value() {
         // 0.46 on a cent market = 460_000 µUSDC/share
-        assert_eq!(Px::new(46, TickSize::Cent).unwrap().microusdc(TickSize::Cent), 460_000);
+        assert_eq!(
+            Px::new(46, TickSize::Cent)
+                .unwrap()
+                .microusdc(TickSize::Cent),
+            460_000
+        );
         // 0.046 on a milli market
-        assert_eq!(Px::new(46, TickSize::Milli).unwrap().microusdc(TickSize::Milli), 46_000);
+        assert_eq!(
+            Px::new(46, TickSize::Milli)
+                .unwrap()
+                .microusdc(TickSize::Milli),
+            46_000
+        );
     }
 
     #[test]
@@ -139,7 +154,10 @@ mod tests {
         assert_eq!(edge_bps(Usdc(1), Usdc(0)), None);
         assert_eq!(edge_bps(Usdc(1), Usdc(-5)), None);
         // dust basis with huge net saturates instead of wrapping negative
-        assert_eq!(edge_bps(Usdc(10_000_000_000_000), Usdc(1)), Some(Bps(i32::MAX)));
+        assert_eq!(
+            edge_bps(Usdc(10_000_000_000_000), Usdc(1)),
+            Some(Bps(i32::MAX))
+        );
     }
 
     proptest! {

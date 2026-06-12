@@ -4,7 +4,7 @@ use crate::{Action, LegFill};
 use pm_core::book::Ladder;
 use pm_core::fees::fee_microusdc;
 use pm_core::instrument::TokenId;
-use pm_core::num::{buy_cost, edge_bps, sell_proceeds, Bps, Px, Qty, Usdc};
+use pm_core::num::{Bps, Px, Qty, Usdc, buy_cost, edge_bps, sell_proceeds};
 
 #[derive(Clone, Copy, Debug)]
 pub struct LegSpec<'a> {
@@ -86,7 +86,12 @@ pub fn walk(
         .map(|leg| {
             let mut levels = leg.ladder.iter_from_best();
             let cur = levels.next().map(|(p, q)| (p, q.0));
-            Cursor { leg: *leg, levels, cur, segs: Vec::new() }
+            Cursor {
+                leg: *leg,
+                levels,
+                cur,
+                segs: Vec::new(),
+            }
         })
         .collect();
 
@@ -134,8 +139,8 @@ pub fn walk(
             // basis per share. Clamp `remaining` so the multiply can't
             // overflow i128 even when max_basis is i128::MAX in tests.
             let rem = remaining.min(1_000_000_000_000_000_000);
-            let cap = (rem * 10_000_000_000 / basis_per_share_scaled)
-                .min(i128::from(u64::MAX)) as u64;
+            let cap =
+                (rem * 10_000_000_000 / basis_per_share_scaled).min(i128::from(u64::MAX)) as u64;
             if cap == 0 {
                 break;
             }
@@ -149,7 +154,11 @@ pub fn walk(
                     Some(last) if last.0 == p => last.1 += chunk,
                     _ => c.segs.push((p, chunk)),
                 }
-                c.cur = if new_rem == 0 { c.levels.next().map(|(p, q)| (p, q.0)) } else { Some((p, new_rem)) };
+                c.cur = if new_rem == 0 {
+                    c.levels.next().map(|(p, q)| (p, q.0))
+                } else {
+                    Some((p, new_rem))
+                };
             }
         }
         units += chunk;
@@ -158,8 +167,7 @@ pub fn walk(
         // per-segment exact-rounding (≤ a few µUSDC), which spec §15's risk
         // check re-validates authoritatively.
         const BASIS_DEN: i128 = 10_000 * 1_000_000;
-        basis_used +=
-            (basis_per_share_scaled * i128::from(chunk) + BASIS_DEN - 1) / BASIS_DEN;
+        basis_used += (basis_per_share_scaled * i128::from(chunk) + BASIS_DEN - 1) / BASIS_DEN;
     }
 
     if units == 0 {
@@ -216,7 +224,13 @@ pub fn walk(
     if edge < floor {
         return None;
     }
-    Some(WalkResult { units: Qty(units), net, basis, edge, fills })
+    Some(WalkResult {
+        units: Qty(units),
+        net,
+        basis,
+        edge,
+        fills,
+    })
 }
 
 #[cfg(test)]
@@ -242,11 +256,21 @@ mod tests {
     }
 
     fn buy_leg(token: u64, l: &Ladder, fee: i32) -> LegSpec<'_> {
-        LegSpec { token: TokenId(token), action: Action::Buy, ladder: l, fee_bps: Bps(fee) }
+        LegSpec {
+            token: TokenId(token),
+            action: Action::Buy,
+            ladder: l,
+            fee_bps: Bps(fee),
+        }
     }
 
     fn sell_leg(token: u64, l: &Ladder, fee: i32) -> LegSpec<'_> {
-        LegSpec { token: TokenId(token), action: Action::Sell, ladder: l, fee_bps: Bps(fee) }
+        LegSpec {
+            token: TokenId(token),
+            action: Action::Sell,
+            ladder: l,
+            fee_bps: Bps(fee),
+        }
     }
 
     /// Independent exact recompute of basket net at `units`, for cross-checking.
@@ -405,7 +429,11 @@ mod tests {
         };
         let cap = Usdc(10_000_000); // $10
         let w = walk(&spec, cap, Usdc(0), Bps(0)).unwrap();
-        assert!(w.basis.0 <= cap.0 + 10, "basis {} exceeds advisory band", w.basis.0);
+        assert!(
+            w.basis.0 <= cap.0 + 10,
+            "basis {} exceeds advisory band",
+            w.basis.0
+        );
         assert!(w.basis.0 >= cap.0 - 2_000_000, "cap left too much unused");
     }
 

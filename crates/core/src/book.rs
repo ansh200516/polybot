@@ -75,7 +75,11 @@ impl Ladder {
     pub fn iter_from_best(&self) -> impl Iterator<Item = (Px, Qty)> + '_ {
         let start = self.best.map(Px::get);
         let ascending = matches!(self.side, Side::Ask);
-        LadderIter { ladder: self, cur: start, ascending }
+        LadderIter {
+            ladder: self,
+            cur: start,
+            ascending,
+        }
     }
 }
 
@@ -98,7 +102,11 @@ impl<'a> Iterator for LadderIter<'a> {
             };
             // advance
             let next = if self.ascending {
-                if t + 1 < self.ladder.ts.levels() { Some(t + 1) } else { None }
+                if t + 1 < self.ladder.ts.levels() {
+                    Some(t + 1)
+                } else {
+                    None
+                }
             } else if t > 1 {
                 Some(t - 1)
             } else {
@@ -126,7 +134,10 @@ pub struct Book {
 
 impl Book {
     pub fn new(ts: TickSize) -> Self {
-        Book { bids: Ladder::new(ts, Side::Bid), asks: Ladder::new(ts, Side::Ask) }
+        Book {
+            bids: Ladder::new(ts, Side::Bid),
+            asks: Ladder::new(ts, Side::Ask),
+        }
     }
 
     pub fn ts(&self) -> TickSize {

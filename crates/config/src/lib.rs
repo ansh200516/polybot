@@ -75,12 +75,19 @@ impl std::error::Error for ConfigError {}
 
 impl Default for Capital {
     fn default() -> Self {
-        Capital { bankroll_usd: 10_000.0, per_market_usd: 1_000.0 }
+        Capital {
+            bankroll_usd: 10_000.0,
+            per_market_usd: 1_000.0,
+        }
     }
 }
 impl Default for Edges {
     fn default() -> Self {
-        Edges { min_edge_class12_bps: 30, min_edge_class3_bps: 100, min_profit_usd: 1.0 }
+        Edges {
+            min_edge_class12_bps: 30,
+            min_edge_class3_bps: 100,
+            min_profit_usd: 1.0,
+        }
     }
 }
 impl Default for Gas {
@@ -100,7 +107,10 @@ impl Default for Lp {
 }
 impl Default for Dedup {
     fn default() -> Self {
-        Dedup { cooldown_ms: 2000, reemit_improvement_pct: 20 }
+        Dedup {
+            cooldown_ms: 2000,
+            reemit_improvement_pct: 20,
+        }
     }
 }
 impl Default for Mode {
@@ -119,16 +129,21 @@ impl Config {
     /// Sanity checks beyond shape: positive capital, per-market ≤ bankroll,
     /// percentage domains.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if !(self.capital.bankroll_usd > 0.0) {
+        if self.capital.bankroll_usd <= 0.0 || !self.capital.bankroll_usd.is_finite() {
             return Err(ConfigError::BadMoney("bankroll_usd must be > 0"));
         }
-        if !(self.capital.per_market_usd > 0.0)
+        if self.capital.per_market_usd <= 0.0
+            || !self.capital.per_market_usd.is_finite()
             || self.capital.per_market_usd > self.capital.bankroll_usd
         {
-            return Err(ConfigError::BadMoney("per_market_usd must be in (0, bankroll]"));
+            return Err(ConfigError::BadMoney(
+                "per_market_usd must be in (0, bankroll]",
+            ));
         }
         if self.dedup.reemit_improvement_pct > 100 {
-            return Err(ConfigError::BadMoney("reemit_improvement_pct must be ≤ 100"));
+            return Err(ConfigError::BadMoney(
+                "reemit_improvement_pct must be ≤ 100",
+            ));
         }
         Ok(())
     }

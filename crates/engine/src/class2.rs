@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::walker::{walk, BasketSpec, LegSpec};
+use crate::walker::{BasketSpec, LegSpec, walk};
 use crate::{Action, ArbClass, EngineParams, Opportunity};
 use pm_core::book::Book;
 use pm_core::instrument::{Market, Partition, TokenId};
@@ -80,7 +80,10 @@ mod tests {
     }
 
     /// n-outcome partition; per outcome: (yes_ask, no_ask) at 100 shares deep.
-    fn fixture(quotes: &[(u16, u16)], verified: bool) -> (Partition, Vec<Market>, HashMap<TokenId, Book>) {
+    fn fixture(
+        quotes: &[(u16, u16)],
+        verified: bool,
+    ) -> (Partition, Vec<Market>, HashMap<TokenId, Book>) {
         let n = quotes.len() as u32;
         let mut markets = Vec::new();
         let mut books = HashMap::new();
@@ -121,7 +124,12 @@ mod tests {
 
     fn zero_gas_params() -> EngineParams {
         EngineParams {
-            gas: crate::GasTable { split: 0, merge: 0, redeem: 0, negrisk_convert: 0 },
+            gas: crate::GasTable {
+                split: 0,
+                merge: 0,
+                redeem: 0,
+                negrisk_convert: 0,
+            },
             min_profit: Usdc(0),
             ..EngineParams::default()
         }

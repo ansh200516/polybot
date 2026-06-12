@@ -29,7 +29,13 @@ impl Opportunity {
         let mut legs: Vec<(u64, bool, u16)> = self
             .fills
             .iter()
-            .map(|f| (f.token.0, matches!(f.action, crate::Action::Buy), f.limit_px.get()))
+            .map(|f| {
+                (
+                    f.token.0,
+                    matches!(f.action, crate::Action::Buy),
+                    f.limit_px.get(),
+                )
+            })
             .collect();
         legs.sort_unstable();
         let class_byte = match self.class {
@@ -64,7 +70,11 @@ const PURGE_THRESHOLD: usize = 1024;
 impl Cooldown {
     /// `window` = suppression window; `improvement_pct` = integer percent (20 = 20%) by which net must improve to re-emit inside the window. Note: for net below 100/pct µUSDC the integer bar truncates to "any improvement" — irrelevant above the $1 min_profit dust filter.
     pub fn new(window: Duration, improvement_pct: u32) -> Self {
-        Cooldown { window, improvement_pct, seen: HashMap::new() }
+        Cooldown {
+            window,
+            improvement_pct,
+            seen: HashMap::new(),
+        }
     }
 
     pub fn tracked(&self) -> usize {
@@ -75,7 +85,8 @@ impl Cooldown {
     pub fn admit(&mut self, now: Instant, op: &Opportunity) -> bool {
         if self.seen.len() > PURGE_THRESHOLD {
             let window = self.window;
-            self.seen.retain(|_, (t, _)| now.duration_since(*t) < window);
+            self.seen
+                .retain(|_, (t, _)| now.duration_since(*t) < window);
         }
         let fp = op.fingerprint();
         let admit = match self.seen.get(&fp) {
@@ -197,8 +208,14 @@ mod tests {
         // px must be in range [1, 99] for TickSize::Cent.
         // We need 8 classes × 99 px × 2 actions = 1584 combinations.
         let classes = [
-            ArbClass::C1Long, ArbClass::C1Short, ArbClass::C2Long, ArbClass::C2Short,
-            ArbClass::C3Implies, ArbClass::C3MutEx, ArbClass::C3Equiv, ArbClass::C4Lp,
+            ArbClass::C1Long,
+            ArbClass::C1Short,
+            ArbClass::C2Long,
+            ArbClass::C2Short,
+            ArbClass::C3Implies,
+            ArbClass::C3MutEx,
+            ArbClass::C3Equiv,
+            ArbClass::C4Lp,
         ];
         let mut idx = 0u16;
         for class in &classes {

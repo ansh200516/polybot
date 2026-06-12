@@ -6,7 +6,7 @@ use crate::{Action, ArbClass, LegFill, Opportunity};
 use pm_core::book::Book;
 use pm_core::fees::fee_microusdc;
 use pm_core::instrument::{Market, MarketId, Partition, Relationship, TokenId};
-use pm_core::num::{buy_cost, edge_bps, sell_proceeds, Bps, Qty, Usdc};
+use pm_core::num::{Bps, Qty, Usdc, buy_cost, edge_bps, sell_proceeds};
 
 /// A logical component: the set of markets + partitions + relationships +
 /// live books the LP will solve over.
@@ -69,24 +69,36 @@ fn consistent(spec: &ComponentSpec, w: &World) -> bool {
     for rel in &spec.relationships {
         match *rel {
             Relationship::Implies { a, b } => {
-                let Some(ai) = market_index(spec, a) else { continue };
-                let Some(bi) = market_index(spec, b) else { continue };
+                let Some(ai) = market_index(spec, a) else {
+                    continue;
+                };
+                let Some(bi) = market_index(spec, b) else {
+                    continue;
+                };
                 // Implies: ¬a ∨ b
                 if w.yes_true[ai] && !w.yes_true[bi] {
                     return false;
                 }
             }
             Relationship::MutuallyExclusive { a, b } => {
-                let Some(ai) = market_index(spec, a) else { continue };
-                let Some(bi) = market_index(spec, b) else { continue };
+                let Some(ai) = market_index(spec, a) else {
+                    continue;
+                };
+                let Some(bi) = market_index(spec, b) else {
+                    continue;
+                };
                 // MutEx: ¬(a ∧ b)
                 if w.yes_true[ai] && w.yes_true[bi] {
                     return false;
                 }
             }
             Relationship::Equivalent { a, b } => {
-                let Some(ai) = market_index(spec, a) else { continue };
-                let Some(bi) = market_index(spec, b) else { continue };
+                let Some(ai) = market_index(spec, a) else {
+                    continue;
+                };
+                let Some(bi) = market_index(spec, b) else {
+                    continue;
+                };
                 // Equivalent: a == b
                 if w.yes_true[ai] != w.yes_true[bi] {
                     return false;
@@ -123,8 +135,9 @@ pub fn enumerate_worlds(spec: &ComponentSpec, max_worlds: usize) -> Option<Vec<W
     }
 
     // Free markets: those not owned by any partition.
-    let free_indices: Vec<usize> =
-        (0..n_markets).filter(|i| partition_owner[*i].is_none()).collect();
+    let free_indices: Vec<usize> = (0..n_markets)
+        .filter(|i| partition_owner[*i].is_none())
+        .collect();
     let n_free = free_indices.len();
 
     // Pre-prune size = Π partition_sizes × 2^free_markets.
@@ -215,7 +228,9 @@ pub fn enumerate_worlds(spec: &ComponentSpec, max_worlds: usize) -> Option<Vec<W
 
 /// Find the `Market` in `spec.markets` that owns `token` (yes or no side).
 fn find_market_for_token<'a>(spec: &'a ComponentSpec, token: TokenId) -> Option<&'a Market> {
-    spec.markets.iter().find(|m| m.yes == token || m.no == token)
+    spec.markets
+        .iter()
+        .find(|m| m.yes == token || m.no == token)
 }
 
 /// Exact re-validation of a candidate LP solution.
@@ -356,10 +371,7 @@ enum VarKind {
 /// Solve one component. Gas-less LP objective; exact reval applies gas and the
 /// §10 floor rule (uses `p.floor_c12` when the component has no relationships,
 /// `p.floor_c3` otherwise (spec §10)).
-pub fn solve_component(
-    spec: &ComponentSpec,
-    p: &crate::EngineParams,
-) -> LpResult {
+pub fn solve_component(spec: &ComponentSpec, p: &crate::EngineParams) -> LpResult {
     use highs::{Col, HighsModelStatus, RowProblem, Sense};
 
     // --- enumerate worlds ---------------------------------------------------
@@ -398,7 +410,9 @@ pub fn solve_component(
 
     for market in &spec.markets {
         for token in [market.yes, market.no] {
-            let Some(book) = spec.books.get(&token) else { continue };
+            let Some(book) = spec.books.get(&token) else {
+                continue;
+            };
             let ts = book.ts();
 
             // Buy levels (asks)
@@ -475,11 +489,19 @@ pub fn solve_component(
         let VarKind::Trade { action, meta } = kind;
         match action {
             Action::Buy => {
-                if token_pays(spec, w, meta.token) == Some(true) { 1.0 } else { 0.0 }
+                if token_pays(spec, w, meta.token) == Some(true) {
+                    1.0
+                } else {
+                    0.0
+                }
             }
             Action::Sell => {
                 // Sells are short positions: costs 1 if token pays
-                if token_pays(spec, w, meta.token) == Some(true) { -1.0 } else { 0.0 }
+                if token_pays(spec, w, meta.token) == Some(true) {
+                    -1.0
+                } else {
+                    0.0
+                }
             }
         }
     };
@@ -566,10 +588,11 @@ pub fn solve_component(
             continue;
         }
         // px_micro comes from a valid book Px value; reconstruction is infallible.
-        let Some(px) = pm_core::num::Px::new(
-            (meta.px_micro / meta.ts.unit_microusdc()) as u16,
-            meta.ts,
-        ).ok() else { continue };
+        let Some(px) =
+            pm_core::num::Px::new((meta.px_micro / meta.ts.unit_microusdc()) as u16, meta.ts).ok()
+        else {
+            continue;
+        };
         match action {
             Action::Buy => {
                 let cost = buy_cost(meta.px_micro, qty);
@@ -629,8 +652,7 @@ pub fn solve_component(
             let proceeds = sell_proceeds(fill.limit_px.microusdc(fill.ts), fill.qty);
             fill.cash = proceeds;
             // Consume holdings so subsequent sells on the same token can't reuse them.
-            *holdings.entry(fill.token).or_insert(0) =
-                avail.saturating_sub(clamped);
+            *holdings.entry(fill.token).or_insert(0) = avail.saturating_sub(clamped);
         }
     }
     // Drop zero fills
@@ -641,7 +663,10 @@ pub fn solve_component(
     }
 
     // --- exact re-validation ------------------------------------------------
-    let lp_sol = LpSolution { fills: fills.clone(), splits: splits.clone() };
+    let lp_sol = LpSolution {
+        fills: fills.clone(),
+        splits: splits.clone(),
+    };
     // Charge one split gas per on-chain split (one per market that is split).
     let split_gas = (splits.len() as u64).saturating_mul(p.gas.split);
     let gas = split_gas + p.gas.redeem;
@@ -655,7 +680,11 @@ pub fn solve_component(
         return LpResult::NoEdge;
     }
 
-    let floor = if spec.relationships.is_empty() { p.floor_c12 } else { p.floor_c3 };
+    let floor = if spec.relationships.is_empty() {
+        p.floor_c12
+    } else {
+        p.floor_c3
+    };
 
     let edge = match edge_bps(worst, basis) {
         Some(e) => e,
@@ -736,7 +765,10 @@ mod tests {
         let spec = ComponentSpec {
             markets: vec![mk(0), mk(1)],
             partitions: vec![],
-            relationships: vec![Relationship::Implies { a: MarketId(0), b: MarketId(1) }],
+            relationships: vec![Relationship::Implies {
+                a: MarketId(0),
+                b: MarketId(1),
+            }],
             books: &books,
         };
         let worlds = enumerate_worlds(&spec, 4096).unwrap();
@@ -754,12 +786,18 @@ mod tests {
         let spec_mutex = ComponentSpec {
             markets: vec![mk(0), mk(1)],
             partitions: vec![],
-            relationships: vec![Relationship::MutuallyExclusive { a: MarketId(0), b: MarketId(1) }],
+            relationships: vec![Relationship::MutuallyExclusive {
+                a: MarketId(0),
+                b: MarketId(1),
+            }],
             books: &books,
         };
         assert_eq!(enumerate_worlds(&spec_mutex, 4096).unwrap().len(), 3);
         let spec_eq = ComponentSpec {
-            relationships: vec![Relationship::Equivalent { a: MarketId(0), b: MarketId(1) }],
+            relationships: vec![Relationship::Equivalent {
+                a: MarketId(0),
+                b: MarketId(1),
+            }],
             ..spec_mutex.clone()
         };
         assert_eq!(enumerate_worlds(&spec_eq, 4096).unwrap().len(), 2);
@@ -771,7 +809,10 @@ mod tests {
         let spec = ComponentSpec {
             markets: vec![mk(0)],
             partitions: vec![],
-            relationships: vec![Relationship::Implies { a: MarketId(0), b: MarketId(99) }],
+            relationships: vec![Relationship::Implies {
+                a: MarketId(0),
+                b: MarketId(99),
+            }],
             books: &books,
         };
         assert_eq!(enumerate_worlds(&spec, 4096).unwrap().len(), 2);
@@ -973,8 +1014,22 @@ mod tests {
         let worlds = enumerate_worlds(&spec, 4096).unwrap();
         let sol = LpSolution {
             fills: vec![
-                LegFill { token: TokenId(10), action: Action::Buy, ts: TS, limit_px: px(46), qty: Qty(100_000_000), cash: Usdc(0) },
-                LegFill { token: TokenId(11), action: Action::Buy, ts: TS, limit_px: px(52), qty: Qty(100_000_000), cash: Usdc(0) },
+                LegFill {
+                    token: TokenId(10),
+                    action: Action::Buy,
+                    ts: TS,
+                    limit_px: px(46),
+                    qty: Qty(100_000_000),
+                    cash: Usdc(0),
+                },
+                LegFill {
+                    token: TokenId(11),
+                    action: Action::Buy,
+                    ts: TS,
+                    limit_px: px(52),
+                    qty: Qty(100_000_000),
+                    cash: Usdc(0),
+                },
             ],
             splits: vec![],
         };
@@ -986,7 +1041,12 @@ mod tests {
 
     fn solver_params() -> crate::EngineParams {
         crate::EngineParams {
-            gas: crate::GasTable { split: 0, merge: 0, redeem: 0, negrisk_convert: 0 },
+            gas: crate::GasTable {
+                split: 0,
+                merge: 0,
+                redeem: 0,
+                negrisk_convert: 0,
+            },
             min_profit: Usdc(0),
             ..crate::EngineParams::default()
         }
@@ -1065,7 +1125,10 @@ mod tests {
         let spec = ComponentSpec {
             markets: vec![mk(0), mk(1)],
             partitions: vec![],
-            relationships: vec![Relationship::Implies { a: MarketId(0), b: MarketId(1) }],
+            relationships: vec![Relationship::Implies {
+                a: MarketId(0),
+                b: MarketId(1),
+            }],
             books: &books,
         };
         let LpResult::Found(op) = solve_component(&spec, &solver_params()) else {
@@ -1074,8 +1137,14 @@ mod tests {
         // NO_a + YES_b = 0.90 → ≥ $10 on 100sh (LP may find more; never less).
         assert!(op.net >= Usdc(10_000_000), "net was {:?}", op.net);
         // Without the relationship the same books are no-arb:
-        let spec_free = ComponentSpec { relationships: vec![], ..spec.clone() };
-        assert!(matches!(solve_component(&spec_free, &solver_params()), LpResult::NoEdge));
+        let spec_free = ComponentSpec {
+            relationships: vec![],
+            ..spec.clone()
+        };
+        assert!(matches!(
+            solve_component(&spec_free, &solver_params()),
+            LpResult::NoEdge
+        ));
     }
 
     #[test]
@@ -1093,12 +1162,21 @@ mod tests {
         let spec = ComponentSpec {
             markets: vec![mk(0), mk(1)],
             partitions: vec![],
-            relationships: vec![Relationship::Implies { a: MarketId(0), b: MarketId(1) }],
+            relationships: vec![Relationship::Implies {
+                a: MarketId(0),
+                b: MarketId(1),
+            }],
             books: &books,
         };
-        let p = crate::EngineParams { floor_c3: Bps(150), ..solver_params() };
+        let p = crate::EngineParams {
+            floor_c3: Bps(150),
+            ..solver_params()
+        };
         assert!(matches!(solve_component(&spec, &p), LpResult::NoEdge));
-        let p = crate::EngineParams { floor_c3: Bps(100), ..solver_params() };
+        let p = crate::EngineParams {
+            floor_c3: Bps(100),
+            ..solver_params()
+        };
         assert!(matches!(solve_component(&spec, &p), LpResult::Found(_)));
     }
 
@@ -1110,7 +1188,10 @@ mod tests {
         quote(&mut books, TokenId(10), 50, 48, 100_000_000);
         quote(&mut books, TokenId(11), 50, 48, 100_000_000);
         let spec = simple_spec(&books);
-        assert!(matches!(solve_component(&spec, &solver_params()), LpResult::NoEdge));
+        assert!(matches!(
+            solve_component(&spec, &solver_params()),
+            LpResult::NoEdge
+        ));
     }
 
     #[test]
@@ -1134,7 +1215,10 @@ mod tests {
         quote(&mut books, TokenId(10), 46, 44, 100_000_000);
         quote(&mut books, TokenId(11), 52, 50, 100_000_000);
         let spec = simple_spec(&books);
-        let p = crate::EngineParams { max_basis: Usdc(9_800_000), ..solver_params() }; // $9.80
+        let p = crate::EngineParams {
+            max_basis: Usdc(9_800_000),
+            ..solver_params()
+        }; // $9.80
         let LpResult::Found(op) = solve_component(&spec, &p) else {
             panic!("expected Found");
         };

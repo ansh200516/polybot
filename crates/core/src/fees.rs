@@ -1,6 +1,6 @@
 //! Venue fee formula (spec §6). Symmetric in price, rounded up (against us).
 
-use crate::num::{Bps, Qty, Usdc, ONE_USDC_MICRO};
+use crate::num::{Bps, ONE_USDC_MICRO, Qty, Usdc};
 
 /// Fee in µUSDC for a fill of `qty` micro-shares at `px_micro` µUSDC/share.
 /// Polymarket's documented schedule shape: rate · min(p, 1−p) · size. Rounded UP.
@@ -35,12 +35,19 @@ mod tests {
     #[test]
     fn golden_value() {
         // 200 bps on 10 shares at 0.40: 0.02 × 0.40 × 10 = $0.08 = 80_000 µUSDC
-        assert_eq!(fee_microusdc(Bps(200), 400_000, Qty(10_000_000)), Usdc(80_000));
+        assert_eq!(
+            fee_microusdc(Bps(200), 400_000, Qty(10_000_000)),
+            Usdc(80_000)
+        );
     }
 
     #[test]
     fn symmetric_in_price() {
-        for (p, q) in [(10_000u64, 3_333_333u64), (250_000, 1), (990_000, 7_777_777)] {
+        for (p, q) in [
+            (10_000u64, 3_333_333u64),
+            (250_000, 1),
+            (990_000, 7_777_777),
+        ] {
             assert_eq!(
                 fee_microusdc(Bps(150), p, Qty(q)),
                 fee_microusdc(Bps(150), 1_000_000 - p, Qty(q))

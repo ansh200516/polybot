@@ -1,6 +1,6 @@
 //! Class 1: binary complete-set arbitrage (spec §8).
 
-use crate::walker::{walk, BasketSpec, LegSpec};
+use crate::walker::{BasketSpec, LegSpec, walk};
 use crate::{Action, ArbClass, EngineParams, Opportunity, RedeemStrategy};
 use pm_core::book::Book;
 use pm_core::instrument::Market;
@@ -14,8 +14,18 @@ pub fn detect(m: &Market, yes: &Book, no: &Book, p: &EngineParams) -> Vec<Opport
     };
     let long = BasketSpec {
         legs: vec![
-            LegSpec { token: m.yes, action: Action::Buy, ladder: &yes.asks, fee_bps: m.fee_bps },
-            LegSpec { token: m.no, action: Action::Buy, ladder: &no.asks, fee_bps: m.fee_bps },
+            LegSpec {
+                token: m.yes,
+                action: Action::Buy,
+                ladder: &yes.asks,
+                fee_bps: m.fee_bps,
+            },
+            LegSpec {
+                token: m.no,
+                action: Action::Buy,
+                ladder: &no.asks,
+                fee_bps: m.fee_bps,
+            },
         ],
         payout_per_share: 1_000_000,
         collateral_per_share: 0,
@@ -26,8 +36,18 @@ pub fn detect(m: &Market, yes: &Book, no: &Book, p: &EngineParams) -> Vec<Opport
     }
     let short = BasketSpec {
         legs: vec![
-            LegSpec { token: m.yes, action: Action::Sell, ladder: &yes.bids, fee_bps: m.fee_bps },
-            LegSpec { token: m.no, action: Action::Sell, ladder: &no.bids, fee_bps: m.fee_bps },
+            LegSpec {
+                token: m.yes,
+                action: Action::Sell,
+                ladder: &yes.bids,
+                fee_bps: m.fee_bps,
+            },
+            LegSpec {
+                token: m.no,
+                action: Action::Sell,
+                ladder: &no.bids,
+                fee_bps: m.fee_bps,
+            },
         ],
         payout_per_share: 0,
         collateral_per_share: 1_000_000,
@@ -79,7 +99,12 @@ mod tests {
 
     fn zero_gas_params() -> EngineParams {
         EngineParams {
-            gas: crate::GasTable { split: 0, merge: 0, redeem: 0, negrisk_convert: 0 },
+            gas: crate::GasTable {
+                split: 0,
+                merge: 0,
+                redeem: 0,
+                negrisk_convert: 0,
+            },
             min_profit: Usdc(0),
             ..EngineParams::default()
         }
@@ -124,7 +149,10 @@ mod tests {
         let mut no = Book::new(ts);
         yes.apply(Side::Ask, mk_px(499), Qty(100_000_000));
         no.apply(Side::Ask, mk_px(499), Qty(100_000_000));
-        let m = Market { tick: ts, ..market(0) };
+        let m = Market {
+            tick: ts,
+            ..market(0)
+        };
         assert!(detect(&m, &yes, &no, &zero_gas_params()).is_empty());
     }
 
