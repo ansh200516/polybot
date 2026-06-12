@@ -500,7 +500,13 @@ impl ExecutionVenue for LiveVenue {
                     .get(target_field)
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
+                    .unwrap_or_else(|| {
+                        tracing::warn!(
+                            field = target_field,
+                            "matched response had unparseable fill target; polling on window only"
+                        );
+                        0
+                    });
                 let (fills, filled_shares) = self
                     .poll_fills(order, &venue_order_id, &venue_token, target)
                     .await?;
