@@ -21,6 +21,7 @@
 //! `can_transition`, `OrderState`, and `ExecError` exactly as declared below.
 
 pub mod basket;
+pub mod secrets;
 pub mod venue;
 
 use pm_core::instrument::TokenId;
