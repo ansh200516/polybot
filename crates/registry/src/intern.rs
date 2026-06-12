@@ -1,4 +1,5 @@
 //! Venue-id interning: the only home of venue strings (spec §3 ids-are-handles).
+// each string lives once in the vec (handle-indexed) and once as the map key; ~2× memory, fine at ≤10k entries
 
 use std::collections::HashMap;
 
@@ -57,6 +58,17 @@ pub struct Interner {
 }
 
 impl Interner {
+    pub fn with_capacity(tokens: usize, markets: usize, events: usize) -> Self {
+        Self {
+            tokens: Vec::with_capacity(tokens),
+            token_idx: HashMap::with_capacity(tokens),
+            markets: Vec::with_capacity(markets),
+            market_idx: HashMap::with_capacity(markets),
+            events: Vec::with_capacity(events),
+            event_idx: HashMap::with_capacity(events),
+        }
+    }
+
     pub fn token(&mut self, venue_id: &str) -> TokenId {
         if let Some(&t) = self.token_idx.get(venue_id) {
             return t;
@@ -67,10 +79,12 @@ impl Interner {
         t
     }
 
+    #[must_use]
     pub fn find_token(&self, venue_id: &str) -> Option<TokenId> {
         self.token_idx.get(venue_id).copied()
     }
 
+    #[must_use]
     pub fn token_str(&self, t: TokenId) -> Option<&str> {
         self.tokens.get(usize::try_from(t.0).ok()?).map(AsRef::as_ref)
     }
@@ -79,16 +93,19 @@ impl Interner {
         if let Some(&m) = self.market_idx.get(venue_id) {
             return m;
         }
+        debug_assert!(self.markets.len() < u32::MAX as usize);
         let m = MarketId(self.markets.len() as u32);
         self.markets.push(venue_id.into());
         self.market_idx.insert(venue_id.into(), m);
         m
     }
 
+    #[must_use]
     pub fn find_market(&self, venue_id: &str) -> Option<MarketId> {
         self.market_idx.get(venue_id).copied()
     }
 
+    #[must_use]
     pub fn market_str(&self, m: MarketId) -> Option<&str> {
         self.markets.get(usize::try_from(m.0).ok()?).map(AsRef::as_ref)
     }
@@ -97,16 +114,19 @@ impl Interner {
         if let Some(&e) = self.event_idx.get(venue_id) {
             return e;
         }
+        debug_assert!(self.events.len() < u32::MAX as usize);
         let e = EventId(self.events.len() as u32);
         self.events.push(venue_id.into());
         self.event_idx.insert(venue_id.into(), e);
         e
     }
 
+    #[must_use]
     pub fn find_event(&self, venue_id: &str) -> Option<EventId> {
         self.event_idx.get(venue_id).copied()
     }
 
+    #[must_use]
     pub fn event_str(&self, e: EventId) -> Option<&str> {
         self.events.get(usize::try_from(e.0).ok()?).map(AsRef::as_ref)
     }
