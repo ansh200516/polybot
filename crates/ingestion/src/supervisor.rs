@@ -29,6 +29,7 @@ use pm_core::num::TickSize;
 use crate::livebook::RawChange;
 use crate::rest::ParsedBook;
 use crate::shard::Shard;
+use crate::stats::StatsCell;
 use crate::ws::{parse_frame, subscribe_message, WsEvent, WsTransport};
 use crate::IngestError;
 
@@ -153,6 +154,15 @@ pub struct Supervisor<R: RestBookSource> {
     rest: R,
     cfg: SupervisorConfig,
     stats: SupStats,
+    /// Optional shared-stats mirror for the probe; set via [`share_stats`].
+    ///
+    /// When `Some`, [`refresh_mirror`] is called at the end of every
+    /// `handle_frame` call and on every sweep tick so the probe can read
+    /// counters without holding any lock on the supervisor.
+    ///
+    /// [`share_stats`]: Supervisor::share_stats
+    /// [`refresh_mirror`]: Supervisor::refresh_mirror
+    stats_mirror: Option<std::sync::Arc<StatsCell>>,
 }
 
 impl<R: RestBookSource> Supervisor<R> {
@@ -180,6 +190,7 @@ impl<R: RestBookSource> Supervisor<R> {
             rest,
             cfg,
             stats: SupStats::default(),
+            stats_mirror: None,
         }
     }
 
@@ -195,6 +206,32 @@ impl<R: RestBookSource> Supervisor<R> {
     /// Read-only access to the underlying shard.
     pub fn shard(&self) -> &Shard {
         &self.shard
+    }
+
+    /// Install a shared-stats mirror and return a clone of the `Arc<StatsCell>`.
+    ///
+    /// The probe calls this before spawning the supervisor task to obtain a
+    /// handle for reading stats without holding the supervisor lock. After this
+    /// call, every `handle_frame` and sweep tick will call `refresh_mirror`.
+    ///
+    /// Calling `share_stats` a second time replaces the previous mirror.
+    pub fn share_stats(&mut self) -> std::sync::Arc<StatsCell> {
+        let cell = StatsCell::new();
+        self.stats_mirror = Some(std::sync::Arc::clone(&cell));
+        cell
+    }
+
+    /// Push current stats + book health into the shared mirror (if installed).
+    ///
+    /// Called by [`handle_frame`] (with latency µs) and by the sweep arm
+    /// (with `None` latencies). The mirror stores relaxed-atomic snapshots that
+    /// the probe reads periodically without any lock on this supervisor.
+    fn refresh_mirror(&self, parse_us: Option<u64>, apply_us: Option<u64>) {
+        if let Some(ref cell) = self.stats_mirror {
+            let now = Instant::now();
+            let stale = self.shard.stale_tokens(now, self.cfg.staleness).len();
+            cell.refresh(&self.stats, self.shard.book_count(), stale, parse_us, apply_us);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -264,6 +301,8 @@ impl<R: RestBookSource> Supervisor<R> {
                             self.resnapshot(token_id).await;
                         }
                     }
+                    // Refresh mirror after sweep (no latency args — sweep is timer-driven).
+                    self.refresh_mirror(None, None);
                 }
             }
         }
@@ -343,16 +382,20 @@ impl<R: RestBookSource> Supervisor<R> {
     // -----------------------------------------------------------------------
 
     async fn handle_frame(&mut self, text: &str) {
+        let parse_start = Instant::now();
         self.stats.frames += 1;
         let events = match parse_frame(text) {
             Ok(ev) => ev,
             Err(_) => {
                 self.stats.parse_errors += 1;
+                self.refresh_mirror(None, None);
                 return;
             }
         };
+        let parse_us = parse_start.elapsed().as_micros() as u64;
         self.stats.events += events.len() as u64;
 
+        let apply_start = Instant::now();
         for event in events {
             match event {
                 WsEvent::Book(book_ev) => {
@@ -400,6 +443,8 @@ impl<R: RestBookSource> Supervisor<R> {
                 }
             }
         }
+        let apply_us = apply_start.elapsed().as_micros() as u64;
+        self.refresh_mirror(Some(parse_us), Some(apply_us));
     }
 
     async fn handle_price_change(&mut self, pc: crate::ws::PriceChangeEvent) {
