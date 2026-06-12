@@ -139,6 +139,28 @@ impl ReadStore {
         Ok(rows)
     }
 
+    /// Most-recent `n` orders, newest first. The durable `orders` table is the
+    /// order ledger (one row per submitted order); `recent_order_events`
+    /// surfaces the per-state transition log. The dashboard's Orders panel wants
+    /// the former — `order_events` stays empty until the executor emits
+    /// transitions, whereas every submitted order lands here immediately.
+    pub fn recent_orders(&self, n: usize) -> Result<Vec<OrderEventView>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts_ms, id, state, '' FROM orders ORDER BY ts_ms DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([n as i64], |row| {
+                Ok(OrderEventView {
+                    ts_ms: row.get(0)?,
+                    order_id: row.get(1)?,
+                    state: row.get(2)?,
+                    detail: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Open positions from FIFO lots: `(token, remaining µshares, remaining cost µUSDC)`.
     /// Only tokens with a positive remaining quantity are returned, ordered by token id.
     pub fn open_positions(&self) -> Result<Vec<(i64, i64, i64)>, StoreError> {

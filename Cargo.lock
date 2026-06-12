@@ -1307,6 +1307,8 @@ dependencies = [
  "pm-registry",
  "pm-risk",
  "pm-store",
+ "pm-tui",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
