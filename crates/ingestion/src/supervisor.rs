@@ -42,8 +42,10 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use pm_core::book::Book;
 use pm_core::instrument::TokenId;
 use pm_core::num::TickSize;
+use tokio::sync::mpsc;
 
 use crate::IngestError;
 use crate::livebook::RawChange;
@@ -51,6 +53,37 @@ use crate::rest::ParsedBook;
 use crate::shard::Shard;
 use crate::stats::StatsCell;
 use crate::ws::{WsEvent, WsTransport, parse_frame, subscribe_message};
+
+// ---------------------------------------------------------------------------
+// M3 seam type aliases
+// ---------------------------------------------------------------------------
+
+/// Detection hook type (M3 seam §5): called after every successful apply.
+type OnApplyFn = Box<dyn FnMut(TokenId, &Shard) + Send>;
+
+// ---------------------------------------------------------------------------
+// SupervisorCommand — M3 seam §12
+// ---------------------------------------------------------------------------
+
+/// Commands servable while a session runs (M3 seam; spec §12 app wiring).
+pub enum SupervisorCommand {
+    /// Snapshot one book: replies with (clone, valid flag), or None if unknown.
+    BookSnapshot {
+        token: TokenId,
+        reply: tokio::sync::oneshot::Sender<Option<(Book, bool)>>,
+    },
+}
+
+/// Await the next command, or pend forever when no channel is installed.
+async fn recv_cmd(rx: &mut Option<mpsc::Receiver<SupervisorCommand>>) -> SupervisorCommand {
+    match rx.as_mut() {
+        Some(r) => match r.recv().await {
+            Some(c) => c,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -199,6 +232,12 @@ pub struct Supervisor<R: RestBookSource> {
     /// [`share_stats`]: Supervisor::share_stats
     /// [`refresh_mirror`]: Supervisor::refresh_mirror
     stats_mirror: Option<std::sync::Arc<StatsCell>>,
+    /// M3 detection hook: called after every successful apply (ApplyOutcome::Ok).
+    /// None when not installed (default) — M2 behavior is completely unchanged.
+    on_apply: Option<OnApplyFn>,
+    /// M3 command channel receiver: serves BookSnapshot queries during a session.
+    /// None when not installed (default).
+    cmd_rx: Option<mpsc::Receiver<SupervisorCommand>>,
 }
 
 impl<R: RestBookSource> Supervisor<R> {
@@ -232,6 +271,8 @@ impl<R: RestBookSource> Supervisor<R> {
             stats: SupStats::default(),
             last_frame: tokio::time::Instant::now(),
             stats_mirror: None,
+            on_apply: None,
+            cmd_rx: None,
         }
     }
 
@@ -269,6 +310,49 @@ impl<R: RestBookSource> Supervisor<R> {
         let cell = StatsCell::new();
         self.stats_mirror = Some(std::sync::Arc::clone(&cell));
         cell
+    }
+
+    /// Install the M3 detection hook.
+    ///
+    /// The callback fires after every apply whose outcome is `ApplyOutcome::Ok`
+    /// (snapshot and delta applies). It is called with the affected `TokenId`
+    /// and an immutable reference to the `Shard` AFTER the apply, so the caller
+    /// can read the new book state.
+    ///
+    /// When not installed (default), M2 behavior is completely unchanged.
+    pub fn set_on_apply(&mut self, cb: OnApplyFn) {
+        self.on_apply = Some(cb);
+    }
+
+    /// Create (or replace) the command channel.
+    ///
+    /// Returns the sender half; the supervisor holds the receiver and polls it
+    /// in the `run_session` select loop. Replacing a previous channel drops the
+    /// old receiver, which will cause senders on the old channel to get errors.
+    pub fn command_channel(&mut self, capacity: usize) -> mpsc::Sender<SupervisorCommand> {
+        let (tx, rx) = mpsc::channel(capacity);
+        self.cmd_rx = Some(rx);
+        tx
+    }
+
+    /// Fire the detection hook after a successful apply (disjoint field borrow).
+    fn fire_on_apply(&mut self, token: TokenId) {
+        if let Some(cb) = self.on_apply.as_mut() {
+            cb(token, &self.shard);
+        }
+    }
+
+    /// Serve a single command (called from the select loop).
+    fn handle_command(&mut self, cmd: SupervisorCommand) {
+        match cmd {
+            SupervisorCommand::BookSnapshot { token, reply } => {
+                let view = self
+                    .shard
+                    .book(token)
+                    .map(|lb| (lb.book().clone(), lb.valid()));
+                let _ = reply.send(view);
+            }
+        }
     }
 
     /// Push current stats + book health into the shared mirror (if installed).
@@ -319,6 +403,10 @@ impl<R: RestBookSource> Supervisor<R> {
         // is relative to session open, not supervisor construction.
         self.last_frame = tokio::time::Instant::now();
 
+        // Take the command receiver out of self so the select loop can hold it
+        // as a local without conflicting with &mut self in arm bodies.
+        let mut cmd_rx = self.cmd_rx.take();
+
         // Step 1: subscribe.
         let venue_ids: Vec<String> = self.tokens.iter().map(|m| m.venue_id.to_string()).collect();
         let sub_msg = subscribe_message(&venue_ids);
@@ -340,12 +428,14 @@ impl<R: RestBookSource> Supervisor<R> {
                 // biased: drain frames first. Under continuous frame flow the sweep arm can
                 // starve — acceptable: busy books are fresh by definition and integrity
                 // failures resnapshot inline; the sweep only backstops INVALID books.
+                // Commands come second — must not starve frames. Sweep is last.
                 biased;
                 frame = transport.next_frame() => {
                     match frame {
                         None | Some(Err(_)) => {
                             self.shard.mark_all_stale();
                             self.stats.reconnects += 1;
+                            self.cmd_rx = cmd_rx;
                             return SessionEnd::TransportLost;
                         }
                         Some(Ok(text)) => {
@@ -357,6 +447,9 @@ impl<R: RestBookSource> Supervisor<R> {
                         }
                     }
                 }
+                cmd = recv_cmd(&mut cmd_rx) => {
+                    self.handle_command(cmd);
+                }
                 _ = sweep.tick() => {
                     // Feed-silence check: if the connection has been quiet for longer
                     // than the configured window, treat it as a dead socket and reconnect.
@@ -367,6 +460,7 @@ impl<R: RestBookSource> Supervisor<R> {
                         let invalid_count = self.shard.invalid_tokens().len();
                         // Refresh mirror so the probe sees the new stale count.
                         self.refresh_mirror(Some(invalid_count), None, None);
+                        self.cmd_rx = cmd_rx;
                         return SessionEnd::FeedSilent;
                     }
 
@@ -516,10 +610,10 @@ impl<R: RestBookSource> Supervisor<R> {
                                     &asks,
                                     &book_ev.hash,
                                 );
-                                if matches!(
-                                    outcome,
-                                    crate::livebook::ApplyOutcome::NeedsResnapshot(_)
-                                ) {
+                                if matches!(outcome, crate::livebook::ApplyOutcome::Ok) {
+                                    // Site (a): fire after successful WS book snapshot.
+                                    self.fire_on_apply(token_id);
+                                } else {
                                     self.resnapshot(token_id).await;
                                 }
                             }
@@ -599,7 +693,10 @@ impl<R: RestBookSource> Supervisor<R> {
             let outcome = self
                 .shard
                 .apply_changes(now, group.token_id, &group.changes, hash_ref);
-            if matches!(outcome, crate::livebook::ApplyOutcome::NeedsResnapshot(_)) {
+            if matches!(outcome, crate::livebook::ApplyOutcome::Ok) {
+                // Site (b): fire after successful delta apply.
+                self.fire_on_apply(group.token_id);
+            } else {
                 self.resnapshot(group.token_id).await;
             }
         }
@@ -625,7 +722,7 @@ impl<R: RestBookSource> Supervisor<R> {
 
         match self.rest.book(&venue_id).await {
             Ok(book) => {
-                self.shard.apply_snapshot(
+                let outcome = self.shard.apply_snapshot(
                     Instant::now(),
                     token_id,
                     tick,
@@ -634,6 +731,12 @@ impl<R: RestBookSource> Supervisor<R> {
                     &book.hash,
                 );
                 self.stats.resnapshots += 1;
+                if matches!(outcome, crate::livebook::ApplyOutcome::Ok) {
+                    // Site (c): fire after a successful REST resnapshot apply.
+                    self.fire_on_apply(token_id);
+                }
+                // NeedsResnapshot outcome after a REST fetch is not re-enqueued
+                // here — the sweep backstop will retry on the next tick.
             }
             Err(_e) => {
                 self.stats.resnapshot_errors += 1;
@@ -700,7 +803,133 @@ fn xorshift64(mut x: u64) -> u64 {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use crate::livebook::RawLevel;
+    use crate::rest::ParsedBook;
+    use crate::ws::WsTransport;
+    use pm_core::instrument::TokenId;
+    use pm_core::num::TickSize;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    /// Transport that plays scripted frames then parks until released.
+    ///
+    /// `release` is a shared `Notify`; the test calls `notify_one()` to unblock
+    /// a parked `next_frame`.  Using `Arc<Notify>` means the future can be
+    /// dropped and re-polled by a biased `select!` without losing the signal:
+    /// `Notify::notified()` correctly re-registers each time.
+    struct SeqTransport {
+        frames: std::collections::VecDeque<String>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl WsTransport for SeqTransport {
+        async fn next_frame(&mut self) -> Option<Result<String, crate::IngestError>> {
+            if let Some(f) = self.frames.pop_front() {
+                return Some(Ok(f));
+            }
+            self.release.notified().await;
+            None
+        }
+
+        async fn send_text(&mut self, _text: &str) -> Result<(), crate::IngestError> {
+            Ok(())
+        }
+    }
+
+    struct OneBookRest;
+
+    impl RestBookSource for OneBookRest {
+        async fn book(&mut self, venue_token_id: &str) -> Result<ParsedBook, crate::IngestError> {
+            Ok(ParsedBook {
+                asset_id: venue_token_id.to_string(),
+                hash: "h1".into(),
+                bids: vec![RawLevel {
+                    price_micro: 440_000,
+                    size_micro: 100_000_000,
+                }],
+                asks: vec![RawLevel {
+                    price_micro: 460_000,
+                    size_micro: 80_000_000,
+                }],
+            })
+        }
+    }
+
+    const PC_FRAME: &str = r#"{"event_type":"price_change","market":"m","price_changes":[{"asset_id":"tok1","price":"0.43","size":"5","side":"BUY"}]}"#;
+
+    #[tokio::test]
+    async fn on_apply_fires_after_snapshot_and_delta_applies() {
+        let mut sup = Supervisor::new(
+            vec![(TokenId(5), "tok1".to_string(), TickSize::Cent)],
+            OneBookRest,
+            SupervisorConfig::default(),
+        );
+        let fired: Arc<Mutex<Vec<TokenId>>> = Arc::default();
+        let fired2 = Arc::clone(&fired);
+        sup.set_on_apply(Box::new(move |t, shard| {
+            assert!(shard.book(t).is_some(), "hook sees the shard post-apply");
+            fired2.lock().unwrap().push(t);
+        }));
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        release.notify_one(); // release immediately: frames drain, then None
+        let mut t = SeqTransport {
+            frames: [PC_FRAME.to_string()].into(),
+            release,
+        };
+        let end = sup.run_session(&mut t).await;
+        assert_eq!(end, SessionEnd::TransportLost);
+        let fired = fired.lock().unwrap();
+        // 1× resnapshot_all apply + 1× delta apply
+        assert_eq!(fired.as_slice(), &[TokenId(5), TokenId(5)]);
+    }
+
+    #[tokio::test]
+    async fn command_channel_serves_book_snapshots_while_session_runs() {
+        let mut sup = Supervisor::new(
+            vec![(TokenId(5), "tok1".to_string(), TickSize::Cent)],
+            OneBookRest,
+            SupervisorConfig::default(),
+        );
+        let cmd_tx = sup.command_channel(8);
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release2 = std::sync::Arc::clone(&release);
+        let task = tokio::spawn(async move {
+            let mut t = SeqTransport {
+                frames: [].into(),
+                release: release2,
+            };
+            sup.run_session(&mut t).await
+        });
+
+        let (otx, orx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(SupervisorCommand::BookSnapshot {
+                token: TokenId(5),
+                reply: otx,
+            })
+            .await
+            .unwrap();
+        let (book, valid) = orx
+            .await
+            .unwrap()
+            .expect("book exists after resnapshot_all");
+        assert!(valid);
+        assert_eq!(book.bids.best().unwrap().get(), 44);
+
+        // Unknown token → None.
+        let (otx, orx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(SupervisorCommand::BookSnapshot {
+                token: TokenId(99),
+                reply: otx,
+            })
+            .await
+            .unwrap();
+        assert!(orx.await.unwrap().is_none());
+
+        release.notify_one();
+        assert_eq!(task.await.unwrap(), SessionEnd::TransportLost);
+    }
 
     #[test]
     fn backoff_grows_and_caps() {
