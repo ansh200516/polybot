@@ -47,7 +47,7 @@ impl Partition {
 }
 
 /// Approved logical relationships (spec §9), stated about market YES outcomes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Relationship {
     /// a true ⇒ b true.
     Implies { a: MarketId, b: MarketId },
