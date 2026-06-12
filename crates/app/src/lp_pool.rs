@@ -46,6 +46,11 @@ pub async fn run_lp_pool(
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+            // Counts every processed job, regardless of outcome (lp_skips stays
+            // Skipped-only).
+            stats
+                .lp_solved
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             drop(permit);
         });
     }
@@ -178,5 +183,11 @@ mod tests {
         );
 
         pool.await.unwrap();
+
+        assert_eq!(
+            stats.lp_solved.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "lp_solved must count the one processed job"
+        );
     }
 }
