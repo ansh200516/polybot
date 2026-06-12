@@ -214,6 +214,31 @@ impl ClobRest {
         Err(IngestError::Http("pagination runaway".into()))
     }
 
+    /// Fetch a single CLOB market by condition id.
+    ///
+    /// Uses the single-market endpoint `GET /markets/{condition_id}` which
+    /// returns a [`ClobMarket`]-shaped object directly (not a page envelope).
+    /// Live-verified 200, per RECON.md fetch strategy.
+    pub async fn market(
+        &mut self,
+        condition_id: &str,
+    ) -> Result<pm_registry::gamma::ClobMarket, IngestError> {
+        self.acquire().await;
+        let url = format!("{}/markets/{}", self.base, condition_id);
+        let body = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| IngestError::Http(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| IngestError::Http(e.to_string()))?
+            .text()
+            .await
+            .map_err(|e| IngestError::Http(e.to_string()))?;
+        serde_json::from_str(&body).map_err(|e| IngestError::Parse(e.to_string()))
+    }
+
     /// Fetch the server's current Unix timestamp in seconds.
     pub async fn server_time(&mut self) -> Result<u64, IngestError> {
         self.acquire().await;

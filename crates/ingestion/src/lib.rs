@@ -5,6 +5,7 @@ pub mod livebook;
 pub mod rest;
 pub mod shard;
 pub mod supervisor;
+pub mod sync;
 pub mod ws;
 
 // ---------------------------------------------------------------------------
