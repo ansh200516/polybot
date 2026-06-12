@@ -14,10 +14,14 @@ alloy-primitives = { workspace = true }
 alloy-sol-types = { workspace = true }
 alloy-signer = { workspace = true }
 alloy-signer-local = { workspace = true }
+reqwest = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
-serde_json = { workspace = true }
 
 [lints]
 workspace = true

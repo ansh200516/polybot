@@ -20,6 +20,7 @@
 //! Tasks 8–10 call `Order::new`, `order.to_row(ts_ms)`, `persist_transition`,
 //! `can_transition`, `OrderState`, and `ExecError` exactly as declared below.
 
+pub mod auth;
 pub mod basket;
 pub mod secrets;
 pub mod sign;

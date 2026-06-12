@@ -38,6 +38,10 @@ alloy-primitives = "1"
 alloy-sol-types = "1"
 alloy-signer = "1"
 alloy-signer-local = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
