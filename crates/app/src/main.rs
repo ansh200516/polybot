@@ -63,6 +63,10 @@ struct Args {
     /// Dry-run live: sign every order but never submit (no network, no money).
     /// Requires `--live`.
     shadow: bool,
+    /// Auth-only check: derive the CLOB trading key (plain-EOA L1) and make one
+    /// authenticated L2 read, then exit. No market fetch, no TUI, no orders, no
+    /// money. Requires `--live`. Run with `--headless` to see the full logs.
+    auth_check: bool,
 }
 
 impl Args {
@@ -82,6 +86,7 @@ impl Args {
         let mut headless = false;
         let mut live = false;
         let mut shadow = false;
+        let mut auth_check = false;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -129,6 +134,9 @@ impl Args {
                 "--shadow" => {
                     shadow = true;
                 }
+                "--auth-check" => {
+                    auth_check = true;
+                }
                 other => return Err(format!("unknown argument: {other}")),
             }
         }
@@ -138,6 +146,9 @@ impl Args {
         // silently run paper.
         if shadow && !live {
             return Err("--shadow requires --live".to_string());
+        }
+        if auth_check && !live {
+            return Err("--auth-check requires --live".to_string());
         }
 
         Ok(Args {
@@ -149,6 +160,7 @@ impl Args {
             headless,
             live,
             shadow,
+            auth_check,
         })
     }
 }
@@ -303,7 +315,7 @@ async fn main() {
         info!(eoa = %signer.address(), deposit_wallet = %deposit_wallet, "live identities");
         // Headless live trades real money on startup: demand the typed phrase.
         // The TUI path confirms via the `l` modal instead (release latch).
-        if !args.shadow && !tui_active {
+        if !args.shadow && !args.auth_check && !tui_active {
             eprintln!(
                 "LIVE MODE — type the confirmation phrase to continue:\n  {}",
                 config.live.confirm_phrase
@@ -319,6 +331,99 @@ async fn main() {
     } else {
         None
     };
+
+    // ---- auth-check: derive + one L2 read, then exit (no orders, no money) --
+    // The fast, zero-risk verification of the auth path: it exercises ONLY the
+    // two layers that gate live trading — plain-EOA L1 key derivation and an L2
+    // authenticated read — mirroring py-clob-client-v2. No market fetch, no TUI,
+    // no order POST. Run as `--live --auth-check` (add `--headless` for full logs).
+    if args.auth_check {
+        let Some((_, signer, _, deposit_wallet)) = &live_rt else {
+            fatal("--auth-check requires --live");
+        };
+        let base = config.endpoints.clob_base.clone();
+        println!("\n=== auth-check: plain-EOA L1 derive + one L2 read (no orders, no money) ===");
+        println!("EOA (signer)   : {}", signer.address());
+        println!("deposit wallet : {deposit_wallet}");
+        println!("CLOB base      : {base}\n");
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|e| fatal(format!("auth-check http build: {e}")));
+        let server_time_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // [1/2] derive the trading key via PLAIN-EOA L1 (POLY_ADDRESS = EOA).
+        println!("[1/2] deriving API key (plain-EOA L1, POLY_ADDRESS = EOA) ...");
+        let creds = match pm_execution::auth::derive_or_create_api_key(
+            &http,
+            &base,
+            signer,
+            server_time_s,
+            None,
+        )
+        .await
+        {
+            Ok(c) => {
+                println!("  OK   api key id = {}", c.key);
+                println!(
+                    "       secret = {} chars (hidden), passphrase = {} chars (hidden)",
+                    c.secret.expose().len(),
+                    c.passphrase.expose().len()
+                );
+                c
+            }
+            Err(e) => {
+                println!("  FAIL  {e}");
+                println!(
+                    "\nVerdict: ❌ plain-EOA L1 derive was REJECTED. Paste this exact error — if it is\n         a 401 / invalid-headers, the endpoint refuses even the plain-EOA path."
+                );
+                return;
+            }
+        };
+
+        // [2/2] one L2-authenticated read: GET /data/orders as the EOA.
+        println!("\n[2/2] L2 read: GET /data/orders (POLY_ADDRESS = EOA) ...");
+        let path = "/data/orders";
+        let ts = server_time_s.to_string();
+        let eoa = signer.address().to_string();
+        let headers =
+            match pm_execution::auth::l2_headers(&creds, &eoa, &ts, "GET", path, None) {
+                Ok(h) => h,
+                Err(e) => {
+                    println!("  FAIL building L2 headers: {e}");
+                    return;
+                }
+            };
+        let url = format!("{base}{path}?next_cursor=MA==");
+        let mut req = http.get(&url);
+        for (k, v) in &headers {
+            req = req.header(*k, v);
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                let snippet: String = body.chars().take(240).collect();
+                println!("  HTTP {status}");
+                println!("  body: {snippet}");
+                if status.is_success() {
+                    println!(
+                        "\nVerdict: ✅ BOTH auth layers work — plain-EOA L1 derive AND L2 read succeeded.\n         The bot can now reach order placement. Next: a tiny live canary to get the\n         order verdict for this type-3 (EIP-7702 / POLY_1271) deposit wallet."
+                    );
+                } else {
+                    println!(
+                        "\nVerdict: ⚠️  L1 derive worked, but the L2 read returned {status}. Paste the body above."
+                    );
+                }
+            }
+            Err(e) => println!("  FAIL  {e}"),
+        }
+        return;
+    }
 
     // ---- store open + reconciliation (BEFORE anything else) ----------------
     let mut store = Store::open(Path::new(&config.store.path))
@@ -599,23 +704,44 @@ async fn main() {
     let market_tokens_for_registration = market_tokens.clone();
     // Both arms produce the same JoinHandle<()> so the binding unifies.
     let exec_handle = if let Some((secrets, signer, proxy, deposit_wallet)) = live_rt {
-        // V2 deposit-wallet flow: the API key MUST be one bound to the deposit
-        // wallet. Auto-creation via the CLOB L1 endpoint is NOT possible for a
-        // deposit wallet — the endpoint validates the L1 signature by ecrecover
-        // against POLY_ADDRESS (a plain-EOA check), which a smart-contract-wallet
-        // (1271) signature can't satisfy (HTTP 401 "Invalid L1 Request headers").
-        // Polymarket's own V2 SDKs have open bugs here (py-clob-client-v2 #70,
-        // clob-client-v2 #65). So the operator must supply PM_API_* generated by
-        // Polymarket's own (working) flow; those bind to the deposit wallet.
+        // CLOB trading credentials. py-clob-client-v2 derives these from a
+        // PLAIN-EOA L1 signature (create_or_derive_api_key): POLY_ADDRESS = the
+        // EOA, plain ECDSA, the key binds to the EOA. The deposit wallet / funder
+        // plays NO part in key derivation — it is only the order maker
+        // (signatureType 3). We mirror that exactly. An operator can still
+        // override with a pre-provisioned PM_API_* key (e.g. one minted by
+        // Polymarket's own UI flow).
         let creds = match secrets.api {
-            Some(c) => c,
-            None => fatal(
-                "live deposit-wallet trading requires PM_API_KEY / PM_API_SECRET / \
-                 PM_API_PASSPHRASE. Generate API credentials in your Polymarket account \
-                 (they bind to your deposit wallet). The bot cannot auto-create a \
-                 deposit-wallet API key — the CLOB L1 endpoint rejects smart-wallet \
-                 signatures (RECON-M5-V2-1271).",
-            ),
+            Some(c) => {
+                info!("live venue: using operator-supplied PM_API_* credentials");
+                c
+            }
+            None => {
+                let http = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .unwrap_or_else(|e| fatal(format!("auth http client build failed: {e}")));
+                let server_time_s = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                info!("live venue: deriving CLOB API credentials (plain-EOA L1, key binds to EOA)");
+                pm_execution::auth::derive_or_create_api_key(
+                    &http,
+                    &config.endpoints.clob_base,
+                    &signer,
+                    server_time_s,
+                    None, // plain-EOA path: bind the key to the EOA (py-clob-client-v2)
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    fatal(format!(
+                        "could not derive CLOB API credentials via plain-EOA L1: {e}. \
+                         If your account needs a pre-provisioned key, set \
+                         PM_API_KEY / PM_API_SECRET / PM_API_PASSPHRASE instead."
+                    ))
+                })
+            }
         };
         // No secret fields on this line — keep it that way (creds/signer must
         // never be interpolated into logs).
