@@ -386,13 +386,17 @@ impl ExecutionVenue for LiveVenue {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        // V2 deposit-wallet flow (RECON-M5-V2-1271): maker = the deposit wallet
-        // (the smart-contract wallet holding funds), signer = the EOA, and the
-        // signature is the ERC-7739 wrapped POLY_1271 form (signatureType 3).
+        // V2 deposit-wallet flow (RECON-M5-V2-1271): for a deposit-wallet order
+        // the `maker` AND `signer` FIELDS are both the deposit wallet (the
+        // reference vector has maker==signer==deposit wallet, and the live venue
+        // requires "the order signer address has to be the address of the API
+        // KEY" — which binds to the deposit-wallet account). The actual ECDSA is
+        // produced by the EOA key (`self.cfg.signer`) inside the ERC-7739 /
+        // POLY_1271 wrap (signatureType 3); the EOA is NOT the order signer field.
         let clob_order = ClobOrder {
             salt: (self.salt_src)(),
             maker: self.cfg.deposit_wallet,
-            signer: self.cfg.signer.address(),
+            signer: self.cfg.deposit_wallet,
             token_id: venue_token.clone(),
             maker_amount,
             taker_amount,
@@ -770,10 +774,17 @@ mod tests {
         // (POLY_1271), a JSON NUMBER; amounts are strings (RECON wire).
         assert!(reqs[0].contains("\"signatureType\":3"), "{}", reqs[0]);
         assert!(reqs[0].contains("\"makerAmount\":\"3300000\""), "{}", reqs[0]);
-        // maker is the DEPOSIT WALLET (0x2222…2222), not the proxy/EOA.
+        // maker AND signer are BOTH the DEPOSIT WALLET (0x2222…2222), not the
+        // proxy/EOA — the venue requires order.signer == the API-key (deposit
+        // wallet) address; the EOA only produces the inner ERC-7739 ECDSA.
         assert!(
             reqs[0].contains(&format!("\"maker\":\"0x{}\"", "22".repeat(20))),
             "maker must be the deposit wallet: {}",
+            reqs[0]
+        );
+        assert!(
+            reqs[0].contains(&format!("\"signer\":\"0x{}\"", "22".repeat(20))),
+            "signer field must be the deposit wallet (not the EOA): {}",
             reqs[0]
         );
         // The signature is the ERC-7739 wrapped form (innerSig 65 + appDomainSep
