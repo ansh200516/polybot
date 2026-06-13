@@ -162,8 +162,45 @@ fn fatal(msg: impl std::fmt::Display) -> ! {
 // Main
 // ---------------------------------------------------------------------------
 
+/// Parse `./.env` (if present) into a key→value map — WITHOUT touching the
+/// process environment (the crate forbids `unsafe`, and `set_var` is unsafe).
+/// The map is consulted only as a fallback in the secrets lookup, so a real
+/// environment variable always wins. Format: one `KEY=value` per line; blank
+/// lines and `#` comments skipped; one optional surrounding pair of single or
+/// double quotes on the value is stripped. Secret VALUES are never logged.
+fn load_dotenv() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Ok(contents) = std::fs::read_to_string(".env") else {
+        return map; // no .env is fine
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = val.trim();
+        let val = val
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| val.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(val);
+        if !key.is_empty() {
+            map.insert(key.to_string(), val.to_string());
+        }
+    }
+    if !map.is_empty() {
+        eprintln!("arb: loaded {} var(s) from .env", map.len());
+    }
+    map
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    let dotenv = load_dotenv();
     let args = match Args::parse() {
         Ok(a) => a,
         Err(e) => fatal(e),
@@ -229,8 +266,12 @@ async fn main() {
         config.mode.paper = false;
     }
     let live_rt = if args.live {
-        let secrets = pm_execution::secrets::LiveSecrets::from_env()
-            .unwrap_or_else(|e| fatal(format!("live secrets: {e}")));
+        // Real env wins; the .env map is the fallback (so secrets can live in a
+        // gitignored .env without exporting them each run).
+        let secrets = pm_execution::secrets::LiveSecrets::from_lookup(|k| {
+            std::env::var(k).ok().or_else(|| dotenv.get(k).cloned())
+        })
+        .unwrap_or_else(|e| fatal(format!("live secrets: {e}")));
         let signer: alloy_signer_local::PrivateKeySigner = secrets
             .private_key
             .expose_key_hex()
