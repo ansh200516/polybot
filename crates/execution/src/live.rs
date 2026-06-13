@@ -377,8 +377,6 @@ impl ExecutionVenue for LiveVenue {
             Action::Sell => Side::Sell,
         };
         // V2 signed struct (RECON-M5-V2): timestamp in ms; metadata/builder zero.
-        // NOTE: the wire body below is still V1-shaped — Task 17 owns the full
-        // V2 wire-body rewrite; here we only keep this compiling + signing V2.
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -399,9 +397,12 @@ impl ExecutionVenue for LiveVenue {
         let signature = sign_order(&self.cfg.signer, &clob_order, neg_risk)
             .map_err(|e| VenueError::Live(e.to_string()))?;
 
-        // Build the wire body ONCE — salt & signatureType are JSON NUMBERS,
-        // every other numeric is a STRING (RECON-M5). serde_json::to_string is
-        // compact (no spaces), matching py-clob-client's separators.
+        // Build the V2 wire body ONCE (RECON-M5-V2 order_to_json_v2): salt &
+        // signatureType are JSON NUMBERS, every other field a STRING; side is
+        // "BUY"/"SELL"; metadata/builder are 0x-prefixed 32-byte hex; new
+        // top-level `deferExec`. V2 drops taker/nonce/feeRateBps from the wire;
+        // `expiration` stays on the wire ("0") though it is NOT in the signed
+        // struct. serde_json::to_string is compact, matching the V2 client.
         let side_str = match side {
             Side::Buy => "BUY",
             Side::Sell => "SELL",
@@ -411,19 +412,20 @@ impl ExecutionVenue for LiveVenue {
                 "salt": clob_order.salt,
                 "maker": format!("{:#x}", clob_order.maker),
                 "signer": format!("{:#x}", clob_order.signer),
-                "taker": format!("{:#x}", Address::ZERO),
                 "tokenId": clob_order.token_id,
                 "makerAmount": clob_order.maker_amount.to_string(),
                 "takerAmount": clob_order.taker_amount.to_string(),
-                "expiration": "0",
-                "nonce": "0",
-                "feeRateBps": "0",
                 "side": side_str,
+                "expiration": "0",
                 "signatureType": 1,
+                "timestamp": clob_order.timestamp.to_string(),
+                "metadata": format!("{:#x}", clob_order.metadata),
+                "builder": format!("{:#x}", clob_order.builder),
                 "signature": signature,
             },
             "owner": self.cfg.creds.key,
             "orderType": "FAK",
+            "deferExec": false,
             "postOnly": false,
         });
         let body = serde_json::to_string(&body_value)
@@ -754,6 +756,23 @@ mod tests {
         // signatureType is also a JSON NUMBER, amounts are strings (RECON wire).
         assert!(reqs[0].contains("\"signatureType\":1"), "{}", reqs[0]);
         assert!(reqs[0].contains("\"makerAmount\":\"3300000\""), "{}", reqs[0]);
+        // V2 wire shape (RECON-M5-V2): timestamp/metadata/builder/deferExec are
+        // present; the V1-only fields taker/nonce/feeRateBps are GONE.
+        assert!(reqs[0].contains("\"timestamp\":\""), "V2 timestamp (string) present: {}", reqs[0]);
+        assert!(
+            reqs[0].contains("\"metadata\":\"0x0000000000000000000000000000000000000000000000000000000000000000\""),
+            "V2 metadata zero bytes32: {}",
+            reqs[0]
+        );
+        assert!(
+            reqs[0].contains("\"builder\":\"0x0000000000000000000000000000000000000000000000000000000000000000\""),
+            "V2 builder zero bytes32: {}",
+            reqs[0]
+        );
+        assert!(reqs[0].contains("\"deferExec\":false"), "V2 deferExec present: {}", reqs[0]);
+        assert!(!reqs[0].contains("\"taker\""), "V2 drops taker: {}", reqs[0]);
+        assert!(!reqs[0].contains("\"nonce\""), "V2 drops nonce: {}", reqs[0]);
+        assert!(!reqs[0].contains("\"feeRateBps\""), "V2 drops feeRateBps: {}", reqs[0]);
         // second request hits /data/trades with a query string (the HMAC was
         // built from the query-LESS path "/data/trades" — see data_rows).
         assert!(reqs[1].starts_with("GET /data/trades"), "second req: {}", reqs[1]);
