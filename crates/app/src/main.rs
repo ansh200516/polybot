@@ -811,13 +811,16 @@ async fn main() {
             use pm_core::num::{Bps, Px, Qty, TickSize};
             use pm_engine::Action;
             use pm_execution::venue::ExecutionVenue; // brings submit_fak into scope
-            const COST_CAP_TICKS: u16 = 50; // ignore asks above 0.50 (≤ $2.50 / 5 shares)
+            const COST_CAP_TICKS: u16 = 50; // ignore asks above 0.50/share (keeps the probe cheap)
             const GOOD_ENOUGH_TICKS: u16 = 5; // ≤ 0.05 found → stop scanning, buy now
             const MAX_FETCHES: u32 = 50;
-            println!("\n=== probe-order: one 5-share FAK BUY via the real signed-order path ===");
+            // The venue rejects marketable BUYs under $1 of value ("min size: 1");
+            // size the probe to ~$1.10 (in cents) to clear it with margin.
+            const MIN_VALUE_CENTS: u16 = 110;
+            println!("\n=== probe-order: one tiny FAK BUY via the real signed-order path ===");
             println!("maker (deposit): {deposit_wallet}");
             println!("signer (EOA)   : {eoa}");
-            println!("(5 shares is the venue minimum; cheapest tokens are ~$0.10, so expect ~$0.50)\n");
+            println!("(the venue's marketable-BUY minimum is $1; sized to ~$1.10 — at ~$0.10/share that's ~11 shares)\n");
             // Scan a sample of tokens (both sides) and keep the CHEAPEST fillable
             // ask, so the probe always finds something to fill, at minimal cost.
             let mut fetches = 0u32;
@@ -859,11 +862,19 @@ async fn main() {
                     "\nNo Cent-tick token had an ask in (0, $0.50] within {fetches} book fetches.\nMarkets may be unusually pricey — re-run, or tell me to widen the cap."
                 ),
                 Some((token, tick, fee, ask)) => {
+                    // ask.get() is the per-share price in cents (Cent-tick markets only).
+                    // Buy enough shares to clear the venue's $1 marketable-BUY minimum
+                    // (~$1.10 of value), never below the legacy 5-share floor.
+                    let ticks = ask.get();
+                    let shares = ((MIN_VALUE_CENTS + ticks - 1) / ticks).max(5);
+                    let cost = f64::from(shares) * f64::from(ticks) / 100.0;
                     println!(
-                        "cheapest fillable: token {} @ {} ticks (= ${:.2}) — buying 5 shares ...",
+                        "cheapest fillable: token {} @ {} ticks (= ${:.2}/share) — buying {} shares (≈ ${:.2}) ...",
                         token.0,
-                        ask.get(),
-                        f64::from(ask.get()) / 100.0
+                        ticks,
+                        f64::from(ticks) / 100.0,
+                        shares,
+                        cost
                     );
                     let order = pm_execution::Order::new(
                         "probe-order".into(),
@@ -871,7 +882,7 @@ async fn main() {
                         Action::Buy,
                         tick,
                         ask,
-                        Qty(5_000_000),
+                        Qty(u64::from(shares) * 1_000_000),
                         fee,
                     );
                     match venue.submit_fak(&order).await {
