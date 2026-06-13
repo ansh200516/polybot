@@ -417,7 +417,7 @@ impl ExecutionVenue for LiveVenue {
                 "takerAmount": clob_order.taker_amount.to_string(),
                 "side": side_str,
                 "expiration": "0",
-                "signatureType": 1,
+                "signatureType": clob_order.signature_type,
                 "timestamp": clob_order.timestamp.to_string(),
                 "metadata": format!("{:#x}", clob_order.metadata),
                 "builder": format!("{:#x}", clob_order.builder),
