@@ -290,9 +290,17 @@ mixed. Mid-session, `p`/`k`/kill-file still pause/stop dispatch.
 
 | Var | Meaning |
 |---|---|
-| `PM_PRIVATE_KEY` | Wallet key exported from Polymarket settings (hex, `0x` ok) |
-| `PM_PROXY_ADDRESS` | Your Polymarket proxy wallet (profile page) — the order `maker` |
+| `PM_PRIVATE_KEY` | Wallet key exported from Polymarket settings (hex, `0x` ok). The EOA = the order `signer`. |
+| `PM_DEPOSIT_WALLET` | **Required in live mode.** Your Polymarket V2 deposit-wallet address (the smart-contract wallet holding your funds) — the order `maker`, signed via ERC-1271/POLY_1271. New accounts trade through this, not a proxy. |
+| `PM_PROXY_ADDRESS` | Legacy POLY_PROXY maker (V1). Not used by the V2 deposit-wallet flow. |
 | `PM_API_KEY` / `PM_API_SECRET` / `PM_API_PASSPHRASE` | Optional; all three or none. Absent → derived at startup via L1 ClobAuth |
+
+CLOB V2 note: Polymarket migrated to "V2" (new order struct, domain version 2,
+new exchange contracts, and a deposit-wallet account model). New accounts must
+sign orders with `signatureType` 3 (POLY_1271 / ERC-7739 wrapped signature) and
+the deposit wallet as `maker`. The binary signs and submits V2 orders; the
+order signing is validated byte-for-byte against Polymarket's V2 reference
+vectors (`crates/execution/tests/fixtures/sign_vectors_v2.json`).
 
 ### Live gates (`[live]` config; defaults are the canary values)
 
@@ -322,7 +330,7 @@ both the shadow rehearsal and the funded canary.
 
 ```bash
 export PM_PRIVATE_KEY=<exported key>
-export PM_PROXY_ADDRESS=<proxy wallet from profile>
+export PM_DEPOSIT_WALLET=<your Polymarket deposit-wallet address>
 cargo build --release --bin arb
 ./target/release/arb --live --shadow --headless --config canary.toml \
   --duration-secs 600 --db /tmp/m5-shadow.sqlite 2>&1 | tee /tmp/m5-shadow.log
