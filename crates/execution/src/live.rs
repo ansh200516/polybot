@@ -168,6 +168,14 @@ pub struct LiveVenueCfg {
     /// verifyingContract (signatureType 3 / POLY_1271, RECON-M5-V2-1271). The
     /// `signer` (EOA) signs; the deposit wallet is the on-chain maker.
     pub deposit_wallet: Address,
+    /// The address the CLOB API key is BOUND to — used as the L2 `POLY_ADDRESS`
+    /// AND the order `signer` field. The CLOB validates the key against this for
+    /// recognized deposit-wallet makers, so for a deposit-wallet-bound key
+    /// (minted by Polymarket's frontend) this is the deposit wallet; for an
+    /// auto-derived plain-EOA key it is the EOA. maker is always the deposit
+    /// wallet. (py-clob-client-v2 #64: the key↔maker association is what the
+    /// venue checks, not the literal signer field.)
+    pub auth_address: Address,
     /// How long to poll `/data/trades` for `matched` fills before giving up
     /// (the remainder is treated as killed — FAK semantics).
     pub fill_window: Duration,
@@ -233,11 +241,10 @@ impl LiveVenue {
         const END: &str = "LTE=";
         const MAX_PAGES: usize = 200;
         let path = format!("/data/{kind}");
-        // L2 POLY_ADDRESS = the EOA (signer.address()), the address the API key
-        // binds to. py-clob-client-v2 uses signer.address() for BOTH L1 and L2
-        // headers regardless of funder / signatureType (headers/headers.py
-        // create_level_2_headers); the deposit wallet is only the order maker.
-        let auth_address = self.cfg.signer.address().to_string();
+        // L2 POLY_ADDRESS = the address the API key is bound to (cfg.auth_address:
+        // the deposit wallet for a frontend-minted key, the EOA for an auto-derived
+        // one). The CLOB validates the key against this.
+        let auth_address = self.cfg.auth_address.to_string();
         let mut cursor = START.to_string();
         let mut out = Vec::new();
         for _ in 0..MAX_PAGES {
@@ -436,20 +443,17 @@ impl ExecutionVenue for LiveVenue {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        // V2 deposit-wallet flow: `maker` = the deposit wallet (the funds holder,
-        // accepted by the venue), but `signer` = the EOA. The CLOB rejects any
-        // order whose signer ≠ the API key's owner ("the order signer address has
-        // to be the address of the API KEY", confirmed live), and our key derives
-        // bound to the EOA (plain-EOA L1; the /auth endpoint refuses a deposit-
-        // wallet-bound key). So signer MUST be the EOA. The signature is still the
-        // ERC-7739 / POLY_1271 (sigType 3) wrap produced by the EOA key and
+        // V2 deposit-wallet flow: `maker` = the deposit wallet (funds holder);
+        // `signer` = cfg.auth_address = the address the API key is bound to. The
+        // CLOB validates the key against this for a recognized deposit-wallet
+        // maker (py-clob-client-v2 #64), so with a frontend-minted deposit-wallet
+        // key auth_address == the deposit wallet and signer == maker. The ECDSA is
+        // produced by the EOA key inside the ERC-7739 / POLY_1271 (sigType 3) wrap,
         // validated on-chain by the deposit wallet's ERC-1271 isValidSignature.
-        // (py-clob-client-v2 sets signer=funder here — the open #64/#70/#71 bug
-        // that can't satisfy the signer==key-owner check with an EOA-bound key.)
         let clob_order = ClobOrder {
             salt: (self.salt_src)(),
             maker: self.cfg.deposit_wallet,
-            signer: self.cfg.signer.address(),
+            signer: self.cfg.auth_address,
             token_id: venue_token.clone(),
             maker_amount,
             taker_amount,
@@ -507,9 +511,9 @@ impl ExecutionVenue for LiveVenue {
                 maker = %format!("{:#x}", clob_order.maker),
                 signer = %format!("{:#x}", clob_order.signer),
                 owner = %self.cfg.creds.key,
-                l2_poly_address = %self.cfg.signer.address(),
+                l2_poly_address = %self.cfg.auth_address,
                 eoa = %self.cfg.signer.address(),
-                "first live order identity (POLY_ADDRESS=signer=EOA=key owner; maker=deposit wallet, sigType 3)"
+                "first live order identity (POLY_ADDRESS=signer=auth_address=API-key binding; maker=deposit wallet, sigType 3)"
             );
         }
 
@@ -528,10 +532,10 @@ impl ExecutionVenue for LiveVenue {
         }
 
         // The L2 HMAC must sign the EXACT wire body string. POLY_ADDRESS = the
-        // EOA (the API key's bound address — py-clob-client-v2 create_level_2_headers).
+        // address the API key is bound to (cfg.auth_address).
         self.limiter.acquire().await;
         let ts = unix_seconds_string();
-        let auth_address = self.cfg.signer.address().to_string();
+        let auth_address = self.cfg.auth_address.to_string();
         let headers = l2_headers(&self.cfg.creds, &auth_address, &ts, "POST", "/order", Some(&body))
             .map_err(|e| VenueError::Live(e.to_string()))?;
         let url = format!("{}/order", self.cfg.base);
@@ -778,6 +782,9 @@ mod tests {
             signer,
             proxy,
             deposit_wallet,
+            // Trading config: a frontend-minted key bound to the deposit wallet,
+            // so POLY_ADDRESS == signer == maker == the deposit wallet.
+            auth_address: deposit_wallet,
             fill_window: Duration::from_millis(200),
             rate_per_sec: 1000.0,
             rate_capacity: 100,
@@ -837,14 +844,12 @@ mod tests {
             "POST carries the POLY_API_KEY auth header: {}",
             reqs[0]
         );
-        // L2 POLY_ADDRESS == the EOA (signer.address()), NOT the deposit wallet —
-        // py-clob-client-v2 uses signer.address() for L1 and L2 headers regardless
-        // of funder, so the API key binds to the EOA.
+        // L2 POLY_ADDRESS == cfg.auth_address. The test cfg models a frontend
+        // deposit-wallet key, so POLY_ADDRESS == the deposit wallet (0x2222…).
         let lower = reqs[0].to_ascii_lowercase();
-        let eoa_hex = format!("{:#x}", "ad".repeat(32).parse::<PrivateKeySigner>().unwrap().address());
         assert!(
-            lower.contains(&format!("poly_address: {eoa_hex}")),
-            "L2 POLY_ADDRESS must be the EOA {eoa_hex}: {}",
+            lower.contains(&format!("poly_address: 0x{}", "22".repeat(20))),
+            "L2 POLY_ADDRESS must be the deposit wallet (auth_address): {}",
             reqs[0]
         );
         assert!(reqs[0].contains("\"orderType\":\"FAK\""));
@@ -854,17 +859,18 @@ mod tests {
         // (POLY_1271), a JSON NUMBER; amounts are strings (RECON wire).
         assert!(reqs[0].contains("\"signatureType\":3"), "{}", reqs[0]);
         assert!(reqs[0].contains("\"makerAmount\":\"3300000\""), "{}", reqs[0]);
-        // maker AND signer are BOTH the DEPOSIT WALLET (0x2222…2222), not the
-        // proxy/EOA — the venue requires order.signer == the API-key (deposit
-        // wallet) address; the EOA only produces the inner ERC-7739 ECDSA.
+        // maker AND signer are BOTH the DEPOSIT WALLET (0x2222…2222): maker is
+        // always the deposit wallet, and signer == cfg.auth_address, which for a
+        // frontend deposit-wallet key is the deposit wallet. The EOA only produces
+        // the inner ERC-7739 ECDSA inside the wrap.
         assert!(
             reqs[0].contains(&format!("\"maker\":\"0x{}\"", "22".repeat(20))),
             "maker must be the deposit wallet: {}",
             reqs[0]
         );
         assert!(
-            reqs[0].contains(&format!("\"signer\":\"{eoa_hex}\"")),
-            "signer field must be the EOA (the API key's owner), not the deposit wallet: {}",
+            reqs[0].contains(&format!("\"signer\":\"0x{}\"", "22".repeat(20))),
+            "signer field must equal auth_address (the deposit wallet here): {}",
             reqs[0]
         );
         // The signature is the ERC-7739 wrapped form (innerSig 65 + appDomainSep

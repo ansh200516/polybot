@@ -724,10 +724,16 @@ async fn main() {
         // (signatureType 3). We mirror that exactly. An operator can still
         // override with a pre-provisioned PM_API_* key (e.g. one minted by
         // Polymarket's own UI flow).
-        let creds = match secrets.api {
+        // `auth_address` = the address the API key is bound to (used as L2
+        // POLY_ADDRESS AND order.signer). A frontend-minted PM_API_* key binds to
+        // the DEPOSIT WALLET — the only key the CLOB accepts for deposit-wallet
+        // orders. The auto-derived plain-EOA key binds to the EOA (fine for reads
+        // / --auth-check, but the venue rejects it for deposit-wallet orders;
+        // py-clob-client-v2 #64).
+        let (creds, auth_address) = match secrets.api {
             Some(c) => {
-                info!("live venue: using operator-supplied PM_API_* credentials");
-                c
+                info!("live venue: using operator-supplied PM_API_* credentials (bound to the deposit wallet)");
+                (c, deposit_wallet)
             }
             None => {
                 let http = reqwest::Client::builder()
@@ -739,7 +745,7 @@ async fn main() {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 info!("live venue: deriving CLOB API credentials (plain-EOA L1, key binds to EOA)");
-                pm_execution::auth::derive_or_create_api_key(
+                let creds = pm_execution::auth::derive_or_create_api_key(
                     &http,
                     &config.endpoints.clob_base,
                     &signer,
@@ -753,7 +759,8 @@ async fn main() {
                          If your account needs a pre-provisioned key, set \
                          PM_API_KEY / PM_API_SECRET / PM_API_PASSPHRASE instead."
                     ))
-                })
+                });
+                (creds, signer.address())
             }
         };
         // No secret fields on this line — keep it that way (creds/signer must
@@ -767,6 +774,7 @@ async fn main() {
             signer,
             proxy,
             deposit_wallet,
+            auth_address,
             fill_window: Duration::from_millis(config.execution.fill_window_ms),
             rate_per_sec: config.ingestion.rest_rate_per_sec,
             rate_capacity: config.ingestion.rest_rate_capacity,
