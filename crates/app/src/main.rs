@@ -724,15 +724,17 @@ async fn main() {
         // (signatureType 3). We mirror that exactly. An operator can still
         // override with a pre-provisioned PM_API_* key (e.g. one minted by
         // Polymarket's own UI flow).
-        // `auth_address` = the address the API key is bound to (used as L2
-        // POLY_ADDRESS AND order.signer). A frontend-minted PM_API_* key binds to
-        // the DEPOSIT WALLET — the only key the CLOB accepts for deposit-wallet
-        // orders. The auto-derived plain-EOA key binds to the EOA (fine for reads
-        // / --auth-check, but the venue rejects it for deposit-wallet orders;
-        // py-clob-client-v2 #64).
+        // `auth_address` = the address the CLOB key is ASSOCIATED with (used as L2
+        // POLY_ADDRESS AND order.signer; maker is also the deposit wallet). The
+        // frontend's poly_clob_api_key_map proves the key (same id our plain-EOA
+        // derive returns — derivation is deterministic) is mapped under the PROXY/
+        // deposit-wallet address, not the EOA. So auth_address = the deposit wallet
+        // regardless of how creds were obtained; only maker==signer==POLY_ADDRESS==
+        // the key's proxy passes the venue's key↔maker check (py-clob-client-v2
+        // #64). The L1 key derive still uses the EOA (plain ecrecover).
         let (creds, auth_address) = match secrets.api {
             Some(c) => {
-                info!("live venue: using operator-supplied PM_API_* credentials (bound to the deposit wallet)");
+                info!("live venue: using operator-supplied PM_API_* credentials");
                 (c, deposit_wallet)
             }
             None => {
@@ -760,7 +762,9 @@ async fn main() {
                          PM_API_KEY / PM_API_SECRET / PM_API_PASSPHRASE instead."
                     ))
                 });
-                (creds, signer.address())
+                // The key associates with the deposit-wallet proxy (not the EOA)
+                // on the CLOB, so auth_address is the deposit wallet here too.
+                (creds, deposit_wallet)
             }
         };
         // No secret fields on this line — keep it that way (creds/signer must
