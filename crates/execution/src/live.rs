@@ -30,7 +30,7 @@ use pm_engine::Action;
 use crate::Order;
 use crate::auth::l2_headers;
 use crate::secrets::ApiCreds;
-use crate::sign::{ClobOrder, Side, clob_amounts, sign_order};
+use crate::sign::{CHAIN_ID, ClobOrder, Side, clob_amounts, sign_order_1271};
 use crate::venue::{ExecutionVenue, Fill, SubmitOutcome, VenueError};
 
 // ---------------------------------------------------------------------------
@@ -161,8 +161,13 @@ pub struct LiveVenueCfg {
     pub base: String,
     pub creds: ApiCreds,
     pub signer: PrivateKeySigner,
-    /// Funder / proxy wallet (the order `maker`, signature_type 1).
+    /// Funder / proxy wallet (legacy POLY_PROXY maker). Retained but no longer
+    /// the maker under the V2 deposit-wallet flow — see `deposit_wallet`.
     pub proxy: Address,
+    /// V2 deposit wallet: the order `maker` AND the ERC-7739 wallet-domain
+    /// verifyingContract (signatureType 3 / POLY_1271, RECON-M5-V2-1271). The
+    /// `signer` (EOA) signs; the deposit wallet is the on-chain maker.
+    pub deposit_wallet: Address,
     /// How long to poll `/data/trades` for `matched` fills before giving up
     /// (the remainder is treated as killed — FAK semantics).
     pub fill_window: Duration,
@@ -381,21 +386,25 @@ impl ExecutionVenue for LiveVenue {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        // V2 deposit-wallet flow (RECON-M5-V2-1271): maker = the deposit wallet
+        // (the smart-contract wallet holding funds), signer = the EOA, and the
+        // signature is the ERC-7739 wrapped POLY_1271 form (signatureType 3).
         let clob_order = ClobOrder {
             salt: (self.salt_src)(),
-            maker: self.cfg.proxy,
+            maker: self.cfg.deposit_wallet,
             signer: self.cfg.signer.address(),
             token_id: venue_token.clone(),
             maker_amount,
             taker_amount,
             side,
-            signature_type: 1,
+            signature_type: 3,
             timestamp,
             metadata: [0u8; 32].into(),
             builder: [0u8; 32].into(),
         };
-        let signature = sign_order(&self.cfg.signer, &clob_order, neg_risk)
-            .map_err(|e| VenueError::Live(e.to_string()))?;
+        let signature =
+            sign_order_1271(&self.cfg.signer, &clob_order, neg_risk, CHAIN_ID, self.cfg.deposit_wallet)
+                .map_err(|e| VenueError::Live(e.to_string()))?;
 
         // Build the V2 wire body ONCE (RECON-M5-V2 order_to_json_v2): salt &
         // signatureType are JSON NUMBERS, every other field a STRING; side is
@@ -681,6 +690,9 @@ mod tests {
         // 64 hex chars (no 0x): the throwaway "0xadad…ad" key.
         let signer: PrivateKeySigner = "ad".repeat(32).parse().unwrap();
         let proxy: Address = format!("0x{}", "11".repeat(20)).parse().unwrap();
+        // Deposit wallet (the V2 maker) — distinct from proxy so the maker
+        // assertion is meaningful.
+        let deposit_wallet: Address = format!("0x{}", "22".repeat(20)).parse().unwrap();
         let creds = ApiCreds {
             key: "test-key".into(),
             secret: crate::secrets::Secret::new("QQ==".into()),
@@ -691,6 +703,7 @@ mod tests {
             creds,
             signer,
             proxy,
+            deposit_wallet,
             fill_window: Duration::from_millis(200),
             rate_per_sec: 1000.0,
             rate_capacity: 100,
@@ -753,9 +766,31 @@ mod tests {
         assert!(reqs[0].contains("\"orderType\":\"FAK\""));
         // salt is a JSON NUMBER (pinned to 42 by the test salt_src), not a string.
         assert!(reqs[0].contains("\"salt\":42"), "salt must be a number: {}", reqs[0]);
-        // signatureType is also a JSON NUMBER, amounts are strings (RECON wire).
-        assert!(reqs[0].contains("\"signatureType\":1"), "{}", reqs[0]);
+        // V2 deposit-wallet flow (RECON-M5-V2-1271): signatureType is 3
+        // (POLY_1271), a JSON NUMBER; amounts are strings (RECON wire).
+        assert!(reqs[0].contains("\"signatureType\":3"), "{}", reqs[0]);
         assert!(reqs[0].contains("\"makerAmount\":\"3300000\""), "{}", reqs[0]);
+        // maker is the DEPOSIT WALLET (0x2222…2222), not the proxy/EOA.
+        assert!(
+            reqs[0].contains(&format!("\"maker\":\"0x{}\"", "22".repeat(20))),
+            "maker must be the deposit wallet: {}",
+            reqs[0]
+        );
+        // The signature is the ERC-7739 wrapped form (innerSig 65 + appDomainSep
+        // 32 + contentsHash 32 + contentsType 186 + 2-byte len = 317 bytes),
+        // far longer than a plain 65-byte (132-hex-char) sigType-1 signature.
+        let sig_hex = {
+            let m = "\"signature\":\"0x";
+            let start = reqs[0].find(m).unwrap() + m.len(); // signature field present
+            let rest = &reqs[0][start..];
+            let end = rest.find('"').unwrap(); // signature field closes
+            &rest[..end]
+        };
+        assert!(
+            sig_hex.len() > 132,
+            "ERC-7739 wrapped sig hex (> 132 chars) expected, got {} chars",
+            sig_hex.len()
+        );
         // V2 wire shape (RECON-M5-V2): timestamp/metadata/builder/deferExec are
         // present; the V1-only fields taker/nonce/feeRateBps are GONE.
         assert!(reqs[0].contains("\"timestamp\":\""), "V2 timestamp (string) present: {}", reqs[0]);

@@ -245,6 +245,21 @@ async fn main() {
                  address from the profile page (docs/RECON-M5.md §Magic/email)",
             ),
         };
+        // V2 deposit-wallet flow (RECON-M5-V2-1271): new accounts trade via the
+        // deposit wallet (the order maker, signatureType 3). Required in live.
+        let deposit_wallet: alloy_primitives::Address = match secrets.deposit_wallet.as_deref() {
+            Some(d) => d
+                .parse()
+                .unwrap_or_else(|e| fatal(format!("PM_DEPOSIT_WALLET invalid: {e}"))),
+            None => fatal(
+                "PM_DEPOSIT_WALLET not set — your Polymarket deposit-wallet \
+                 address (the smart-contract wallet holding your funds; see \
+                 docs/RECON-M5-V2-1271.md). New V2 accounts must trade via the \
+                 deposit wallet.",
+            ),
+        };
+        // Cross-check identities at startup. Addresses are public — no secrets.
+        info!(eoa = %signer.address(), deposit_wallet = %deposit_wallet, "live identities");
         // Headless live trades real money on startup: demand the typed phrase.
         // The TUI path confirms via the `l` modal instead (release latch).
         if !args.shadow && !tui_active {
@@ -259,7 +274,7 @@ async fn main() {
                 fatal("confirmation phrase mismatch — refusing to trade live");
             }
         }
-        Some((secrets, signer, proxy))
+        Some((secrets, signer, proxy, deposit_wallet))
     } else {
         None
     };
@@ -542,7 +557,7 @@ async fn main() {
     // run_execution (which moves it); clone before either arm takes ownership.
     let market_tokens_for_registration = market_tokens.clone();
     // Both arms produce the same JoinHandle<()> so the binding unifies.
-    let exec_handle = if let Some((secrets, signer, proxy)) = live_rt {
+    let exec_handle = if let Some((secrets, signer, proxy, deposit_wallet)) = live_rt {
         // Server time for the L1 timestamp comes from the venue clock; reuse the
         // ingestion REST client (token-bucket limited, same base).
         let mut rest = ClobRest::new(
@@ -578,6 +593,7 @@ async fn main() {
             creds,
             signer,
             proxy,
+            deposit_wallet,
             fill_window: Duration::from_millis(config.execution.fill_window_ms),
             rate_per_sec: config.ingestion.rest_rate_per_sec,
             rate_capacity: config.ingestion.rest_rate_capacity,

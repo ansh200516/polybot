@@ -42,6 +42,12 @@ pub struct LiveSecrets {
     /// when absent the binary refuses to start live (RECON-M5: no reliable
     /// unauthenticated lookup; the operator copies it from the profile page).
     pub proxy_address: Option<String>,
+    /// V2 deposit-wallet address (the order `maker`, signatureType 3 / POLY_1271).
+    /// New API accounts must trade via the deposit wallet (RECON-M5-V2-1271).
+    /// Optional here; the binary requires it in live mode and copies it from the
+    /// Polymarket UI (no reliable unauthenticated derivation — clone type needs
+    /// an on-chain probe).
+    pub deposit_wallet: Option<String>,
     /// When present, API-key derivation is skipped.
     pub api: Option<ApiCreds>,
 }
@@ -58,6 +64,7 @@ impl LiveSecrets {
             lookup("PM_PRIVATE_KEY").ok_or_else(|| "PM_PRIVATE_KEY not set (export your wallet key from Polymarket settings)".to_string())?,
         );
         let proxy_address = lookup("PM_PROXY_ADDRESS");
+        let deposit_wallet = lookup("PM_DEPOSIT_WALLET");
         let api = match (lookup("PM_API_KEY"), lookup("PM_API_SECRET"), lookup("PM_API_PASSPHRASE")) {
             (None, None, None) => None,
             (Some(key), Some(secret), Some(pass)) => Some(ApiCreds {
@@ -82,6 +89,7 @@ impl LiveSecrets {
         Ok(LiveSecrets {
             private_key,
             proxy_address,
+            deposit_wallet,
             api,
         })
     }
@@ -113,12 +121,19 @@ mod tests {
         let lookup = |k: &str| match k {
             "PM_PRIVATE_KEY" => Some("0x".to_string() + &"cd".repeat(32)),
             "PM_PROXY_ADDRESS" => Some("0x".to_string() + &"11".repeat(20)),
+            "PM_DEPOSIT_WALLET" => Some("0x".to_string() + &"22".repeat(20)),
             _ => None,
         };
         let s = LiveSecrets::from_lookup(lookup).unwrap();
         assert_eq!(s.private_key.expose_key_hex(), "cd".repeat(32));
         let expected_proxy = format!("0x{}", "11".repeat(20));
         assert_eq!(s.proxy_address.as_deref(), Some(expected_proxy.as_str()));
+        let expected_deposit = format!("0x{}", "22".repeat(20));
+        assert_eq!(
+            s.deposit_wallet.as_deref(),
+            Some(expected_deposit.as_str()),
+            "PM_DEPOSIT_WALLET is read (V2 deposit-wallet maker)"
+        );
         assert!(s.api.is_none(), "no PM_API_* given → derive at startup");
 
         let none = |_: &str| None::<String>;
