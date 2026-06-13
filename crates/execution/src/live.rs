@@ -376,20 +376,25 @@ impl ExecutionVenue for LiveVenue {
             Action::Buy => Side::Buy,
             Action::Sell => Side::Sell,
         };
-        let fee_rate_bps = u64::try_from(order.fee_bps.0.max(0)).unwrap_or(0);
+        // V2 signed struct (RECON-M5-V2): timestamp in ms; metadata/builder zero.
+        // NOTE: the wire body below is still V1-shaped — Task 17 owns the full
+        // V2 wire-body rewrite; here we only keep this compiling + signing V2.
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let clob_order = ClobOrder {
             salt: (self.salt_src)(),
             maker: self.cfg.proxy,
             signer: self.cfg.signer.address(),
-            taker: Address::ZERO,
             token_id: venue_token.clone(),
             maker_amount,
             taker_amount,
-            expiration: 0,
-            nonce: 0,
-            fee_rate_bps,
             side,
             signature_type: 1,
+            timestamp,
+            metadata: [0u8; 32].into(),
+            builder: [0u8; 32].into(),
         };
         let signature = sign_order(&self.cfg.signer, &clob_order, neg_risk)
             .map_err(|e| VenueError::Live(e.to_string()))?;
@@ -406,13 +411,13 @@ impl ExecutionVenue for LiveVenue {
                 "salt": clob_order.salt,
                 "maker": format!("{:#x}", clob_order.maker),
                 "signer": format!("{:#x}", clob_order.signer),
-                "taker": format!("{:#x}", clob_order.taker),
+                "taker": format!("{:#x}", Address::ZERO),
                 "tokenId": clob_order.token_id,
                 "makerAmount": clob_order.maker_amount.to_string(),
                 "takerAmount": clob_order.taker_amount.to_string(),
                 "expiration": "0",
                 "nonce": "0",
-                "feeRateBps": clob_order.fee_rate_bps.to_string(),
+                "feeRateBps": "0",
                 "side": side_str,
                 "signatureType": 1,
                 "signature": signature,
