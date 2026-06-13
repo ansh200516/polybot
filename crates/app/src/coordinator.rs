@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pm_config::{Config, ConfigError};
 use pm_core::instrument::{MarketId, TokenId};
-use pm_core::num::{Bps, Qty, Usdc, sell_proceeds};
+use pm_core::num::{Bps, Qty, Usdc, buy_cost, sell_proceeds};
 use pm_engine::dedup::Cooldown;
 use pm_engine::{Action, EngineParams, Opportunity};
 use pm_execution::basket::{BasketOutcome, BasketReport, ExecParams};
@@ -134,6 +134,9 @@ pub struct LiveParams {
     pub basket_cap: Usdc,
     /// Venue minimum per leg, µshares (RECON: 5 shares).
     pub min_leg: Qty,
+    /// Venue minimum order VALUE per leg, µUSDC (Polymarket V2 $1 floor). A
+    /// basket with any buy leg whose makerAmount is below this is rejected whole.
+    pub min_leg_value: Usdc,
 }
 
 pub struct Coordinator {
@@ -160,6 +163,7 @@ pub struct Coordinator {
     live_released: bool,
     live_basket_cap: Usdc,
     live_min_leg: Qty,
+    live_min_leg_value: Usdc,
 
     busy: bool,
     in_flight: Option<BasketCheck>,
@@ -215,6 +219,7 @@ impl Coordinator {
             live_released: live.released_at_start,
             live_basket_cap: live.basket_cap,
             live_min_leg: live.min_leg,
+            live_min_leg_value: live.min_leg_value,
             busy: false,
             in_flight: None,
             report_closed: false,
@@ -395,6 +400,21 @@ impl Coordinator {
             if d.opp.fills.iter().any(|f| f.qty.0 < self.live_min_leg.0) {
                 self.stats.live_rej.fetch_add(1, Relaxed);
                 info!("live: basket has a leg under the venue minimum");
+                return;
+            }
+            // Venue minimum order VALUE per leg (Polymarket V2 $1 marketable-BUY
+            // floor). Every leg is a buy here (pure-buy gate above), so the venue's
+            // makerAmount is buy_cost(px, qty) — match it exactly. A leg below the
+            // floor kills the whole basket; never resize upward. The 5-share gate
+            // above is too weak on cheap tokens (5 × $0.10 = $0.50 < $1).
+            if d
+                .opp
+                .fills
+                .iter()
+                .any(|f| buy_cost(f.limit_px.microusdc(f.ts), f.qty).0 < self.live_min_leg_value.0)
+            {
+                self.stats.live_rej.fetch_add(1, Relaxed);
+                info!("live: basket has a leg under the venue's per-order $ minimum");
                 return;
             }
         }
@@ -706,6 +726,7 @@ mod tests {
             released_at_start: true,
             basket_cap: Usdc(0),
             min_leg: Qty(0),
+            min_leg_value: Usdc(0),
         }
     }
 
@@ -1391,6 +1412,7 @@ mod tests {
             released_at_start,
             basket_cap: Usdc(10_000_000),
             min_leg: Qty(5_000_000),
+            min_leg_value: Usdc(1_000_000),
         }
     }
 
@@ -1513,6 +1535,57 @@ mod tests {
         let req = tokio::time::timeout(Duration::from_secs(2), exec_rx.recv())
             .await
             .expect("timeout waiting for [6sh,20sh] dispatch")
+            .expect("exec channel closed before dispatch");
+        assert!(req.check.total_cost.0 > 0);
+        assert_eq!(stats.dispatched.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.live_rej.load(Ordering::Relaxed), 1, "no extra reject");
+
+        drop(opp_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn live_rejects_baskets_with_a_leg_under_the_dollar_minimum() {
+        let kill = Arc::new(AtomicBool::new(false));
+        let (coord, opp_tx, mut exec_rx, _report_tx, _store_rx, stats) = build_coord_live(
+            Arc::clone(&kill),
+            BookFetcher::new(HashMap::new()),
+            crate::wiring::risk_config(&Config::default(), None).unwrap(),
+            live_params(true, true), // min_leg_value = $1
+            false,
+        );
+        let handle = tokio::spawn(coord.run());
+
+        // leg1 = 5 shares @ $0.10 = $0.50 makerAmount: clears the 5-share floor
+        // but is under the $1 marketable-BUY minimum → whole basket rejected.
+        // (leg0 = 10 shares @ $0.44 = $4.40; total $4.90 < $10 cap, both legs ≥ 5sh,
+        // so ONLY the new value gate can reject it.)
+        opp_tx
+            .send(DetectedOpp {
+                opp: buy_opp(-4_400_000, 10_000_000, -500_000, 5_000_000, 10),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            exec_rx.try_recv().is_err(),
+            "a buy leg under the $1 venue minimum must kill the basket"
+        );
+        assert_eq!(stats.live_rej.load(Ordering::Relaxed), 1);
+
+        // Distinct fingerprint, every leg ≥ $1: leg1 = 15 shares @ $0.11 = $1.65,
+        // leg0 = 10 shares @ $0.44 = $4.40; total $6.05 < $10 → dispatched.
+        opp_tx
+            .send(DetectedOpp {
+                opp: buy_opp(-4_400_000, 10_000_000, -1_650_000, 15_000_000, 11),
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        let req = tokio::time::timeout(Duration::from_secs(2), exec_rx.recv())
+            .await
+            .expect("timeout waiting for ≥$1-per-leg dispatch")
             .expect("exec channel closed before dispatch");
         assert!(req.check.total_cost.0 > 0);
         assert_eq!(stats.dispatched.load(Ordering::Relaxed), 1);

@@ -302,6 +302,12 @@ pub struct Live {
     /// Venue minimum order size per leg, SHARES (RECON-pinned: 5; a basket
     /// with any leg below this is rejected whole — never resized upward).
     pub min_leg_shares: f64,
+    /// Venue minimum order VALUE per leg, USD (Polymarket V2 rejects marketable
+    /// orders under $1: `"invalid amount for a marketable BUY order, min size: 1"`).
+    /// A basket with any buy leg whose makerAmount is below this is rejected
+    /// whole — never resized upward. The 5-share `min_leg_shares` floor is too
+    /// weak on cheap tokens (5 × $0.10 = $0.50 < $1); this is the real gate.
+    pub min_leg_value_usd: f64,
     /// Phrase typed at startup (headless --live) to release dispatch.
     pub confirm_phrase: String,
 }
@@ -312,6 +318,7 @@ impl Default for Live {
             basket_cap_usd: 10.0,
             session_loss_usd: 25.0,
             min_leg_shares: 5.0,
+            min_leg_value_usd: 1.0,
             confirm_phrase: "I understand this trades real money".into(),
         }
     }
@@ -434,6 +441,9 @@ impl Config {
         }
         if self.live.min_leg_shares < 0.0 || !self.live.min_leg_shares.is_finite() {
             return Err(ConfigError::BadMoney("live.min_leg_shares must be ≥ 0"));
+        }
+        if self.live.min_leg_value_usd < 0.0 || !self.live.min_leg_value_usd.is_finite() {
+            return Err(ConfigError::BadMoney("live.min_leg_value_usd must be ≥ 0"));
         }
         if self.live.confirm_phrase.is_empty() {
             return Err(ConfigError::BadMoney("live.confirm_phrase must not be empty"));
@@ -693,6 +703,7 @@ mod tests {
         assert!((c.live.basket_cap_usd - 10.0).abs() < 1e-9);
         assert!((c.live.session_loss_usd - 25.0).abs() < 1e-9);
         assert!((c.live.min_leg_shares - 5.0).abs() < 1e-9);
+        assert!((c.live.min_leg_value_usd - 1.0).abs() < 1e-9);
         assert_eq!(c.live.confirm_phrase, "I understand this trades real money");
     }
 
@@ -711,6 +722,7 @@ mod tests {
         assert!(Config::from_toml_str("[live]\nbasket_cap_usd = 0.0\n").is_err());
         assert!(Config::from_toml_str("[live]\nsession_loss_usd = -1.0\n").is_err());
         assert!(Config::from_toml_str("[live]\nmin_leg_shares = -1.0\n").is_err());
+        assert!(Config::from_toml_str("[live]\nmin_leg_value_usd = -1.0\n").is_err());
         assert!(Config::from_toml_str("[risk]\nmid_spread_cap_ticks = 0\n").is_err());
         // empty confirm_phrase must be rejected
         assert!(Config::from_toml_str("[live]\nconfirm_phrase = \"\"\n").is_err());
@@ -728,6 +740,10 @@ mod tests {
 
         let mut c = Config::default();
         c.live.min_leg_shares = f64::NAN;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.live.min_leg_value_usd = f64::NAN;
         assert!(c.validate().is_err());
     }
 }

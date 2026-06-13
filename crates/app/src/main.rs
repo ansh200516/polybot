@@ -866,7 +866,7 @@ async fn main() {
                     // Buy enough shares to clear the venue's $1 marketable-BUY minimum
                     // (~$1.10 of value), never below the legacy 5-share floor.
                     let ticks = ask.get();
-                    let shares = ((MIN_VALUE_CENTS + ticks - 1) / ticks).max(5);
+                    let shares = MIN_VALUE_CENTS.div_ceil(ticks).max(5);
                     let cost = f64::from(shares) * f64::from(ticks) / 100.0;
                     println!(
                         "cheapest fillable: token {} @ {} ticks (= ${:.2}/share) — buying {} shares (≈ ${:.2}) ...",
@@ -974,6 +974,10 @@ async fn main() {
                     .unwrap_or_else(|e| fatal(format!("live.basket_cap_usd: {e}"))),
             ),
             min_leg: pm_core::num::Qty((config.live.min_leg_shares * 1e6).round() as u64),
+            min_leg_value: pm_core::num::Usdc(
+                pm_config::usd_to_microusdc(config.live.min_leg_value_usd)
+                    .unwrap_or_else(|e| fatal(format!("live.min_leg_value_usd: {e}"))),
+            ),
         },
     )
     .unwrap_or_else(|e| fatal(format!("Coordinator::new: {e}")));

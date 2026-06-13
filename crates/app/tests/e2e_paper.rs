@@ -278,6 +278,7 @@ async fn run_e2e() {
             released_at_start: true,
             basket_cap: Usdc(0),
             min_leg: pm_core::num::Qty(0),
+            min_leg_value: Usdc(0),
         },
     )
     .expect("coordinator new");
