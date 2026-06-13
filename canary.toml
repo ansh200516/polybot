@@ -1,0 +1,26 @@
+# Canary config — M5 funded round-trip (and the shadow rehearsal before it).
+#
+# Deviates from the locked paper params in basket SIZING only, so a genuine
+# pure-buy arbitrage fits under the $10 live cap. Every safety guard is left at
+# its default and UNCHANGED: pure-buy-only live dispatch, $10 basket cap, $25
+# latched session-loss halt, 5-share venue minimum, capped mid-mark, and the
+# 30 bps (class 1-2) / 100 bps (class 3) NET edge floors — the real "is this a
+# true arb" gate.
+#
+# Why this exists: the engine normally sizes every basket up to per_market_usd
+# ($1000). The $10 canary cap rejects whole baskets over the cap (it never
+# shrinks them), so at $1000 sizing every pure-buy candidate is rejected and a
+# funded session would never fill. Sizing to ~$8 lets the SAME pure-buy arbs
+# (the ones logged as "basket over canary cap" in the first shadow run) fit and
+# dispatch.
+
+[capital]
+per_market_usd = 8.0      # size baskets to ~$8 basis → under the $10 live cap
+
+[edges]
+min_profit_usd = 0.01     # absolute $ floor, scaled for ~$8 baskets. The
+                          # 30/100 bps NET edge floors (defaults, unchanged)
+                          # remain the real arbitrage gate.
+
+[universe]
+max_markets = 100         # wider net: pure-buy arbs are rare at 20 markets

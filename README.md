@@ -309,23 +309,35 @@ mixed. Mid-session, `p`/`k`/kill-file still pause/stop dispatch.
 - Live forces `redeem = hold`: a filled C1Long keeps its complete set
   (manual redeem via the UI until M6); on-chain merge is never attempted.
 
+### Canary sizing (`canary.toml`)
+
+The engine sizes every basket up to `per_market_usd` ($1000). The $10 live cap
+**rejects** whole baskets over the cap — it never shrinks them — so at default
+sizing every pure-buy candidate is rejected and a live session never fills.
+`canary.toml` sizes baskets to ~$8 (changing sizing only; all safety guards
+stay at their defaults) so genuine pure-buy arbs fit under the cap. Use it for
+both the shadow rehearsal and the funded canary.
+
 ### Shadow rehearsal (operator runbook)
 
 ```bash
 export PM_PRIVATE_KEY=<exported key>
 export PM_PROXY_ADDRESS=<proxy wallet from profile>
 cargo build --release --bin arb
-./target/release/arb --live --shadow --headless --duration-secs 600 \
-  --max-markets 20 --db /tmp/m5-shadow.sqlite 2>&1 | tee /tmp/m5-shadow.log
+./target/release/arb --live --shadow --headless --config canary.toml \
+  --duration-secs 600 --db /tmp/m5-shadow.sqlite 2>&1 | tee /tmp/m5-shadow.log
 # checks:
-grep -c "live venue armed" /tmp/m5-shadow.log            # 1 — auth derive ok
-grep -c "SHADOW: signed, not submitted" /tmp/m5-shadow.log  # ≥1 if a pure-buy opp passed the gates
-grep "session result" /tmp/m5-shadow.log                 # healthy=true
+grep -c "live venue armed" /tmp/m5-shadow.log               # 1 — auth derive ok
+grep -c "SHADOW: signed, not submitted" /tmp/m5-shadow.log  # ≥1 — signing path exercised
+grep "session result" /tmp/m5-shadow.log                    # healthy=true
 sqlite3 /tmp/m5-shadow.sqlite "select count(*) from fills"  # 0 — shadow never fills
 ```
 
-(Zero shadow signs in 10 min can be normal — thin-book LP opps are mostly
-risk-rejected at 20 markets; re-run with `--max-markets 100`.)
+Without `canary.toml` (default $1000 sizing) the run logs only
+`basket over canary cap` / `rejected non-pure-buy` and **zero** signs — auth is
+proven but the signing path is never reached. With it, expect at least one
+`SHADOW: signed, not submitted` when a pure-buy arb appears (still
+opportunity-dependent; re-run if the market is quiet).
 
 ### Shadow rehearsal results
 
