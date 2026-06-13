@@ -187,6 +187,10 @@ pub struct LiveVenue {
     /// overridable in tests for determinism. `FnMut` so the counter can bump.
     pub salt_src: Box<dyn FnMut() -> u64 + Send>,
     limiter: RateLimiter,
+    /// One-shot: log the identity binding (maker/signer/owner/POLY_ADDRESS) on
+    /// the FIRST submitted order so the operator run is decisive without
+    /// spamming every order. Set false after the first submit.
+    log_first_order: bool,
 }
 
 impl LiveVenue {
@@ -208,6 +212,7 @@ impl LiveVenue {
             // unique per order (replay/idempotency), not cryptographically random.
             salt_src: Box::new(default_salt),
             limiter: RateLimiter::new(rate_capacity, rate_per_sec),
+            log_first_order: true,
         })
     }
 
@@ -228,14 +233,17 @@ impl LiveVenue {
         const END: &str = "LTE=";
         const MAX_PAGES: usize = 200;
         let path = format!("/data/{kind}");
-        let eoa = self.cfg.signer.address().to_string();
+        // L2 POLY_ADDRESS must equal the API key's bound address — the deposit
+        // wallet under the V2 POLY_1271 flow (RECON-M5-V2-1271 "Auth binding";
+        // clob-client-v2 #65: "the same change is needed in createL2Headers").
+        let auth_address = self.cfg.deposit_wallet.to_string();
         let mut cursor = START.to_string();
         let mut out = Vec::new();
         for _ in 0..MAX_PAGES {
             self.limiter.acquire().await;
             let ts = unix_seconds_string();
             // HMAC signs the query-LESS path (RECON-M5); query is appended after.
-            let headers = l2_headers(&self.cfg.creds, &eoa, &ts, "GET", &path, None)
+            let headers = l2_headers(&self.cfg.creds, &auth_address, &ts, "GET", &path, None)
                 .map_err(|e| VenueError::Live(e.to_string()))?;
             let url = format!(
                 "{}{}?next_cursor={}{}",
@@ -444,6 +452,22 @@ impl ExecutionVenue for LiveVenue {
         let body = serde_json::to_string(&body_value)
             .map_err(|e| VenueError::Live(e.to_string()))?;
 
+        // First-order diagnostic (no secrets — addresses + api-key id only).
+        // RECON-M5-V2-1271 "Auth binding": maker, signer, and the L2
+        // POLY_ADDRESS must ALL equal the deposit wallet (the API key's bound
+        // address); owner is the api-key id. One line, then silenced.
+        if self.log_first_order {
+            self.log_first_order = false;
+            info!(
+                maker = %format!("{:#x}", clob_order.maker),
+                signer = %format!("{:#x}", clob_order.signer),
+                owner = %self.cfg.creds.key,
+                l2_poly_address = %format!("{:#x}", self.cfg.deposit_wallet),
+                eoa = %self.cfg.signer.address(),
+                "first live order identity binding (maker/signer/POLY_ADDRESS must == deposit wallet)"
+            );
+        }
+
         // SHADOW: signed, never submitted. No limiter, no network. Return a
         // zero-fill outcome with no venue id (nothing was placed).
         if self.cfg.shadow {
@@ -458,11 +482,12 @@ impl ExecutionVenue for LiveVenue {
             return Ok(SubmitOutcome::default());
         }
 
-        // The L2 HMAC must sign the EXACT wire body string.
+        // The L2 HMAC must sign the EXACT wire body string. POLY_ADDRESS = the
+        // deposit wallet (the API key's bound address — RECON-M5-V2-1271).
         self.limiter.acquire().await;
         let ts = unix_seconds_string();
-        let eoa = self.cfg.signer.address().to_string();
-        let headers = l2_headers(&self.cfg.creds, &eoa, &ts, "POST", "/order", Some(&body))
+        let auth_address = self.cfg.deposit_wallet.to_string();
+        let headers = l2_headers(&self.cfg.creds, &auth_address, &ts, "POST", "/order", Some(&body))
             .map_err(|e| VenueError::Live(e.to_string()))?;
         let url = format!("{}/order", self.cfg.base);
         let mut req = self
@@ -765,6 +790,14 @@ mod tests {
         assert!(
             reqs[0].to_ascii_lowercase().contains("poly_api_key"),
             "POST carries the POLY_API_KEY auth header: {}",
+            reqs[0]
+        );
+        // L2 POLY_ADDRESS == the DEPOSIT WALLET (0x2222…2222), NOT the EOA — the
+        // API key binds to the deposit wallet (RECON-M5-V2-1271 "Auth binding").
+        let lower = reqs[0].to_ascii_lowercase();
+        assert!(
+            lower.contains(&format!("poly_address: 0x{}", "22".repeat(20))),
+            "L2 POLY_ADDRESS must be the deposit wallet: {}",
             reqs[0]
         );
         assert!(reqs[0].contains("\"orderType\":\"FAK\""));

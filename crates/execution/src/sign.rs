@@ -170,7 +170,12 @@ pub fn sign_order_with_chain(
 /// domain of the ERC-7739 `TypedDataSign` envelope (POLY_1271). Name
 /// "DepositWallet", version "1", `verifyingContract` = the deposit wallet, salt
 /// 0x0 — RECON-pinned (RECON-M5-V2-1271.md, confirmed vs Solady ERC1271.sol).
-fn wallet_domain(chain_id: u64, deposit_wallet: Address) -> Eip712Domain {
+///
+/// `pub(crate)` so the auth-side ClobAuth L1 wrap (which binds the API key to
+/// the deposit wallet, RECON-M5-V2-1271 "Auth binding") reuses the SAME wallet
+/// domain as orders — the deposit-wallet account validates both via one
+/// ERC-1271 implementation.
+pub(crate) fn wallet_domain(chain_id: u64, deposit_wallet: Address) -> Eip712Domain {
     eip712_domain! {
         name: "DepositWallet",
         version: "1",
@@ -178,6 +183,98 @@ fn wallet_domain(chain_id: u64, deposit_wallet: Address) -> Eip712Domain {
         verifying_contract: deposit_wallet,
         salt: B256::ZERO,
     }
+}
+
+/// Generic Solady ERC-7739 `TypedDataSign` wrap (POLY_1271). The order path and
+/// the auth-side ClobAuth L1 path share this; they differ ONLY in the app
+/// domain and the wrapped `contents` struct.
+///
+/// Inputs:
+/// - `app_domain_separator` = the *app's* EIP-712 domain separator
+///   (`domain.hash_struct()`): the Exchange V2 domain for orders, the
+///   ClobAuthDomain for L1 auth.
+/// - `contents_hash` = the contents struct's `eip712_hash_struct()`.
+/// - `contents_type` = the contents struct's EIP-712 type string (e.g. the
+///   `Order(...)` or `ClobAuth(...)` typestring). Its leading token up to the
+///   first `(` is `contents_name` (Solady implicit mode).
+/// - `wallet_domain` = the DepositWallet account domain.
+///
+/// Produces the nested digest `keccak256(0x1901 ‖ appDomainSeparator ‖
+/// hashStruct(TypedDataSign))`, signs it with the EOA, and assembles the wire
+/// `innerSig(65) ‖ appDomainSeparator(32) ‖ contentsHash(32) ‖ contentsType ‖
+/// uint16_be(len(contentsType))`. RECON-M5-V2-1271 "Pinned algorithm".
+pub(crate) fn erc7739_wrap(
+    signer: &PrivateKeySigner,
+    app_domain_separator: B256,
+    contents_hash: B256,
+    contents_type: &str,
+    wallet_domain: &Eip712Domain,
+) -> Result<String, SignError> {
+    use alloy_primitives::keccak256;
+
+    // contentsName = contentsType up to its first '(' (Solady implicit mode).
+    let contents_name = contents_type
+        .split_once('(')
+        .map_or(contents_type, |(n, _)| n);
+
+    // typedDataSignTypehash = keccak256("TypedDataSign(" + contentsName +
+    // " contents,string name,string version,uint256 chainId,address
+    // verifyingContract,bytes32 salt)" + contentsType). Domain fields are
+    // ALWAYS name,version,chainId,verifyingContract,salt (5 fields, no
+    // extensions) — RECON-M5-V2-1271, confirmed vs Solady ERC1271.sol.
+    let mut type_preimage = String::with_capacity(64 + contents_name.len() + contents_type.len());
+    type_preimage.push_str("TypedDataSign(");
+    type_preimage.push_str(contents_name);
+    type_preimage.push_str(
+        " contents,string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)",
+    );
+    type_preimage.push_str(contents_type);
+    let typed_data_sign_typehash = keccak256(type_preimage.as_bytes());
+
+    // hashStruct(TypedDataSign): 7 × 32-byte words. `contents` BEFORE `name`
+    // (order is load-bearing). Wallet-domain fields.
+    let chain_id = wallet_domain.chain_id.map_or(0, |c| c.to::<u64>());
+    let verifying_contract = wallet_domain.verifying_contract.unwrap_or(Address::ZERO);
+    let salt = wallet_domain.salt.unwrap_or(B256::ZERO);
+    let mut buf = [0u8; 7 * 32];
+    buf[0..32].copy_from_slice(typed_data_sign_typehash.as_slice());
+    buf[32..64].copy_from_slice(contents_hash.as_slice());
+    buf[64..96]
+        .copy_from_slice(keccak256(wallet_domain.name.as_deref().unwrap_or("").as_bytes()).as_slice());
+    buf[96..128].copy_from_slice(
+        keccak256(wallet_domain.version.as_deref().unwrap_or("").as_bytes()).as_slice(),
+    );
+    buf[128..160].copy_from_slice(&U256::from(chain_id).to_be_bytes::<32>());
+    // address left-padded to 32 bytes (the low 20 bytes are the address).
+    buf[172..192].copy_from_slice(verifying_contract.as_slice());
+    buf[192..224].copy_from_slice(salt.as_slice());
+    let hash_struct = keccak256(buf);
+
+    // Nested digest = keccak256(0x1901 ‖ appDomainSeparator ‖ hashStruct).
+    let mut digest_buf = [0u8; 2 + 32 + 32];
+    digest_buf[0] = 0x19;
+    digest_buf[1] = 0x01;
+    digest_buf[2..34].copy_from_slice(app_domain_separator.as_slice());
+    digest_buf[34..66].copy_from_slice(hash_struct.as_slice());
+    let nested_digest = keccak256(digest_buf);
+
+    // EOA signs the nested digest (ECDSA, v = 27/28 via as_bytes).
+    let sig = signer
+        .sign_hash_sync(&nested_digest)
+        .map_err(|e| SignError::Signer(e.to_string()))?;
+    let inner = sig.as_bytes(); // 65 bytes r‖s‖v
+
+    // Wrap: innerSig(65) ‖ appDomainSeparator(32) ‖ contentsHash(32) ‖
+    // contentsType(ascii) ‖ uint16_be(len).
+    let ct = contents_type.as_bytes();
+    let mut wire = Vec::with_capacity(65 + 32 + 32 + ct.len() + 2);
+    wire.extend_from_slice(&inner);
+    wire.extend_from_slice(app_domain_separator.as_slice());
+    wire.extend_from_slice(contents_hash.as_slice());
+    wire.extend_from_slice(ct);
+    wire.extend_from_slice(&(ct.len() as u16).to_be_bytes());
+
+    Ok(format!("0x{}", hex::encode(wire)))
 }
 
 /// The V2 Order EIP-712 type string (`contentsType`), 186 bytes. This is the
@@ -214,8 +311,6 @@ pub fn sign_order_1271(
     chain_id: u64,
     deposit_wallet: Address,
 ) -> Result<String, SignError> {
-    use alloy_primitives::keccak256;
-
     let token_id =
         U256::from_str_radix(&order.token_id, 10).map_err(|_| SignError::BadTokenId(order.token_id.clone()))?;
 
@@ -233,60 +328,18 @@ pub fn sign_order_1271(
         builder: order.builder,
     };
 
-    // App domain separator (exchange V2) and the Order struct (contents) hash.
+    // App domain = the exchange V2 domain; contents = the Order struct. The
+    // nesting/wrapping is the generic ERC-7739 scheme (shared with the auth-side
+    // ClobAuth L1 wrap). contentsName "Order" is derived inside the helper.
     let app_domain_separator = domain(neg_risk, chain_id).hash_struct();
     let contents_hash = sol_order.eip712_hash_struct();
-
-    // typedDataSignTypehash = keccak256(prefix+walletFieldsDecl + contentsType).
-    // Solady: "TypedDataSign(" + contentsName + " contents,string name,string
-    // version,uint256 chainId,address verifyingContract,bytes32 salt)" +
-    // contentsType. contentsName = contentsType up to its first '(' = "Order",
-    // so the prefix+decl is exactly the literal below.
-    const TDS_PREFIX: &str =
-        "TypedDataSign(Order contents,string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)";
-    let mut type_preimage = String::with_capacity(TDS_PREFIX.len() + ORDER_CONTENTS_TYPE.len());
-    type_preimage.push_str(TDS_PREFIX);
-    type_preimage.push_str(ORDER_CONTENTS_TYPE);
-    let typed_data_sign_typehash = keccak256(type_preimage.as_bytes());
-
-    // hashStruct(TypedDataSign): 7 × 32-byte words. Wallet-domain fields.
-    let wd = wallet_domain(chain_id, deposit_wallet);
-    let mut buf = [0u8; 7 * 32];
-    buf[0..32].copy_from_slice(typed_data_sign_typehash.as_slice());
-    buf[32..64].copy_from_slice(contents_hash.as_slice());
-    buf[64..96].copy_from_slice(keccak256(wd.name.as_deref().unwrap_or("").as_bytes()).as_slice());
-    buf[96..128].copy_from_slice(keccak256(wd.version.as_deref().unwrap_or("").as_bytes()).as_slice());
-    buf[128..160].copy_from_slice(&U256::from(chain_id).to_be_bytes::<32>());
-    // address left-padded to 32 bytes (the low 20 bytes are the address).
-    buf[172..192].copy_from_slice(deposit_wallet.as_slice());
-    // salt is 0x0 (buf[192..224] already zero).
-    let hash_struct = keccak256(buf);
-
-    // Nested digest = keccak256(0x1901 ‖ appDomainSeparator ‖ hashStruct).
-    let mut digest_buf = [0u8; 2 + 32 + 32];
-    digest_buf[0] = 0x19;
-    digest_buf[1] = 0x01;
-    digest_buf[2..34].copy_from_slice(app_domain_separator.as_slice());
-    digest_buf[34..66].copy_from_slice(hash_struct.as_slice());
-    let nested_digest = keccak256(digest_buf);
-
-    // EOA signs the nested digest (ECDSA, v = 27/28 via as_bytes).
-    let sig = signer
-        .sign_hash_sync(&nested_digest)
-        .map_err(|e| SignError::Signer(e.to_string()))?;
-    let inner = sig.as_bytes(); // 65 bytes r‖s‖v
-
-    // Wrap: innerSig(65) ‖ appDomainSeparator(32) ‖ contentsHash(32) ‖
-    // contentsType(ascii) ‖ uint16_be(len).
-    let ct = ORDER_CONTENTS_TYPE.as_bytes();
-    let mut wire = Vec::with_capacity(65 + 32 + 32 + ct.len() + 2);
-    wire.extend_from_slice(&inner);
-    wire.extend_from_slice(app_domain_separator.as_slice());
-    wire.extend_from_slice(contents_hash.as_slice());
-    wire.extend_from_slice(ct);
-    wire.extend_from_slice(&(ct.len() as u16).to_be_bytes());
-
-    Ok(format!("0x{}", hex::encode(wire)))
+    erc7739_wrap(
+        signer,
+        app_domain_separator,
+        contents_hash,
+        ORDER_CONTENTS_TYPE,
+        &wallet_domain(chain_id, deposit_wallet),
+    )
 }
 
 /// (makerAmount, takerAmount) for a leg, µ units, against-us rounding —

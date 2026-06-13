@@ -123,3 +123,115 @@ innerSig(65) ‖ appDomainSeparator(32) ‖ contentsHash(32) ‖ contentsType(18
 Returned as `0x` + hex. RESULT: reproduces the full
 `EXPECTED_POLY_1271_SIGNATURE` byte-for-byte (validated in
 `sign.rs::reproduces_poly1271_reference_vector`).
+
+## Auth binding (Task 22)
+
+Why: with the V2 order format + POLY_1271 order signature both correct, a live
+order is rejected with `400 {"error":"the order signer address has to be the
+address of the API KEY"}`. We tried `order.signer` = EOA (rejected) AND
+`order.signer` = deposit wallet (rejected, same error). The reason: the API key
+the bot derives is bound to NEITHER usefully — it is bound to the **EOA**, while
+the venue requires `order.signer == the API key's bound address`, and a
+deposit-wallet order's signer is the **deposit wallet**. The earlier "auth
+works / live venue armed" success was a false positive: deriving a key against
+the EOA succeeds (you get valid creds), but that key is bound to the EOA, not
+the deposit wallet — the binding only bites at order time.
+
+**This is a known, still-open SDK bug.** Both the Python and TS V2 SDKs have the
+same defect, reported in detail with fix sketches but no maintainer response and
+no merged PR as of this recon (2026-06-13):
+- py-clob-client-v2 #70 "POLY_1271 (sig type 3) order placement fails: L1 auth
+  always binds API key to EOA, never the deposit wallet"
+- py-clob-client-v2 #64, #71, #90 (Safe wallet) — same symptom.
+- clob-client-v2 (TS) #65 — same defect, with the clearest fix sketch.
+
+Root cause, quoted from py-clob-client-v2 #70:
+> "_l1_headers ignores self.signature_type and self.funder entirely"
+> "sign_clob_auth_message puts signer.address() (the EOA) into the ClobAuth.address
+>  field of the EIP-712 payload"
+
+From clob-client-v2 #65:
+> "order.signer == api_key.address on every order. For POLY_1271 the SDK sends
+>  order.signer = funderAddress (deposit wallet) while the api-key is bound to the
+>  EOA. The two values can never match."
+
+### The 5 questions, answered authoritatively
+
+1. **API-key creation/derivation — what address does the key BIND to, and is the
+   L1 sig plain ECDSA or ERC-1271/7739 wrapped?**
+   For a POLY_1271 deposit wallet the key must bind to the **DEPOSIT WALLET**.
+   The ClobAuth `address` field = **deposit wallet (funder)**, and the L1
+   signature is an **ERC-7739 `TypedDataSign`-wrapped** signature (the EOA signs
+   on behalf of the deposit wallet; the CLOB validates it via the deposit
+   wallet's ERC-1271 `isValidSignature`). Source — clob-client-v2 #65 fix sketch:
+   > "ClobAuth.address should be set to the deposit wallet address (funderAddress)…
+   >  Must use ERC-7739/EIP-1271 wrapping (TypedDataSign)… verifyingContract:
+   >  funderAddress (the deposit wallet)… The pattern mirrors order signing:
+   >  buildOrderSignature for signatureType === 3 … wraps via TypedDataSign with
+   >  verifyingContract: msg.signer so the deposit wallet's ERC-1271 implementation
+   >  can validate it."
+   py-clob-client-v2 #70 fix sketch (Python): when `signature_type == POLY_1271`,
+   build `ClobAuth(address=funder, …)`, ERC-7739-wrap with the **deposit-wallet
+   domain (name "DepositWallet", version "1", verifyingContract = funder)**, sign
+   with the EOA, return headers with `POLY_ADDRESS = funder`.
+   (For a plain EOA/POLY_PROXY account: ClobAuth.address = EOA, plain ECDSA — the
+   existing path, unchanged.)
+
+2. **L2 headers POLY_ADDRESS — EOA or deposit wallet?** The **deposit wallet**.
+   clob-client-v2 #65:
+   > "The same change is needed in createL2Headers for L2 auth; otherwise reads
+   >  against api-keys registered to deposit wallets break the same way."
+   (POLY_ADDRESS must equal the API key's bound address; the key is now bound to
+   the deposit wallet.)
+
+3. **order.signer / order.maker — both = deposit wallet?** Yes. Confirmed by the
+   reference vector (maker == signer == the deposit wallet) and by #65
+   ("the SDK sends order.signer = funderAddress"). Already implemented in live.rs.
+
+4. **order "owner" field — api key string or an address?** The **api key string**
+   (the `apiKey` UUID), NOT an address. Already implemented (`owner: creds.key`).
+   The address binding is enforced via the bound key + POLY_ADDRESS, not `owner`.
+
+5. **How does the official client make `order.signer == the API KEY's address`
+   hold?** By binding the API key to the **deposit wallet** at create/derive time
+   (ClobAuth.address = deposit wallet + ERC-7739-wrapped L1 sig + L1 POLY_ADDRESS
+   = deposit wallet), AND setting order.signer = deposit wallet. Both sides equal
+   the deposit wallet. The bot's bug was binding the key to the EOA, so neither
+   EOA-signer nor deposit-wallet-signer could ever equal the bound address.
+
+### ClobAuth EIP-712 struct (py-clob-client-v2 signing/eip712.py, confirmed)
+Domain: name **"ClobAuthDomain"**, version **"1"**, chainId, **NO
+verifyingContract**. Struct fields in order: `address` (address), `timestamp`
+(string), `nonce` (uint256), `message` (string). Message constant =
+"This message attests that I control the given wallet". (Matches `auth.rs`.)
+
+### Implementation (Task 22) — generalised ERC-7739 wrap
+The order-path nesting in `sign.rs::sign_order_1271` is generalised into
+`erc7739_wrap(signer, app_domain_sep, contents_hash, contents_type,
+contents_name, wallet_domain)`; the order path reproduces its reference vector
+byte-for-byte (gate intact). For the ClobAuth L1 wrap:
+- app domain = **ClobAuthDomain/1/chainId** (no verifyingContract) — separator
+  computed from that domain (NOT the exchange domain — ClobAuth is a different
+  app).
+- contents = the ClobAuth struct; contentsHash = `ClobAuth.eip712_hash_struct()`;
+  contentsType = `"ClobAuth(address address,string timestamp,uint256 nonce,string
+  message)"`; contentsName = "ClobAuth".
+- wallet domain = **DepositWallet/1/chainId/deposit_wallet/salt0** (same wallet
+  domain as orders).
+- nested digest the EOA signs = `keccak256(0x1901 ‖ clobAuthDomainSep ‖
+  hashStruct(TypedDataSign))`; wire = `innerSig(65) ‖ clobAuthDomainSep(32) ‖
+  contentsHash(32) ‖ contentsType(ascii) ‖ uint16_be(len)`.
+
+NOTE: no Polymarket-published ClobAuth-1271 reference vector exists (the SDK bug
+means the official clients never produce one). The construction is pinned to the
+SAME Solady ERC-7739 scheme proven byte-exact for orders, only swapping the app
+domain + contents — so it is mechanically validated, but the FIRST live run is
+the end-to-end proof. Diagnostics (below) make that run decisive.
+
+### Diagnostics added (Part B)
+- `auth.rs::derive_or_create_api_key`: logs the raw create/derive JSON response
+  with `secret`+`passphrase` REDACTED, ALL other fields shown (reveals any bound
+  `address`/`profileAddress` the venue returns), plus the ClobAuth `address` used
+  and the L1 POLY_ADDRESS sent.
+- `live.rs::submit_fak`: on the first order logs `maker`, `signer`, `owner`
+  (api-key id), and the L2 POLY_ADDRESS sent. (Addresses/ids only — no secrets.)

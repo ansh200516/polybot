@@ -575,11 +575,16 @@ async fn main() {
                     .await
                     .unwrap_or_else(|e| fatal(format!("server_time: {e}")));
                 let http = reqwest::Client::new();
+                // V2 deposit-wallet flow: bind the API key to the DEPOSIT WALLET
+                // (ClobAuth.address = deposit wallet, ERC-7739-wrapped L1 sig,
+                // POLY_ADDRESS = deposit wallet) so order.signer = deposit wallet
+                // matches the bound key (RECON-M5-V2-1271 "Auth binding").
                 pm_execution::auth::derive_or_create_api_key(
                     &http,
                     &config.endpoints.clob_base,
                     &signer,
                     t,
+                    Some(deposit_wallet),
                 )
                 .await
                 .unwrap_or_else(|e| fatal(format!("API key derive/create: {e}")))
