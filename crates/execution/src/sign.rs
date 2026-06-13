@@ -166,6 +166,129 @@ pub fn sign_order_with_chain(
     Ok(format!("0x{}", hex::encode(sig.as_bytes())))
 }
 
+/// The wallet (account) EIP-712 domain for a deposit wallet, used as the inner
+/// domain of the ERC-7739 `TypedDataSign` envelope (POLY_1271). Name
+/// "DepositWallet", version "1", `verifyingContract` = the deposit wallet, salt
+/// 0x0 — RECON-pinned (RECON-M5-V2-1271.md, confirmed vs Solady ERC1271.sol).
+fn wallet_domain(chain_id: u64, deposit_wallet: Address) -> Eip712Domain {
+    eip712_domain! {
+        name: "DepositWallet",
+        version: "1",
+        chain_id: chain_id,
+        verifying_contract: deposit_wallet,
+        salt: B256::ZERO,
+    }
+}
+
+/// The V2 Order EIP-712 type string (`contentsType`), 186 bytes. This is the
+/// SAME string the `sol! Order` derives; we pin it as a constant so the
+/// ERC-7739 typehash and the wire `contentsType` are byte-exact, and assert
+/// equality with alloy's derived type string in tests.
+const ORDER_CONTENTS_TYPE: &str = "Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
+
+/// ERC-7739 wrapped signature for a deposit-wallet (POLY_1271, sigType 3) order.
+/// `deposit_wallet` is the order maker AND the wallet-domain verifyingContract.
+///
+/// Implements the Solady `_erc1271IsValidSignatureViaNestedEIP712` scheme
+/// (RECON-M5-V2-1271.md "Pinned algorithm"):
+/// - app domain  = the Exchange V2 domain ([`domain`]); its separator is
+///   `appDomainSeparator`.
+/// - wallet domain = [`wallet_domain`] (DepositWallet/1/chainId/wallet/salt0).
+/// - contentsHash = the Order struct hash (`Order::eip712_hash_struct`).
+/// - typedDataSignTypehash = keccak256("TypedDataSign(Order contents,string
+///   name,string version,uint256 chainId,address verifyingContract,bytes32
+///   salt)" + contentsType).
+/// - hashStruct = keccak256(typehash ‖ contentsHash ‖ keccak(name) ‖
+///   keccak(version) ‖ chainId ‖ verifyingContract ‖ salt)  (7 words; the
+///   `contents`-before-`name` order is load-bearing).
+/// - nested digest the EOA signs = keccak256(0x1901 ‖ appDomainSeparator ‖
+///   hashStruct).
+/// - wire = innerSig(65) ‖ appDomainSeparator(32) ‖ contentsHash(32) ‖
+///   contentsType(ascii) ‖ uint16_be(len(contentsType)).
+///
+/// The plain POLY_PROXY ([`sign_order`], sigType 1) path is unaffected.
+pub fn sign_order_1271(
+    signer: &PrivateKeySigner,
+    order: &ClobOrder,
+    neg_risk: bool,
+    chain_id: u64,
+    deposit_wallet: Address,
+) -> Result<String, SignError> {
+    use alloy_primitives::keccak256;
+
+    let token_id =
+        U256::from_str_radix(&order.token_id, 10).map_err(|_| SignError::BadTokenId(order.token_id.clone()))?;
+
+    let sol_order = Order {
+        salt: U256::from(order.salt),
+        maker: order.maker,
+        signer: order.signer,
+        tokenId: token_id,
+        makerAmount: U256::from(order.maker_amount),
+        takerAmount: U256::from(order.taker_amount),
+        side: order.side.as_u8(),
+        signatureType: order.signature_type,
+        timestamp: U256::from(order.timestamp),
+        metadata: order.metadata,
+        builder: order.builder,
+    };
+
+    // App domain separator (exchange V2) and the Order struct (contents) hash.
+    let app_domain_separator = domain(neg_risk, chain_id).hash_struct();
+    let contents_hash = sol_order.eip712_hash_struct();
+
+    // typedDataSignTypehash = keccak256(prefix+walletFieldsDecl + contentsType).
+    // Solady: "TypedDataSign(" + contentsName + " contents,string name,string
+    // version,uint256 chainId,address verifyingContract,bytes32 salt)" +
+    // contentsType. contentsName = contentsType up to its first '(' = "Order",
+    // so the prefix+decl is exactly the literal below.
+    const TDS_PREFIX: &str =
+        "TypedDataSign(Order contents,string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)";
+    let mut type_preimage = String::with_capacity(TDS_PREFIX.len() + ORDER_CONTENTS_TYPE.len());
+    type_preimage.push_str(TDS_PREFIX);
+    type_preimage.push_str(ORDER_CONTENTS_TYPE);
+    let typed_data_sign_typehash = keccak256(type_preimage.as_bytes());
+
+    // hashStruct(TypedDataSign): 7 × 32-byte words. Wallet-domain fields.
+    let wd = wallet_domain(chain_id, deposit_wallet);
+    let mut buf = [0u8; 7 * 32];
+    buf[0..32].copy_from_slice(typed_data_sign_typehash.as_slice());
+    buf[32..64].copy_from_slice(contents_hash.as_slice());
+    buf[64..96].copy_from_slice(keccak256(wd.name.as_deref().unwrap_or("").as_bytes()).as_slice());
+    buf[96..128].copy_from_slice(keccak256(wd.version.as_deref().unwrap_or("").as_bytes()).as_slice());
+    buf[128..160].copy_from_slice(&U256::from(chain_id).to_be_bytes::<32>());
+    // address left-padded to 32 bytes (the low 20 bytes are the address).
+    buf[172..192].copy_from_slice(deposit_wallet.as_slice());
+    // salt is 0x0 (buf[192..224] already zero).
+    let hash_struct = keccak256(buf);
+
+    // Nested digest = keccak256(0x1901 ‖ appDomainSeparator ‖ hashStruct).
+    let mut digest_buf = [0u8; 2 + 32 + 32];
+    digest_buf[0] = 0x19;
+    digest_buf[1] = 0x01;
+    digest_buf[2..34].copy_from_slice(app_domain_separator.as_slice());
+    digest_buf[34..66].copy_from_slice(hash_struct.as_slice());
+    let nested_digest = keccak256(digest_buf);
+
+    // EOA signs the nested digest (ECDSA, v = 27/28 via as_bytes).
+    let sig = signer
+        .sign_hash_sync(&nested_digest)
+        .map_err(|e| SignError::Signer(e.to_string()))?;
+    let inner = sig.as_bytes(); // 65 bytes r‖s‖v
+
+    // Wrap: innerSig(65) ‖ appDomainSeparator(32) ‖ contentsHash(32) ‖
+    // contentsType(ascii) ‖ uint16_be(len).
+    let ct = ORDER_CONTENTS_TYPE.as_bytes();
+    let mut wire = Vec::with_capacity(65 + 32 + 32 + ct.len() + 2);
+    wire.extend_from_slice(&inner);
+    wire.extend_from_slice(app_domain_separator.as_slice());
+    wire.extend_from_slice(contents_hash.as_slice());
+    wire.extend_from_slice(ct);
+    wire.extend_from_slice(&(ct.len() as u16).to_be_bytes());
+
+    Ok(format!("0x{}", hex::encode(wire)))
+}
+
 /// (makerAmount, takerAmount) for a leg, µ units, against-us rounding —
 /// matches the engine's own cash math AND the reference client (vectors).
 pub fn clob_amounts(action: Action, ts: TickSize, limit_px: Px, qty: Qty) -> (u64, u64) {
@@ -306,6 +429,81 @@ mod tests {
             signer.address(),
             "production sig must recover to the signer over the order EIP-712 hash"
         );
+    }
+
+    /// THE GATE (Task 19): reproduce the FULL `EXPECTED_POLY_1271_SIGNATURE`
+    /// from py-clob-client-v2 byte-for-byte via `sign_order_1271`.
+    ///
+    /// The fixture's order has maker = signer = 0x1111…1111, which IS the
+    /// deposit wallet for this vector → the wallet-domain verifyingContract.
+    /// Intermediate asserts localise any failure to the nested-digest/typehash
+    /// (appDomainSeparator + contentsHash are independently known-good).
+    #[test]
+    fn reproduces_poly1271_reference_vector() {
+        let raw = include_str!("../tests/fixtures/sign_vectors_v2.json");
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let signer: PrivateKeySigner = v["private_key"].as_str().unwrap().parse().unwrap();
+        let o = &v["order"];
+        let chain_id = v["chain_id"].as_u64().unwrap();
+        let neg_risk = v["neg_risk"].as_bool().unwrap();
+        let deposit_wallet: Address = o["maker"].as_str().unwrap().parse().unwrap();
+        let order = ClobOrder {
+            salt: o["salt"].as_u64().unwrap(),
+            maker: deposit_wallet,
+            signer: o["signer"].as_str().unwrap().parse().unwrap(),
+            token_id: o["tokenId"].as_str().unwrap().to_string(),
+            maker_amount: o["makerAmount"].as_u64().unwrap(),
+            taker_amount: o["takerAmount"].as_u64().unwrap(),
+            side: Side::Buy,
+            signature_type: 3, // POLY_1271
+            timestamp: o["timestamp"].as_u64().unwrap(),
+            metadata: parse_b256(o["metadata"].as_str().unwrap()),
+            builder: parse_b256(o["builder"].as_str().unwrap()),
+        };
+
+        let wrapped = sign_order_1271(&signer, &order, neg_risk, chain_id, deposit_wallet).unwrap();
+        let bytes = hex::decode(wrapped.trim_start_matches("0x")).unwrap();
+
+        // Localise: embedded appDomainSeparator [65:97) + contentsHash [97:129)
+        // must equal the known-good fixture values BEFORE comparing the whole.
+        assert_eq!(
+            hex::encode(&bytes[65..97]),
+            v["ref_app_domain_separator"].as_str().unwrap(),
+            "embedded appDomainSeparator mismatch"
+        );
+        assert_eq!(
+            hex::encode(&bytes[97..129]),
+            v["ref_contents_hash"].as_str().unwrap(),
+            "embedded contentsHash mismatch"
+        );
+        // Localise: the leading 65-byte innerSig pins the nested digest/typehash.
+        assert_eq!(
+            format!("0x{}", hex::encode(&bytes[0..65])),
+            v["ref_inner_sig_first65"].as_str().unwrap(),
+            "innerSig mismatch → nested-digest / TypedDataSign typehash wrong"
+        );
+
+        // THE GATE: full wrapped wire signature, byte-for-byte.
+        assert_eq!(
+            wrapped,
+            v["expected_poly1271_signature_full"].as_str().unwrap(),
+            "full EXPECTED_POLY_1271_SIGNATURE mismatch"
+        );
+    }
+
+    /// The pinned `ORDER_CONTENTS_TYPE` constant (used to build the ERC-7739
+    /// typehash AND emitted as the wire `contentsType`) MUST equal the type
+    /// string alloy derives from the `sol! Order` struct. If the struct ever
+    /// changes, this fails loudly rather than silently desyncing the 1271 wrap.
+    #[test]
+    fn order_contents_type_matches_sol_derived() {
+        assert_eq!(
+            ORDER_CONTENTS_TYPE,
+            Order::eip712_encode_type(),
+            "pinned contentsType drifted from the sol! Order type string"
+        );
+        // And its length is the 0x00ba (186) the reference wire trailer encodes.
+        assert_eq!(ORDER_CONTENTS_TYPE.len(), 186);
     }
 
     #[test]

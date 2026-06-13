@@ -68,3 +68,58 @@ nested digest; reproducing the full expected validates the wrapper.
 
 L1 ClobAuth + L2 HMAC unchanged (the operator already derives an API key fine —
 the earlier "live venue armed" success proves auth works).
+
+## Pinned algorithm (Task 19)
+
+Pinned byte-for-byte against Solady `src/accounts/ERC1271.sol`
+(`_erc1271IsValidSignatureViaNestedEIP712`, the canonical ERC-7739
+implementation Polymarket's deposit wallet uses) AND reproduced against the
+py-clob-client-v2 `EXPECTED_POLY_1271_SIGNATURE` (full literal, ends `00ba`).
+
+**contentsType** (the V2 Order EIP-712 type string, the SAME string our `sol!`
+Order produces) — ASCII, length 186 = `0x00ba` (matches the wire trailer):
+```
+Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)
+```
+**contentsName** = the substring up to the first `(` = `Order` (Solady implicit
+mode: the wire's `contentsDescription` == `contentsType`, which starts with the
+name; no separate appended name).
+
+**TypedDataSign typehash** = `keccak256(preimage)` where the preimage is
+(Solady line 248 — `TypedDataSign({ContentsName} contents,...){ContentsType}`):
+```
+TypedDataSign(Order contents,string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)
+```
+i.e. `"TypedDataSign(" + contentsName + " contents,string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)" + contentsType`.
+Domain fields are ALWAYS `name,version,chainId,verifyingContract,salt` (5 fields,
+NO `extensions`, no conditional) — confirmed from the literal at lines 271–273.
+
+**Wallet domain** = { name "DepositWallet", version "1", chainId, verifyingContract
+= deposit_wallet, salt = 0x0 }. salt IS part of the struct (the 7th word).
+
+**hashStruct(TypedDataSign)** = `keccak256(7 words)` (Solady `keccak256(t,0xe0)`,
+order is load-bearing — `contents` BEFORE `name`, line 156):
+```
+[0] typedDataSignTypehash
+[1] contentsHash                 (= Order.eip712_hash_struct(), known-good d23d42d3…)
+[2] keccak256("DepositWallet")   (wallet domain name)
+[3] keccak256("1")               (wallet domain version)
+[4] chainId                      (uint256, e.g. 80002)
+[5] verifyingContract            (deposit_wallet, left-padded to 32)
+[6] salt                         (0x0…0)
+```
+
+**Nested digest the EOA signs** (Solady line 283, `keccak256(0x1e, 0x42)`):
+```
+keccak256(0x1901 ‖ appDomainSeparator ‖ hashStruct(TypedDataSign))
+```
+appDomainSeparator = the EXCHANGE V2 domain separator (known-good a440cbd8…),
+NOT the wallet domain. Sign this 32-byte digest with the EOA (ECDSA, v=27/28).
+
+**Wrapped wire signature** (Solady lines 158–159):
+```
+innerSig(65) ‖ appDomainSeparator(32) ‖ contentsHash(32) ‖ contentsType(186 ascii) ‖ uint16_be(186)=00ba
+```
+Returned as `0x` + hex. RESULT: reproduces the full
+`EXPECTED_POLY_1271_SIGNATURE` byte-for-byte (validated in
+`sign.rs::reproduces_poly1271_reference_vector`).
