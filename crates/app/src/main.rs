@@ -67,6 +67,11 @@ struct Args {
     /// authenticated L2 read, then exit. No market fetch, no TUI, no orders, no
     /// money. Requires `--live`. Run with `--headless` to see the full logs.
     auth_check: bool,
+    /// Probe-order: after arming, place ONE tiny 5-share FAK BUY (on a cheap
+    /// liquid token, ≤ $0.10) through the real signing/auth/submit path, report
+    /// the venue's verdict, then exit. Settles whether a type-3 deposit-wallet
+    /// order is accepted, without waiting for an arb. Requires `--live`.
+    probe_order: bool,
 }
 
 impl Args {
@@ -87,6 +92,7 @@ impl Args {
         let mut live = false;
         let mut shadow = false;
         let mut auth_check = false;
+        let mut probe_order = false;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -137,6 +143,9 @@ impl Args {
                 "--auth-check" => {
                     auth_check = true;
                 }
+                "--probe-order" => {
+                    probe_order = true;
+                }
                 other => return Err(format!("unknown argument: {other}")),
             }
         }
@@ -150,6 +159,9 @@ impl Args {
         if auth_check && !live {
             return Err("--auth-check requires --live".to_string());
         }
+        if probe_order && !live {
+            return Err("--probe-order requires --live".to_string());
+        }
 
         Ok(Args {
             config_path,
@@ -161,6 +173,7 @@ impl Args {
             live,
             shadow,
             auth_check,
+            probe_order,
         })
     }
 }
@@ -746,6 +759,8 @@ async fn main() {
         // No secret fields on this line — keep it that way (creds/signer must
         // never be interpolated into logs).
         info!(shadow = args.shadow, "live venue armed (api key ready)");
+        // Capture the EOA before `signer` is moved into the venue cfg (probe diag).
+        let eoa = signer.address();
         let mut venue = pm_execution::live::LiveVenue::new(pm_execution::live::LiveVenueCfg {
             base: config.endpoints.clob_base.clone(),
             creds,
@@ -776,6 +791,103 @@ async fn main() {
                     }
                 }
             }
+        }
+        // Probe-order: place ONE tiny 5-share FAK BUY through the real signing /
+        // auth / submit path on a cheap, liquid YES token, report the venue's
+        // verdict, then exit. Settles whether a type-3 deposit-wallet order is
+        // accepted, without waiting for an arbitrage to appear.
+        if args.probe_order {
+            use pm_core::instrument::TokenId;
+            use pm_core::num::{Bps, Px, Qty, TickSize};
+            use pm_engine::Action;
+            use pm_execution::venue::ExecutionVenue; // brings submit_fak into scope
+            const COST_CAP_TICKS: u16 = 50; // ignore asks above 0.50 (≤ $2.50 / 5 shares)
+            const GOOD_ENOUGH_TICKS: u16 = 5; // ≤ 0.05 found → stop scanning, buy now
+            const MAX_FETCHES: u32 = 50;
+            println!("\n=== probe-order: one 5-share FAK BUY via the real signed-order path ===");
+            println!("maker (deposit): {deposit_wallet}");
+            println!("signer (EOA)   : {eoa}");
+            println!("(5 shares is the venue minimum; cheapest tokens are ~$0.10, so expect ~$0.50)\n");
+            // Scan a sample of tokens (both sides) and keep the CHEAPEST fillable
+            // ask, so the probe always finds something to fill, at minimal cost.
+            let mut fetches = 0u32;
+            let mut best: Option<(TokenId, TickSize, Bps, Px)> = None;
+            'scan: for m in reg.markets() {
+                if !matches!(m.tick, TickSize::Cent)
+                    || !market_tokens_for_registration.contains_key(&m.id)
+                {
+                    continue;
+                }
+                for token in [m.yes, m.no] {
+                    if fetches >= MAX_FETCHES {
+                        break 'scan;
+                    }
+                    if reg.token_venue_id(token).is_none() {
+                        continue;
+                    }
+                    fetches += 1;
+                    let Ok(Some(ask)) = venue.best_ask(token, m.tick).await else {
+                        continue;
+                    };
+                    if ask.get() == 0 || ask.get() > COST_CAP_TICKS {
+                        continue;
+                    }
+                    let cheaper = match &best {
+                        None => true,
+                        Some((_, _, _, b)) => ask.get() < b.get(),
+                    };
+                    if cheaper {
+                        best = Some((token, m.tick, m.fee_bps, ask));
+                        if ask.get() <= GOOD_ENOUGH_TICKS {
+                            break 'scan; // cheap enough — no need to scan further
+                        }
+                    }
+                }
+            }
+            match best {
+                None => println!(
+                    "\nNo Cent-tick token had an ask in (0, $0.50] within {fetches} book fetches.\nMarkets may be unusually pricey — re-run, or tell me to widen the cap."
+                ),
+                Some((token, tick, fee, ask)) => {
+                    println!(
+                        "cheapest fillable: token {} @ {} ticks (= ${:.2}) — buying 5 shares ...",
+                        token.0,
+                        ask.get(),
+                        f64::from(ask.get()) / 100.0
+                    );
+                    let order = pm_execution::Order::new(
+                        "probe-order".into(),
+                        token,
+                        Action::Buy,
+                        tick,
+                        ask,
+                        Qty(5_000_000),
+                        fee,
+                    );
+                    match venue.submit_fak(&order).await {
+                        Ok(out) => {
+                            println!("\n✅ ACCEPTED — the signed order path WORKS.");
+                            println!("   venue_order_id = {:?}", out.venue_order_id);
+                            println!(
+                                "   filled = {} shares ({} µ), {} fill(s)",
+                                out.filled.0 / 1_000_000,
+                                out.filled.0,
+                                out.fills.len()
+                            );
+                            println!(
+                                "\nVerdict: the type-3 deposit-wallet signature / auth / signer are all\n         correct. An arb basket's buy legs submit identically — the M5 live\n         order path is PROVEN."
+                            );
+                        }
+                        Err(e) => {
+                            println!("\n❌ venue returned an error:\n   {e}");
+                            println!(
+                                "\nVerdict: if this is \"signer must = API key\", order.signer must flip\n         (deposit wallet ↔ EOA). Paste this and I'll adjust + you retest."
+                            );
+                        }
+                    }
+                }
+            }
+            return;
         }
         tokio::spawn(run_execution(
             venue,

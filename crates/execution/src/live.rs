@@ -354,6 +354,47 @@ impl LiveVenue {
     pub async fn recent_trades(&mut self) -> Result<Vec<serde_json::Value>, VenueError> {
         self.data_rows("trades", "").await
     }
+
+    /// Fetch the public order book for a registered `token` and return its best
+    /// (lowest) ask as a tick `Px`, or `None` if the ask side is empty/
+    /// unparseable. Public read — no auth, no limiter. Used by `--probe-order`
+    /// to find a cheap, fillable level to exercise the signed-order path.
+    pub async fn best_ask(
+        &self,
+        token: TokenId,
+        ts: TickSize,
+    ) -> Result<Option<Px>, VenueError> {
+        let (venue_token, _neg) = self
+            .tokens
+            .get(&token)
+            .cloned()
+            .ok_or_else(|| VenueError::Live(format!("probe: token {} not registered", token.0)))?;
+        let url = format!("{}/book?token_id={}", self.cfg.base, venue_token);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| VenueError::Live(e.to_string()))?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| VenueError::Live(e.to_string()))?;
+        if !status.is_success() {
+            return Err(VenueError::Live(format!("book {status}: {body}")));
+        }
+        let book: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| VenueError::Live(e.to_string()))?;
+        let asks = match book.get("asks").and_then(|a| a.as_array()) {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+        // Lowest ask across all levels — don't assume the venue's sort order.
+        let best = asks
+            .iter()
+            .filter_map(|lvl| lvl.get("price").and_then(|p| p.as_str()))
+            .filter_map(|p| px_from_decimal(p, ts))
+            .min_by_key(|px| px.get());
+        Ok(best)
+    }
 }
 
 /// Default salt: wall-clock nanos XOR a process-monotonic counter.
@@ -395,16 +436,20 @@ impl ExecutionVenue for LiveVenue {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        // V2 deposit-wallet flow: for a POLY_1271 (signatureType 3) order both
-        // the `maker` AND `signer` fields are the deposit wallet — py-clob-client-v2
-        // OrderBuilder sets signer = funder for POLY_1271 (_v2_order_signer), and
-        // the reference vector has maker==signer==deposit wallet. The actual ECDSA
-        // is produced by the EOA key (`self.cfg.signer`) inside the ERC-7739 wrap;
-        // the deposit wallet's delegate validates it via ERC-1271 isValidSignature.
+        // V2 deposit-wallet flow: `maker` = the deposit wallet (the funds holder,
+        // accepted by the venue), but `signer` = the EOA. The CLOB rejects any
+        // order whose signer ≠ the API key's owner ("the order signer address has
+        // to be the address of the API KEY", confirmed live), and our key derives
+        // bound to the EOA (plain-EOA L1; the /auth endpoint refuses a deposit-
+        // wallet-bound key). So signer MUST be the EOA. The signature is still the
+        // ERC-7739 / POLY_1271 (sigType 3) wrap produced by the EOA key and
+        // validated on-chain by the deposit wallet's ERC-1271 isValidSignature.
+        // (py-clob-client-v2 sets signer=funder here — the open #64/#70/#71 bug
+        // that can't satisfy the signer==key-owner check with an EOA-bound key.)
         let clob_order = ClobOrder {
             salt: (self.salt_src)(),
             maker: self.cfg.deposit_wallet,
-            signer: self.cfg.deposit_wallet,
+            signer: self.cfg.signer.address(),
             token_id: venue_token.clone(),
             maker_amount,
             taker_amount,
@@ -464,7 +509,7 @@ impl ExecutionVenue for LiveVenue {
                 owner = %self.cfg.creds.key,
                 l2_poly_address = %self.cfg.signer.address(),
                 eoa = %self.cfg.signer.address(),
-                "first live order identity (POLY_ADDRESS=EOA=key owner; maker=signer=deposit wallet, sigType 3)"
+                "first live order identity (POLY_ADDRESS=signer=EOA=key owner; maker=deposit wallet, sigType 3)"
             );
         }
 
@@ -818,8 +863,8 @@ mod tests {
             reqs[0]
         );
         assert!(
-            reqs[0].contains(&format!("\"signer\":\"0x{}\"", "22".repeat(20))),
-            "signer field must be the deposit wallet (not the EOA): {}",
+            reqs[0].contains(&format!("\"signer\":\"{eoa_hex}\"")),
+            "signer field must be the EOA (the API key's owner), not the deposit wallet: {}",
             reqs[0]
         );
         // The signature is the ERC-7739 wrapped form (innerSig 65 + appDomainSep
