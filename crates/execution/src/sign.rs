@@ -244,31 +244,20 @@ mod tests {
         let our_domain_sep = dom.hash_struct();
         let our_struct_hash = order.eip712_hash_struct();
 
-        // The reference POLY_1271 signature embeds appDomainSeparator at bytes
-        // [65..97) and contentsHash at [97..129) (Solady EIP-7739 layout).
-        let full = v["expected_signature_first65"]
-            .as_str()
-            .unwrap()
-            .trim_start_matches("0x");
-        let bytes = hex::decode(full).unwrap();
-        assert_eq!(bytes.len(), 65, "fixture pins the leading 65-byte ECDSA component only");
-
-        // The 65-byte fixture slice is the inner ECDSA sig over the 7739 nested
-        // digest; we don't reproduce it from the plain order hash. Instead we
-        // pin the struct + domain via the FULL reference signature's embedded
-        // appDomainSeparator/contentsHash, decoded byte-exactly here:
-        const REF_DOMAIN_SEP: &str =
-            "a440cbd865bc0c6243d7a8df9a8bf48a8827b0a4abbb61c30e96d305423af148";
-        const REF_CONTENTS_HASH: &str =
-            "d23d42d3ad94e65d78258cecaf8dcbaddac0f73dc085040f2c12bb595dd83804";
+        // The reference POLY_1271 signature uses the Solady EIP-7739 layout
+        // (innerSig ‖ appDomainSeparator ‖ contentsHash ‖ contentsType ‖ len);
+        // its embedded appDomainSeparator (bytes [65:97)) and contentsHash
+        // (bytes [97:129)) are recorded in the fixture, transcribed from
+        // py-clob-client-v2's EXPECTED_POLY_1271_SIGNATURE. Matching them pins
+        // our V2 domain + order-struct hashing against Polymarket's reference.
         assert_eq!(
             hex::encode(our_domain_sep),
-            REF_DOMAIN_SEP,
+            v["ref_app_domain_separator"].as_str().unwrap(),
             "V2 domain separator mismatch (name/version/chainId/verifyingContract)"
         );
         assert_eq!(
             hex::encode(our_struct_hash),
-            REF_CONTENTS_HASH,
+            v["ref_contents_hash"].as_str().unwrap(),
             "V2 order struct (contents) hash mismatch (typestring/field order/types/values)"
         );
     }

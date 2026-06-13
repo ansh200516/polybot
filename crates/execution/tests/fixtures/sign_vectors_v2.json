@@ -1,5 +1,5 @@
 {
-  "_note": "CLOB V2 order signing vector, read from py-clob-client-v2 tests/order_utils/test_exchange_order_builder_v2.py (RECON-M5-V2). It is POLY_1271 (signatureType 3) on AMOY (chainId 80002), NOT our POLY_PROXY (1) on mainnet (137) — but signing is the same ECDSA-over-EIP712-hash op, so reproducing the leading 65-byte ECDSA signature validates the V2 struct + domain hashing. The full EXPECTED_POLY_1271_SIGNATURE appends 1271-specific bytes (ends 00ba); we match only the first 65 bytes. Production swaps chainId->137, signatureType->1, verifyingContract per neg_risk.",
+  "_note": "CLOB V2 order signing vector, from py-clob-client-v2 tests/order_utils/test_exchange_order_builder_v2.py (RECON-M5-V2). The reference is POLY_1271 (signatureType 3) on AMOY (chainId 80002); its full EXPECTED_POLY_1271_SIGNATURE uses the Solady EIP-7739 TypedDataSign layout: innerSig(65) ‖ appDomainSeparator(32) ‖ contentsHash(32) ‖ contentsType ‖ len. So the leading 65 bytes are the NESTED inner ECDSA sig (not reproducible from the plain order hash); the externally-meaningful checks are the embedded appDomainSeparator (bytes [65:97)) and contentsHash (bytes [97:129)), recorded below. Reproducing those two pins our V2 domain + order-struct hashing exactly. Production differs only in value substitution: chainId 137, signatureType 1 (POLY_PROXY), verifyingContract per neg_risk — same hashing/signing scheme (validated end-to-end by the V1 py-clob-client sigType-1 vectors).",
   "private_key": "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
   "chain_id": 80002,
   "verifying_contract": "0xE111180000d2663C0091e4f400237545B87B996B",
@@ -17,5 +17,7 @@
     "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
     "builder": "0x0000000000000000000000000000000000000000000000000000000000000000"
   },
-  "expected_signature_first65": "0xa3a093c83b6c20c83355c16ce94c92e6e9fcbdeb840618cc74f6c57a42ad145b2b98db73d2c73cbf1f2b6af288566ae81960ddbc3a13921027358a8bff3be6ff1c"
+  "ref_inner_sig_first65": "0xa3a093c83b6c20c83355c16ce94c92e6e9fcbdeb840618cc74f6c57a42ad145b2b98db73d2c73cbf1f2b6af288566ae81960ddbc3a13921027358a8bff3be6ff1c",
+  "ref_app_domain_separator": "a440cbd865bc0c6243d7a8df9a8bf48a8827b0a4abbb61c30e96d305423af148",
+  "ref_contents_hash": "d23d42d3ad94e65d78258cecaf8dcbaddac0f73dc085040f2c12bb595dd83804"
 }
