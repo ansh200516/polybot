@@ -29,6 +29,7 @@ use pm_engine::{Action, ArbClass, Opportunity, RedeemStrategy};
 use pm_store::writer::StoreMsg;
 use pm_store::{ConversionRow, FillRow, usdc_to_i64};
 use tokio::sync::{mpsc, oneshot};
+use tracing::warn;
 
 use crate::venue::{ExecutionVenue, SubmitOutcome, VenueError};
 use crate::{ExecError, Order, OrderState, persist_transition};
@@ -253,9 +254,15 @@ async fn close_order(
     errors: &mut u32,
 ) -> Result<Qty, ExecError> {
     let out = match result {
-        Err(_) => {
+        Err(e) => {
             *errors += 1;
-            persist_transition(store, order, OrderState::Rejected, "venue error", ts_ms).await?;
+            // Surface the venue's actual rejection reason: WARN it (visible in
+            // the TUI log panel live) and persist it (truncated) as the Rejected
+            // event detail — an opaque "venue error" left a live operator blind.
+            let msg = e.to_string();
+            warn!(order = %order.id, "venue rejected order: {msg}");
+            let detail: String = msg.chars().take(160).collect();
+            persist_transition(store, order, OrderState::Rejected, &detail, ts_ms).await?;
             return Ok(Qty(0));
         }
         Ok(out) => out,
@@ -1022,6 +1029,74 @@ mod tests {
             "Merge against an unsupported venue must fail the basket: {result:?}"
         );
         assert_eq!(v.merges.len(), 1, "merge was reached (and rejected)");
+    }
+
+    #[tokio::test]
+    async fn venue_rejection_persists_the_real_error_not_a_placeholder() {
+        // A live operator must be able to see WHY an order was rejected. The
+        // Rejected event detail must carry the actual VenueError text, not an
+        // opaque "venue error" placeholder. (no MockVenue script → submit_fak
+        // returns BookUnavailable, standing in for any live venue rejection.)
+        let mut v = MockVenue::new();
+        // Force the venue to reject both legs (stand-in for a live rejection).
+        v.errors.insert(TokenId(YES));
+        v.errors.insert(TokenId(NO));
+        // Recording receiver: capture Rejected event details, ack everything so
+        // execute_basket's write-ahead transitions don't stall.
+        let (tx, mut rx) = mpsc::channel::<StoreMsg>(256);
+        let recorder = tokio::spawn(async move {
+            let mut rejected_details: Vec<String> = Vec::new();
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    StoreMsg::OrderEvent(row, ack) => {
+                        if row.state == "Rejected" {
+                            rejected_details.push(row.detail.clone());
+                        }
+                        if let Some(a) = ack {
+                            let _ = a.send(());
+                        }
+                    }
+                    StoreMsg::OrderInsert(_, ack)
+                    | StoreMsg::Fill(_, ack)
+                    | StoreMsg::Conversion(_, ack) => {
+                        if let Some(a) = ack {
+                            let _ = a.send(());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rejected_details
+        });
+        let (token_market, market_tokens) = maps();
+        let token_fee: HashMap<TokenId, Bps> = HashMap::new();
+        let opp = c1long();
+        let p = params(RedeemStrategy::Hold);
+        let _ = execute_basket(
+            &mut v,
+            &tx,
+            &opp,
+            &token_market,
+            &market_tokens,
+            &token_fee,
+            &p,
+            1,
+        )
+        .await;
+        drop(tx);
+        let details = recorder.await.unwrap();
+
+        assert!(
+            !details.is_empty(),
+            "a Rejected order event must be persisted for a venue rejection"
+        );
+        for d in &details {
+            assert_ne!(d, "venue error", "must not be the opaque placeholder");
+            assert!(
+                d.contains("no live book for token"),
+                "Rejected detail must carry the venue error text, got: {d:?}"
+            );
+        }
     }
 
     #[tokio::test]
