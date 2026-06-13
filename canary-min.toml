@@ -1,18 +1,18 @@
-# Minimal canary config — tuned for a ~$5.88 wallet (2026-06-13).
+# Minimal canary config — tuned for a ~$4.88 wallet (2026-06-13, post manual trade).
 #
 # Same intent as canary.toml (sizing-only deviation; all safety guards intact)
-# but sized so a single basket fits a tiny balance: baskets are capped at ~$5
-# of basis, leaving margin under $5.88 for venue fees/rounding. The 5-share
-# venue minimum still applies per leg; the pure-buy arbs the bot finds are on
-# cheap (cents-per-share) legs, so a 5-share leg costs cents and a whole basket
-# fits well under $5.
+# but sized so a single basket fits a tiny balance: baskets capped at ~$4.30 of
+# basis, leaving margin under ~$4.88 (the operator spent ~$1 on a manual trade)
+# for venue fees/rounding. The 5-share venue minimum still applies per leg; the
+# pure-buy arbs the bot finds are on cheap (cents-per-share) legs, so a 5-share
+# leg costs cents and a whole basket fits well under the cap.
 #
 # After the FIRST fill the wallet is mostly spent — stop the session (k or q)
 # and reconcile. Further dispatches would be rejected by the venue for
 # insufficient balance (harmless: they error and, after 5, latch a halt).
 
 [capital]
-per_market_usd = 5.0      # size baskets to <= ~$5 basis (fits $5.88 with margin)
+per_market_usd = 4.0      # size baskets to <= ~$4 basis (fits ~$4.88 with margin)
 
 [edges]
 min_profit_usd = 0.01     # 30/100 bps NET edge floors (defaults) stay the real gate
@@ -21,5 +21,5 @@ min_profit_usd = 0.01     # 30/100 bps NET edge floors (defaults) stay the real 
 max_markets = 100
 
 [live]
-basket_cap_usd   = 5.2    # hard reject anything over $5.20 (wallet is $5.88)
+basket_cap_usd   = 4.3    # hard reject anything over $4.30 (wallet ~$4.88)
 session_loss_usd = 3.0    # latched halt if bid-marked P&L drops to -$3
