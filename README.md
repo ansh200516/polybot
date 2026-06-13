@@ -339,9 +339,25 @@ proven but the signing path is never reached. With it, expect at least one
 `SHADOW: signed, not submitted` when a pure-buy arb appears (still
 opportunity-dependent; re-run if the market is quiet).
 
-### Shadow rehearsal results
+### Shadow rehearsal results (2026-06-13, `canary.toml`, 100 markets)
 
-_Pending operator run._
+| Check | Result |
+|---|---|
+| `live venue armed (api key ready) shadow=true` | yes — API key derived against the live CLOB |
+| session duration | 602 s |
+| opportunities admitted | 1,519 |
+| live-gate rejects (over-cap / non-pure-buy / sub-min-leg) | 519 |
+| baskets dispatched → **signed** → not submitted (`nofill`) | 970 |
+| every signed leg `side=Buy` | yes (pure-buy gate held end to end) |
+| fills | 0 (shadow never submits) |
+| `exec_err` / `write_errors` / `halts` | 0 / 0 / 0 |
+| cash / equity / realized / open positions | $0 / $0 / $0 / 0 |
+| `arb session result: healthy=true` | yes |
+
+The full path — detect → gate → risk-approve → dispatch → EIP-712 sign →
+report → account — ran 970 times against live data with zero submissions and
+zero side effects. Auth, signing, the pure-buy/cap/min-leg gates, and basket
+sizing are all proven live; only the network submit is stubbed in shadow.
 
 ### Funded canary results
 
