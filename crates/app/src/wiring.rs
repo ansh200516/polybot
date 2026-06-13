@@ -86,6 +86,16 @@ pub fn build_component_index(reg: &Registry) -> ComponentIndex {
         by_token.insert(m.no, cid);
     }
     for p in reg.partitions() {
+        // Only verified-exhaustive, well-formed partitions may enter an entry.
+        // The LP path (engine::lp::enumerate_worlds) assumes exactly-one-winner
+        // per partition and debug-asserts both properties; an unverified
+        // partition panics in debug and silently produces wrong worlds (→ false
+        // arbs) in release. Dropping it leaves its markets as free binary vars —
+        // the conservative over-approximation, and exactly what class2 does
+        // (class2.rs gates on the same flags).
+        if !p.verified_exhaustive || !p.is_well_formed() {
+            continue;
+        }
         if let Some(&first) = p.markets.first() {
             let cid = reg.component_of(first);
             // Registry construction guarantees it.
@@ -300,6 +310,43 @@ mod tests {
         let b = r.market_by_condition("0xb").unwrap().id;
         let eb = &idx.entries[&r.component_of(b)];
         assert_eq!(eb.partitions.len(), 1);
+    }
+
+    /// build_component_index must NOT leak unverified or ill-formed partitions
+    /// into entries. enumerate_worlds (the LP path) assumes exactly-one-winner
+    /// per partition and debug-asserts on it: an unverified partition panics in
+    /// a debug build and silently produces wrong worlds (→ false arbs) in
+    /// release. Markets of a dropped partition fall back to free binary vars,
+    /// which is the conservative over-approximation (class2 filters the same).
+    #[test]
+    fn component_index_excludes_unverified_partitions() {
+        let mut b = RegistryBuilder::default();
+        // Verified 2-member NegRisk event ev1 (b + c).
+        b.add_market("0xb", "yb", "nb", TickSize::Cent, 0, true, Some("B?".into()), true, false, Some("ev1"));
+        b.add_market("0xc", "yc", "nc", TickSize::Cent, 0, true, Some("C?".into()), true, false, Some("ev1"));
+        // Unverified single-member event ev2 (TooFewMembers → verified_exhaustive=false).
+        b.add_market("0xe", "ye", "ne", TickSize::Cent, 0, true, Some("E?".into()), true, false, Some("ev2"));
+        let r = b.finish("").unwrap();
+
+        // Sanity: the fixture really does contain an unverified partition.
+        assert!(
+            r.partitions().iter().any(|p| !p.verified_exhaustive),
+            "fixture must contain an unverified partition"
+        );
+
+        let idx = build_component_index(&r);
+        // No entry may carry a partition that violates enumerate_worlds' contract.
+        for e in idx.entries.values() {
+            assert!(
+                e.partitions.iter().all(|p| p.verified_exhaustive && p.is_well_formed()),
+                "build_component_index leaked an unverified/ill-formed partition"
+            );
+        }
+        // The verified ev1 partition is still retained.
+        assert!(
+            idx.entries.values().any(|e| e.partitions.len() == 1),
+            "verified partition must be retained"
+        );
     }
 
     #[test]
