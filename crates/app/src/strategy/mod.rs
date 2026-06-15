@@ -8,11 +8,12 @@ use pm_risk::RiskConfig;
 
 /// Stable identity for a strategy (e.g. `"arb"`, `"mm"`). A `&'static str`
 /// keeps it copyable and cheap to use as a label/map key.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct StrategyId(pub &'static str);
 
 /// One strategy's slice of the platform: its identity, the capital carved out
 /// for it, and the risk envelope it runs under.
+#[derive(Debug, Clone)]
 pub struct StrategyEnvelope {
     pub id: StrategyId,
     pub capital: Usdc,
