@@ -109,18 +109,31 @@ fn consistent(spec: &ComponentSpec, w: &World) -> bool {
     true
 }
 
+/// World-choices a partition contributes:
+/// - `verified_exhaustive` → EXACTLY one winner → `k` choices.
+/// - mutually-exclusive only (NegRisk, not provably exhaustive) → AT MOST one
+///   winner → `k + 1` choices (each member wins, or none win).
+///
+/// The at-most-one model is the conservative truth for a NegRisk set we can't
+/// prove complete: it never assumes a $1 payout (the "none win" world pays $0),
+/// yet keeps the world count linear (`k+1`) instead of the `2^k` blow-up that a
+/// fall-back to free binary variables would cause.
+fn partition_choices(p: &Partition) -> usize {
+    p.markets.len() + usize::from(!p.verified_exhaustive)
+}
+
 /// Enumerate all worlds consistent with the component's relationships.
 ///
 /// Returns `None` if the pre-prune cartesian-product size exceeds `max_worlds`.
 ///
-/// Each partition contributes exactly one winning YES outcome (the others are
-/// false). Markets that belong to no partition are "free" binary variables.
-///
-/// Callers must not include unverified partitions: worlds assume
-/// exactly-one-winner per partition (the registry guarantees this upstream).
+/// A verified-exhaustive partition contributes exactly one winning YES outcome;
+/// a mutually-exclusive-only (NegRisk) partition adds a "no member wins" world.
+/// Markets that belong to no partition are "free" binary variables.
 pub fn enumerate_worlds(spec: &ComponentSpec, max_worlds: usize) -> Option<Vec<World>> {
     debug_assert!(spec.partitions.iter().all(Partition::is_well_formed));
-    debug_assert!(spec.partitions.iter().all(|p| p.verified_exhaustive));
+    // A partition must be at least mutually exclusive (NegRisk) to constrain
+    // worlds; verified_exhaustive is the stronger exactly-one case.
+    debug_assert!(spec.partitions.iter().all(|p| p.neg_risk));
 
     let n_markets = spec.markets.len();
 
@@ -144,7 +157,7 @@ pub fn enumerate_worlds(spec: &ComponentSpec, max_worlds: usize) -> Option<Vec<W
     // Use u128 with saturating mul so we never overflow on absurd inputs.
     let mut preprune: u128 = 1u128;
     for part in &spec.partitions {
-        preprune = preprune.saturating_mul(part.markets.len() as u128);
+        preprune = preprune.saturating_mul(partition_choices(part) as u128);
     }
     // 2^n_free, saturating at u128::MAX to avoid overflow.
     // loop shifts 1u64<<n_free: safe — preprune check already returned None for n_free ≥ 64
@@ -179,10 +192,12 @@ pub fn enumerate_worlds(spec: &ComponentSpec, max_worlds: usize) -> Option<Vec<W
 
             // Apply partition choices.
             for (pi, part) in spec.partitions.iter().enumerate() {
-                let winner_mid = part.markets[part_choice[pi]];
+                // `get` is None at choice == k — the "no member wins" world that
+                // only a non-exhaustive (at-most-one) partition reaches.
+                let winner_mid = part.markets.get(part_choice[pi]).copied();
                 for mid in &part.markets {
                     if let Some(idx) = market_index(spec, *mid) {
-                        yes_true[idx] = *mid == winner_mid;
+                        yes_true[idx] = Some(*mid) == winner_mid;
                     }
                 }
             }
@@ -206,7 +221,7 @@ pub fn enumerate_worlds(spec: &ComponentSpec, max_worlds: usize) -> Option<Vec<W
         for pi in (0..n_partitions).rev() {
             if carry {
                 part_choice[pi] += 1;
-                if part_choice[pi] < spec.partitions[pi].markets.len() {
+                if part_choice[pi] < partition_choices(&spec.partitions[pi]) {
                     carry = false;
                     break;
                 }
@@ -827,6 +842,7 @@ mod tests {
             yes_tokens: vec![TokenId(10), TokenId(12), TokenId(14)],
             no_tokens: vec![TokenId(11), TokenId(13), TokenId(15)],
             verified_exhaustive: true,
+            neg_risk: true,
         };
         let spec = ComponentSpec {
             markets: vec![mk(0), mk(1), mk(2), mk(3)], // 3 in partition + 1 free
@@ -844,6 +860,71 @@ mod tests {
                 .count();
             assert_eq!(paying, 1);
         }
+    }
+
+    #[test]
+    fn nonexhaustive_partition_is_at_most_one_winner() {
+        // Same 3-member set, but NOT verified exhaustive (mutually exclusive
+        // only). The exhaustive model gives 3 worlds; at-most-one gives 4 — the
+        // extra one is the "no member wins" world that makes a cheap YES set NOT
+        // a guaranteed $1 (so the LP can't fabricate a complete-set arb).
+        let books = HashMap::new();
+        let part = Partition {
+            event: EventId(0),
+            markets: vec![MarketId(0), MarketId(1), MarketId(2)],
+            yes_tokens: vec![TokenId(10), TokenId(12), TokenId(14)],
+            no_tokens: vec![TokenId(11), TokenId(13), TokenId(15)],
+            verified_exhaustive: false,
+            neg_risk: true,
+        };
+        let spec = ComponentSpec {
+            markets: vec![mk(0), mk(1), mk(2)],
+            partitions: vec![part],
+            relationships: vec![],
+            books: &books,
+        };
+        let worlds = enumerate_worlds(&spec, 4096).unwrap();
+        assert_eq!(worlds.len(), 4, "k members → k+1 worlds (k winners + none)");
+        let yes = [TokenId(10), TokenId(12), TokenId(14)];
+        // Mutual exclusivity holds in every world: never 2+ YES paying.
+        for w in &worlds {
+            let paying = yes
+                .iter()
+                .filter(|&&t| token_pays(&spec, w, t).unwrap())
+                .count();
+            assert!(paying <= 1, "mutual exclusivity violated: {paying} winners");
+        }
+        // Exactly one world has NO winner (the case the exhaustive model omits).
+        let none_win = worlds
+            .iter()
+            .filter(|w| yes.iter().all(|&t| !token_pays(&spec, w, t).unwrap()))
+            .count();
+        assert_eq!(none_win, 1, "must include the 'no member wins' world");
+    }
+
+    #[test]
+    fn nonexhaustive_partition_stays_linear_not_exponential() {
+        // 30-member NegRisk set: at-most-one is 31 worlds (fits 4096); the old
+        // free-variable fallback would be 2^30 → would return None (skip).
+        let books = HashMap::new();
+        let n = 30u32;
+        let part = Partition {
+            event: EventId(0),
+            markets: (0..n).map(MarketId).collect(),
+            yes_tokens: (0..n).map(|i| TokenId(u64::from(i) * 2 + 10)).collect(),
+            no_tokens: (0..n).map(|i| TokenId(u64::from(i) * 2 + 11)).collect(),
+            verified_exhaustive: false,
+            neg_risk: true,
+        };
+        let spec = ComponentSpec {
+            markets: (0..n).map(mk).collect(),
+            partitions: vec![part],
+            relationships: vec![],
+            books: &books,
+        };
+        // 31 worlds fit the 4096 cap (the 2^30 free-var fallback would not).
+        let worlds = enumerate_worlds(&spec, 4096).unwrap();
+        assert_eq!(worlds.len(), 31);
     }
 
     #[test]
@@ -1100,6 +1181,7 @@ mod tests {
             yes_tokens: vec![TokenId(10), TokenId(12), TokenId(14)],
             no_tokens: vec![TokenId(11), TokenId(13), TokenId(15)],
             verified_exhaustive: true,
+            neg_risk: true,
         };
         let spec = ComponentSpec {
             markets: vec![mk(0), mk(1), mk(2)],
@@ -1244,6 +1326,7 @@ mod tests {
             yes_tokens: vec![TokenId(10), TokenId(12), TokenId(14)],
             no_tokens: vec![TokenId(11), TokenId(13), TokenId(15)],
             verified_exhaustive: true,
+            neg_risk: true,
         };
         let spec = ComponentSpec {
             markets: vec![mk(0), mk(1), mk(2)],

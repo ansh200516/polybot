@@ -33,7 +33,15 @@ pub struct Partition {
     pub markets: Vec<MarketId>,
     pub yes_tokens: Vec<TokenId>,
     pub no_tokens: Vec<TokenId>,
+    /// Verified to be a complete set: EXACTLY one member YES resolves true
+    /// (the set sums to $1). Required by class 2's complete-set math.
     pub verified_exhaustive: bool,
+    /// The venue's NegRisk flag: members are MUTUALLY EXCLUSIVE (AT MOST one
+    /// member YES resolves true) — enforced on-chain by the NegRisk adapter.
+    /// Holds even when exhaustiveness can't be verified. The LP can model such a
+    /// set as at-most-one-winner (k+1 worlds) instead of falling back to 2^k
+    /// free variables. `verified_exhaustive` implies `neg_risk`.
+    pub neg_risk: bool,
 }
 
 impl Partition {
@@ -69,6 +77,7 @@ mod tests {
             yes_tokens: (0..n_yes as u64).map(TokenId).collect(),
             no_tokens: (100..100 + n_no as u64).map(TokenId).collect(),
             verified_exhaustive: true,
+            neg_risk: true,
         }
     }
 

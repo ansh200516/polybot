@@ -68,7 +68,7 @@ pub struct ComponentIndex {
     pub entries: HashMap<ComponentId, ComponentEntry>,
 }
 
-pub fn build_component_index(reg: &Registry) -> ComponentIndex {
+pub fn build_component_index(reg: &Registry, include_nonexhaustive_negrisk: bool) -> ComponentIndex {
     let mut entries: HashMap<ComponentId, ComponentEntry> = HashMap::new();
     let mut by_token = HashMap::new();
     for m in reg.markets() {
@@ -86,14 +86,19 @@ pub fn build_component_index(reg: &Registry) -> ComponentIndex {
         by_token.insert(m.no, cid);
     }
     for p in reg.partitions() {
-        // Only verified-exhaustive, well-formed partitions may enter an entry.
-        // The LP path (engine::lp::enumerate_worlds) assumes exactly-one-winner
-        // per partition and debug-asserts both properties; an unverified
-        // partition panics in debug and silently produces wrong worlds (→ false
-        // arbs) in release. Dropping it leaves its markets as free binary vars —
-        // the conservative over-approximation, and exactly what class2 does
-        // (class2.rs gates on the same flags).
-        if !p.verified_exhaustive || !p.is_well_formed() {
+        // Well-formedness is mandatory. Beyond that:
+        //  - verified-exhaustive sets always enter (class 2 + LP exactly-one).
+        //  - mutually-exclusive-only NegRisk sets enter ONLY when opted in; the
+        //    LP then models them as at-most-one-winner (k+1 worlds, see
+        //    enumerate_worlds). class 2 still gates on verified_exhaustive, so it
+        //    never trades them as complete sets.
+        //  - a non-NegRisk grouping is never mutually exclusive → never entered;
+        //    its markets stay free binary vars (the conservative fallback).
+        if !p.is_well_formed() {
+            continue;
+        }
+        let include = p.verified_exhaustive || (include_nonexhaustive_negrisk && p.neg_risk);
+        if !include {
             continue;
         }
         if let Some(&first) = p.markets.first() {
@@ -125,7 +130,9 @@ pub fn build_component_index(reg: &Registry) -> ComponentIndex {
 /// First-fit-decreasing: pack whole components into chunks of ≤ `max_tokens`
 /// tokens. An oversized component gets its own oversized chunk (caller warns).
 pub fn pack_components(reg: &Registry, max_tokens: usize) -> Vec<Vec<TokenId>> {
-    let idx = build_component_index(reg);
+    // Token→component grouping is independent of which partitions enter LP
+    // entries, so the gate is irrelevant here.
+    let idx = build_component_index(reg, false);
     let mut comps: Vec<&ComponentEntry> = idx.entries.values().collect();
     comps.sort_by_key(|e| std::cmp::Reverse(e.tokens.len()));
     let mut chunks: Vec<Vec<TokenId>> = Vec::new();
@@ -293,7 +300,7 @@ mod tests {
     #[test]
     fn component_index_groups_partitions_and_relationships() {
         let r = reg();
-        let idx = build_component_index(&r);
+        let idx = build_component_index(&r, false);
         assert_eq!(idx.entries.len(), 2); // {a,d} via relationship, {b,c} via partition
         let a = r.market_by_condition("0xa").unwrap().id;
         let d = r.market_by_condition("0xd").unwrap().id;
@@ -312,12 +319,10 @@ mod tests {
         assert_eq!(eb.partitions.len(), 1);
     }
 
-    /// build_component_index must NOT leak unverified or ill-formed partitions
-    /// into entries. enumerate_worlds (the LP path) assumes exactly-one-winner
-    /// per partition and debug-asserts on it: an unverified partition panics in
-    /// a debug build and silently produces wrong worlds (→ false arbs) in
-    /// release. Markets of a dropped partition fall back to free binary vars,
-    /// which is the conservative over-approximation (class2 filters the same).
+    /// By DEFAULT (gate off) build_component_index must NOT leak unverified or
+    /// ill-formed partitions into entries — preserving the conservative M5
+    /// behavior (their markets fall back to free binary vars). The opt-in path
+    /// is covered by `component_index_includes_nonexhaustive_negrisk_when_opted_in`.
     #[test]
     fn component_index_excludes_unverified_partitions() {
         let mut b = RegistryBuilder::default();
@@ -334,7 +339,7 @@ mod tests {
             "fixture must contain an unverified partition"
         );
 
-        let idx = build_component_index(&r);
+        let idx = build_component_index(&r, false);
         // No entry may carry a partition that violates enumerate_worlds' contract.
         for e in idx.entries.values() {
             assert!(
@@ -350,11 +355,46 @@ mod tests {
     }
 
     #[test]
+    fn component_index_includes_nonexhaustive_negrisk_when_opted_in() {
+        let mut b = RegistryBuilder::default();
+        // 2-member NegRisk event where one outcome is a placeholder ("Other") →
+        // mutually exclusive (neg_risk) yet NOT verified-exhaustive, still
+        // well-formed (2 members).
+        b.add_market("0xf", "yf", "nf", TickSize::Cent, 0, true, Some("Will F win?".into()), true, false, Some("ev9"));
+        b.add_market("0xg", "yg", "ng", TickSize::Cent, 0, true, Some("Other".into()), true, false, Some("ev9"));
+        let r = b.finish("").unwrap();
+
+        // Fixture sanity: a well-formed, non-exhaustive, NegRisk partition exists.
+        assert!(
+            r.partitions()
+                .iter()
+                .any(|p| p.neg_risk && !p.verified_exhaustive && p.is_well_formed()),
+            "fixture must contain a well-formed non-exhaustive NegRisk partition"
+        );
+
+        // Gate OFF (default): the non-exhaustive partition is excluded.
+        let off = build_component_index(&r, false);
+        assert!(
+            off.entries.values().all(|e| e.partitions.is_empty()),
+            "non-exhaustive partition must be excluded by default"
+        );
+
+        // Gate ON: it is included, and it is the mutually-exclusive-only one.
+        let on = build_component_index(&r, true);
+        let included: Vec<_> = on.entries.values().flat_map(|e| &e.partitions).collect();
+        assert_eq!(included.len(), 1, "opt-in must include the NegRisk partition");
+        assert!(
+            !included[0].verified_exhaustive && included[0].neg_risk,
+            "the included partition is mutually-exclusive-only"
+        );
+    }
+
+    #[test]
     fn pack_components_keeps_components_whole() {
         let r = reg();
         let chunks = pack_components(&r, 4);
         assert_eq!(chunks.len(), 2);
-        let idx = build_component_index(&r);
+        let idx = build_component_index(&r, false);
         for chunk in &chunks {
             let cid = idx.by_token[&chunk[0]];
             assert!(

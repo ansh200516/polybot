@@ -77,6 +77,7 @@ mod tests {
                 .map(|&i| TokenId(u64::from(i) * 2 + 1))
                 .collect(),
             verified_exhaustive: true,
+            neg_risk: true,
         }
     }
 

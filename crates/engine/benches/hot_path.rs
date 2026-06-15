@@ -143,6 +143,7 @@ fn bench_class2_scan_n16(c: &mut Criterion) {
         yes_tokens,
         no_tokens,
         verified_exhaustive: true,
+        neg_risk: true,
     };
     let p = params();
     c.bench_function("class2_scan_n16", |b| {

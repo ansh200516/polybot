@@ -145,7 +145,7 @@ async fn run_e2e() {
     let risk_cfg = risk_config(&cfg, None).expect("risk_config");
     let (token_market, market_tokens) = token_maps(&reg);
     let token_fee = fee_map(&reg);
-    let index = Arc::new(build_component_index(&reg));
+    let index = Arc::new(build_component_index(&reg, false));
 
     // ---- 4. Store + writer -------------------------------------------------
     let tmp = tempfile::tempdir().expect("tempdir");

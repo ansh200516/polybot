@@ -118,6 +118,7 @@ mod tests {
             yes_tokens,
             no_tokens,
             verified_exhaustive: verified,
+            neg_risk: true,
         };
         (part, markets, books)
     }

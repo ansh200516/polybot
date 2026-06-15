@@ -35,6 +35,13 @@ pub struct Edges {
     pub min_edge_class12_bps: i32,
     pub min_edge_class3_bps: i32,
     pub min_profit_usd: f64,
+    /// Plausibility ceiling, bps. A genuine risk-free arb is bounded (tens to
+    /// low-hundreds of bps); an edge above this is a structural artifact —
+    /// stale/dead books with dust asks, or a NegRisk set assumed exhaustive that
+    /// isn't — and must NEVER be dispatched. The coordinator suppresses any opp
+    /// over this ceiling (counted as `implausible`, logged). Set very high to
+    /// effectively disable; must be ≥ `min_edge_class3_bps`.
+    pub max_edge_bps: i32,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
@@ -52,6 +59,12 @@ pub struct Lp {
     pub max_worlds: usize,
     pub min_resolve_interval_ms: u64,
     pub solver_concurrency: usize,
+    /// Opt-in: let the LP analyse NegRisk events that are mutually exclusive but
+    /// NOT verified-exhaustive, modelling them as at-most-one-winner (k+1 worlds)
+    /// instead of dropping them (→ 2^k free vars → `TooManyWorlds` skip). OFF by
+    /// default: it enables new live trade surface on big multi-outcome events, so
+    /// prove it in paper and review before enabling for a live run.
+    pub nonexhaustive_negrisk_worlds: bool,
 }
 
 #[derive(Debug, PartialEq, Deserialize)]
@@ -127,6 +140,9 @@ impl Default for Edges {
             min_edge_class12_bps: 30,
             min_edge_class3_bps: 100,
             min_profit_usd: 1.0,
+            // 5000 bps = 50% risk-free return: never real on a live book, but
+            // far above any genuine arb, so it only ever catches false positives.
+            max_edge_bps: 5000,
         }
     }
 }
@@ -146,6 +162,7 @@ impl Default for Lp {
             max_worlds: 4096,
             min_resolve_interval_ms: 500,
             solver_concurrency: 2,
+            nonexhaustive_negrisk_worlds: false,
         }
     }
 }
@@ -350,6 +367,15 @@ impl Config {
                 "reemit_improvement_pct must be ≤ 100",
             ));
         }
+        // The plausibility ceiling must sit above the trade floors, else nothing
+        // could ever pass (floor ≤ edge ≤ ceiling). This also keeps it positive.
+        if self.edges.max_edge_bps < self.edges.min_edge_class3_bps
+            || self.edges.max_edge_bps < self.edges.min_edge_class12_bps
+        {
+            return Err(ConfigError::BadMoney(
+                "edges.max_edge_bps must be ≥ the min-edge floors",
+            ));
+        }
         // Ingestion validation
         if self.ingestion.staleness_ms < 100 {
             return Err(ConfigError::BadMoney("staleness_ms must be ≥ 100"));
@@ -477,11 +503,13 @@ mod tests {
         assert_eq!(c.edges.min_edge_class12_bps, 30);
         assert_eq!(c.edges.min_edge_class3_bps, 100);
         assert_eq!(c.edges.min_profit_usd, 1.0);
+        assert_eq!(c.edges.max_edge_bps, 5000);
         assert_eq!(c.gas.split_microusdc, 10_000);
         assert_eq!(c.gas.merge_microusdc, 10_000);
         assert_eq!(c.gas.redeem_microusdc, 15_000);
         assert_eq!(c.gas.negrisk_convert_microusdc, 20_000);
         assert_eq!(c.lp.max_worlds, 4096);
+        assert!(!c.lp.nonexhaustive_negrisk_worlds);
         assert_eq!(c.dedup.cooldown_ms, 2000);
         assert_eq!(c.dedup.reemit_improvement_pct, 20);
         assert!(c.mode.paper);
@@ -529,6 +557,19 @@ mod tests {
         assert!(Config::from_toml_str("[capital]\nbankroll_usd = -5.0\n").is_err());
         assert!(Config::from_toml_str("[capital]\nper_market_usd = 99999.0\n").is_err());
         assert!(Config::from_toml_str("[dedup]\nreemit_improvement_pct = 150\n").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_implausible_ceiling_below_floor() {
+        // Ceiling below the class-3 floor would make every opp unrepresentable
+        // (floor ≤ edge ≤ ceiling is empty) — must be rejected.
+        assert!(Config::from_toml_str("[edges]\nmax_edge_bps = 50\n").is_err());
+        // A ceiling at/above the floors parses fine.
+        let c = Config::from_toml_str("[edges]\nmax_edge_bps = 100\n").unwrap();
+        assert_eq!(c.edges.max_edge_bps, 100);
+        // A custom higher ceiling round-trips.
+        let c = Config::from_toml_str("[edges]\nmax_edge_bps = 8000\n").unwrap();
+        assert_eq!(c.edges.max_edge_bps, 8000);
     }
 
     #[test]

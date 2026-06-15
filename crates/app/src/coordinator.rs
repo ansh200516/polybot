@@ -158,6 +158,10 @@ pub struct Coordinator {
     pnl_interval: Duration,
     dispatch_enabled: bool,
     mid_spread_cap_ticks: u16,
+    /// Plausibility ceiling (bps): opps with a larger edge are suppressed as
+    /// false arbs (stale/dead books or a non-exhaustive NegRisk set). See
+    /// `Config::edges.max_edge_bps`.
+    max_edge_bps: i32,
 
     live: bool,
     live_released: bool,
@@ -215,6 +219,7 @@ impl Coordinator {
             // the gates (mode.paper here silently disabled live dispatch).
             dispatch_enabled: true,
             mid_spread_cap_ticks: cfg.risk.mid_spread_cap_ticks,
+            max_edge_bps: cfg.edges.max_edge_bps,
             live: live.live,
             live_released: live.released_at_start,
             live_basket_cap: live.basket_cap,
@@ -364,6 +369,24 @@ impl Coordinator {
         }
         if !self.cooldown.admit(Instant::now(), &d.opp) {
             self.stats.suppressed_cooldown.fetch_add(1, Relaxed);
+            return;
+        }
+        // Plausibility guard (defense-in-depth): a genuine risk-free arb is
+        // bounded in edge. An edge above the ceiling means degenerate inputs —
+        // stale/dead books with dust asks, or a NegRisk set treated as exhaustive
+        // that isn't — so the "free money" is an illusion that would lose real
+        // funds if dispatched. Suppress it (never trade), but keep it counted and
+        // logged so the operator can see and investigate. Placed after the
+        // cooldown admit so re-emissions are throttled to ~one log per window.
+        if d.opp.edge.0 > self.max_edge_bps {
+            self.stats.suppressed_implausible.fetch_add(1, Relaxed);
+            warn!(
+                class = ?d.opp.class,
+                edge_bps = d.opp.edge.0,
+                ceiling_bps = self.max_edge_bps,
+                net_micro = usdc_to_i64(d.opp.net).unwrap_or(i64::MAX),
+                "suppressed implausible arb (edge over ceiling — likely stale/dead books or a non-exhaustive NegRisk set)"
+            );
             return;
         }
         self.stats.admitted.fetch_add(1, Relaxed);
@@ -883,6 +906,67 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(h.exec_rx.try_recv().is_err(), "aged opp must not dispatch");
         assert_eq!(h.stats.expired_age.load(Ordering::Relaxed), 1);
+
+        drop(h.opp_tx);
+        drop(h.report_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), h.handle).await;
+    }
+
+    #[tokio::test]
+    async fn implausible_edge_opp_is_suppressed_and_not_stored() {
+        // The false-arb signature: an otherwise-approvable basket whose edge is
+        // absurd (700% — stale/dead books or a non-exhaustive NegRisk set). The
+        // plausibility guard must suppress it: no dispatch, no store row, counted.
+        let mut h = spawn(false);
+        let mut opp = opp_fixture(50);
+        opp.edge = Bps(70_000); // 7000% ≫ 5000 bps default ceiling
+        h.opp_tx
+            .send(DetectedOpp {
+                opp,
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            h.exec_rx.try_recv().is_err(),
+            "implausible-edge opp must not dispatch"
+        );
+        assert_eq!(h.stats.suppressed_implausible.load(Ordering::Relaxed), 1);
+        assert_eq!(h.stats.dispatched.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            h.stats.admitted.load(Ordering::Relaxed),
+            0,
+            "suppressed-implausible must not count as admitted"
+        );
+
+        drop(h.opp_tx);
+        drop(h.report_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), h.handle).await;
+        let (opps, _, _) = drain_store(&mut h.store_rx);
+        assert_eq!(opps, 0, "implausible opp must never be written to the store");
+    }
+
+    /// A just-under-the-ceiling edge still trades (boundary: the guard must not
+    /// clip genuine fat arbs).
+    #[tokio::test]
+    async fn edge_just_below_ceiling_still_dispatches() {
+        let mut h = spawn(false);
+        let mut opp = opp_fixture(50);
+        opp.edge = Bps(5000); // exactly at the default ceiling → allowed (> is the test)
+        h.opp_tx
+            .send(DetectedOpp {
+                opp,
+                at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        let req = tokio::time::timeout(Duration::from_secs(2), h.exec_rx.recv())
+            .await
+            .expect("timeout waiting for dispatch")
+            .expect("channel closed before dispatch");
+        assert!(req.check.total_cost.0 > 0);
+        assert_eq!(h.stats.suppressed_implausible.load(Ordering::Relaxed), 0);
 
         drop(h.opp_tx);
         drop(h.report_tx);

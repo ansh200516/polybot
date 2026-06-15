@@ -223,6 +223,10 @@ pub fn derive_partition(
         yes_tokens: members.iter().map(|m| m.yes).collect(),
         no_tokens: members.iter().map(|m| m.no).collect(),
         verified_exhaustive: reasons.is_empty(),
+        // Mutual exclusivity is the NegRisk adapter's on-chain guarantee; it
+        // holds whenever the event is NegRisk, independent of the exhaustiveness
+        // checks above (which can fail on placeholder/inactive members).
+        neg_risk,
     };
     (partition, reasons)
 }

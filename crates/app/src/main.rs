@@ -573,7 +573,10 @@ async fn main() {
         .unwrap_or_else(|e| fatal(format!("risk_config: {e}")));
     let (token_market, market_tokens) = token_maps(&reg);
     let token_fee = fee_map(&reg);
-    let index = Arc::new(build_component_index(&reg));
+    let index = Arc::new(build_component_index(
+        &reg,
+        config.lp.nonexhaustive_negrisk_worlds,
+    ));
     let chunk_size = config.ingestion.ws_chunk_size;
     let chunks = pack_components(&reg, chunk_size);
 
