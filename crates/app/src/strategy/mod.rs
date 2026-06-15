@@ -10,15 +10,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use pm_core::instrument::TokenId;
 use pm_core::num::Usdc;
-use pm_ingestion::shard::Shard;
+use pm_ingestion::supervisor::OnApplyFn;
 use pm_registry::Registry;
 use pm_risk::RiskConfig;
 use pm_store::writer::StoreMsg;
 use tokio::sync::{mpsc, watch};
 
-use crate::coordinator::CtlCommand;
 use crate::wiring::BookFetcher;
 
 /// Stable identity for a strategy (e.g. `"arb"`, `"mm"`). A `&'static str`
@@ -62,18 +60,29 @@ pub fn allocate(envs: &[StrategyEnvelope], bankroll: Usdc) -> Result<(), String>
 /// mirroring the columns `publisher.rs` reads — `cash_micro`, `equity_micro`
 /// (bid-marked, reporting), `equity_mid_micro` (mid-marked, risk/halt feed),
 /// `realized_micro`, `unrealized_micro` — plus the latched halt reason and the
-/// pause flag. (Process-wide gates — `killed`, `live`, `busy` — stay on the
-/// host/coordinator, not on the per-strategy status.)
+/// pause flag. Field order matches `CoordStatus` (minus the process-wide gates
+/// `killed`/`live`/`busy`, which stay on the host/coordinator) so the host's
+/// Task-1.7 aggregation maps 1:1.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StrategyStatus {
+    pub paused: bool,
+    pub halted: Option<String>,
     pub cash_micro: i64,
     pub equity_micro: i64,
     pub equity_mid_micro: i64,
     pub realized_micro: i64,
     pub unrealized_micro: i64,
     pub open_positions: usize,
-    pub halted: Option<String>,
-    pub paused: bool,
+}
+
+/// Neutral per-strategy control command from the host (TUI-translated),
+/// decoupled from the coordinator. Pause is the only control for now;
+/// per-strategy and global kill flow through `StrategyCtx.kill`, not here.
+/// Arb-specific controls (e.g. the coordinator's live-release latch) stay on
+/// arb's own path — Task 1.4 bridges `SetPaused` into the coordinator's pause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrategyCommand {
+    SetPaused(bool),
 }
 
 /// The runtime handles a strategy's `run` loop owns: shared read-only ingestion
@@ -87,7 +96,7 @@ pub struct StrategyCtx {
     pub fetcher: BookFetcher,
     pub store_tx: mpsc::Sender<StoreMsg>,
     pub kill: Arc<AtomicBool>,
-    pub ctl_rx: mpsc::Receiver<CtlCommand>,
+    pub ctl_rx: mpsc::Receiver<StrategyCommand>,
     pub status_tx: watch::Sender<StrategyStatus>,
 }
 
@@ -95,15 +104,20 @@ pub struct StrategyCtx {
 /// (not `Sync`): the host owns each unit and drives it on its own task. A unit
 /// gets market data two ways, either or both: an inline per-supervisor
 /// `on_apply` hook (arb's hot path) and/or its owned async loop reading via
-/// `ctx.fetcher` on its own cadence.
+/// `ctx.fetcher` on its own cadence. `run` returns a boxed future (rather than
+/// being an `async fn`) so the trait stays dyn-compatible — the host holds
+/// units as `Box<dyn Strategy>`.
 pub trait Strategy: Send {
     /// Stable identity (status-map key / log label).
     fn id(&self) -> StrategyId;
     /// Per-supervisor inline hook (arb uses this); `None` if the strategy reads
-    /// books on its own cadence.
-    #[allow(clippy::type_complexity)] // the boxed hook type is the boundary's shape, kept inline for clarity
-    fn make_on_apply(&self) -> Option<Box<dyn FnMut(TokenId, &Shard) + Send>>;
-    /// The strategy's owned async loop; resolves when the strategy ends.
+    /// books on its own cadence. `OnApplyFn` is exactly the type
+    /// `Supervisor::set_on_apply` consumes.
+    fn make_on_apply(&self) -> Option<OnApplyFn>;
+    /// The strategy's owned async loop; resolves when the strategy ends. Final
+    /// state is reported out-of-band via `ctx.status_tx` (the host reads the
+    /// last published `StrategyStatus`), so the future's `Output` is `()` by
+    /// design rather than the spec's `StrategySummary`.
     fn run(self: Box<Self>, ctx: StrategyCtx) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
@@ -144,7 +158,7 @@ mod tests {
             self.id
         }
 
-        fn make_on_apply(&self) -> Option<Box<dyn FnMut(TokenId, &Shard) + Send>> {
+        fn make_on_apply(&self) -> Option<OnApplyFn> {
             None
         }
 

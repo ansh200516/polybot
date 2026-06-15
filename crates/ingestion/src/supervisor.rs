@@ -59,7 +59,8 @@ use crate::ws::{WsEvent, WsTransport, parse_frame, subscribe_message};
 // ---------------------------------------------------------------------------
 
 /// Detection hook type (M3 seam §5): called after every successful apply.
-type OnApplyFn = Box<dyn FnMut(TokenId, &Shard) + Send>;
+/// Public so strategies (`pm-app`) can name the exact type `set_on_apply` takes.
+pub type OnApplyFn = Box<dyn FnMut(TokenId, &Shard) + Send>;
 
 // ---------------------------------------------------------------------------
 // SupervisorCommand — M3 seam §12
