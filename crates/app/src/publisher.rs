@@ -9,7 +9,7 @@
 //! lives in the coordinator/positions/store in integer µUSDC.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use pm_core::instrument::TokenId;
@@ -135,13 +135,24 @@ pub struct PublisherCtx {
     pub cells: Vec<Arc<pm_ingestion::stats::StatsCell>>,
     pub status_rx: watch::Receiver<CoordStatus>,
     /// Optional aggregated per-strategy status from the `StrategyHost` (multi-
-    /// strategy platform, Task 1.7). When `Some`, [`assemble`] sources the
-    /// header money from the SUM of every strategy's micros and fills
-    /// `AppState.per_strategy`; when `None` (today's wiring) the publisher
-    /// behaves exactly as before, sourcing money from the single `CoordStatus`
-    /// above. Task 1.8 switches production wiring to set this. Header badges
-    /// (paused/halted/killed/live) still come from `CoordStatus` in both paths.
+    /// strategy platform, Task 1.7/1.8). When `Some` (production wiring, Task
+    /// 1.8), [`assemble`] sources the header money from the SUM of every
+    /// strategy's micros, fills `AppState.per_strategy`, and reconciles the
+    /// header badges from the aggregate + `kill` + `arb_status_rx` (see below).
+    /// When `None` (legacy single-strategy wiring) the publisher behaves exactly
+    /// as before, sourcing both money and badges from the single `CoordStatus`.
     pub strategy_status_rx: Option<watch::Receiver<StrategyStatusView>>,
+    /// Global kill flag (multi-strategy platform, Task 1.8). On the wired path
+    /// (`strategy_status_rx` is `Some`) the `killed` header badge is sourced from
+    /// this flag directly — the host aggregate's per-strategy `StrategyStatus`
+    /// has no process-wide `killed` gate. Ignored on the `None` path (badges
+    /// still come from `CoordStatus`).
+    pub kill: Arc<AtomicBool>,
+    /// Arb's coordinator `CoordStatus` watch (multi-strategy platform, Task 1.8).
+    /// On the wired path it supplies the arb-process gates the aggregate drops —
+    /// `live_released` + `busy` — for the header badges (default `false` when
+    /// `None`). Ignored on the `None` path.
+    pub arb_status_rx: Option<watch::Receiver<CoordStatus>>,
     pub registry: Arc<Registry>,
     pub logbuf: Arc<LogBuffer>,
     pub fetcher: BookFetcher,
@@ -316,41 +327,62 @@ pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
         live_held: ctx.stats.live_held.load(Ordering::Relaxed),
     };
 
-    // --- Header money + per-strategy breakdown -----------------------------
-    // When the host's aggregated view is wired (Task 1.8), the header money is
-    // the SUM of every strategy's micros and `per_strategy` lists each strategy;
-    // otherwise (today) money comes from the single CoordStatus and
-    // `per_strategy` is empty. Header badges (paused/halted/killed/live) still
-    // come from CoordStatus in BOTH paths — Task 1.8 reconciles those.
-    let (money, per_strategy) = match &ctx.strategy_status_rx {
-        Some(rx) => {
-            let view = rx.borrow();
-            (
-                aggregate_money(view.as_slice()),
-                strategy_lines(view.as_slice()),
-            )
-        }
-        None => (
-            AggregatedMoney {
-                cash_micro: status.cash_micro,
-                equity_micro: status.equity_micro,
-                equity_mid_micro: status.equity_mid_micro,
-                realized_micro: status.realized_micro,
-                unrealized_micro: status.unrealized_micro,
-            },
-            Vec::new(),
-        ),
-    };
+    // --- Header money + per-strategy breakdown + badges --------------------
+    // Wired path (Task 1.8, `strategy_status_rx` is `Some`): header money is the
+    // SUM of every strategy's micros, `per_strategy` lists each strategy, and the
+    // badges are reconciled across sources — `killed` from the global kill flag,
+    // `paused` from ANY strategy paused, `halted` from the first halted strategy,
+    // and `live_released`/`busy` from arb's `CoordStatus` (the aggregate drops
+    // these process-wide gates). Legacy path (`None`): money, `per_strategy`
+    // empty, and ALL badges come from the single `CoordStatus`, exactly as before.
+    let (money, per_strategy, live_released, paused, halted, killed, busy) =
+        match &ctx.strategy_status_rx {
+            Some(rx) => {
+                let view = rx.borrow();
+                let money = aggregate_money(view.as_slice());
+                let per_strategy = strategy_lines(view.as_slice());
+                let paused = view.iter().any(|(_, s)| s.paused);
+                let halted = view.iter().find_map(|(_, s)| s.halted.clone());
+                drop(view);
+                let killed = ctx.kill.load(Ordering::Acquire);
+                let (live_released, busy) = match &ctx.arb_status_rx {
+                    Some(a) => {
+                        let cs = a.borrow();
+                        (cs.live_released, cs.busy)
+                    }
+                    None => (false, false),
+                };
+                (money, per_strategy, live_released, paused, halted, killed, busy)
+            }
+            None => {
+                let money = AggregatedMoney {
+                    cash_micro: status.cash_micro,
+                    equity_micro: status.equity_micro,
+                    equity_mid_micro: status.equity_mid_micro,
+                    realized_micro: status.realized_micro,
+                    unrealized_micro: status.unrealized_micro,
+                };
+                (
+                    money,
+                    Vec::new(),
+                    status.live_released,
+                    status.paused,
+                    status.halted.clone(),
+                    status.killed,
+                    status.busy,
+                )
+            }
+        };
 
     AppState {
         uptime_s: ctx.start.elapsed().as_secs(),
         mode_paper: ctx.mode_paper,
         shadow: ctx.shadow,
-        live_released: status.live_released,
-        paused: status.paused,
-        halted: status.halted,
-        killed: status.killed,
-        busy: status.busy,
+        live_released,
+        paused,
+        halted,
+        killed,
+        busy,
         cash_usd: usd(money.cash_micro),
         equity_usd: usd(money.equity_micro),
         equity_mid_usd: usd(money.equity_mid_micro),
@@ -492,6 +524,8 @@ mod tests {
             cells: vec![cell0, cell1],
             status_rx,
             strategy_status_rx: None,
+            kill: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            arb_status_rx: None,
             registry: r,
             logbuf,
             fetcher,
@@ -622,6 +656,8 @@ mod tests {
             cells: Vec::new(),
             status_rx,
             strategy_status_rx: None,
+            kill: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            arb_status_rx: None,
             registry: r,
             logbuf,
             fetcher,
@@ -683,6 +719,8 @@ mod tests {
             cells: vec![StatsCell::new()],
             status_rx,
             strategy_status_rx: None,
+            kill: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            arb_status_rx: None,
             registry: r,
             logbuf,
             fetcher,
@@ -754,6 +792,8 @@ mod tests {
             cells: Vec::new(),
             status_rx,
             strategy_status_rx: Some(strat_rx),
+            kill: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            arb_status_rx: None,
             registry: r,
             logbuf,
             fetcher,

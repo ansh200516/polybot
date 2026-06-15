@@ -283,11 +283,21 @@ impl RunningHost {
     }
 
     /// Await completion: resolves once every strategy task has finished (driven
-    /// by the global kill + the channel cascade). Consuming `self` drops the
-    /// control senders, so any strategy that shuts down on a closed control
-    /// channel also unblocks here.
+    /// by the global kill + the channel cascade). Drops the control senders (and
+    /// the aggregate receiver) BEFORE awaiting, so any strategy that shuts down
+    /// on a closed control channel — e.g. the heartbeat when the global kill flag
+    /// is not set (a duration / quit / ctrl-c shutdown) — unblocks here. Awaiting
+    /// `join_handle` while still holding `ctl` would deadlock such a strategy (and
+    /// thus the host); destructuring up front guarantees `ctl` drops first.
     pub async fn join(self) {
-        let _ = self.join_handle.await;
+        let RunningHost {
+            status_rx,
+            ctl,
+            join_handle,
+        } = self;
+        drop(ctl);
+        drop(status_rx);
+        let _ = join_handle.await;
     }
 }
 

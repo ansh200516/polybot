@@ -131,6 +131,15 @@ pub struct ArbStrategy {
     // ---- arb-specific live-release bridge (Task 1.8 routes ReleaseLive here) ----
     live_ctl_tx: mpsc::Sender<CtlCommand>,
     live_ctl_rx: mpsc::Receiver<CtlCommand>,
+
+    // ---- arb-process status watch (Task 1.8) ----
+    /// The coordinator's `CoordStatus` republished on a watch created UP FRONT
+    /// (in `new`) so the publisher can read the arb-process gates the host
+    /// aggregate drops (`live_released`/`busy`) BEFORE `run` consumes the
+    /// strategy. `run`'s status bridge forwards every coordinator status onto
+    /// `arb_status_tx`; `arb_status_rx()` hands out receivers.
+    arb_status_tx: watch::Sender<CoordStatus>,
+    arb_status_rx: watch::Receiver<CoordStatus>,
 }
 
 impl ArbStrategy {
@@ -157,6 +166,10 @@ impl ArbStrategy {
         let (exec_tx, exec_rx) = mpsc::channel(EXEC_CAP);
         let (report_tx, report_rx) = mpsc::channel(REPORT_CAP);
         let (live_ctl_tx, live_ctl_rx) = mpsc::channel(CTL_CAP);
+        // Created up front so `arb_status_rx()` is callable before `run` consumes
+        // the strategy; `run`'s status bridge forwards the coordinator's status
+        // onto `arb_status_tx`.
+        let (arb_status_tx, arb_status_rx) = watch::channel(CoordStatus::default());
         ArbStrategy {
             cfg,
             risk_cfg,
@@ -179,6 +192,8 @@ impl ArbStrategy {
             exec_builder,
             live_ctl_tx,
             live_ctl_rx,
+            arb_status_tx,
+            arb_status_rx,
         }
     }
 
@@ -190,6 +205,16 @@ impl ArbStrategy {
     /// Obtain it BEFORE `run` consumes the strategy.
     pub fn live_release_sender(&self) -> mpsc::Sender<CtlCommand> {
         self.live_ctl_tx.clone()
+    }
+
+    /// Arb-process status watch. `StrategyStatus` (the host aggregate) drops the
+    /// process-wide gates `live_released`/`busy`, so the publisher reads them
+    /// from arb's coordinator `CoordStatus` here. Created up front in `new` and
+    /// fed by `run`'s status bridge, so it is obtainable BEFORE `run` consumes
+    /// the strategy (Task 1.8). Defaults to `CoordStatus::default()` until the
+    /// coordinator publishes its first status.
+    pub fn arb_status_rx(&self) -> watch::Receiver<CoordStatus> {
+        self.arb_status_rx.clone()
     }
 }
 
@@ -244,24 +269,35 @@ async fn bridge_control(
     }
 }
 
-/// Republish the coordinator's `CoordStatus` watch as a per-strategy
-/// `StrategyStatus` for the host to aggregate. Forwards the current value, then
-/// every change; on coordinator shutdown it forwards the final retained value so
-/// the discarded `CoordinatorSummary`'s state is never lost.
+/// Republish the coordinator's `CoordStatus` watch two ways: the mapped
+/// per-strategy `StrategyStatus` for the host to aggregate, and the RAW
+/// `CoordStatus` onto `arb_status_tx` for the publisher's arb-process gates
+/// (`live_released`/`busy`, which the aggregate intentionally drops — Task 1.8).
+/// Forwards the current value, then every change; on coordinator shutdown it
+/// forwards the final retained value on BOTH so the discarded
+/// `CoordinatorSummary`'s state is never lost. Stops when the host drops the
+/// per-strategy receiver (the primary sink); the raw forward is best-effort.
 async fn bridge_status(
     mut coord_status: watch::Receiver<CoordStatus>,
     status_tx: watch::Sender<StrategyStatus>,
+    arb_status_tx: watch::Sender<CoordStatus>,
 ) {
     loop {
-        let snap = coord_status_to_strategy(&coord_status.borrow_and_update());
-        if status_tx.send(snap).is_err() {
-            return; // host dropped the StrategyStatus receiver
+        {
+            let cs = coord_status.borrow_and_update();
+            // Raw CoordStatus → publisher (best-effort: a dropped arb_status_rx
+            // just means the publisher is gone). Mapped → host aggregate.
+            let _ = arb_status_tx.send(cs.clone());
+            if status_tx.send(coord_status_to_strategy(&cs)).is_err() {
+                return; // host dropped the StrategyStatus receiver
+            }
         }
         if coord_status.changed().await.is_err() {
             // Coordinator dropped its sender after its final publish; the watch
-            // retains that last value — forward it, then stop.
-            let snap = coord_status_to_strategy(&coord_status.borrow());
-            let _ = status_tx.send(snap);
+            // retains that last value — forward it on both, then stop.
+            let cs = coord_status.borrow();
+            let _ = arb_status_tx.send(cs.clone());
+            let _ = status_tx.send(coord_status_to_strategy(&cs));
             return;
         }
     }
@@ -311,6 +347,8 @@ impl Strategy for ArbStrategy {
                 exec_builder,
                 live_ctl_tx: _,
                 live_ctl_rx,
+                arb_status_tx,
+                arb_status_rx: _,
             } = *self;
 
             // ---- Coordinator FIRST: construct it (and handle its `Result`)
@@ -371,7 +409,8 @@ impl Strategy for ArbStrategy {
             // ---- Bridges: pause/live-release → coordinator ctl; CoordStatus →
             // per-strategy StrategyStatus.
             let ctl_bridge = tokio::spawn(bridge_control(ctx.ctl_rx, live_ctl_rx, coord_ctl));
-            let status_bridge = tokio::spawn(bridge_status(coord_status, ctx.status_tx));
+            let status_bridge =
+                tokio::spawn(bridge_status(coord_status, ctx.status_tx, arb_status_tx));
 
             // ---- Return when the coordinator loop ends. The `CoordinatorSummary`
             // is discarded (final state already surfaced via status_tx, per the

@@ -22,13 +22,15 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-use pm_app::coordinator::{Coordinator, LiveParams, now_ms, run_execution};
-use pm_app::detector::Detector;
+use pm_app::coordinator::{CoordinatorSummary, CtlCommand, LiveParams, now_ms, run_execution};
 use pm_app::kill::spawn_kill_watch;
-use pm_app::lp_pool::run_lp_pool;
 use pm_app::stats::AppStats;
+use pm_app::strategy::arb::{ArbStrategy, ExecTaskBuilder};
+use pm_app::strategy::host::{HostShared, StrategyHost};
+use pm_app::strategy::stub::HeartbeatStrategy;
+use pm_app::strategy::{StrategyEnvelope, StrategyId};
 use pm_app::wiring::{
     BookFetcher, build_component_index, engine_params, fee_map, pack_components, risk_config,
     token_maps,
@@ -580,18 +582,18 @@ async fn main() {
     let chunk_size = config.ingestion.ws_chunk_size;
     let chunks = pack_components(&reg, chunk_size);
 
-    // ---- channels + shared state -------------------------------------------
-    let (opp_tx, opp_rx) = mpsc::channel(1024);
-    let (lp_tx, lp_rx) = mpsc::channel(64);
-    let (exec_tx, exec_rx) = mpsc::channel(4);
-    let (report_tx, report_rx) = mpsc::channel(4);
+    // ---- shared state ------------------------------------------------------
+    // The arb-internal channels (opp/lp/exec/report) now live inside
+    // `ArbStrategy`; main only owns the process-wide kill flag and shared stats.
     let kill = Arc::new(AtomicBool::new(false));
     let stats = AppStats::new();
 
-    // LP pool's opp sender, cloned BEFORE main's opp_tx is dropped.
-    let opp_tx_lp = opp_tx.clone();
-
-    // ---- supervisors per chunk ---------------------------------------------
+    // ---- supervisors per chunk (created now, spawned after the host) --------
+    // The per-supervisor inline hook is the StrategyHost's combined `on_apply`,
+    // which needs `ArbStrategy`, which needs the `BookFetcher` — and that is
+    // built from THESE supervisors' command channels. So supervisors are CREATED
+    // here (to populate `routes` → fetcher) and SPAWNED below, once the host
+    // exists, each with `host.make_on_apply()` installed.
     let ws_url = config.endpoints.ws_market_url.clone();
     let clob_base = config.endpoints.clob_base.clone();
     let rest_rate_capacity = config.ingestion.rest_rate_capacity;
@@ -607,9 +609,9 @@ async fn main() {
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut stat_cells: Vec<Arc<StatsCell>> = Vec::new();
-    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut routes: HashMap<pm_core::instrument::TokenId, mpsc::Sender<SupervisorCommand>> =
         HashMap::new();
+    let mut supervisors: Vec<Supervisor<ClobRest>> = Vec::new();
 
     for chunk in &chunks {
         if chunk.len() > chunk_size {
@@ -647,69 +649,35 @@ async fn main() {
             routes.insert(tok, cmd_tx.clone());
         }
 
-        // Install the detector hook.
-        let mut det = Detector::new(
-            Arc::clone(&index),
-            params,
-            opp_tx.clone(),
-            lp_tx.clone(),
-            lp_min_interval,
-            Arc::clone(&stats),
-        );
-        sup.set_on_apply(Box::new(move |t, shard| det.on_apply(t, shard)));
-
+        // The inline detection hook (host.make_on_apply) is installed when these
+        // supervisors are spawned below — once the host exists. Here we only
+        // populate `routes` and share the stats cell.
         stat_cells.push(sup.share_stats());
-
-        let ws_url_clone = ws_url.clone();
-        let shutdown_clone = Arc::clone(&shutdown);
-        let handle = tokio::spawn(async move {
-            sup.run(move || {
-                let url = ws_url_clone.clone();
-                let is_shutdown = shutdown_clone.load(Ordering::Acquire);
-                async move {
-                    if is_shutdown {
-                        return Ok(FactoryDecision::Stop);
-                    }
-                    match TungsteniteTransport::connect(&url).await {
-                        Ok(t) => Ok(FactoryDecision::Connect(t)),
-                        Err(e) => Err(e),
-                    }
-                }
-            })
-            .await;
-        });
-        handles.push(handle);
+        supervisors.push(sup);
     }
 
-    // Drop main's detector-side senders so channel closure cascades on shutdown.
-    // The LP pool holds opp_tx_lp (cloned above); the detectors hold their own
-    // clones inside the supervisor tasks.
-    drop(opp_tx);
-    drop(lp_tx);
-
-    if handles.is_empty() {
+    if supervisors.is_empty() {
         eprintln!("error: no supervisors started (empty universe?)");
         // Tear down the writer cleanly before exiting.
         drop(store_tx);
         let _ = writer.await;
         std::process::exit(1);
     }
-    let supervisors_started = handles.len();
-    info!(supervisors = supervisors_started, "supervisors spawned");
+    let supervisors_started = supervisors.len();
+    info!(supervisors = supervisors_started, "supervisors created");
 
-    // ---- book fetcher + LP pool --------------------------------------------
+    // ---- book fetcher ------------------------------------------------------
+    // Built from the supervisors' command channels; cloned into the paper venue
+    // and the publisher, and moved into the strategies via `HostShared` below.
     let fetcher = BookFetcher::new(routes);
-    let lp_handle = tokio::spawn(run_lp_pool(
-        lp_rx,
-        opp_tx_lp,
-        params,
-        config.lp.solver_concurrency,
-        Arc::clone(&stats),
-    ));
 
-    // ---- execution task -----------------------------------------------------
-    // Config-driven base; used as-is by the PAPER arm. The LIVE arm derives its
-    // own params via live_exec_params (forces redeem = Hold — see that fn).
+    // ---- execution task builder --------------------------------------------
+    // The execution task is now spawned INSIDE `ArbStrategy::run`; here we capture
+    // the concrete venue (+ run_execution's static inputs) into an
+    // `ExecTaskBuilder` closure that arb invokes with the arb-internal exec/report
+    // channel halves + the per-run store_tx. Config-driven base ExecParams; the
+    // PAPER arm uses it as-is, the LIVE arm forces redeem = Hold via
+    // live_exec_params (see that fn).
     let exec_params = ExecParams {
         fill_window: Duration::from_millis(config.execution.fill_window_ms),
         max_unhedged: risk_cfg.max_unhedged,
@@ -718,8 +686,10 @@ async fn main() {
     // The live arm needs market_tokens for BOTH venue registration and
     // run_execution (which moves it); clone before either arm takes ownership.
     let market_tokens_for_registration = market_tokens.clone();
-    // Both arms produce the same JoinHandle<()> so the binding unifies.
-    let exec_handle = if let Some((secrets, signer, proxy, deposit_wallet)) = live_rt {
+    // Both arms produce the same ExecTaskBuilder so the binding unifies.
+    let exec_builder: ExecTaskBuilder = if let Some((secrets, signer, proxy, deposit_wallet)) =
+        live_rt
+    {
         // CLOB trading credentials. py-clob-client-v2 derives these from a
         // PLAIN-EOA L1 signature (create_or_derive_api_key): POLY_ADDRESS = the
         // EOA, plain ECDSA, the key binds to the EOA. The deposit wallet / funder
@@ -913,38 +883,44 @@ async fn main() {
             }
             return;
         }
-        tokio::spawn(run_execution(
-            venue,
-            exec_rx,
-            report_tx,
-            store_tx.clone(),
-            token_market.clone(),
-            market_tokens,
-            token_fee,
-            // Live never performs on-chain ops: a filled C1Long HOLDS its complete set
-            // (manual redeem until M6). venue.merge would return NotSupportedLive and
-            // fail the basket AFTER real money filled (integration-review catch).
-            live_exec_params(&exec_params),
-        ))
+        let token_market_exec = token_market.clone();
+        Box::new(move |exec_rx, report_tx, store_tx| {
+            Box::pin(run_execution(
+                venue,
+                exec_rx,
+                report_tx,
+                store_tx,
+                token_market_exec,
+                market_tokens,
+                token_fee,
+                // Live never performs on-chain ops: a filled C1Long HOLDS its complete set
+                // (manual redeem until M6). venue.merge would return NotSupportedLive and
+                // fail the basket AFTER real money filled (integration-review catch).
+                live_exec_params(&exec_params),
+            ))
+        })
     } else {
         let venue = PaperVenue::new(
             fetcher.clone(),
             Duration::from_millis(config.execution.paper_latency_ms),
             params.gas,
         );
-        tokio::spawn(run_execution(
-            venue,
-            exec_rx,
-            report_tx,
-            store_tx.clone(),
-            token_market.clone(),
-            market_tokens,
-            token_fee,
-            exec_params,
-        ))
+        let token_market_exec = token_market.clone();
+        Box::new(move |exec_rx, report_tx, store_tx| {
+            Box::pin(run_execution(
+                venue,
+                exec_rx,
+                report_tx,
+                store_tx,
+                token_market_exec,
+                market_tokens,
+                token_fee,
+                exec_params,
+            ))
+        })
     };
 
-    // Clone the fetcher for the publisher BEFORE the coordinator consumes it
+    // Clone the fetcher for the publisher BEFORE it is moved into HostShared
     // (the publisher marks open positions at the live bid). None in headless.
     let fetcher_pub = if tui_active {
         Some(fetcher.clone())
@@ -952,46 +928,107 @@ async fn main() {
         None
     };
 
-    // ---- coordinator --------------------------------------------------------
-    let mut coord = Coordinator::new(
-        &config,
+    // ---- strategies: arb (#1) + heartbeat (#2) via the StrategyHost ---------
+    // Live dispatch params (spec §Mode ladder). released_at_start is true for
+    // paper (inert — no live venue), shadow (signs but no money moves), and
+    // headless live (the typed phrase was demanded at startup); it is HELD only
+    // for TUI live, where the `l` modal releases the latch. Passed verbatim into
+    // arb's coordinator, so the live gating is byte-identical.
+    let live_params = LiveParams {
+        live: args.live,
+        released_at_start: !args.live || args.shadow || !tui_active,
+        basket_cap: pm_core::num::Usdc(
+            pm_config::usd_to_microusdc(config.live.basket_cap_usd)
+                .unwrap_or_else(|e| fatal(format!("live.basket_cap_usd: {e}"))),
+        ),
+        min_leg: pm_core::num::Qty((config.live.min_leg_shares * 1e6).round() as u64),
+        min_leg_value: pm_core::num::Usdc(
+            pm_config::usd_to_microusdc(config.live.min_leg_value_usd)
+                .unwrap_or_else(|e| fatal(format!("live.min_leg_value_usd: {e}"))),
+        ),
+    };
+    // Platform bankroll = today's configured bankroll. Arb's envelope claims the
+    // whole bankroll (its RiskEngine global cap IS the bankroll); the heartbeat
+    // claims zero — so Σcapital == bankroll and the startup allocator passes.
+    let bankroll = risk_cfg.bankroll;
+    let arb_envelope = StrategyEnvelope::new(StrategyId("arb"), bankroll, risk_cfg.clone());
+    let hb_envelope =
+        StrategyEnvelope::new(StrategyId("heartbeat"), pm_core::num::Usdc(0), risk_cfg.clone());
+
+    // Arb keeps every Coordinator/Detector/LP-pool/execution input it has today
+    // (byte-identical); the venue arrives as the ExecTaskBuilder captured above,
+    // and `starts` is forwarded to the coordinator's restart-storm guard inside
+    // arb's run (note_session_starts).
+    let arb = ArbStrategy::new(
+        config.clone(),
         risk_cfg,
         params,
         token_market,
-        fetcher,
-        opp_rx,
-        exec_tx,
-        report_rx,
-        store_tx.clone(),
-        Arc::clone(&kill),
+        index,
         Arc::clone(&stats),
-        // Live dispatch params (spec §Mode ladder). released_at_start is true
-        // for paper (inert — no live venue), shadow (signs but no money moves),
-        // and headless live (the typed phrase was demanded at startup); it is
-        // HELD only for TUI live, where the `l` modal releases the latch.
-        LiveParams {
-            live: args.live,
-            released_at_start: !args.live || args.shadow || !tui_active,
-            basket_cap: pm_core::num::Usdc(
-                pm_config::usd_to_microusdc(config.live.basket_cap_usd)
-                    .unwrap_or_else(|e| fatal(format!("live.basket_cap_usd: {e}"))),
-            ),
-            min_leg: pm_core::num::Qty((config.live.min_leg_shares * 1e6).round() as u64),
-            min_leg_value: pm_core::num::Usdc(
-                pm_config::usd_to_microusdc(config.live.min_leg_value_usd)
-                    .unwrap_or_else(|e| fatal(format!("live.min_leg_value_usd: {e}"))),
-            ),
-        },
-    )
-    .unwrap_or_else(|e| fatal(format!("Coordinator::new: {e}")));
-    coord.note_session_starts(starts);
-    // Wire the dashboard channels BEFORE spawning coord.run() (both take &mut).
-    // ctl_tx translates TuiCommands into coordinator control; status_rx feeds the
-    // publisher. Held even in headless mode (cheap; keeps the spawn ordering one
-    // shape), though only the TUI path uses them.
-    let ctl_tx = coord.control_channel(8);
-    let status_rx = coord.status_channel();
-    let coord_handle = tokio::spawn(coord.run());
+        lp_min_interval,
+        config.lp.solver_concurrency,
+        live_params,
+        starts,
+        exec_builder,
+    );
+    // Obtain arb's control/status handles BEFORE moving it into the host:
+    // arb_status_rx feeds the publisher's arb-process badges + the final summary;
+    // live_release_sender is the TUI `l`-modal's path into the coordinator.
+    let arb_status_rx = arb.arb_status_rx();
+    let live_release_sender = arb.live_release_sender();
+
+    let mut host = StrategyHost::new(bankroll);
+    host.add(Box::new(arb), arb_envelope);
+    host.add(
+        Box::new(HeartbeatStrategy::new(StrategyId("heartbeat"))),
+        hb_envelope,
+    );
+
+    // ---- spawn supervisors with the host's combined inline hook ------------
+    // host.make_on_apply rebuilds the combined hook per call, constructing FRESH
+    // per-supervisor detector state each time — exactly as main.rs built one
+    // Detector per supervisor before. Must run before host.run (which consumes
+    // the host).
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    for mut sup in supervisors {
+        if let Some(hook) = host.make_on_apply() {
+            sup.set_on_apply(hook);
+        }
+        let ws_url_clone = ws_url.clone();
+        let shutdown_clone = Arc::clone(&shutdown);
+        let handle = tokio::spawn(async move {
+            sup.run(move || {
+                let url = ws_url_clone.clone();
+                let is_shutdown = shutdown_clone.load(Ordering::Acquire);
+                async move {
+                    if is_shutdown {
+                        return Ok(FactoryDecision::Stop);
+                    }
+                    match TungsteniteTransport::connect(&url).await {
+                        Ok(t) => Ok(FactoryDecision::Connect(t)),
+                        Err(e) => Err(e),
+                    }
+                }
+            })
+            .await;
+        });
+        handles.push(handle);
+    }
+    info!(supervisors = supervisors_started, "supervisors spawned");
+
+    // ---- run the host: spawns arb + heartbeat as fault-isolated tasks ------
+    // The capital allocator runs first (over-allocation is a fatal startup error,
+    // before any task spawns). Strategies get the shared ingestion/store/kill
+    // handles via HostShared; arb's coordinator reads books through `fetcher`.
+    let running = host
+        .run(HostShared {
+            registry: Arc::clone(&reg),
+            fetcher,
+            store_tx: store_tx.clone(),
+            kill: Arc::clone(&kill),
+        })
+        .unwrap_or_else(|e| fatal(format!("StrategyHost::run: {e}")));
 
     // ---- kill watch ---------------------------------------------------------
     let kill_handle = spawn_kill_watch(PathBuf::from(&config.risk.kill_file), Arc::clone(&kill));
@@ -1022,10 +1059,18 @@ async fn main() {
             read,
             stats: Arc::clone(&stats),
             cells: stat_cells.clone(),
-            status_rx: status_rx.clone(),
-            // Task 1.7 additive field: None preserves today's CoordStatus-driven
-            // money path. Task 1.8 switches this to the StrategyHost's view.
-            strategy_status_rx: None,
+            // Loop control: arb's CoordStatus watch closes when the arb
+            // coordinator finishes (its status bridge drops the sender) — the
+            // same publisher-exit signal the coordinator's status watch gave
+            // before. Its value drives nothing on the wired path (badges below).
+            status_rx: arb_status_rx.clone(),
+            // Task 1.8: the host's aggregated per-strategy view drives header
+            // money + the per-strategy breakdown; the header badges are reconciled
+            // from that view plus the global kill flag and arb's CoordStatus
+            // (live_released/busy — the gates the aggregate drops).
+            strategy_status_rx: Some(running.status()),
+            kill: Arc::clone(&kill),
+            arb_status_rx: Some(arb_status_rx.clone()),
             registry: Arc::clone(&reg),
             logbuf: Arc::clone(&logbuf),
             fetcher: fetcher_pub.expect("fetcher_pub is Some when tui_active"),
@@ -1113,14 +1158,17 @@ async fn main() {
             }
             cmd = recv_tui(&mut tui_cmd_rx) => match cmd {
                 pm_tui::state::TuiCommand::SetPaused(p) => {
-                    let _ = ctl_tx.send(pm_app::coordinator::CtlCommand::SetPaused(p)).await;
+                    // Pause dispatch → arb, via the host. Matches today's
+                    // semantics: arb is the only dispatching strategy, and the
+                    // header `paused` badge ("any strategy paused") still lights.
+                    let _ = running.pause(StrategyId("arb"), p).await;
                 }
                 pm_tui::state::TuiCommand::Kill => kill.store(true, Ordering::Release),
                 pm_tui::state::TuiCommand::GoLive => {
                     if args.live {
-                        let _ = ctl_tx
-                            .send(pm_app::coordinator::CtlCommand::ReleaseLive)
-                            .await;
+                        // Release the coordinator's live latch via arb's
+                        // live_release_sender (bridged into the coordinator).
+                        let _ = live_release_sender.send(CtlCommand::ReleaseLive).await;
                     } else {
                         warn!("live not armed — restart with --live to trade real money");
                     }
@@ -1148,21 +1196,25 @@ async fn main() {
     for h in handles {
         let _ = h.await;
     }
-    // Supervisors dropped → detectors dropped → opp/lp senders close → LP pool
-    // exits → its opp_tx clone drops → coordinator's opp_rx closes → drains.
-    let _ = lp_handle.await;
-    // On coordinator panic: log the error but do NOT exit immediately — continue
-    // the shutdown sequence so the writer flushes and the store is cleanly closed.
-    // Treat coordinator panic as unhealthy (exit 2 at the end).
-    let coord_summary = match coord_handle.await {
-        Ok(s) => Some(s),
-        Err(e) => {
-            error!(error = %e, "coordinator task panicked; continuing shutdown to flush writer");
-            None
-        }
-    };
-    // Coordinator dropped exec_tx → execution task's rx closes → it ends.
-    let _ = exec_handle.await;
+    // Supervisors dropped → detectors dropped → arb's opp/lp senders close → the
+    // LP pool + coordinator + execution task inside `ArbStrategy::run` drain — the
+    // exact cascade main.rs drove by hand before, now owned by arb. RunningHost::
+    // join awaits arb AND the heartbeat; it drops the per-strategy control senders
+    // first, so the heartbeat exits on its closed control channel even when the
+    // global kill flag was never set (a duration / quit / ctrl-c shutdown).
+    running.join().await;
+    // Session summary: arb's coordinator publishes a final CoordStatus on clean
+    // shutdown (cash / equity / open_positions — the same numbers the discarded
+    // CoordinatorSummary carried); reconstruct it from the arb-process status
+    // watch (retained after the bridge drops its sender). A panicking
+    // arb/coordinator is now fault-isolated (logged by arb + the host) instead of
+    // surfacing as a task JoinError, so this is always Some.
+    let final_arb = arb_status_rx.borrow().clone();
+    let coord_summary = Some(CoordinatorSummary {
+        cash: pm_core::num::Usdc(final_arb.cash_micro as i128),
+        equity: pm_core::num::Usdc(final_arb.equity_micro as i128),
+        open_positions: final_arb.open_positions,
+    });
     kill_handle.abort();
 
     // Drop main's writer sender LAST so all StoreMsg producers are gone.
@@ -1173,12 +1225,12 @@ async fn main() {
     };
 
     // Await the TUI task LAST so its terminal teardown is ordered before the
-    // final report hits the (now normal) screen. The coordinator was awaited
-    // above; dropping its status_tx closed the publisher's watch → the publisher
-    // exits → its state_tx drops → run_tui's state_rx closes → run_tui returns →
-    // the task runs disable_raw_mode + LeaveAlternateScreen. So a session ending
-    // for NON-TUI reasons (duration/kill/sentinel/ctrl_c) still tears the screen
-    // down here.
+    // final report hits the (now normal) screen. The host was joined above; arb's
+    // coordinator finishing drops the arb-process status sender → the publisher's
+    // watch closes → the publisher exits → its state_tx drops → run_tui's state_rx
+    // closes → run_tui returns → the task runs disable_raw_mode +
+    // LeaveAlternateScreen. So a session ending for NON-TUI reasons
+    // (duration/kill/sentinel/ctrl_c) still tears the screen down here.
     if let Some(t) = tui_task {
         let _ = t.await;
     }

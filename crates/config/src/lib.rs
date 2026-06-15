@@ -3,7 +3,7 @@
 
 use serde::Deserialize;
 
-#[derive(Debug, PartialEq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     pub capital: Capital,
@@ -22,14 +22,14 @@ pub struct Config {
     pub live: Live,
 }
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Capital {
     pub bankroll_usd: f64,
     pub per_market_usd: f64,
 }
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Edges {
     pub min_edge_class12_bps: i32,
@@ -44,7 +44,7 @@ pub struct Edges {
     pub max_edge_bps: i32,
 }
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Gas {
     pub split_microusdc: u64,
@@ -53,7 +53,7 @@ pub struct Gas {
     pub negrisk_convert_microusdc: u64,
 }
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Lp {
     pub max_worlds: usize,
@@ -67,20 +67,20 @@ pub struct Lp {
     pub nonexhaustive_negrisk_worlds: bool,
 }
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Dedup {
     pub cooldown_ms: u64,
     pub reemit_improvement_pct: u32,
 }
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Mode {
     pub paper: bool,
 }
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Endpoints {
     pub gamma_base: String,
@@ -88,14 +88,14 @@ pub struct Endpoints {
     pub ws_market_url: String,
 }
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Universe {
     pub max_markets: usize,
     pub require_active: bool,
 }
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Ingestion {
     pub staleness_ms: u64,
@@ -213,7 +213,7 @@ impl Default for Ingestion {
     }
 }
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Execution {
     /// Simulated venue latency before a paper fill re-reads the book (spec §14).
@@ -234,7 +234,7 @@ impl Default for Execution {
     }
 }
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Risk {
     pub max_unhedged_usd: f64,
@@ -270,7 +270,7 @@ impl Default for Risk {
     }
 }
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Store {
     pub path: String,
@@ -284,7 +284,7 @@ impl Default for Store {
     }
 }
 
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Tui {
     /// AppState publish + redraw cadence (spec §17 "~10 Hz").
@@ -309,7 +309,7 @@ impl Default for Tui {
 }
 
 /// M5 live-trading canary parameters (spec 2026-06-13 §Config & env).
-#[derive(Debug, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Live {
     /// Live per-basket basis cap, USD.
