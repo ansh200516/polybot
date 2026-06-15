@@ -21,6 +21,7 @@ use crate::wiring::BookFetcher;
 
 pub mod arb;
 pub mod host;
+pub mod stub;
 
 /// Stable identity for a strategy (e.g. `"arb"`, `"mm"`). A `&'static str`
 /// keeps it copyable and cheap to use as a label/map key.
