@@ -495,6 +495,7 @@ impl Coordinator {
             basis_micro: usdc_to_i64(opp.basis).unwrap_or(i64::MAX),
             legs_json,
             dispatched,
+            strategy: "arb".into(),
         };
         // Fire-and-forget (spec §16 allows coalescing under back-pressure).
         let _ = self.store_tx.try_send(StoreMsg::Opportunity(row));
@@ -647,6 +648,7 @@ impl Coordinator {
             realized_micro: usdc_to_i64(pnl.realized).unwrap_or(i64::MAX),
             unrealized_micro: usdc_to_i64(pnl.unrealized).unwrap_or(i64::MAX),
             equity_micro: usdc_to_i64(pnl.equity).unwrap_or(i64::MAX),
+            strategy: "arb".into(),
         };
         let _ = self.store_tx.send(StoreMsg::PnlSnapshot(row)).await;
         // Persist the money fields on last_status (they survive pause/kill

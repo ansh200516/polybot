@@ -233,6 +233,7 @@ async fn record_fills(
             qty_micro: f.qty.0 as i64,
             cash_micro,
             fee_micro,
+            strategy: "arb".into(),
         };
         store_acked(store, |ack| StoreMsg::Fill(row, Some(ack))).await?;
         match order.action {

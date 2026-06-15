@@ -82,6 +82,7 @@ mod tests {
             limit_ticks: 44,
             tick_levels: 100,
             qty_micro: 1_000_000,
+            strategy: "arb".into(),
         }
     }
 
@@ -142,6 +143,7 @@ mod tests {
                 qty_micro: 1_000_000,
                 cash_micro: 500_000,
                 fee_micro: 0,
+                strategy: "arb".into(),
             },
             Some(ack_tx),
         ))

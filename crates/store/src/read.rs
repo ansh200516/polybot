@@ -177,7 +177,7 @@ impl ReadStore {
     /// The most-recent P&L snapshot, or `None` if the table is empty.
     pub fn latest_pnl(&self) -> Result<Option<PnlRow>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT ts_ms, cash_micro, realized_micro, unrealized_micro, equity_micro
+            "SELECT ts_ms, cash_micro, realized_micro, unrealized_micro, equity_micro, strategy
              FROM pnl_snapshots ORDER BY id DESC LIMIT 1",
         )?;
         let mut rows = stmt.query_map([], |row| {
@@ -187,9 +187,36 @@ impl ReadStore {
                 realized_micro: row.get(2)?,
                 unrealized_micro: row.get(3)?,
                 equity_micro: row.get(4)?,
+                strategy: row.get(5)?,
             })
         })?;
         rows.next().transpose().map_err(StoreError::from)
+    }
+
+    /// Most-recent `n` P&L snapshots for a single `strategy`, newest first.
+    /// Mirrors the other `recent_*` readers; backs per-strategy dashboards.
+    pub fn recent_pnl_by_strategy(
+        &self,
+        strategy: &str,
+        n: usize,
+    ) -> Result<Vec<PnlRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts_ms, cash_micro, realized_micro, unrealized_micro, equity_micro, strategy
+             FROM pnl_snapshots WHERE strategy = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![strategy, n as i64], |row| {
+                Ok(PnlRow {
+                    ts_ms: row.get(0)?,
+                    cash_micro: row.get(1)?,
+                    realized_micro: row.get(2)?,
+                    unrealized_micro: row.get(3)?,
+                    equity_micro: row.get(4)?,
+                    strategy: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Most-recent `n` halts, newest first.
@@ -244,6 +271,7 @@ mod tests {
                     "[{{\"token\":{i},\"action\":\"Buy\",\"px\":44,\"qty\":100000000}}]"
                 ),
                 dispatched: i == 2,
+                strategy: "arb".into(),
             })
             .unwrap();
         }
@@ -256,6 +284,7 @@ mod tests {
             limit_ticks: 44,
             tick_levels: 100,
             qty_micro: 100_000_000,
+            strategy: "arb".into(),
         })
         .unwrap();
         s.insert_order_event(&OrderEventRow {
@@ -275,6 +304,7 @@ mod tests {
             qty_micro: 100_000_000,
             cash_micro: -44_000_000,
             fee_micro: 0,
+            strategy: "arb".into(),
         })
         .unwrap();
         s.insert_pnl_snapshot(&PnlRow {
@@ -283,6 +313,7 @@ mod tests {
             realized_micro: 0,
             unrealized_micro: -1_000_000,
             equity_micro: -45_000_000,
+            strategy: "arb".into(),
         })
         .unwrap();
         s.insert_halt(&HaltRow {
@@ -377,6 +408,7 @@ mod tests {
             limit_ticks: 50,
             tick_levels: 100,
             qty_micro: 1_000_000,
+            strategy: "arb".into(),
         })
         .unwrap();
         let r = ReadStore::open(&path).unwrap();

@@ -454,6 +454,7 @@ mod tests {
                     m.yes.0
                 ),
                 dispatched: true,
+                strategy: "arb".into(),
             })
             .unwrap();
             s.insert_order(&pm_store::OrderRow {
@@ -465,6 +466,7 @@ mod tests {
                 limit_ticks: 44,
                 tick_levels: 100,
                 qty_micro: 100_000_000,
+                strategy: "arb".into(),
             })
             .unwrap();
             s.insert_fill(&pm_store::FillRow {
@@ -477,6 +479,7 @@ mod tests {
                 qty_micro: 100_000_000,
                 cash_micro: -44_000_000,
                 fee_micro: 0,
+                strategy: "arb".into(),
             })
             .unwrap();
         }

@@ -194,6 +194,7 @@ impl Order {
             limit_ticks: i64::from(self.limit_px.get()),
             tick_levels: i64::from(self.ts.levels()),
             qty_micro: self.qty.0 as i64,
+            strategy: "arb".into(),
         }
     }
 }

@@ -98,6 +98,8 @@ pub struct OppRow {
     pub basis_micro: i64,
     pub legs_json: String,
     pub dispatched: bool,
+    /// Strategy that produced this row (default `"arb"`; legacy DBs back-fill).
+    pub strategy: String,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +112,8 @@ pub struct OrderRow {
     pub limit_ticks: i64,
     pub tick_levels: i64,
     pub qty_micro: i64,
+    /// Strategy that produced this row (default `"arb"`; legacy DBs back-fill).
+    pub strategy: String,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +138,8 @@ pub struct FillRow {
     /// Informational only — never used in P&L math (cash_micro is already net
     /// of fee).
     pub fee_micro: i64,
+    /// Strategy that produced this row (default `"arb"`; legacy DBs back-fill).
+    pub strategy: String,
 }
 
 /// A split or merge (complete-set conversion). `kind` is "split" | "merge".
@@ -157,6 +163,8 @@ pub struct PnlRow {
     pub realized_micro: i64,
     pub unrealized_micro: i64,
     pub equity_micro: i64,
+    /// Strategy that produced this row (default `"arb"`; legacy DBs back-fill).
+    pub strategy: String,
 }
 
 #[derive(Debug, Clone)]
@@ -183,11 +191,12 @@ CREATE TABLE IF NOT EXISTS opportunities (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, class TEXT NOT NULL,
   fingerprint TEXT NOT NULL, edge_bps INTEGER NOT NULL, units_micro INTEGER NOT NULL,
   net_micro INTEGER NOT NULL, basis_micro INTEGER NOT NULL, legs_json TEXT NOT NULL,
-  dispatched INTEGER NOT NULL);
+  dispatched INTEGER NOT NULL, strategy TEXT NOT NULL DEFAULT 'arb');
 CREATE TABLE IF NOT EXISTS orders (
   id TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL, fingerprint TEXT NOT NULL,
   token INTEGER NOT NULL, action TEXT NOT NULL, limit_ticks INTEGER NOT NULL,
-  tick_levels INTEGER NOT NULL, qty_micro INTEGER NOT NULL, state TEXT NOT NULL);
+  tick_levels INTEGER NOT NULL, qty_micro INTEGER NOT NULL, state TEXT NOT NULL,
+  strategy TEXT NOT NULL DEFAULT 'arb');
 CREATE TABLE IF NOT EXISTS order_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL REFERENCES orders(id),
   ts_ms INTEGER NOT NULL, state TEXT NOT NULL, detail TEXT NOT NULL);
@@ -195,7 +204,8 @@ CREATE TABLE IF NOT EXISTS fills (
   id INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL REFERENCES orders(id),
   ts_ms INTEGER NOT NULL, token INTEGER NOT NULL, action TEXT NOT NULL,
   px_ticks INTEGER NOT NULL, tick_levels INTEGER NOT NULL, qty_micro INTEGER NOT NULL,
-  cash_micro INTEGER NOT NULL, fee_micro INTEGER NOT NULL, realized_micro INTEGER NOT NULL);
+  cash_micro INTEGER NOT NULL, fee_micro INTEGER NOT NULL, realized_micro INTEGER NOT NULL,
+  strategy TEXT NOT NULL DEFAULT 'arb');
 CREATE TABLE IF NOT EXISTS conversions (
   id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, ts_ms INTEGER NOT NULL,
   market INTEGER NOT NULL, yes_token INTEGER NOT NULL, no_token INTEGER NOT NULL,
@@ -207,12 +217,49 @@ CREATE TABLE IF NOT EXISTS lots (
 CREATE INDEX IF NOT EXISTS lots_token ON lots(token) WHERE remaining_micro > 0;
 CREATE TABLE IF NOT EXISTS pnl_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, cash_micro INTEGER NOT NULL,
-  realized_micro INTEGER NOT NULL, unrealized_micro INTEGER NOT NULL, equity_micro INTEGER NOT NULL);
+  realized_micro INTEGER NOT NULL, unrealized_micro INTEGER NOT NULL, equity_micro INTEGER NOT NULL,
+  strategy TEXT NOT NULL DEFAULT 'arb');
 CREATE TABLE IF NOT EXISTS halts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, reason TEXT NOT NULL, detail TEXT NOT NULL);
 ";
 
 const TERMINAL_STATES: [&str; 4] = ["Filled", "Cancelled", "Rejected", "Expired"];
+
+/// Tables that carry a per-strategy tag. Pre-strategy databases (created before
+/// the column existed) are upgraded in `open` by the idempotent migration below.
+const STRATEGY_TABLES: [&str; 4] = ["opportunities", "orders", "fills", "pnl_snapshots"];
+
+/// Whether `table` already has a column named `column` (via `PRAGMA table_info`).
+/// Table names are crate-internal constants, so the formatted SQL is injection-safe.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        // PRAGMA table_info columns: 0=cid, 1=name, 2=type, 3=notnull, 4=dflt, 5=pk.
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Add the `strategy` column to any `STRATEGY_TABLES` that predate it.
+///
+/// Idempotent and safe on both new and old databases: a freshly created DB
+/// already has the column (from `SCHEMA`), so this is a no-op there; a legacy
+/// DB gets `ALTER TABLE ... ADD COLUMN strategy TEXT NOT NULL DEFAULT 'arb'`,
+/// which back-fills every existing row with `'arb'`.
+fn migrate_strategy_columns(conn: &Connection) -> Result<(), StoreError> {
+    for table in STRATEGY_TABLES {
+        if !column_exists(conn, table, "strategy")? {
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN strategy TEXT NOT NULL DEFAULT 'arb'"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
 
 /// Synchronous store core. One instance = one connection; the async writer
 /// task (writer.rs) owns it exclusively in production.
@@ -228,6 +275,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        migrate_strategy_columns(&conn)?;
         Ok(Store {
             conn,
             write_errors: 0,
@@ -237,6 +285,7 @@ impl Store {
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate_strategy_columns(&conn)?;
         Ok(Store {
             conn,
             write_errors: 0,
@@ -265,8 +314,8 @@ impl Store {
     pub fn insert_opportunity(&mut self, r: &OppRow) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO opportunities (ts_ms, class, fingerprint, edge_bps, units_micro,
-             net_micro, basis_micro, legs_json, dispatched)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             net_micro, basis_micro, legs_json, dispatched, strategy)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 r.ts_ms,
                 r.class,
@@ -276,7 +325,8 @@ impl Store {
                 r.net_micro,
                 r.basis_micro,
                 r.legs_json,
-                r.dispatched
+                r.dispatched,
+                r.strategy
             ],
         )?;
         Ok(())
@@ -285,8 +335,8 @@ impl Store {
     pub fn insert_order(&mut self, r: &OrderRow) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO orders (id, ts_ms, fingerprint, token, action, limit_ticks,
-             tick_levels, qty_micro, state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'Draft')",
+             tick_levels, qty_micro, state, strategy)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'Draft', ?9)",
             rusqlite::params![
                 r.id,
                 r.ts_ms,
@@ -295,7 +345,8 @@ impl Store {
                 r.action,
                 r.limit_ticks,
                 r.tick_levels,
-                r.qty_micro
+                r.qty_micro,
+                r.strategy
             ],
         )?;
         Ok(())
@@ -382,8 +433,8 @@ impl Store {
         };
         tx.execute(
             "INSERT INTO fills (order_id, ts_ms, token, action, px_ticks, tick_levels,
-             qty_micro, cash_micro, fee_micro, realized_micro)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             qty_micro, cash_micro, fee_micro, realized_micro, strategy)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 r.order_id,
                 r.ts_ms,
@@ -394,7 +445,8 @@ impl Store {
                 r.qty_micro,
                 r.cash_micro,
                 r.fee_micro,
-                realized
+                realized,
+                r.strategy
             ],
         )?;
         tx.commit()?;
@@ -488,9 +540,9 @@ impl Store {
 
     pub fn insert_pnl_snapshot(&mut self, r: &PnlRow) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO pnl_snapshots (ts_ms, cash_micro, realized_micro, unrealized_micro, equity_micro)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![r.ts_ms, r.cash_micro, r.realized_micro, r.unrealized_micro, r.equity_micro],
+            "INSERT INTO pnl_snapshots (ts_ms, cash_micro, realized_micro, unrealized_micro, equity_micro, strategy)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![r.ts_ms, r.cash_micro, r.realized_micro, r.unrealized_micro, r.equity_micro, r.strategy],
         )?;
         Ok(())
     }
@@ -580,6 +632,7 @@ mod tests {
             limit_ticks: 44,
             tick_levels: 100,
             qty_micro: 100_000_000,
+            strategy: "arb".into(),
         }
     }
 
@@ -628,6 +681,7 @@ mod tests {
             basis_micro: 94_000_000,
             legs_json: "[]".into(),
             dispatched: true,
+            strategy: "arb".into(),
         })
         .unwrap();
         assert_eq!(s.count_opportunities().unwrap(), 1);
@@ -682,6 +736,7 @@ mod tests {
                 qty_micro: 100_000_000,
                 cash_micro: -44_000_000,
                 fee_micro: 0,
+                strategy: "arb".into(),
             })
             .unwrap();
         assert_eq!(realized, 0);
@@ -704,6 +759,7 @@ mod tests {
             qty_micro: 100_000_000,
             cash_micro: -44_000_000,
             fee_micro: 0,
+            strategy: "arb".into(),
         })
         .unwrap();
         s.insert_fill(&FillRow {
@@ -716,6 +772,7 @@ mod tests {
             qty_micro: 100_000_000,
             cash_micro: -46_000_000,
             fee_micro: 0,
+            strategy: "arb".into(),
         })
         .unwrap();
         // Sell 150 sh @ .50 → proceeds 75. FIFO: 100@.44 (44) + 50@.46 (23) → realized 75−67 = 8
@@ -730,6 +787,7 @@ mod tests {
                 qty_micro: 150_000_000,
                 cash_micro: 75_000_000,
                 fee_micro: 0,
+                strategy: "arb".into(),
             })
             .unwrap();
         assert_eq!(realized, 8_000_000);
@@ -752,6 +810,7 @@ mod tests {
             qty_micro: 3,
             cash_micro: -10,
             fee_micro: 0,
+            strategy: "arb".into(),
         })
         .unwrap();
         // consumed = ceil(10·1/3) = 4 → realized = 4 − 4 = 0 (NOT 4 − 3 = 1)
@@ -766,6 +825,7 @@ mod tests {
                 qty_micro: 1,
                 cash_micro: 4,
                 fee_micro: 0,
+                strategy: "arb".into(),
             })
             .unwrap();
         assert_eq!(realized, 0);
@@ -786,6 +846,7 @@ mod tests {
             qty_micro: 1_000_000,
             cash_micro: 500_000,
             fee_micro: 0,
+            strategy: "arb".into(),
         });
         assert!(matches!(err, Err(StoreError::Oversell { token: 7, .. })));
         // The fill row must NOT exist (tx rollback).
@@ -826,6 +887,7 @@ mod tests {
             qty_micro: 100_000_000,
             cash_micro: -44_000_000,
             fee_micro: 0,
+            strategy: "arb".into(),
         })
         .unwrap();
         s.insert_fill(&FillRow {
@@ -838,6 +900,7 @@ mod tests {
             qty_micro: 100_000_000,
             cash_micro: -50_000_000,
             fee_micro: 0,
+            strategy: "arb".into(),
         })
         .unwrap();
         let realized = s
@@ -874,6 +937,7 @@ mod tests {
             qty_micro: 3,
             cash_micro: -10,
             fee_micro: 0,
+            strategy: "arb".into(),
         })
         .unwrap();
         let mut total_realized = 0;
@@ -889,6 +953,7 @@ mod tests {
                     qty_micro: 1,
                     cash_micro: 4,
                     fee_micro: 0,
+                    strategy: "arb".into(),
                 })
                 .unwrap();
         }
@@ -914,6 +979,7 @@ mod tests {
             qty_micro: 7,
             cash_micro: -13,
             fee_micro: 0,
+            strategy: "arb".into(),
         })
         .unwrap();
         s.insert_fill(&FillRow {
@@ -926,6 +992,7 @@ mod tests {
             qty_micro: 5,
             cash_micro: -11,
             fee_micro: 0,
+            strategy: "arb".into(),
         })
         .unwrap();
         let realized = s
@@ -939,6 +1006,7 @@ mod tests {
                 qty_micro: 9,
                 cash_micro: 20,
                 fee_micro: 0,
+                strategy: "arb".into(),
             })
             .unwrap();
         assert_eq!(realized, 2);
@@ -961,6 +1029,7 @@ mod tests {
             qty_micro: 1,
             cash_micro: 1,
             fee_micro: 0,
+            strategy: "arb".into(),
         });
         assert!(matches!(r, Err(StoreError::BadVariant { .. })));
         assert_eq!(s.count_fills().unwrap(), 0); // no lot mutation
@@ -1013,6 +1082,7 @@ mod tests {
             realized_micro: 0,
             unrealized_micro: 5,
             equity_micro: -5,
+            strategy: "arb".into(),
         })
         .unwrap();
         s.insert_halt(&HaltRow {
@@ -1026,5 +1096,80 @@ mod tests {
         assert_eq!(s.record_session_start(1000, 1500).unwrap(), 1);
         assert_eq!(s.record_session_start(2000, 1500).unwrap(), 2);
         assert_eq!(s.record_session_start(3000, 1500).unwrap(), 2); // 1000 pruned
+    }
+
+    #[test]
+    fn pnl_snapshot_is_tagged_by_strategy_and_filterable() {
+        // File-backed: the strategy-filtered reader lives on ReadStore, which
+        // needs a real file (a read-only conn can't see another conn's :memory:).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strat.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        s.insert_pnl_snapshot(&PnlRow {
+            ts_ms: 1,
+            cash_micro: -10,
+            realized_micro: 0,
+            unrealized_micro: 5,
+            equity_micro: -5,
+            strategy: "arb".into(),
+        })
+        .unwrap();
+        s.insert_pnl_snapshot(&PnlRow {
+            ts_ms: 2,
+            cash_micro: -20,
+            realized_micro: 1,
+            unrealized_micro: 6,
+            equity_micro: -14,
+            strategy: "mm".into(),
+        })
+        .unwrap();
+        drop(s);
+
+        let r = crate::read::ReadStore::open(&path).unwrap();
+        let mm = r.recent_pnl_by_strategy("mm", 10).unwrap();
+        assert_eq!(mm.len(), 1, "only the mm-tagged snapshot matches");
+        assert_eq!(mm[0].strategy, "mm");
+        assert_eq!(mm[0].equity_micro, -14);
+        let arb = r.recent_pnl_by_strategy("arb", 10).unwrap();
+        assert_eq!(arb.len(), 1);
+        assert_eq!(arb[0].strategy, "arb");
+    }
+
+    #[test]
+    fn legacy_db_without_strategy_column_opens_and_backfills_arb() {
+        // Simulate a pre-strategy database: pnl_snapshots created WITHOUT the
+        // strategy column, with one row inserted the old way.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pnl_snapshots (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL,
+                   cash_micro INTEGER NOT NULL, realized_micro INTEGER NOT NULL,
+                   unrealized_micro INTEGER NOT NULL, equity_micro INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pnl_snapshots
+                   (ts_ms, cash_micro, realized_micro, unrealized_micro, equity_micro)
+                 VALUES (7, 1, 2, 3, 4)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Opening a legacy DB must succeed: the idempotent migration adds the
+        // missing column rather than failing on the absent field.
+        let s = Store::open(&path).unwrap();
+        drop(s);
+
+        // The pre-existing row is back-filled with the 'arb' default.
+        let r = crate::read::ReadStore::open(&path).unwrap();
+        let arb = r.recent_pnl_by_strategy("arb", 10).unwrap();
+        assert_eq!(arb.len(), 1);
+        assert_eq!(arb[0].ts_ms, 7);
+        assert_eq!(arb[0].equity_micro, 4);
+        assert_eq!(arb[0].strategy, "arb");
     }
 }
