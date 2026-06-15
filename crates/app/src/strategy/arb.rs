@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use pm_config::Config;
@@ -41,7 +42,7 @@ use pm_ingestion::supervisor::OnApplyFn;
 use pm_risk::RiskConfig;
 use pm_store::writer::StoreMsg;
 use tokio::sync::{mpsc, watch};
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::coordinator::{
     CoordStatus, Coordinator, CtlCommand, ExecReport, ExecRequest, LiveParams,
@@ -140,6 +141,16 @@ pub struct ArbStrategy {
     /// `arb_status_tx`; `arb_status_rx()` hands out receivers.
     arb_status_tx: watch::Sender<CoordStatus>,
     arb_status_rx: watch::Receiver<CoordStatus>,
+
+    // ---- coordinator-death health signal (Task 1.8 follow-fix) ----
+    /// Set to `true` by `run` ONLY when the coordinator task ends abnormally
+    /// (panic/cancel). `ArbStrategy::run` swallows the coordinator `JoinError`
+    /// and returns `Ok`, so a host task-outcome check alone cannot see a
+    /// mid-session coordinator panic — this flag surfaces it to `main.rs` for
+    /// the health / exit-code signal. Created up front so `coordinator_aborted()`
+    /// is callable before `run` consumes the strategy. Untouched on the normal
+    /// shutdown path (stays `false`), keeping that path byte-identical.
+    coordinator_aborted: Arc<AtomicBool>,
 }
 
 impl ArbStrategy {
@@ -170,6 +181,7 @@ impl ArbStrategy {
         // the strategy; `run`'s status bridge forwards the coordinator's status
         // onto `arb_status_tx`.
         let (arb_status_tx, arb_status_rx) = watch::channel(CoordStatus::default());
+        let coordinator_aborted = Arc::new(AtomicBool::new(false));
         ArbStrategy {
             cfg,
             risk_cfg,
@@ -194,6 +206,7 @@ impl ArbStrategy {
             live_ctl_rx,
             arb_status_tx,
             arb_status_rx,
+            coordinator_aborted,
         }
     }
 
@@ -215,6 +228,16 @@ impl ArbStrategy {
     /// coordinator publishes its first status.
     pub fn arb_status_rx(&self) -> watch::Receiver<CoordStatus> {
         self.arb_status_rx.clone()
+    }
+
+    /// A clone of the coordinator-death flag (Task 1.8 follow-fix). `main.rs`
+    /// obtains this BEFORE `run` consumes the strategy and, after the host joins,
+    /// folds `coordinator_aborted.load(Acquire)` into the session health signal
+    /// (a dead arb coordinator ⇒ `healthy = false` / non-zero exit). Set ONLY on
+    /// the coordinator-abort path inside `run`, so it is `false` after a normal
+    /// shutdown.
+    pub fn coordinator_aborted(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.coordinator_aborted)
     }
 }
 
@@ -349,6 +372,7 @@ impl Strategy for ArbStrategy {
                 live_ctl_rx,
                 arb_status_tx,
                 arb_status_rx: _,
+                coordinator_aborted,
             } = *self;
 
             // ---- Coordinator FIRST: construct it (and handle its `Result`)
@@ -408,17 +432,25 @@ impl Strategy for ArbStrategy {
 
             // ---- Bridges: pause/live-release → coordinator ctl; CoordStatus →
             // per-strategy StrategyStatus.
+            // Retain sender clones so the coordinator-abort path can stamp a
+            // terminal "coordinator aborted" status AFTER the bridge has forwarded
+            // the coordinator's last value (so it isn't overwritten). On the
+            // normal path these clones are never written and just drop with `run`.
+            let status_tx_marker = ctx.status_tx.clone();
+            let arb_status_tx_marker = arb_status_tx.clone();
             let ctl_bridge = tokio::spawn(bridge_control(ctx.ctl_rx, live_ctl_rx, coord_ctl));
             let status_bridge =
                 tokio::spawn(bridge_status(coord_status, ctx.status_tx, arb_status_tx));
 
             // ---- Return when the coordinator loop ends. The `CoordinatorSummary`
             // is discarded (final state already surfaced via status_tx, per the
-            // trait doc), but a JoinError (panic/cancel) is logged so a dead
-            // coordinator task is visible rather than silent — mirroring main.rs,
-            // which logs on the coordinator's JoinError instead of swallowing it.
+            // trait doc). A JoinError (panic/cancel) means the coordinator died:
+            // record it on `coordinator_aborted` (the health signal `main.rs`
+            // folds into the exit code, since this `run` still returns `Ok`) and
+            // log at `error!`. Set ONLY here, so the normal path stays untouched.
             if let Err(e) = coord_handle.await {
-                warn!(error = %e, "ArbStrategy: coordinator task ended abnormally");
+                coordinator_aborted.store(true, Ordering::Release);
+                error!(error = %e, "ArbStrategy: coordinator task ended abnormally");
             }
             let _ = lp_handle.await;
             let _ = exec_handle.await;
@@ -429,6 +461,17 @@ impl Strategy for ArbStrategy {
             // the coordinator gone it is inert, so stop it.
             ctl_bridge.abort();
             let _ = ctl_bridge.await;
+            // Failure path ONLY: stamp a terminal "coordinator aborted" marker so
+            // the TUI surfaces the dead coordinator (header HALT + per-strategy
+            // line). Done AFTER the status bridge so it is the LAST published value
+            // (not overwritten by the bridge's final forward); `send_modify`
+            // preserves the coordinator's last money fields and only sets `halted`.
+            if coordinator_aborted.load(Ordering::Acquire) {
+                status_tx_marker
+                    .send_modify(|s| s.halted = Some("coordinator aborted".to_string()));
+                arb_status_tx_marker
+                    .send_modify(|cs| cs.halted = Some("coordinator aborted".to_string()));
+            }
         })
     }
 }

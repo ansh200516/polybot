@@ -225,22 +225,29 @@ impl StrategyHost {
         spawn_aggregator(seed, delta_rx, agg_tx);
 
         // Join task: await every strategy, logging panics/abnormal exits with the
-        // StrategyId. Completes when ALL strategy tasks have finished.
+        // StrategyId and tracking whether ANY task ended abnormally. Completes
+        // when ALL strategy tasks have finished; its `bool` result surfaces to
+        // [`RunningHost::join`] so the caller can fold a dead strategy task into
+        // the session health signal (Task 1.8 follow-fix).
         let join_handle = tokio::spawn(async move {
+            let mut any_abnormal = false;
             for (id, handle) in handles {
                 match handle.await {
                     Ok(()) => {}
                     Err(e) if e.is_panic() => {
+                        any_abnormal = true;
                         warn!(
                             strategy = id.0,
                             "strategy task panicked — fault isolated; other strategies keep running"
                         );
                     }
                     Err(_) => {
+                        any_abnormal = true;
                         warn!(strategy = id.0, "strategy task ended abnormally (cancelled)");
                     }
                 }
             }
+            any_abnormal
         });
 
         Ok(RunningHost {
@@ -256,7 +263,8 @@ impl StrategyHost {
 pub struct RunningHost {
     status_rx: watch::Receiver<StrategyStatusView>,
     ctl: HashMap<StrategyId, mpsc::Sender<StrategyCommand>>,
-    join_handle: JoinHandle<()>,
+    /// Resolves to `true` if any strategy task ended abnormally (panic/cancel).
+    join_handle: JoinHandle<bool>,
 }
 
 impl RunningHost {
@@ -289,7 +297,13 @@ impl RunningHost {
     /// is not set (a duration / quit / ctrl-c shutdown) — unblocks here. Awaiting
     /// `join_handle` while still holding `ctl` would deadlock such a strategy (and
     /// thus the host); destructuring up front guarantees `ctl` drops first.
-    pub async fn join(self) {
+    ///
+    /// Returns `true` if any strategy TASK ended abnormally (panicked or was
+    /// cancelled) — the caller folds this into the session health signal. (A join
+    /// task panic is itself treated as abnormal.) Note: a strategy whose `run`
+    /// catches an inner failure and returns `Ok` looks normal HERE; such cases
+    /// (e.g. arb's coordinator panic) report via their own channel.
+    pub async fn join(self) -> bool {
         let RunningHost {
             status_rx,
             ctl,
@@ -297,7 +311,7 @@ impl RunningHost {
         } = self;
         drop(ctl);
         drop(status_rx);
-        let _ = join_handle.await;
+        join_handle.await.unwrap_or(true)
     }
 }
 

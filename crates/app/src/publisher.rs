@@ -172,7 +172,6 @@ pub struct PublisherCtx {
 /// (never panic, never block the producer path — see `ReadStore`'s rationale).
 pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
     let now = now_ms();
-    let status = ctx.status_rx.borrow().clone();
 
     let age_s = |ts_ms: i64| -> u64 { ((now - ts_ms).max(0) / 1000) as u64 };
 
@@ -355,6 +354,10 @@ pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
                 (money, per_strategy, live_released, paused, halted, killed, busy)
             }
             None => {
+                // Legacy single-strategy path: money + all badges from the single
+                // CoordStatus. Borrowed only here, since the wired path above does
+                // not use it.
+                let status = ctx.status_rx.borrow().clone();
                 let money = AggregatedMoney {
                     cash_micro: status.cash_micro,
                     equity_micro: status.equity_micro,
@@ -760,7 +763,10 @@ mod tests {
 
         // CoordStatus money is deliberately non-zero so the test proves the
         // aggregated view OVERRIDES it (header equity is the per-strategy sum,
-        // not 999). Badges still flow from CoordStatus, untouched here.
+        // not 999). On the `Some` (wired) path the badges are RECONCILED, not
+        // taken from this CoordStatus: killed ← kill flag, paused ← any strategy,
+        // halted ← first halted strategy, live_released/busy ← arb_status_rx
+        // (`None` here ⇒ false). The dedicated badge test below asserts those.
         let (_status_tx, status_rx) =
             tokio::sync::watch::channel(crate::coordinator::CoordStatus {
                 equity_micro: 999_000_000,
@@ -845,5 +851,100 @@ mod tests {
 
         drop(_status_tx);
         drop(_strat_tx);
+    }
+
+    /// Task 1.8: on the `Some` (wired) path the header badges are RECONCILED from
+    /// multiple sources, NOT from the single `CoordStatus` (`status_rx`). With
+    /// `status_rx` left all-false, every badge that comes out `true` must have
+    /// come from its real source: `killed` ← the global kill flag; `paused` ←
+    /// ANY strategy paused; `halted` ← the first halted strategy; and
+    /// `live_released`/`busy` ← arb's `CoordStatus` (`arb_status_rx`).
+    #[tokio::test]
+    async fn wired_path_reconciles_header_badges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.sqlite");
+        let _ = pm_store::Store::open(&path).unwrap();
+        let read = pm_store::read::ReadStore::open(&path).unwrap();
+
+        let stats = crate::stats::AppStats::new();
+        let logbuf = crate::logbuf::LogBuffer::new(10);
+        let r = reg();
+        let fetcher = crate::wiring::BookFetcher::new(std::collections::HashMap::new());
+
+        // The single CoordStatus is deliberately all-false (default), so any badge
+        // that ends up true MUST have come from its reconciled source — proving the
+        // wired path does not read badges from `status_rx`.
+        let (_status_tx, status_rx) =
+            tokio::sync::watch::channel(crate::coordinator::CoordStatus::default());
+
+        // View: "arb" paused (not halted), "mm" halted (not paused).
+        let view: StrategyStatusView = vec![
+            (
+                StrategyId("arb"),
+                StrategyStatus {
+                    paused: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                StrategyId("mm"),
+                StrategyStatus {
+                    halted: Some("DailyDrawdown".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let (_strat_tx, strat_rx) = tokio::sync::watch::channel(view);
+
+        // arb's CoordStatus supplies the process-wide gates the aggregate drops.
+        let (_arb_status_tx, arb_status_rx) =
+            tokio::sync::watch::channel(crate::coordinator::CoordStatus {
+                live_released: true,
+                busy: true,
+                ..Default::default()
+            });
+
+        // Global kill flag is set.
+        let kill = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let mut ctx = PublisherCtx {
+            read,
+            stats,
+            cells: Vec::new(),
+            status_rx,
+            strategy_status_rx: Some(strat_rx),
+            kill: std::sync::Arc::clone(&kill),
+            arb_status_rx: Some(arb_status_rx),
+            registry: r,
+            logbuf,
+            fetcher,
+            feed_rows: 10,
+            fills_rows: 10,
+            log_lines: 10,
+            mode_paper: true,
+            shadow: false,
+            start: std::time::Instant::now(),
+            last_frames: 0,
+            last_at: std::time::Instant::now(),
+        };
+
+        let state = assemble(&mut ctx).await;
+
+        assert!(state.killed, "killed must come from the global kill flag");
+        assert!(state.paused, "paused must be true when ANY strategy is paused");
+        assert_eq!(
+            state.halted,
+            Some("DailyDrawdown".to_string()),
+            "halted must be the first halted strategy's reason"
+        );
+        assert!(
+            state.live_released,
+            "live_released must come from arb_status_rx (CoordStatus)"
+        );
+        assert!(state.busy, "busy must come from arb_status_rx (CoordStatus)");
+
+        drop(_status_tx);
+        drop(_strat_tx);
+        drop(_arb_status_tx);
     }
 }

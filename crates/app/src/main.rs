@@ -974,9 +974,13 @@ async fn main() {
     );
     // Obtain arb's control/status handles BEFORE moving it into the host:
     // arb_status_rx feeds the publisher's arb-process badges + the final summary;
-    // live_release_sender is the TUI `l`-modal's path into the coordinator.
+    // live_release_sender is the TUI `l`-modal's path into the coordinator;
+    // arb_coordinator_aborted is the coordinator-death health signal (arb's run
+    // swallows the coordinator JoinError, so the host's task-outcome check can't
+    // see a mid-session coordinator panic — this flag does).
     let arb_status_rx = arb.arb_status_rx();
     let live_release_sender = arb.live_release_sender();
+    let arb_coordinator_aborted = arb.coordinator_aborted();
 
     let mut host = StrategyHost::new(bankroll);
     host.add(Box::new(arb), arb_envelope);
@@ -1202,13 +1206,16 @@ async fn main() {
     // join awaits arb AND the heartbeat; it drops the per-strategy control senders
     // first, so the heartbeat exits on its closed control channel even when the
     // global kill flag was never set (a duration / quit / ctrl-c shutdown).
-    running.join().await;
-    // Session summary: arb's coordinator publishes a final CoordStatus on clean
-    // shutdown (cash / equity / open_positions — the same numbers the discarded
-    // CoordinatorSummary carried); reconstruct it from the arb-process status
-    // watch (retained after the bridge drops its sender). A panicking
-    // arb/coordinator is now fault-isolated (logged by arb + the host) instead of
-    // surfacing as a task JoinError, so this is always Some.
+    // join() returns whether any strategy TASK ended abnormally (panic/cancel —
+    // e.g. a future MM strategy). Arb's coordinator death is separate: arb's run
+    // swallows the coordinator JoinError and returns Ok, so it is reported via the
+    // coordinator_aborted flag instead. Fold BOTH into the health signal.
+    let host_any_abnormal = running.join().await;
+    let strategy_died = host_any_abnormal || arb_coordinator_aborted.load(Ordering::Acquire);
+    // Session summary (display / happy path): arb's coordinator publishes a final
+    // CoordStatus on clean shutdown (cash / equity / open_positions — the numbers
+    // the discarded CoordinatorSummary carried); reconstruct it from the
+    // arb-process status watch (retained after the bridge drops its sender).
     let final_arb = arb_status_rx.borrow().clone();
     let coord_summary = Some(CoordinatorSummary {
         cash: pm_core::num::Usdc(final_arb.cash_micro as i128),
@@ -1269,8 +1276,11 @@ async fn main() {
     println!("FINAL stats: {}", stats.line());
     println!("session ended: duration_s={}", start.elapsed().as_secs());
 
-    let coord_panicked = coord_summary.is_none();
-    let healthy = write_errors == 0 && !restart_storm && supervisors_started > 0 && !coord_panicked;
+    // A dead strategy (host task panic/cancel, or arb's coordinator aborting) is
+    // unhealthy — restores the pre-Task-1.8 "exit 2 on coordinator death" signal
+    // that the host's fault isolation would otherwise mask.
+    let healthy =
+        write_errors == 0 && !restart_storm && supervisors_started > 0 && !strategy_died;
     println!("arb session result: healthy={healthy}");
     if healthy {
         std::process::exit(0);
