@@ -1172,4 +1172,82 @@ mod tests {
         assert_eq!(arb[0].equity_micro, 4);
         assert_eq!(arb[0].strategy, "arb");
     }
+
+    #[test]
+    fn legacy_db_migrates_strategy_column_across_all_four_tables() {
+        // A pre-strategy database has EVERY tagged table without the strategy
+        // column. Opening it must migrate all four (not just whichever table a
+        // later write happens to touch first): `CREATE TABLE IF NOT EXISTS` is a
+        // no-op on the existing tables, so only the ALTER path can add the column.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_all.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            // Column-less legacy schema: the real pre-strategy tables minus the
+            // strategy column (FK clauses dropped so each seed row stands alone).
+            conn.execute_batch(
+                "CREATE TABLE opportunities (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, class TEXT NOT NULL,
+                   fingerprint TEXT NOT NULL, edge_bps INTEGER NOT NULL, units_micro INTEGER NOT NULL,
+                   net_micro INTEGER NOT NULL, basis_micro INTEGER NOT NULL, legs_json TEXT NOT NULL,
+                   dispatched INTEGER NOT NULL);
+                 CREATE TABLE orders (
+                   id TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL, fingerprint TEXT NOT NULL,
+                   token INTEGER NOT NULL, action TEXT NOT NULL, limit_ticks INTEGER NOT NULL,
+                   tick_levels INTEGER NOT NULL, qty_micro INTEGER NOT NULL, state TEXT NOT NULL);
+                 CREATE TABLE fills (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL, ts_ms INTEGER NOT NULL,
+                   token INTEGER NOT NULL, action TEXT NOT NULL, px_ticks INTEGER NOT NULL,
+                   tick_levels INTEGER NOT NULL, qty_micro INTEGER NOT NULL, cash_micro INTEGER NOT NULL,
+                   fee_micro INTEGER NOT NULL, realized_micro INTEGER NOT NULL);
+                 CREATE TABLE pnl_snapshots (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, cash_micro INTEGER NOT NULL,
+                   realized_micro INTEGER NOT NULL, unrealized_micro INTEGER NOT NULL, equity_micro INTEGER NOT NULL);",
+            )
+            .unwrap();
+            // One pre-existing row per table, inserted the old (column-less) way.
+            conn.execute(
+                "INSERT INTO opportunities
+                   (ts_ms, class, fingerprint, edge_bps, units_micro, net_micro, basis_micro, legs_json, dispatched)
+                 VALUES (1, 'C1Long', 'fp', 600, 1, 2, 3, '[]', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO orders
+                   (id, ts_ms, fingerprint, token, action, limit_ticks, tick_levels, qty_micro, state)
+                 VALUES ('o1', 1, 'fp', 7, 'Buy', 44, 100, 100, 'Draft')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fills
+                   (order_id, ts_ms, token, action, px_ticks, tick_levels, qty_micro, cash_micro, fee_micro, realized_micro)
+                 VALUES ('o1', 1, 7, 'Buy', 44, 100, 100, -44, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pnl_snapshots
+                   (ts_ms, cash_micro, realized_micro, unrealized_micro, equity_micro)
+                 VALUES (1, -44, 0, 0, -44)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Opening migrates every tagged table (idempotent ALTER per table).
+        Store::open(&path).unwrap();
+
+        // For each table the strategy column must now exist AND the pre-existing
+        // row must back-fill to 'arb'. A `SELECT strategy` round-trip on a raw
+        // connection proves both at once (it errors if the column is absent).
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for table in STRATEGY_TABLES {
+            let strategy: String = conn
+                .query_row(&format!("SELECT strategy FROM {table}"), [], |row| row.get(0))
+                .unwrap_or_else(|e| panic!("table `{table}` was not migrated: {e}"));
+            assert_eq!(strategy, "arb", "table `{table}` must back-fill 'arb'");
+        }
+    }
 }
