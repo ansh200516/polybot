@@ -41,7 +41,7 @@ use pm_ingestion::supervisor::OnApplyFn;
 use pm_risk::RiskConfig;
 use pm_store::writer::StoreMsg;
 use tokio::sync::{mpsc, watch};
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::coordinator::{
     CoordStatus, Coordinator, CtlCommand, ExecReport, ExecRequest, LiveParams,
@@ -313,28 +313,15 @@ impl Strategy for ArbStrategy {
                 live_ctl_rx,
             } = *self;
 
-            // ---- LP pool: clone the opp sender BEFORE dropping main's copies,
-            // then drop the detector-side senders this strategy held only so
-            // `make_on_apply` could clone them — the cascade then mirrors main.rs
-            // (the live detectors clone live inside the supervisor tasks).
-            let opp_tx_lp = opp_tx.clone();
-            drop(opp_tx);
-            drop(lp_tx);
-            let lp_handle = tokio::spawn(run_lp_pool(
-                lp_rx,
-                opp_tx_lp,
-                params,
-                lp_concurrency,
-                Arc::clone(&stats),
-            ));
-
-            // ---- Execution task: the caller-built `run_execution` future, fed
-            // the arb's exec/report halves + ctx.store_tx (see ExecTaskBuilder).
-            let exec_handle = tokio::spawn(exec_builder(exec_rx, report_tx, ctx.store_tx.clone()));
-
-            // ---- Coordinator (constructed exactly as main.rs, with ctx.kill /
-            // ctx.store_tx / ctx.fetcher). Coordinator::new never actually errors
-            // (its only path is Ok), but it returns a Result, so handle it.
+            // ---- Coordinator FIRST: construct it (and handle its `Result`)
+            // before spawning ANY task, so a construction failure can't strand /
+            // leak the LP-pool or execution tasks. The constructor is infallible
+            // today (its only path is `Ok`), but the `Err` arm `return`s, which in
+            // a long-running process would detach already-spawned tasks — so the
+            // order is a guard, not cosmetics. Constructed exactly as main.rs,
+            // with ctx.kill / ctx.store_tx / ctx.fetcher. Spawn order is otherwise
+            // behavior-irrelevant: the pipeline is wired by the channels `new`
+            // already created.
             let mut coord = match Coordinator::new(
                 &cfg,
                 risk_cfg,
@@ -358,6 +345,27 @@ impl Strategy for ArbStrategy {
             coord.note_session_starts(session_starts);
             let coord_ctl = coord.control_channel(CTL_CAP);
             let coord_status = coord.status_channel();
+
+            // ---- LP pool: clone the opp sender BEFORE dropping main's copies,
+            // then drop the detector-side senders this strategy held only so
+            // `make_on_apply` could clone them — the cascade then mirrors main.rs
+            // (the live detectors clone live inside the supervisor tasks).
+            let opp_tx_lp = opp_tx.clone();
+            drop(opp_tx);
+            drop(lp_tx);
+            let lp_handle = tokio::spawn(run_lp_pool(
+                lp_rx,
+                opp_tx_lp,
+                params,
+                lp_concurrency,
+                Arc::clone(&stats),
+            ));
+
+            // ---- Execution task: the caller-built `run_execution` future, fed
+            // the arb's exec/report halves + ctx.store_tx (see ExecTaskBuilder).
+            let exec_handle = tokio::spawn(exec_builder(exec_rx, report_tx, ctx.store_tx.clone()));
+
+            // ---- Coordinator run loop (spawned last, after its peer tasks are up).
             let coord_handle = tokio::spawn(coord.run());
 
             // ---- Bridges: pause/live-release → coordinator ctl; CoordStatus →
@@ -365,9 +373,14 @@ impl Strategy for ArbStrategy {
             let ctl_bridge = tokio::spawn(bridge_control(ctx.ctl_rx, live_ctl_rx, coord_ctl));
             let status_bridge = tokio::spawn(bridge_status(coord_status, ctx.status_tx));
 
-            // ---- Return when the coordinator loop ends (summary discarded —
-            // final state already surfaced via status_tx, per the trait doc).
-            let _ = coord_handle.await;
+            // ---- Return when the coordinator loop ends. The `CoordinatorSummary`
+            // is discarded (final state already surfaced via status_tx, per the
+            // trait doc), but a JoinError (panic/cancel) is logged so a dead
+            // coordinator task is visible rather than silent — mirroring main.rs,
+            // which logs on the coordinator's JoinError instead of swallowing it.
+            if let Err(e) = coord_handle.await {
+                warn!(error = %e, "ArbStrategy: coordinator task ended abnormally");
+            }
             let _ = lp_handle.await;
             let _ = exec_handle.await;
             // The coordinator has dropped its status sender; let the status bridge
