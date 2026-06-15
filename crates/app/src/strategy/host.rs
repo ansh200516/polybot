@@ -31,20 +31,29 @@
 //! finished strategy's last-published [`StrategyStatus`] stays visible in the
 //! aggregate (its `watch` channel retains the final value).
 //!
-//! ## Status aggregation
+//! ## Status aggregation (single writer)
 //!
-//! Every strategy publishes its [`StrategyStatus`] on its own
-//! `watch::Sender` (the `status_tx` in its [`StrategyCtx`]). The host keeps the
-//! matching receivers and exposes a single aggregated
-//! `watch::Receiver<`[`StrategyStatusView`]`>` for the publisher (Task 1.7/1.8).
-//! The aggregate is driven by one small **forwarder** task per strategy: when a
-//! strategy's status changes, its forwarder re-reads every strategy's latest
-//! status and republishes the whole vec. Concurrent forwarders are safe — each
-//! reads the latest of all and the aggregate `watch` keeps the newest snapshot.
-//! When a strategy's `status_tx` drops (the strategy finished), its forwarder
-//! publishes one final snapshot and exits; when all forwarders exit the
-//! aggregate `watch` closes, signalling shutdown to the publisher exactly like
-//! the coordinator's status watch does today.
+//! Every strategy publishes its [`StrategyStatus`] on its own `watch::Sender`
+//! (the `status_tx` in its [`StrategyCtx`]). The host exposes one aggregated
+//! `watch::Receiver<`[`StrategyStatusView`]`>` for the publisher (Task 1.7/1.8),
+//! fed by a strictly single-writer pipeline:
+//!
+//! * one **forwarder** task per strategy turns that strategy's `watch` changes
+//!   into `(`[`StrategyId`]`, `[`StrategyStatus`]`)` deltas on one shared `mpsc`
+//!   channel, then
+//! * one **aggregator** task — the SOLE writer of the aggregate `watch` — owns
+//!   the authoritative vec (seeded with every registered strategy), applies each
+//!   delta to the matching slot in place, and republishes the updated vec.
+//!
+//! Because only the aggregator ever writes the aggregate `watch`, a slow
+//! forwarder can never clobber a fresher value with a staler snapshot — the
+//! last-writer race a multi-writer (snapshot-per-forwarder) design would have. A
+//! forwarder exits when its strategy's `status_tx` drops (the strategy finished);
+//! once every forwarder has exited, the delta channel closes, the aggregator
+//! returns and drops the aggregate sender, and the aggregate `watch` closes — the
+//! same shutdown signal the coordinator's status watch gives the publisher today.
+//! A finished strategy keeps its last status in the view (the aggregator never
+//! removes a slot).
 //!
 //! ## Per-strategy control & shutdown
 //!
@@ -75,8 +84,15 @@ use super::{
     Strategy, StrategyCommand, StrategyCtx, StrategyEnvelope, StrategyId, StrategyStatus, allocate,
 };
 
-/// Per-strategy control-channel capacity (mirrors the coordinator's `CTL_CAP`).
+/// Per-strategy control-channel capacity. Pause commands are rare, so a small
+/// fixed buffer is plenty.
 const CTL_CAP: usize = 8;
+
+/// Capacity of the shared status-delta channel that feeds the single aggregator.
+/// Per-strategy updates coalesce (each forwarder forwards only its strategy's
+/// latest), so a modest buffer absorbs bursts; forwarders back-pressure if the
+/// aggregator ever lags.
+const DELTA_CAP: usize = 64;
 
 /// The aggregated dashboard view: every strategy's id paired with its latest
 /// [`StrategyStatus`]. Published on a `watch` channel for the TUI publisher
@@ -165,23 +181,19 @@ impl StrategyHost {
     /// task is spawned (fatal at startup). Must be called from within a Tokio
     /// runtime (it calls [`tokio::spawn`], mirroring `publisher::spawn_publisher`).
     pub fn run(self, shared: HostShared) -> Result<RunningHost, String> {
-        let StrategyHost { bankroll, entries } = self;
-
         // Capital allocation guard FIRST — fatal at startup, before any spawn.
-        let envelopes: Vec<StrategyEnvelope> =
-            entries.iter().map(|(_, env)| env.clone()).collect();
-        allocate(&envelopes, bankroll)?;
+        self.validate_capital()?;
+        let entries = self.entries;
+
+        // One shared status-delta channel feeds the single aggregator below.
+        let (delta_tx, delta_rx) = mpsc::channel::<(StrategyId, StrategyStatus)>(DELTA_CAP);
 
         let mut handles: Vec<(StrategyId, JoinHandle<()>)> = Vec::with_capacity(entries.len());
         let mut ctl: HashMap<StrategyId, mpsc::Sender<StrategyCommand>> =
             HashMap::with_capacity(entries.len());
-        // Two clones of each status receiver: the `reader_pairs` set is read
-        // (`borrow`) to build each aggregate snapshot; each `changed_rx` is the
-        // dedicated receiver one forwarder awaits (`changed`) for its strategy.
-        let mut reader_pairs: Vec<(StrategyId, watch::Receiver<StrategyStatus>)> =
-            Vec::with_capacity(entries.len());
-        let mut changed_rxs: Vec<watch::Receiver<StrategyStatus>> =
-            Vec::with_capacity(entries.len());
+        // Seed the aggregate with every registered strategy (default status) so
+        // the view lists all strategies from the very first publish.
+        let mut seed: StrategyStatusView = Vec::with_capacity(entries.len());
 
         for (strategy, _envelope) in entries {
             let id = strategy.id();
@@ -200,20 +212,17 @@ impl StrategyHost {
             // process or the sibling tasks.
             handles.push((id, tokio::spawn(strategy.run(ctx))));
             ctl.insert(id, ctl_tx);
-            changed_rxs.push(status_rx.clone());
-            reader_pairs.push((id, status_rx));
+            seed.push((id, StrategyStatus::default()));
+            // One forwarder per strategy turns its watch changes into deltas.
+            spawn_forwarder(id, status_rx, delta_tx.clone());
         }
+        // Drop the host's delta sender so the channel (and then the aggregate
+        // watch) closes once every forwarder — i.e. every strategy — has exited.
+        drop(delta_tx);
 
-        // Aggregation: seed the view with every strategy at its default status,
-        // then let one forwarder per strategy republish the whole view on change.
-        let readers: Readers = Arc::new(reader_pairs);
-        let (agg_tx, agg_rx) = watch::channel(snapshot(&readers));
-        for changed_rx in changed_rxs {
-            spawn_forwarder(changed_rx, Arc::clone(&readers), agg_tx.clone());
-        }
-        // The host holds no aggregate sender; only the forwarders do, so the view
-        // closes once every strategy has finished (all forwarders exited).
-        drop(agg_tx);
+        // The single aggregator is the ONLY writer of the aggregate watch.
+        let (agg_tx, agg_rx) = watch::channel(seed.clone());
+        spawn_aggregator(seed, delta_rx, agg_tx);
 
         // Join task: await every strategy, logging panics/abnormal exits with the
         // StrategyId. Completes when ALL strategy tasks have finished.
@@ -241,10 +250,6 @@ impl StrategyHost {
         })
     }
 }
-
-/// The set of per-strategy status receivers, shared (read-only `borrow`) by every
-/// forwarder so any one can rebuild the full aggregate view.
-type Readers = Arc<Vec<(StrategyId, watch::Receiver<StrategyStatus>)>>;
 
 /// A live, running host: the aggregated status receiver, the per-strategy control
 /// senders, and the completion handle. Returned by [`StrategyHost::run`].
@@ -286,40 +291,54 @@ impl RunningHost {
     }
 }
 
-/// Read every strategy's latest [`StrategyStatus`] into one aggregate snapshot.
-/// `borrow()` always yields the current value (even after the sender dropped —
-/// the `watch` retains the final value), so a finished strategy keeps its last
-/// status in the view.
-fn snapshot(readers: &[(StrategyId, watch::Receiver<StrategyStatus>)]) -> StrategyStatusView {
-    readers
-        .iter()
-        .map(|(id, rx)| (*id, rx.borrow().clone()))
-        .collect()
-}
-
-/// Spawn the per-strategy forwarder: when `changed_rx`'s strategy publishes a new
-/// status, republish the whole aggregate view (the latest of every strategy).
-/// On the strategy finishing (its `status_tx` dropped → `changed()` errors),
-/// publish one final snapshot and stop. Exits early if the aggregate receiver is
-/// gone (`send` errors).
+/// Spawn one per-strategy forwarder: each `status_rx` change becomes a
+/// `(StrategyId, StrategyStatus)` delta on the shared channel carrying that
+/// strategy's latest status. Exits when the strategy's `status_tx` drops (it
+/// finished) or the aggregator is gone (`send` errors). Forwarders never write
+/// the aggregate watch — only the aggregator does.
 fn spawn_forwarder(
-    mut changed_rx: watch::Receiver<StrategyStatus>,
-    readers: Readers,
-    agg_tx: watch::Sender<StrategyStatusView>,
+    id: StrategyId,
+    mut status_rx: watch::Receiver<StrategyStatus>,
+    delta_tx: mpsc::Sender<(StrategyId, StrategyStatus)>,
 ) {
     tokio::spawn(async move {
         loop {
-            match changed_rx.changed().await {
+            match status_rx.changed().await {
                 Ok(()) => {
-                    if agg_tx.send(snapshot(&readers)).is_err() {
-                        return; // publisher dropped the aggregate receiver
+                    // `borrow_and_update` reads the latest and marks it seen, so a
+                    // burst of updates coalesces into the freshest delta.
+                    let status = status_rx.borrow_and_update().clone();
+                    if delta_tx.send((id, status)).await.is_err() {
+                        return; // aggregator gone
                     }
                 }
-                Err(_) => {
-                    // This strategy finished: its last value is retained, so
-                    // publish a final snapshot reflecting it, then stop.
-                    let _ = agg_tx.send(snapshot(&readers));
-                    return;
+                Err(_) => return, // strategy's status_tx dropped → it finished
+            }
+        }
+    });
+}
+
+/// Spawn the single aggregator — the SOLE writer of the aggregate watch. It owns
+/// the authoritative view (seeded with every strategy), applies each incoming
+/// delta to that strategy's slot in place, and republishes the updated vec, so no
+/// staler snapshot can ever clobber a fresher one. When every forwarder has
+/// dropped its delta sender (all strategies finished), `recv` returns `None`, the
+/// task returns, and dropping `agg_tx` closes the aggregate watch (the
+/// publisher's shutdown signal).
+fn spawn_aggregator(
+    mut view: StrategyStatusView,
+    mut delta_rx: mpsc::Receiver<(StrategyId, StrategyStatus)>,
+    agg_tx: watch::Sender<StrategyStatusView>,
+) {
+    // O(1) slot lookup; every strategy is present in the seed.
+    let index: HashMap<StrategyId, usize> =
+        view.iter().enumerate().map(|(i, (id, _))| (*id, i)).collect();
+    tokio::spawn(async move {
+        while let Some((id, status)) = delta_rx.recv().await {
+            if let Some(&i) = index.get(&id) {
+                view[i].1 = status;
+                if agg_tx.send(view.clone()).is_err() {
+                    return; // publisher dropped the aggregate receiver
                 }
             }
         }
@@ -342,16 +361,26 @@ mod tests {
 
     // ---- test fakes -------------------------------------------------------
 
-    /// Publishes a fixed `equity_micro` once, then idles until the global kill
+    /// Publishes one or more `equity_micro` values back-to-back (yielding between
+    /// each so a forwarder can observe them), then idles until the global kill
     /// flag is set or its control channel closes. No inline hook.
     struct FixedEquityStrategy {
         id: StrategyId,
-        equity_micro: i64,
+        equities: Vec<i64>,
     }
 
     impl FixedEquityStrategy {
         fn new(id: StrategyId, equity_micro: i64) -> Self {
-            FixedEquityStrategy { id, equity_micro }
+            FixedEquityStrategy {
+                id,
+                equities: vec![equity_micro],
+            }
+        }
+
+        /// Publish a sequence of equity values rapidly (the last is the final,
+        /// "true" value) to prove the aggregate settles on the LATEST.
+        fn with_sequence(id: StrategyId, equities: Vec<i64>) -> Self {
+            FixedEquityStrategy { id, equities }
         }
     }
 
@@ -372,10 +401,18 @@ mod tests {
                     status_tx,
                     ..
                 } = ctx;
-                let _ = status_tx.send(StrategyStatus {
-                    equity_micro: self.equity_micro,
-                    ..Default::default()
-                });
+                let n = self.equities.len();
+                for (i, equity_micro) in self.equities.iter().enumerate() {
+                    let _ = status_tx.send(StrategyStatus {
+                        equity_micro: *equity_micro,
+                        ..Default::default()
+                    });
+                    if i + 1 < n {
+                        // Yield so the forwarder can observe this update before the
+                        // next one overwrites it (no fixed sleep).
+                        tokio::task::yield_now().await;
+                    }
+                }
                 // Idle: poll the global kill (the real shutdown signal) on a short
                 // cadence, and react to control commands / channel close. No long
                 // sleeps — tests drive shutdown via the kill flag + a timeout.
@@ -541,5 +578,61 @@ mod tests {
         // We reached here ⇒ the process is alive and no panic propagated.
         kill.store(true, Ordering::Release);
         let _ = tokio::time::timeout(Duration::from_secs(5), host.join()).await;
+    }
+
+    /// The single-writer aggregator must settle on the LATEST status when a
+    /// strategy emits two rapid updates — a slower sibling forwarder can never
+    /// clobber the newer value with a staler snapshot (the last-writer race the
+    /// old per-forwarder snapshot writer was prone to).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_aggregate_reflects_latest_of_rapid_updates() {
+        let kill = Arc::new(AtomicBool::new(false));
+        let shared = test_shared(Arc::clone(&kill));
+
+        let mut host = StrategyHost::new(Usdc(10_000_000));
+        // "a" emits a stale value then its final value back-to-back; "b" is a
+        // steady sibling whose forwarder is the other source of deltas.
+        host.add(
+            Box::new(FixedEquityStrategy::with_sequence(
+                StrategyId("a"),
+                vec![1_000_000, 7_000_000],
+            )),
+            envelope(StrategyId("a"), 7_000_000),
+        );
+        host.add(
+            Box::new(FixedEquityStrategy::new(StrategyId("b"), 0)),
+            envelope(StrategyId("b"), 0),
+        );
+
+        let host = host.run(shared).expect("capital validates");
+        let mut status = host.status();
+
+        // Converge to "a" == 7_000_000 (its latest, NOT the stale 1_000_000),
+        // with "b" present at 0.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let done = {
+                    let view = status.borrow_and_update();
+                    view.iter()
+                        .any(|(id, s)| *id == StrategyId("a") && s.equity_micro == 7_000_000)
+                        && view
+                            .iter()
+                            .any(|(id, s)| *id == StrategyId("b") && s.equity_micro == 0)
+                };
+                if done {
+                    break;
+                }
+                if status.changed().await.is_err() {
+                    panic!("aggregate view closed before settling on the latest status");
+                }
+            }
+        })
+        .await
+        .expect("aggregate did not settle on the latest of the rapid updates");
+
+        kill.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(5), host.join())
+            .await
+            .expect("host did not finish after global kill");
     }
 }
