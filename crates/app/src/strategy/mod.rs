@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, watch};
 use crate::wiring::BookFetcher;
 
 pub mod arb;
+pub mod host;
 
 /// Stable identity for a strategy (e.g. `"arb"`, `"mm"`). A `&'static str`
 /// keeps it copyable and cheap to use as a label/map key.
