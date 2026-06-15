@@ -1,10 +1,25 @@
-//! Strategy identity, per-strategy capital envelope, and the startup capital
-//! allocator (multi-strategy platform, Task 1.2). The allocator is a pure
-//! startup guard: Σ per-strategy capital must not exceed the bankroll. No
-//! `StrategyHost` and no strategy trait yet — those arrive in later tasks.
+//! Strategy identity, per-strategy capital envelope, the startup capital
+//! allocator, and the `Strategy` boundary — the trait plus its runtime
+//! `StrategyCtx` and per-strategy `StrategyStatus` (multi-strategy platform,
+//! Tasks 1.2–1.3). The allocator is a pure startup guard: Σ per-strategy
+//! capital must not exceed the bankroll. No `StrategyHost` yet, and arb is not
+//! wrapped as a `Strategy` yet — those arrive in later tasks.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use pm_core::instrument::TokenId;
 use pm_core::num::Usdc;
+use pm_ingestion::shard::Shard;
+use pm_registry::Registry;
 use pm_risk::RiskConfig;
+use pm_store::writer::StoreMsg;
+use tokio::sync::{mpsc, watch};
+
+use crate::coordinator::CtlCommand;
+use crate::wiring::BookFetcher;
 
 /// Stable identity for a strategy (e.g. `"arb"`, `"mm"`). A `&'static str`
 /// keeps it copyable and cheap to use as a label/map key.
@@ -41,6 +56,57 @@ pub fn allocate(envs: &[StrategyEnvelope], bankroll: Usdc) -> Result<(), String>
     Ok(())
 }
 
+/// One strategy's slice of the dashboard state, published on a `watch` channel
+/// for the host to aggregate. The per-strategy analogue of the coordinator's
+/// `CoordStatus`: the money fields are µUSDC (display conversion is the TUI's),
+/// mirroring the columns `publisher.rs` reads — `cash_micro`, `equity_micro`
+/// (bid-marked, reporting), `equity_mid_micro` (mid-marked, risk/halt feed),
+/// `realized_micro`, `unrealized_micro` — plus the latched halt reason and the
+/// pause flag. (Process-wide gates — `killed`, `live`, `busy` — stay on the
+/// host/coordinator, not on the per-strategy status.)
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StrategyStatus {
+    pub cash_micro: i64,
+    pub equity_micro: i64,
+    pub equity_mid_micro: i64,
+    pub realized_micro: i64,
+    pub unrealized_micro: i64,
+    pub open_positions: usize,
+    pub halted: Option<String>,
+    pub paused: bool,
+}
+
+/// The runtime handles a strategy's `run` loop owns: shared read-only ingestion
+/// (`registry`, `fetcher`), the durable-store sender, the global kill flag, its
+/// own control-command stream, and its status publisher. The host builds one
+/// per strategy; the `ctl_rx`/`status_tx` pair is the per-strategy control and
+/// dashboard channel (the same shape the coordinator exposes via
+/// `control_channel`/`status_channel`).
+pub struct StrategyCtx {
+    pub registry: Arc<Registry>,
+    pub fetcher: BookFetcher,
+    pub store_tx: mpsc::Sender<StoreMsg>,
+    pub kill: Arc<AtomicBool>,
+    pub ctl_rx: mpsc::Receiver<CtlCommand>,
+    pub status_tx: watch::Sender<StrategyStatus>,
+}
+
+/// A self-contained trading unit the `StrategyHost` runs in parallel. `Send`
+/// (not `Sync`): the host owns each unit and drives it on its own task. A unit
+/// gets market data two ways, either or both: an inline per-supervisor
+/// `on_apply` hook (arb's hot path) and/or its owned async loop reading via
+/// `ctx.fetcher` on its own cadence.
+pub trait Strategy: Send {
+    /// Stable identity (status-map key / log label).
+    fn id(&self) -> StrategyId;
+    /// Per-supervisor inline hook (arb uses this); `None` if the strategy reads
+    /// books on its own cadence.
+    #[allow(clippy::type_complexity)] // the boxed hook type is the boundary's shape, kept inline for clarity
+    fn make_on_apply(&self) -> Option<Box<dyn FnMut(TokenId, &Shard) + Send>>;
+    /// The strategy's owned async loop; resolves when the strategy ends.
+    fn run(self: Box<Self>, ctx: StrategyCtx) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -58,5 +124,43 @@ mod tests {
         ];
         assert!(allocate(&envs, Usdc(10_000_000)).is_err()); // 6+5 > 10
         assert!(allocate(&envs, Usdc(11_000_000)).is_ok());
+    }
+
+    /// Minimal `Strategy`: a stable id, no inline hook, and a `run` loop that
+    /// observes the kill flag once and returns. Lives in the test module — the
+    /// host's real heartbeat stub arrives with `StrategyHost` (Task 1.5).
+    struct NoopStrategy {
+        id: StrategyId,
+    }
+
+    impl NoopStrategy {
+        fn new(id: StrategyId) -> Self {
+            NoopStrategy { id }
+        }
+    }
+
+    impl Strategy for NoopStrategy {
+        fn id(&self) -> StrategyId {
+            self.id
+        }
+
+        fn make_on_apply(&self) -> Option<Box<dyn FnMut(TokenId, &Shard) + Send>> {
+            None
+        }
+
+        fn run(self: Box<Self>, ctx: StrategyCtx) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async move {
+                // A real strategy loops until kill/ctl close; the noop reads the
+                // kill flag once (proving ctx is wired) and returns immediately.
+                let _ = ctx.kill.load(std::sync::atomic::Ordering::Relaxed);
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn strategy_trait_object_reports_id_and_status() {
+        let s: Box<dyn Strategy> = Box::new(NoopStrategy::new(StrategyId("noop")));
+        assert_eq!(s.id(), StrategyId("noop"));
+        assert!(s.make_on_apply().is_none());
     }
 }
