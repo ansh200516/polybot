@@ -40,6 +40,22 @@ pub struct OrderLine {
     pub detail: String,
 }
 
+/// One strategy's display-only money + control flags for the per-strategy
+/// dashboard breakdown (multi-strategy platform). Same "display only" rule as
+/// the header: the publisher converts µUSDC→USD (`usd()`) and these `f64`
+/// dollars are never fed back into accounting. `id` is the strategy's stable
+/// label (e.g. "arb").
+#[derive(Debug, Clone, PartialEq)]
+pub struct StrategyLine {
+    pub id: String,
+    pub equity_usd: f64,
+    pub cash_usd: f64,
+    pub realized_usd: f64,
+    pub unrealized_usd: f64,
+    pub paused: bool,
+    pub halted: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Health {
     pub ws_connected: bool,
@@ -104,6 +120,11 @@ pub struct AppState {
     pub health: Health,
     /// (level, formatted line) — level: 1=ERROR 2=WARN 3=INFO 4=DEBUG 5=TRACE.
     pub log: Vec<(u8, String)>,
+    /// Per-strategy money/control breakdown (multi-strategy platform). Empty
+    /// when the publisher is driven by the single `CoordStatus` (today's
+    /// wiring); populated when fed the `StrategyHost`'s aggregated view (Task
+    /// 1.8 switches the source). Display only — never fed back into accounting.
+    pub per_strategy: Vec<StrategyLine>,
 }
 
 /// Commands the TUI emits toward the app (translated in main.rs).

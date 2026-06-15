@@ -328,6 +328,22 @@ fn draw_health(f: &mut Frame, s: &AppState, area: Rect) {
     if !s.mode_paper {
         text.push_str(&format!("\nlive_rej {}  held {}", h.live_rej, h.live_held));
     }
+    // Per-strategy breakdown (multi-strategy platform): one compact line each,
+    // shown only when the publisher is fed the host's aggregated view. Empty in
+    // single-strategy / CoordStatus sessions, so the panel is otherwise unchanged.
+    for line in &s.per_strategy {
+        text.push_str(&format!(
+            "\n{} eq {} cash {}",
+            line.id,
+            fmt_usd(line.equity_usd),
+            fmt_usd(line.cash_usd),
+        ));
+        if let Some(reason) = &line.halted {
+            text.push_str(&format!(" HALT:{reason}"));
+        } else if line.paused {
+            text.push_str(" PAUSED");
+        }
+    }
     let block = Block::default().borders(Borders::ALL).title(" Health ");
     let para = Paragraph::new(text).block(block);
     f.render_widget(para, area);
@@ -871,6 +887,50 @@ mod tests {
         let p = AppState { mode_paper: true, ..Default::default() };
         let text = render_to_text(&p, &UiState::default(), 140, 40);
         assert!(!text.contains("live_rej"), "no dead chrome in paper mode");
+    }
+
+    #[test]
+    fn health_panel_shows_per_strategy_breakdown() {
+        // Multi-strategy platform: when the aggregated view drives the
+        // publisher, the Health panel gains one compact line per strategy
+        // (id + display-only money + paused/halt flag). Empty otherwise.
+        let mut s = sample_state();
+        s.per_strategy = vec![
+            crate::state::StrategyLine {
+                id: "arb".into(),
+                equity_usd: 7.00,
+                cash_usd: 1.00,
+                realized_usd: 2.00,
+                unrealized_usd: -0.50,
+                paused: true,
+                halted: None,
+            },
+            crate::state::StrategyLine {
+                id: "mm".into(),
+                equity_usd: 3.00,
+                cash_usd: 0.00,
+                realized_usd: 0.00,
+                unrealized_usd: 0.00,
+                paused: false,
+                halted: Some("DailyDrawdown".into()),
+            },
+        ];
+        let text = render_to_text(&s, &UiState::default(), 160, 60);
+        // "eq 7.00" is unique to the per-strategy line ("arb" alone collides
+        // with the header title), proving the breakdown rendered.
+        assert!(text.contains("eq 7.00"), "arb per-strategy line missing:\n{text}");
+        assert!(text.contains("mm eq 3.00"), "mm per-strategy line missing:\n{text}");
+        // Per-strategy control flags surface (header is neither paused nor halted
+        // in sample_state, so these come only from the breakdown lines).
+        assert!(text.contains("PAUSED"), "arb paused flag missing:\n{text}");
+        assert!(
+            text.contains("HALT:DailyDrawdown"),
+            "mm halt flag missing:\n{text}"
+        );
+
+        // No per_strategy ⇒ no breakdown lines (unchanged single-strategy panel).
+        let bare = render_to_text(&sample_state(), &UiState::default(), 160, 60);
+        assert!(!bare.contains("eq 7.00"), "breakdown must be empty without per_strategy");
     }
 
     #[test]

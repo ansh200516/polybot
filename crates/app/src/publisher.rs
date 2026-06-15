@@ -16,18 +16,68 @@ use pm_core::instrument::TokenId;
 use pm_core::num::{Qty, sell_proceeds};
 use pm_registry::Registry;
 use pm_store::read::ReadStore;
-use pm_tui::state::{AppState, FillLine, Health, OppLine, OrderLine, PositionLine};
+use pm_tui::state::{AppState, FillLine, Health, OppLine, OrderLine, PositionLine, StrategyLine};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::coordinator::{CoordStatus, now_ms};
 use crate::logbuf::LogBuffer;
 use crate::stats::AppStats;
+use crate::strategy::host::StrategyStatusView;
+use crate::strategy::{StrategyId, StrategyStatus};
 use crate::wiring::BookFetcher;
 
 /// Display-only µUSDC → USD (`micro / 1e6`). Never fed back into accounting.
 pub fn usd(micro: i64) -> f64 {
     micro as f64 / 1e6
+}
+
+/// Summed per-strategy money in µUSDC, produced by [`aggregate_money`] when the
+/// publisher is driven by the `StrategyHost`'s aggregated view: the dashboard
+/// header equity/cash/etc. become the SUM of every strategy's micros. Held as
+/// integer µUSDC only to defer rounding — the µUSDC→USD step still happens at
+/// the `AppState` boundary via [`usd`]; like every value here it is display
+/// only and never fed back into accounting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AggregatedMoney {
+    pub cash_micro: i64,
+    pub equity_micro: i64,
+    pub equity_mid_micro: i64,
+    pub realized_micro: i64,
+    pub unrealized_micro: i64,
+}
+
+/// Sum every strategy's money fields across the host's aggregated view. Pure.
+/// Saturating adds so a pathological strategy can't panic the publisher in a
+/// debug build (realistic totals sit far below i64's µUSDC range).
+pub fn aggregate_money(view: &[(StrategyId, StrategyStatus)]) -> AggregatedMoney {
+    let mut m = AggregatedMoney::default();
+    for (_, s) in view {
+        m.cash_micro = m.cash_micro.saturating_add(s.cash_micro);
+        m.equity_micro = m.equity_micro.saturating_add(s.equity_micro);
+        m.equity_mid_micro = m.equity_mid_micro.saturating_add(s.equity_mid_micro);
+        m.realized_micro = m.realized_micro.saturating_add(s.realized_micro);
+        m.unrealized_micro = m.unrealized_micro.saturating_add(s.unrealized_micro);
+    }
+    m
+}
+
+/// One display-only [`StrategyLine`] per strategy in the host's aggregated view,
+/// in view order. Pure: µUSDC→USD via [`usd`], id via `StrategyId.0`, and the
+/// per-strategy `paused`/`halted` carried through verbatim. The per-strategy
+/// analogue of the header money — display only, never fed back into accounting.
+pub fn strategy_lines(view: &[(StrategyId, StrategyStatus)]) -> Vec<StrategyLine> {
+    view.iter()
+        .map(|(id, s)| StrategyLine {
+            id: id.0.to_string(),
+            equity_usd: usd(s.equity_micro),
+            cash_usd: usd(s.cash_micro),
+            realized_usd: usd(s.realized_micro),
+            unrealized_usd: usd(s.unrealized_micro),
+            paused: s.paused,
+            halted: s.halted.clone(),
+        })
+        .collect()
 }
 
 /// Resolve a token id to a display name: `"Question YES"` / `"Question NO"`.
@@ -84,6 +134,14 @@ pub struct PublisherCtx {
     pub stats: Arc<AppStats>,
     pub cells: Vec<Arc<pm_ingestion::stats::StatsCell>>,
     pub status_rx: watch::Receiver<CoordStatus>,
+    /// Optional aggregated per-strategy status from the `StrategyHost` (multi-
+    /// strategy platform, Task 1.7). When `Some`, [`assemble`] sources the
+    /// header money from the SUM of every strategy's micros and fills
+    /// `AppState.per_strategy`; when `None` (today's wiring) the publisher
+    /// behaves exactly as before, sourcing money from the single `CoordStatus`
+    /// above. Task 1.8 switches production wiring to set this. Header badges
+    /// (paused/halted/killed/live) still come from `CoordStatus` in both paths.
+    pub strategy_status_rx: Option<watch::Receiver<StrategyStatusView>>,
     pub registry: Arc<Registry>,
     pub logbuf: Arc<LogBuffer>,
     pub fetcher: BookFetcher,
@@ -258,6 +316,32 @@ pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
         live_held: ctx.stats.live_held.load(Ordering::Relaxed),
     };
 
+    // --- Header money + per-strategy breakdown -----------------------------
+    // When the host's aggregated view is wired (Task 1.8), the header money is
+    // the SUM of every strategy's micros and `per_strategy` lists each strategy;
+    // otherwise (today) money comes from the single CoordStatus and
+    // `per_strategy` is empty. Header badges (paused/halted/killed/live) still
+    // come from CoordStatus in BOTH paths — Task 1.8 reconciles those.
+    let (money, per_strategy) = match &ctx.strategy_status_rx {
+        Some(rx) => {
+            let view = rx.borrow();
+            (
+                aggregate_money(view.as_slice()),
+                strategy_lines(view.as_slice()),
+            )
+        }
+        None => (
+            AggregatedMoney {
+                cash_micro: status.cash_micro,
+                equity_micro: status.equity_micro,
+                equity_mid_micro: status.equity_mid_micro,
+                realized_micro: status.realized_micro,
+                unrealized_micro: status.unrealized_micro,
+            },
+            Vec::new(),
+        ),
+    };
+
     AppState {
         uptime_s: ctx.start.elapsed().as_secs(),
         mode_paper: ctx.mode_paper,
@@ -267,17 +351,18 @@ pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
         halted: status.halted,
         killed: status.killed,
         busy: status.busy,
-        cash_usd: usd(status.cash_micro),
-        equity_usd: usd(status.equity_micro),
-        equity_mid_usd: usd(status.equity_mid_micro),
-        realized_usd: usd(status.realized_micro),
-        unrealized_usd: usd(status.unrealized_micro),
+        cash_usd: usd(money.cash_micro),
+        equity_usd: usd(money.equity_micro),
+        equity_mid_usd: usd(money.equity_mid_micro),
+        realized_usd: usd(money.realized_micro),
+        unrealized_usd: usd(money.unrealized_micro),
         opportunities,
         positions,
         fills,
         orders,
         health,
         log: ctx.logbuf.tail(ctx.log_lines),
+        per_strategy,
     }
 }
 
@@ -406,6 +491,7 @@ mod tests {
             stats,
             cells: vec![cell0, cell1],
             status_rx,
+            strategy_status_rx: None,
             registry: r,
             logbuf,
             fetcher,
@@ -535,6 +621,7 @@ mod tests {
             stats,
             cells: Vec::new(),
             status_rx,
+            strategy_status_rx: None,
             registry: r,
             logbuf,
             fetcher,
@@ -595,6 +682,7 @@ mod tests {
             stats,
             cells: vec![StatsCell::new()],
             status_rx,
+            strategy_status_rx: None,
             registry: r,
             logbuf,
             fetcher,
@@ -614,5 +702,108 @@ mod tests {
         assert_eq!(state.health.live_rej, 5, "live_rej from AppStats");
         assert_eq!(state.health.live_held, 3, "live_held from AppStats");
         drop(_status_tx);
+    }
+
+    /// Task 1.7: fed the host's aggregated per-strategy view, the publisher
+    /// produces the header money as the SUM of every strategy's micros
+    /// (overriding the single CoordStatus) and fills `per_strategy` with one
+    /// display-only line per strategy (ids + usd values + paused flag).
+    #[tokio::test]
+    async fn aggregated_view_sums_header_money_and_fills_per_strategy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.sqlite");
+        let _ = pm_store::Store::open(&path).unwrap();
+        let read = pm_store::read::ReadStore::open(&path).unwrap();
+
+        let stats = crate::stats::AppStats::new();
+        let logbuf = crate::logbuf::LogBuffer::new(10);
+        let r = reg();
+        let fetcher = crate::wiring::BookFetcher::new(std::collections::HashMap::new());
+
+        // CoordStatus money is deliberately non-zero so the test proves the
+        // aggregated view OVERRIDES it (header equity is the per-strategy sum,
+        // not 999). Badges still flow from CoordStatus, untouched here.
+        let (_status_tx, status_rx) =
+            tokio::sync::watch::channel(crate::coordinator::CoordStatus {
+                equity_micro: 999_000_000,
+                cash_micro: 999_000_000,
+                ..Default::default()
+            });
+
+        // Two strategies: "arb" (equity 7.0, cash 1.0, realized 2.0, unreal
+        // -0.5, paused) and "mm" (all zeros). Header equity must sum to 7.0.
+        let view: StrategyStatusView = vec![
+            (
+                StrategyId("arb"),
+                StrategyStatus {
+                    equity_micro: 7_000_000,
+                    cash_micro: 1_000_000,
+                    realized_micro: 2_000_000,
+                    unrealized_micro: -500_000,
+                    paused: true,
+                    ..Default::default()
+                },
+            ),
+            (StrategyId("mm"), StrategyStatus::default()),
+        ];
+        let (_strat_tx, strat_rx) = tokio::sync::watch::channel(view);
+
+        let mut ctx = PublisherCtx {
+            read,
+            stats,
+            cells: Vec::new(),
+            status_rx,
+            strategy_status_rx: Some(strat_rx),
+            registry: r,
+            logbuf,
+            fetcher,
+            feed_rows: 10,
+            fills_rows: 10,
+            log_lines: 10,
+            mode_paper: true,
+            shadow: false,
+            start: std::time::Instant::now(),
+            last_frames: 0,
+            last_at: std::time::Instant::now(),
+        };
+
+        let state = assemble(&mut ctx).await;
+
+        // Header money is the SUM of the per-strategy micros, NOT the CoordStatus.
+        assert!(
+            (state.equity_usd - 7.0).abs() < 1e-9,
+            "header equity must be the per-strategy sum 7.0, got {}",
+            state.equity_usd
+        );
+        assert!(
+            (state.cash_usd - 1.0).abs() < 1e-9,
+            "header cash sum = {}",
+            state.cash_usd
+        );
+        assert!((state.realized_usd - 2.0).abs() < 1e-9);
+        assert!((state.unrealized_usd + 0.5).abs() < 1e-9);
+
+        // per_strategy lists BOTH ids with correct display-only usd values.
+        assert_eq!(state.per_strategy.len(), 2);
+        let arb = state
+            .per_strategy
+            .iter()
+            .find(|l| l.id == "arb")
+            .unwrap();
+        assert!((arb.equity_usd - 7.0).abs() < 1e-9, "arb equity_usd");
+        assert!((arb.cash_usd - 1.0).abs() < 1e-9, "arb cash_usd");
+        assert!((arb.realized_usd - 2.0).abs() < 1e-9, "arb realized_usd");
+        assert!((arb.unrealized_usd + 0.5).abs() < 1e-9, "arb unrealized_usd");
+        assert!(arb.paused, "arb paused flag carried through");
+        let mm = state
+            .per_strategy
+            .iter()
+            .find(|l| l.id == "mm")
+            .unwrap();
+        assert!((mm.equity_usd - 0.0).abs() < 1e-9, "mm equity_usd");
+        assert!(!mm.paused, "mm not paused");
+
+        drop(_status_tx);
+        drop(_strat_tx);
     }
 }

@@ -1023,6 +1023,9 @@ async fn main() {
             stats: Arc::clone(&stats),
             cells: stat_cells.clone(),
             status_rx: status_rx.clone(),
+            // Task 1.7 additive field: None preserves today's CoordStatus-driven
+            // money path. Task 1.8 switches this to the StrategyHost's view.
+            strategy_status_rx: None,
             registry: Arc::clone(&reg),
             logbuf: Arc::clone(&logbuf),
             fetcher: fetcher_pub.expect("fetcher_pub is Some when tui_active"),
