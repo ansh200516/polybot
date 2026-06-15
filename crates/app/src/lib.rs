@@ -7,4 +7,5 @@ pub mod lp_pool;
 pub mod positions;
 pub mod publisher;
 pub mod stats;
+pub mod strategy;
 pub mod wiring;
