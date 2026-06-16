@@ -213,7 +213,8 @@ CREATE TABLE IF NOT EXISTS conversions (
 CREATE TABLE IF NOT EXISTS lots (
   id INTEGER PRIMARY KEY AUTOINCREMENT, token INTEGER NOT NULL, ts_ms INTEGER NOT NULL,
   qty_micro INTEGER NOT NULL, remaining_micro INTEGER NOT NULL,
-  cost_micro INTEGER NOT NULL, cost_remaining_micro INTEGER NOT NULL);
+  cost_micro INTEGER NOT NULL, cost_remaining_micro INTEGER NOT NULL,
+  strategy TEXT NOT NULL DEFAULT 'arb');
 CREATE INDEX IF NOT EXISTS lots_token ON lots(token) WHERE remaining_micro <> 0;
 CREATE TABLE IF NOT EXISTS pnl_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, cash_micro INTEGER NOT NULL,
@@ -261,6 +262,25 @@ fn migrate_strategy_columns(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Add the `strategy` column to the `lots` table if it predates per-strategy
+/// lot accounting. Kept separate from [`migrate_strategy_columns`] because
+/// `lots` is a cost-basis ledger (not one of the `STRATEGY_TABLES` event logs),
+/// but the mechanism is identical: idempotent and safe on new and old DBs — a
+/// fresh DB already has the column (from `SCHEMA`), so this is a no-op there; a
+/// legacy DB gets `ALTER TABLE lots ADD COLUMN strategy TEXT NOT NULL DEFAULT
+/// 'arb'`, which back-fills every existing lot to `'arb'`. That back-fill is the
+/// arb invariant's foundation: on an arb-only DB every lot is `'arb'`, so the
+/// strategy-scoped lot queries match exactly the rows the un-scoped queries did.
+fn migrate_lots_strategy(conn: &Connection) -> Result<(), StoreError> {
+    if !column_exists(conn, "lots", "strategy")? {
+        conn.execute(
+            "ALTER TABLE lots ADD COLUMN strategy TEXT NOT NULL DEFAULT 'arb'",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Widen the partial `lots_token` index to index SHORT lots too.
 ///
 /// The pre-signed-lots index was `... WHERE remaining_micro > 0`, which omits
@@ -303,6 +323,7 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         migrate_strategy_columns(&conn)?;
+        migrate_lots_strategy(&conn)?;
         migrate_lots_index(&conn)?;
         Ok(Store {
             conn,
@@ -314,6 +335,7 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrate_strategy_columns(&conn)?;
+        migrate_lots_strategy(&conn)?;
         migrate_lots_index(&conn)?;
         Ok(Store {
             conn,
@@ -479,20 +501,23 @@ impl Store {
         let realized: i64 = match (r.action.as_str(), signed) {
             // Strict (arb) path — byte-identical to the original insert_fill:
             // Buy opens a long lot; Sell consumes FIFO longs (Oversell + rollback).
+            // Every lot is tagged with the fill's `strategy` (`"arb"` here) and
+            // each consume is scoped to that same tag, so an arb-only DB keys on
+            // the identical row set it always did.
             ("Buy", false) => {
-                lots::insert_lot(&tx, r.token, r.ts_ms, r.qty_micro, -r.cash_micro)?;
+                lots::insert_lot(&tx, r.token, r.ts_ms, r.qty_micro, -r.cash_micro, &r.strategy)?;
                 0
             }
             ("Sell", false) => {
-                let consumed = lots::consume_lots(&tx, r.token, r.qty_micro)?;
+                let consumed = lots::consume_lots(&tx, r.token, r.qty_micro, &r.strategy)?;
                 r.cash_micro - consumed
             }
             // Signed (market-making) path — Buy may cover a short, Sell may open one.
             ("Buy", true) => {
-                lots::buy_signed(&tx, r.token, r.ts_ms, r.qty_micro, r.cash_micro)?
+                lots::buy_signed(&tx, r.token, r.ts_ms, r.qty_micro, r.cash_micro, &r.strategy)?
             }
             // Only ("Sell", true) remains (action validated to Buy|Sell above).
-            _ => lots::sell_signed(&tx, r.token, r.ts_ms, r.qty_micro, r.cash_micro)?,
+            _ => lots::sell_signed(&tx, r.token, r.ts_ms, r.qty_micro, r.cash_micro, &r.strategy)?,
         };
         tx.execute(
             "INSERT INTO fills (order_id, ts_ms, token, action, px_ticks, tick_levels,
@@ -552,14 +577,16 @@ impl Store {
                 let total_cost = -r.cash_micro; // cash is negative for splits (validated above)
                 let yes_cost = (total_cost + 1) / 2; // ceil(total/2)
                 let no_cost = total_cost - yes_cost;
-                lots::insert_lot(&tx, r.yes_token, r.ts_ms, r.units_micro, yes_cost)?;
-                lots::insert_lot(&tx, r.no_token, r.ts_ms, r.units_micro, no_cost)?;
+                // Complete-set conversions are an arb-only mechanism, so the
+                // lots they create/consume are tagged + scoped to `"arb"`.
+                lots::insert_lot(&tx, r.yes_token, r.ts_ms, r.units_micro, yes_cost, "arb")?;
+                lots::insert_lot(&tx, r.no_token, r.ts_ms, r.units_micro, no_cost, "arb")?;
                 0
             }
             _ => {
                 // "merge" — validated above
-                let cost_yes = lots::consume_lots(&tx, r.yes_token, r.units_micro)?;
-                let cost_no = lots::consume_lots(&tx, r.no_token, r.units_micro)?;
+                let cost_yes = lots::consume_lots(&tx, r.yes_token, r.units_micro, "arb")?;
+                let cost_no = lots::consume_lots(&tx, r.no_token, r.units_micro, "arb")?;
                 r.cash_micro - cost_yes - cost_no
             }
         };
@@ -1587,5 +1614,105 @@ mod tests {
                 .unwrap_or_else(|e| panic!("table `{table}` was not migrated: {e}"));
             assert_eq!(strategy, "arb", "table `{table}` must back-fill 'arb'");
         }
+    }
+
+    #[test]
+    fn legacy_lots_without_strategy_column_backfills_arb() {
+        // A pre-strategy DB has a `lots` table WITHOUT the strategy column, with
+        // one open long lot. Opening must ALTER in the column (idempotent),
+        // back-filling the legacy lot to 'arb' — so the arb-scoped consume and
+        // `open_positions` see exactly the rows they always did.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_lots.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE lots (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, token INTEGER NOT NULL, ts_ms INTEGER NOT NULL,
+                   qty_micro INTEGER NOT NULL, remaining_micro INTEGER NOT NULL,
+                   cost_micro INTEGER NOT NULL, cost_remaining_micro INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO lots (token, ts_ms, qty_micro, remaining_micro, cost_micro, cost_remaining_micro)
+                 VALUES (7, 1, 100000000, 100000000, 44000000, 44000000)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Opening migrates the lots table (adds + back-fills the strategy column).
+        let s = Store::open(&path).unwrap();
+        // The un-scoped, per-token position is unchanged by the migration.
+        assert_eq!(s.position(7).unwrap(), (100_000_000, 44_000_000));
+        drop(s);
+
+        // open_positions now tags the back-filled legacy lot 'arb'.
+        let r = crate::read::ReadStore::open(&path).unwrap();
+        assert_eq!(
+            r.open_positions().unwrap(),
+            vec![(7, "arb".to_string(), 100_000_000, 44_000_000)],
+            "the legacy lot back-fills to the 'arb' tag"
+        );
+
+        // A raw SELECT proves the column exists and the row back-filled.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let strategy: String = conn
+            .query_row("SELECT strategy FROM lots", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(strategy, "arb");
+    }
+
+    #[test]
+    fn arb_consume_is_strategy_scoped_oversells_despite_mm_holdings() {
+        // Lot consumption is scoped to the fill's strategy: a strategy only ever
+        // draws down its OWN lots. mm holds a long 100 on token 7, but arb holds
+        // nothing there — so a strict arb Sell must STILL Oversell + roll back
+        // (without scoping it would wrongly consume mm's long). This is the
+        // converse of the arb invariant: arb-only DBs are unchanged precisely
+        // BECAUSE the scope is the fill's own tag.
+        let mut s = mem();
+        // mm long via the signed Buy path (no shorts → opens a long, realized 0).
+        s.insert_order(&order_row("mm1")).unwrap();
+        s.insert_fill_signed(&FillRow {
+            order_id: "mm1".into(),
+            ts_ms: 1,
+            token: 7,
+            action: "Buy".into(),
+            px_ticks: 44,
+            tick_levels: 100,
+            qty_micro: 100_000_000,
+            cash_micro: -44_000_000,
+            fee_micro: 0,
+            strategy: "mm".into(),
+        })
+        .unwrap();
+        assert_eq!(s.position(7).unwrap(), (100_000_000, 44_000_000), "mm's long exists");
+
+        // A strict arb Sell on the same token: arb owns no lots → Oversell.
+        s.insert_order(&order_row("arb1")).unwrap();
+        let err = s.insert_fill(&FillRow {
+            order_id: "arb1".into(),
+            ts_ms: 2,
+            token: 7,
+            action: "Sell".into(),
+            px_ticks: 50,
+            tick_levels: 100,
+            qty_micro: 10_000_000,
+            cash_micro: 5_000_000,
+            fee_micro: 0,
+            strategy: "arb".into(),
+        });
+        assert!(
+            matches!(err, Err(StoreError::Oversell { token: 7, .. })),
+            "arb must oversell — it cannot consume mm's lots"
+        );
+        // mm's long is untouched (arb's failed sell rolled back); the un-scoped
+        // per-token sum is unchanged.
+        assert_eq!(
+            s.position(7).unwrap(),
+            (100_000_000, 44_000_000),
+            "mm long untouched by arb's rolled-back sell"
+        );
     }
 }

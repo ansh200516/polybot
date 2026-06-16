@@ -39,6 +39,9 @@ pub struct FillView {
     pub tick_levels: i64,
     pub qty_micro: i64,
     pub cash_micro: i64,
+    /// Strategy that produced the fill (`"arb"` / `"mm"`); lets the dashboard
+    /// tag each fill row by which strategy traded.
+    pub strategy: String,
 }
 
 #[derive(Debug, Clone)]
@@ -101,7 +104,7 @@ impl ReadStore {
     /// Most-recent `n` fills, newest first.
     pub fn recent_fills(&self, n: usize) -> Result<Vec<FillView>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT ts_ms, token, action, px_ticks, tick_levels, qty_micro, cash_micro
+            "SELECT ts_ms, token, action, px_ticks, tick_levels, qty_micro, cash_micro, strategy
              FROM fills ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -114,6 +117,7 @@ impl ReadStore {
                     tick_levels: row.get(4)?,
                     qty_micro: row.get(5)?,
                     cash_micro: row.get(6)?,
+                    strategy: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -161,15 +165,27 @@ impl ReadStore {
         Ok(rows)
     }
 
-    /// Open positions from FIFO lots: `(token, remaining µshares, remaining cost µUSDC)`.
-    /// Only tokens with a positive remaining quantity are returned, ordered by token id.
-    pub fn open_positions(&self) -> Result<Vec<(i64, i64, i64)>, StoreError> {
+    /// Open positions from FIFO lots, grouped per `(token, strategy)`:
+    /// `(token, strategy, signed net µshares, signed remaining cost µUSDC)`,
+    /// ordered by token then strategy.
+    ///
+    /// Each strategy's lots are summed independently, so an arb long and an mm
+    /// short on the SAME token surface as two distinct rows. The `HAVING ... <>
+    /// 0` predicate (was `> 0`) keeps SHORT positions (negative net, negative
+    /// basis) as well as longs — only fully-closed `(token, strategy)` groups
+    /// (net 0) are dropped. On an arb-only DB every lot is `'arb'`, so this
+    /// returns exactly the long rows the old per-token query did, each now
+    /// carrying the `"arb"` tag.
+    pub fn open_positions(&self) -> Result<Vec<(i64, String, i64, i64)>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT token, SUM(remaining_micro), SUM(cost_remaining_micro)
-             FROM lots GROUP BY token HAVING SUM(remaining_micro) > 0 ORDER BY token",
+            "SELECT token, strategy, SUM(remaining_micro), SUM(cost_remaining_micro)
+             FROM lots GROUP BY token, strategy HAVING SUM(remaining_micro) <> 0
+             ORDER BY token, strategy",
         )?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -343,18 +359,96 @@ mod tests {
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].token, 7);
         assert_eq!(fills[0].cash_micro, -44_000_000);
+        assert_eq!(fills[0].strategy, "arb", "recent_fills surfaces the strategy tag");
 
         let events = r.recent_order_events(10).unwrap();
         assert!(events.iter().any(|e| e.state == "Signed"));
 
         let pos = r.open_positions().unwrap();
-        assert_eq!(pos, vec![(7, 100_000_000, 44_000_000)]);
+        assert_eq!(pos, vec![(7, "arb".to_string(), 100_000_000, 44_000_000)]);
 
         let pnl = r.latest_pnl().unwrap().unwrap();
         assert_eq!(pnl.equity_micro, -45_000_000);
 
         let halts = r.recent_halts(5).unwrap();
         assert_eq!(halts[0].reason, "KillSwitch");
+    }
+
+    #[test]
+    fn open_positions_groups_by_strategy_and_returns_signed_shorts() {
+        // An arb long and an mm short on the SAME token surface as two distinct,
+        // strategy-tagged rows. The mm row is a SHORT — negative net + negative
+        // basis — proving `open_positions` returns shorts (the `<> 0` HAVING),
+        // and the per-(token,strategy) grouping keeps the strategies independent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pos.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        s.insert_order(&OrderRow {
+            id: "arb1".into(),
+            ts_ms: 1,
+            fingerprint: "fp".into(),
+            token: 7,
+            action: "Buy".into(),
+            limit_ticks: 44,
+            tick_levels: 100,
+            qty_micro: 100_000_000,
+            strategy: "arb".into(),
+        })
+        .unwrap();
+        s.insert_fill(&FillRow {
+            order_id: "arb1".into(),
+            ts_ms: 2,
+            token: 7,
+            action: "Buy".into(),
+            px_ticks: 44,
+            tick_levels: 100,
+            qty_micro: 100_000_000,
+            cash_micro: -44_000_000,
+            fee_micro: 0,
+            strategy: "arb".into(),
+        })
+        .unwrap();
+        s.insert_order(&OrderRow {
+            id: "mm1".into(),
+            ts_ms: 3,
+            fingerprint: "fp".into(),
+            token: 7,
+            action: "Sell".into(),
+            limit_ticks: 40,
+            tick_levels: 100,
+            qty_micro: 50_000_000,
+            strategy: "mm".into(),
+        })
+        .unwrap();
+        // mm Sell-to-open on the same token: scoped consume means it opens an
+        // INDEPENDENT short (realized 0) rather than closing arb's long.
+        let realized = s
+            .insert_fill_signed(&FillRow {
+                order_id: "mm1".into(),
+                ts_ms: 4,
+                token: 7,
+                action: "Sell".into(),
+                px_ticks: 40,
+                tick_levels: 100,
+                qty_micro: 50_000_000,
+                cash_micro: 20_000_000,
+                fee_micro: 0,
+                strategy: "mm".into(),
+            })
+            .unwrap();
+        assert_eq!(realized, 0, "mm short-open must NOT consume arb's long");
+        drop(s);
+
+        let r = ReadStore::open(&path).unwrap();
+        let pos = r.open_positions().unwrap();
+        assert_eq!(
+            pos,
+            vec![
+                (7, "arb".to_string(), 100_000_000, 44_000_000),
+                (7, "mm".to_string(), -50_000_000, -20_000_000),
+            ],
+            "two tagged rows on one token: arb long + mm short (signed)"
+        );
     }
 
     #[test]

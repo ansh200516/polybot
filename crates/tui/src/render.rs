@@ -195,13 +195,18 @@ fn draw_opps(f: &mut Frame, s: &AppState, area: Rect) {
 
 fn draw_positions(f: &mut Frame, s: &AppState, area: Rect) {
     let header_style = Style::default().add_modifier(Modifier::BOLD);
-    let header = Row::new(["market", "qty", "basis $", "mark $"]).style(header_style);
+    let header = Row::new(["strat", "market", "qty", "basis $", "mark $"]).style(header_style);
 
     let rows: Vec<Row> = s
         .positions
         .iter()
         .map(|p| {
+            // qty carries its sign (negative = short). The P&L color compares
+            // signed mark vs signed basis, which is correct for both sides: a
+            // short profits when its (negative) mark rises toward its (negative)
+            // basis, i.e. `mark - basis > 0`.
             Row::new([
+                Cell::from(p.strategy.clone()),
                 Cell::from(p.market.clone()),
                 Cell::from(format!("{:.0}", p.qty_shares)),
                 Cell::from(fmt_usd(p.basis_usd)),
@@ -211,7 +216,8 @@ fn draw_positions(f: &mut Frame, s: &AppState, area: Rect) {
         .collect();
 
     let widths = [
-        Constraint::Min(16),
+        Constraint::Length(5),
+        Constraint::Min(14),
         Constraint::Length(7),
         Constraint::Length(9),
         Constraint::Length(9),
@@ -238,13 +244,15 @@ fn draw_fills_orders(f: &mut Frame, s: &AppState, area: Rect) {
     // Fills table
     {
         let header_style = Style::default().add_modifier(Modifier::BOLD);
-        let header = Row::new(["age", "market", "side", "px", "qty", "cash $"]).style(header_style);
+        let header = Row::new(["age", "strat", "market", "side", "px", "qty", "cash $"])
+            .style(header_style);
         let rows: Vec<Row> = s
             .fills
             .iter()
             .map(|fi| {
                 Row::new([
                     Cell::from(format!("{}s", fi.ago_s)),
+                    Cell::from(fi.strategy.clone()),
                     Cell::from(fi.market.clone()),
                     Cell::from(fi.action.clone()),
                     Cell::from(fi.px.clone()),
@@ -255,7 +263,8 @@ fn draw_fills_orders(f: &mut Frame, s: &AppState, area: Rect) {
             .collect();
         let widths = [
             Constraint::Length(5),
-            Constraint::Min(16),
+            Constraint::Length(5),
+            Constraint::Min(14),
             Constraint::Length(6),
             Constraint::Length(6),
             Constraint::Length(7),
@@ -333,10 +342,13 @@ fn draw_health(f: &mut Frame, s: &AppState, area: Rect) {
     // single-strategy / CoordStatus sessions, so the panel is otherwise unchanged.
     for line in &s.per_strategy {
         text.push_str(&format!(
-            "\n{} eq {} cash {}",
+            "\n{} eq {} cash {} pos {} rlzd {} unrl {}",
             line.id,
             fmt_usd(line.equity_usd),
             fmt_usd(line.cash_usd),
+            line.open_positions,
+            fmt_usd(line.realized_usd),
+            fmt_usd(line.unrealized_usd),
         ));
         if let Some(reason) = &line.halted {
             text.push_str(&format!(" HALT:{reason}"));
@@ -670,6 +682,7 @@ mod tests {
                 dispatched: true,
             }],
             positions: vec![crate::state::PositionLine {
+                strategy: "arb".into(),
                 market: "Will Y win? YES".into(),
                 qty_shares: 100.0,
                 basis_usd: 44.0,
@@ -677,6 +690,7 @@ mod tests {
             }],
             fills: vec![crate::state::FillLine {
                 ago_s: 5,
+                strategy: "arb".into(),
                 market: "Will X win?".into(),
                 action: "Buy".into(),
                 px: "0.44".into(),
@@ -735,17 +749,51 @@ mod tests {
     #[test]
     fn positions_panel_renders_holdings() {
         let text = render_to_text(&sample_state(), &UiState::default(), 160, 45);
-        for needle in ["Will Y win? YES", "44.00", "42.00"] {
+        for needle in ["strat", "Will Y win? YES", "44.00", "42.00"] {
             assert!(text.contains(needle), "positions missing {needle}");
         }
+        // The leading strat column tags the row with its owning strategy.
+        let row = text
+            .lines()
+            .find(|l| l.contains("Will Y win? YES"))
+            .unwrap();
+        assert!(row.contains("arb"), "position row must show its strategy:\n{row}");
+    }
+
+    #[test]
+    fn positions_panel_renders_short_with_signed_qty() {
+        // A short shows a NEGATIVE qty, its mm tag, and a negative (liability)
+        // mark — the operator can watch the market maker carry inventory.
+        let mut s = sample_state();
+        s.positions = vec![crate::state::PositionLine {
+            strategy: "mm".into(),
+            market: "Will Z win? NO".into(),
+            qty_shares: -5.0,
+            basis_usd: -2.00, // received $2 opening the short
+            mark_usd: -2.10,  // costs $2.10 to buy back → underwater
+        }];
+        let text = render_to_text(&s, &UiState::default(), 160, 45);
+        let row = text
+            .lines()
+            .find(|l| l.contains("Will Z win? NO"))
+            .unwrap();
+        assert!(row.contains("mm"), "short row must show the mm strategy:\n{row}");
+        assert!(row.contains("-5"), "short row must show a signed (negative) qty:\n{row}");
+        assert!(row.contains("-2.10"), "short row must show its (negative) mark:\n{row}");
     }
 
     #[test]
     fn fills_and_orders_render() {
         let text = render_to_text(&sample_state(), &UiState::default(), 160, 45);
-        for needle in ["0.44", "-44.00", "0192abcd", "Filled"] {
+        for needle in ["strat", "0.44", "-44.00", "0192abcd", "Filled"] {
             assert!(text.contains(needle), "fills/orders missing {needle}");
         }
+        // The strat column tags each fill with the strategy that traded it.
+        let fill_row = text
+            .lines()
+            .find(|l| l.contains("-44.00"))
+            .unwrap();
+        assert!(fill_row.contains("arb"), "fill row must show its strategy:\n{fill_row}");
     }
 
     #[test]
@@ -893,7 +941,9 @@ mod tests {
     fn health_panel_shows_per_strategy_breakdown() {
         // Multi-strategy platform: when the aggregated view drives the
         // publisher, the Health panel gains one compact line per strategy
-        // (id + display-only money + paused/halt flag). Empty otherwise.
+        // (id + display-only money + open-position count + paused/halt flag).
+        // Empty otherwise. Rendered wide (200 cols) so the mm line's full
+        // HALT suffix is not clipped by the Health panel's width.
         let mut s = sample_state();
         s.per_strategy = vec![
             crate::state::StrategyLine {
@@ -902,6 +952,7 @@ mod tests {
                 cash_usd: 1.00,
                 realized_usd: 2.00,
                 unrealized_usd: -0.50,
+                open_positions: 3,
                 paused: true,
                 halted: None,
             },
@@ -911,15 +962,22 @@ mod tests {
                 cash_usd: 0.00,
                 realized_usd: 0.00,
                 unrealized_usd: 0.00,
+                open_positions: 1,
                 paused: false,
                 halted: Some("DailyDrawdown".into()),
             },
         ];
-        let text = render_to_text(&s, &UiState::default(), 160, 60);
+        let text = render_to_text(&s, &UiState::default(), 200, 60);
         // "eq 7.00" is unique to the per-strategy line ("arb" alone collides
         // with the header title), proving the breakdown rendered.
         assert!(text.contains("eq 7.00"), "arb per-strategy line missing:\n{text}");
         assert!(text.contains("mm eq 3.00"), "mm per-strategy line missing:\n{text}");
+        // The enriched fields surface: open-position count, realized, unrealized.
+        // "pos 3"/"rlzd 2.00"/"unrl -0.50" are unique to the arb breakdown line.
+        assert!(text.contains("pos 3"), "arb open-position count missing:\n{text}");
+        assert!(text.contains("rlzd 2.00"), "arb realized missing:\n{text}");
+        assert!(text.contains("unrl -0.50"), "arb unrealized missing:\n{text}");
+        assert!(text.contains("pos 1"), "mm open-position count missing:\n{text}");
         // Per-strategy control flags surface (header is neither paused nor halted
         // in sample_state, so these come only from the breakdown lines).
         assert!(text.contains("PAUSED"), "arb paused flag missing:\n{text}");
@@ -929,7 +987,7 @@ mod tests {
         );
 
         // No per_strategy ⇒ no breakdown lines (unchanged single-strategy panel).
-        let bare = render_to_text(&sample_state(), &UiState::default(), 160, 60);
+        let bare = render_to_text(&sample_state(), &UiState::default(), 200, 60);
         assert!(!bare.contains("eq 7.00"), "breakdown must be empty without per_strategy");
     }
 

@@ -28,36 +28,47 @@ fn floor_mul_div(a: i64, b: i64, c: i64) -> Result<i64, StoreError> {
     i64::try_from(result).map_err(|_| StoreError::Overflow("floor_mul_div result overflows i64"))
 }
 
-/// Insert a new lot for `token`.
+/// Insert a new lot for `token`, tagged with the owning `strategy`. Each
+/// strategy's lots are independent: consumption (below) is scoped to the same
+/// tag, so one strategy never draws down another's inventory.
 pub fn insert_lot(
     tx: &Transaction,
     token: i64,
     ts_ms: i64,
     qty_micro: i64,
     cost_micro: i64,
+    strategy: &str,
 ) -> Result<(), StoreError> {
     tx.execute(
-        "INSERT INTO lots (token, ts_ms, qty_micro, remaining_micro, cost_micro, cost_remaining_micro)
-         VALUES (?1, ?2, ?3, ?3, ?4, ?4)",
-        rusqlite::params![token, ts_ms, qty_micro, cost_micro],
+        "INSERT INTO lots (token, ts_ms, qty_micro, remaining_micro, cost_micro, cost_remaining_micro, strategy)
+         VALUES (?1, ?2, ?3, ?3, ?4, ?4, ?5)",
+        rusqlite::params![token, ts_ms, qty_micro, cost_micro, strategy],
     )?;
     Ok(())
 }
 
-/// Consume `qty_micro` shares of `token` oldest-lot-first. Returns the cost
-/// basis consumed (µUSDC, rounded UP against us per partial lot).
-/// Errors with `Oversell` (caller must roll back the tx) if holdings are short.
-pub fn consume_lots(tx: &Transaction, token: i64, qty_micro: i64) -> Result<i64, StoreError> {
+/// Consume `qty_micro` shares of `token` for `strategy`, oldest-lot-first.
+/// Returns the cost basis consumed (µUSDC, rounded UP against us per partial
+/// lot). Errors with `Oversell` (caller must roll back the tx) if THAT
+/// strategy's holdings are short — a strategy only ever consumes its OWN lots.
+pub fn consume_lots(
+    tx: &Transaction,
+    token: i64,
+    qty_micro: i64,
+    strategy: &str,
+) -> Result<i64, StoreError> {
     let mut need = qty_micro;
     let mut consumed_cost: i64 = 0;
 
     let lots: Vec<(i64, i64, i64)> = {
         let mut stmt = tx.prepare(
             "SELECT id, remaining_micro, cost_remaining_micro FROM lots
-             WHERE token = ?1 AND remaining_micro > 0 ORDER BY id",
+             WHERE token = ?1 AND strategy = ?2 AND remaining_micro > 0 ORDER BY id",
         )?;
-        stmt.query_map([token], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<Result<Vec<_>, _>>()?
+        stmt.query_map(rusqlite::params![token, strategy], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
     };
 
     for (id, remaining, cost_remaining) in lots {
@@ -115,20 +126,24 @@ fn consume_open_side(
     token: i64,
     want_qty: i64,
     long: bool,
+    strategy: &str,
 ) -> Result<(i64, i64), StoreError> {
     let lots: Vec<(i64, i64, i64)> = {
         // Internal predicate (no user input) selects the side; the partial
         // `lots_token` index (`remaining_micro <> 0`) serves both directions.
+        // Scoped to `strategy` so a strategy walks only its OWN open lots.
         let sql = if long {
             "SELECT id, remaining_micro, cost_remaining_micro FROM lots
-             WHERE token = ?1 AND remaining_micro > 0 ORDER BY id"
+             WHERE token = ?1 AND strategy = ?2 AND remaining_micro > 0 ORDER BY id"
         } else {
             "SELECT id, remaining_micro, cost_remaining_micro FROM lots
-             WHERE token = ?1 AND remaining_micro < 0 ORDER BY id"
+             WHERE token = ?1 AND strategy = ?2 AND remaining_micro < 0 ORDER BY id"
         };
         let mut stmt = tx.prepare(sql)?;
-        stmt.query_map([token], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<Result<Vec<_>, _>>()?
+        stmt.query_map(rusqlite::params![token, strategy], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
     };
 
     let mut need = want_qty;
@@ -184,8 +199,9 @@ pub fn sell_signed(
     ts_ms: i64,
     qty_micro: i64,
     cash_micro: i64,
+    strategy: &str,
 ) -> Result<i64, StoreError> {
-    let (closed_qty, consumed_cost) = consume_open_side(tx, token, qty_micro, true)?;
+    let (closed_qty, consumed_cost) = consume_open_side(tx, token, qty_micro, true, strategy)?;
     let proceeds_close = if closed_qty == qty_micro {
         cash_micro // fully covered by longs → no split, identical to strict Sell
     } else {
@@ -196,8 +212,8 @@ pub fn sell_signed(
     if open_qty > 0 {
         let proceeds_open = cash_micro - proceeds_close;
         // Short lot: negative qty + negative basis (cash taken in), so SUM-based
-        // `position` reports a signed short directly.
-        insert_lot(tx, token, ts_ms, -open_qty, -proceeds_open)?;
+        // `position` reports a signed short directly. Tagged with `strategy`.
+        insert_lot(tx, token, ts_ms, -open_qty, -proceeds_open, strategy)?;
     }
     Ok(realized)
 }
@@ -218,9 +234,10 @@ pub fn buy_signed(
     ts_ms: i64,
     qty_micro: i64,
     cash_micro: i64,
+    strategy: &str,
 ) -> Result<i64, StoreError> {
     let cost_paid = -cash_micro; // cash_micro ≤ 0 for a buy → cost_paid ≥ 0
-    let (covered_qty, consumed_basis) = consume_open_side(tx, token, qty_micro, false)?;
+    let (covered_qty, consumed_basis) = consume_open_side(tx, token, qty_micro, false, strategy)?;
     let cost_cover = if covered_qty == qty_micro {
         cost_paid // fully covers existing shorts → no split
     } else {
@@ -231,7 +248,7 @@ pub fn buy_signed(
     let open_qty = qty_micro - covered_qty;
     if open_qty > 0 {
         let cost_open = cost_paid - cost_cover;
-        insert_lot(tx, token, ts_ms, open_qty, cost_open)?;
+        insert_lot(tx, token, ts_ms, open_qty, cost_open, strategy)?;
     }
     Ok(realized)
 }

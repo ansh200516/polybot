@@ -16,7 +16,11 @@ pub struct OppLine {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PositionLine {
+    /// Owning strategy (e.g. "arb" / "mm") so the operator can tell whose
+    /// position this is — the same token can be held independently by each.
+    pub strategy: String,
     pub market: String,
+    /// SIGNED net shares: positive = long, negative = short (e.g. -5.0).
     pub qty_shares: f64,
     pub basis_usd: f64,
     pub mark_usd: f64,
@@ -25,6 +29,8 @@ pub struct PositionLine {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FillLine {
     pub ago_s: u64,
+    /// Strategy that traded this fill (e.g. "arb" / "mm").
+    pub strategy: String,
     pub market: String,
     pub action: String,
     pub px: String, // pre-formatted, e.g. "0.44"
@@ -52,6 +58,9 @@ pub struct StrategyLine {
     pub cash_usd: f64,
     pub realized_usd: f64,
     pub unrealized_usd: f64,
+    /// Count of open positions (tokens with non-zero net) for this strategy,
+    /// so the MM's live exposure is legible even before fills scroll.
+    pub open_positions: usize,
     pub paused: bool,
     pub halted: Option<String>,
 }

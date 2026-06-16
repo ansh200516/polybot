@@ -83,6 +83,7 @@ pub fn strategy_lines(view: &[(StrategyId, StrategyStatus)]) -> Vec<StrategyLine
             cash_usd: usd(s.cash_micro),
             realized_usd: usd(s.realized_micro),
             unrealized_usd: usd(s.unrealized_micro),
+            open_positions: s.open_positions,
             paused: s.paused,
             halted: s.halted.clone(),
         })
@@ -209,6 +210,7 @@ pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
         .into_iter()
         .map(|f| FillLine {
             ago_s: age_s(f.ts_ms),
+            strategy: f.strategy,
             market: market_display(&ctx.registry, f.token),
             action: f.action,
             // Display-only price: ticks / tick_levels (e.g. 44/100 = "0.44").
@@ -232,22 +234,46 @@ pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
         })
         .collect();
 
-    // --- Positions (marked at the current bid) -----------------------------
+    // --- Positions (per (token, strategy); SIGNED net incl. shorts) --------
+    // Sign/mark convention: a positive net is a LONG, marked at the best BID
+    // (what we'd sell into) → a positive mark. A negative net is a SHORT,
+    // marked at the best ASK (what it'd cost to buy back) → a negative mark (a
+    // liability). Both `qty_shares` and `mark_usd` carry the sign so the panel
+    // shows e.g. `-5.0` shares with a negative mark. Longs are byte-identical
+    // to before (bid-marked via `sell_proceeds`).
     let mut positions = Vec::new();
-    for (token, qty_micro, cost_micro) in ctx.read.open_positions().unwrap_or_default() {
+    for (token, strategy, net_micro, cost_micro) in ctx.read.open_positions().unwrap_or_default() {
         let mark_usd = match ctx.fetcher.fetch(TokenId(token as u64)).await {
-            Some((book, true)) => match book.bids.best() {
-                Some(bid) => {
-                    let proceeds = sell_proceeds(bid.microusdc(book.ts()), Qty(qty_micro as u64));
-                    usd(i64::try_from(proceeds.0).unwrap_or(i64::MAX))
+            Some((book, true)) => {
+                if net_micro >= 0 {
+                    match book.bids.best() {
+                        Some(bid) => {
+                            let proceeds =
+                                sell_proceeds(bid.microusdc(book.ts()), Qty(net_micro as u64));
+                            usd(i64::try_from(proceeds.0).unwrap_or(i64::MAX))
+                        }
+                        None => 0.0,
+                    }
+                } else {
+                    match book.asks.best() {
+                        // Cost to buy back the short → a negative mark.
+                        Some(ask) => {
+                            let cost = sell_proceeds(
+                                ask.microusdc(book.ts()),
+                                Qty(net_micro.unsigned_abs()),
+                            );
+                            -usd(i64::try_from(cost.0).unwrap_or(i64::MAX))
+                        }
+                        None => 0.0,
+                    }
                 }
-                None => 0.0,
-            },
+            }
             _ => 0.0,
         };
         positions.push(PositionLine {
+            strategy,
             market: market_display(&ctx.registry, token),
-            qty_shares: qty_micro as f64 / 1e6,
+            qty_shares: net_micro as f64 / 1e6,
             basis_usd: usd(cost_micro),
             mark_usd,
         });
@@ -462,6 +488,74 @@ mod tests {
             None,
         );
         std::sync::Arc::new(b.finish("").unwrap())
+    }
+
+    /// Spawn a book responder serving a single (bid, ask) snapshot for one
+    /// token's `BookSnapshot` requests — the test analogue of a live feed, used
+    /// to mark positions. Returns the command sender to register in a
+    /// [`BookFetcher`].
+    fn spawn_book(
+        bid_tick: u16,
+        ask_tick: u16,
+    ) -> tokio::sync::mpsc::Sender<pm_ingestion::supervisor::SupervisorCommand> {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            use pm_core::book::{Book, Side};
+            use pm_core::num::{Px, Qty};
+            while let Some(pm_ingestion::supervisor::SupervisorCommand::BookSnapshot {
+                reply,
+                ..
+            }) = cmd_rx.recv().await
+            {
+                let mut b = Book::new(TickSize::Cent);
+                b.apply(
+                    Side::Bid,
+                    Px::new(bid_tick, TickSize::Cent).unwrap(),
+                    Qty(200_000_000),
+                );
+                b.apply(
+                    Side::Ask,
+                    Px::new(ask_tick, TickSize::Cent).unwrap(),
+                    Qty(200_000_000),
+                );
+                let _ = reply.send(Some((b, true)));
+            }
+        });
+        cmd_tx
+    }
+
+    /// Build a legacy-path (`strategy_status_rx: None`) `PublisherCtx` over the
+    /// given store + fetcher + registry. Returns the ctx and the `CoordStatus`
+    /// sender (kept by the caller so the watch borrow inside `assemble` stays
+    /// valid). Defaults mirror the other publisher tests.
+    fn legacy_ctx(
+        read: ReadStore,
+        fetcher: crate::wiring::BookFetcher,
+        registry: std::sync::Arc<pm_registry::Registry>,
+    ) -> (PublisherCtx, watch::Sender<crate::coordinator::CoordStatus>) {
+        let (status_tx, status_rx) =
+            watch::channel(crate::coordinator::CoordStatus::default());
+        let ctx = PublisherCtx {
+            read,
+            stats: crate::stats::AppStats::new(),
+            cells: Vec::new(),
+            status_rx,
+            strategy_status_rx: None,
+            kill: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            arb_status_rx: None,
+            registry,
+            logbuf: crate::logbuf::LogBuffer::new(10),
+            fetcher,
+            feed_rows: 10,
+            fills_rows: 10,
+            log_lines: 10,
+            mode_paper: true,
+            shadow: false,
+            start: std::time::Instant::now(),
+            last_frames: 0,
+            last_at: std::time::Instant::now(),
+        };
+        (ctx, status_tx)
     }
 
     #[test]
@@ -836,6 +930,7 @@ mod tests {
                     cash_micro: 1_000_000,
                     realized_micro: 2_000_000,
                     unrealized_micro: -500_000,
+                    open_positions: 4,
                     paused: true,
                     ..Default::default()
                 },
@@ -892,6 +987,7 @@ mod tests {
         assert!((arb.cash_usd - 1.0).abs() < 1e-9, "arb cash_usd");
         assert!((arb.realized_usd - 2.0).abs() < 1e-9, "arb realized_usd");
         assert!((arb.unrealized_usd + 0.5).abs() < 1e-9, "arb unrealized_usd");
+        assert_eq!(arb.open_positions, 4, "arb open-position count carried through");
         assert!(arb.paused, "arb paused flag carried through");
         let mm = state
             .per_strategy
@@ -998,5 +1094,159 @@ mod tests {
         drop(_status_tx);
         drop(_strat_tx);
         drop(_arb_status_tx);
+    }
+
+    /// A DB with one arb fill (strict long Buy) and one mm fill (signed
+    /// Sell-to-open) → `AppState.fills` carries BOTH, each tagged with the
+    /// strategy that traded it, so the dashboard can show who did what.
+    #[tokio::test]
+    async fn assemble_tags_fills_by_strategy() {
+        let r = reg();
+        let m = r.markets()[0];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.sqlite");
+        {
+            let mut s = pm_store::Store::open(&path).unwrap();
+            s.insert_order(&pm_store::OrderRow {
+                id: "arb1".into(),
+                ts_ms: 1,
+                fingerprint: "f".into(),
+                token: m.yes.0 as i64,
+                action: "Buy".into(),
+                limit_ticks: 44,
+                tick_levels: 100,
+                qty_micro: 100_000_000,
+                strategy: "arb".into(),
+            })
+            .unwrap();
+            s.insert_fill(&pm_store::FillRow {
+                order_id: "arb1".into(),
+                ts_ms: 10,
+                token: m.yes.0 as i64,
+                action: "Buy".into(),
+                px_ticks: 44,
+                tick_levels: 100,
+                qty_micro: 100_000_000,
+                cash_micro: -44_000_000,
+                fee_micro: 0,
+                strategy: "arb".into(),
+            })
+            .unwrap();
+            s.insert_order(&pm_store::OrderRow {
+                id: "mm1".into(),
+                ts_ms: 2,
+                fingerprint: "f".into(),
+                token: m.no.0 as i64,
+                action: "Sell".into(),
+                limit_ticks: 40,
+                tick_levels: 100,
+                qty_micro: 50_000_000,
+                strategy: "mm".into(),
+            })
+            .unwrap();
+            // Signed Sell-to-open: no longs → a pure mm short (never Oversells).
+            s.insert_fill_signed(&pm_store::FillRow {
+                order_id: "mm1".into(),
+                ts_ms: 20,
+                token: m.no.0 as i64,
+                action: "Sell".into(),
+                px_ticks: 40,
+                tick_levels: 100,
+                qty_micro: 50_000_000,
+                cash_micro: 20_000_000,
+                fee_micro: 0,
+                strategy: "mm".into(),
+            })
+            .unwrap();
+        }
+        let read = pm_store::read::ReadStore::open(&path).unwrap();
+        // Fills don't need a book (only positions are marked) → empty fetcher.
+        let fetcher = crate::wiring::BookFetcher::new(std::collections::HashMap::new());
+        let (mut ctx, _status_tx) = legacy_ctx(read, fetcher, r);
+
+        let state = assemble(&mut ctx).await;
+
+        assert_eq!(state.fills.len(), 2, "both fills surface");
+        let arb = state
+            .fills
+            .iter()
+            .find(|f| f.strategy == "arb")
+            .unwrap();
+        assert_eq!(arb.action, "Buy", "the arb fill is the long Buy");
+        let mm = state
+            .fills
+            .iter()
+            .find(|f| f.strategy == "mm")
+            .unwrap();
+        assert_eq!(mm.action, "Sell", "the mm fill is the short-open Sell");
+        drop(_status_tx);
+    }
+
+    /// An mm SHORT position surfaces as a `PositionLine` tagged `"mm"` with a
+    /// NEGATIVE signed qty, marked at the best ASK (what it'd cost to buy back)
+    /// → a negative mark. Proves the signed/short convention end to end.
+    #[tokio::test]
+    async fn assemble_marks_mm_short_at_ask_tagged_mm() {
+        let r = reg();
+        let m = r.markets()[0];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.sqlite");
+        {
+            let mut s = pm_store::Store::open(&path).unwrap();
+            s.insert_order(&pm_store::OrderRow {
+                id: "mm1".into(),
+                ts_ms: 1,
+                fingerprint: "f".into(),
+                token: m.no.0 as i64,
+                action: "Sell".into(),
+                limit_ticks: 40,
+                tick_levels: 100,
+                qty_micro: 50_000_000,
+                strategy: "mm".into(),
+            })
+            .unwrap();
+            // Short 50 NO @ $0.40 → proceeds $20 → basis −$20, net −50.
+            s.insert_fill_signed(&pm_store::FillRow {
+                order_id: "mm1".into(),
+                ts_ms: 2,
+                token: m.no.0 as i64,
+                action: "Sell".into(),
+                px_ticks: 40,
+                tick_levels: 100,
+                qty_micro: 50_000_000,
+                cash_micro: 20_000_000,
+                fee_micro: 0,
+                strategy: "mm".into(),
+            })
+            .unwrap();
+        }
+        let read = pm_store::read::ReadStore::open(&path).unwrap();
+        // Book for the NO token: bid 38, ask 41. The short marks at the ASK.
+        let fetcher = crate::wiring::BookFetcher::new(std::collections::HashMap::from([(
+            m.no,
+            spawn_book(38, 41),
+        )]));
+        let (mut ctx, _status_tx) = legacy_ctx(read, fetcher, r);
+
+        let state = assemble(&mut ctx).await;
+
+        assert_eq!(state.positions.len(), 1, "one open mm short");
+        let p = &state.positions[0];
+        assert_eq!(p.strategy, "mm", "position tagged with its strategy");
+        assert!(
+            (p.qty_shares + 50.0).abs() < 1e-9,
+            "signed (negative) short qty, got {}",
+            p.qty_shares
+        );
+        assert!((p.basis_usd + 20.0).abs() < 1e-9, "short basis −$20, got {}", p.basis_usd);
+        // Marked at the ASK (0.41 × 50 = $20.50) as a liability → −$20.50, NOT
+        // the bid (0.38 × 50 = $19.00). A bid-mark would give −19.00, so this
+        // also proves the short uses the ask side.
+        assert!(
+            (p.mark_usd + 20.5).abs() < 1e-9,
+            "short marked at the ask as a negative liability, got {}",
+            p.mark_usd
+        );
+        drop(_status_tx);
     }
 }
