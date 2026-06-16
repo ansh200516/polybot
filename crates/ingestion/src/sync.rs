@@ -255,13 +255,33 @@ fn add_accepted_market(
         clob.closed,
         event_key,
     );
-    // Phase-5 segmentation: capture the per-market Gamma liquidity metrics.
-    builder.record_market_metrics(MarketMetrics {
-        volume: gm.volume,
-        volume_24hr: gm.volume_24hr,
-        liquidity: gm.liquidity,
+    // Phase-5 segmentation: capture the per-market Gamma liquidity metrics
+    // (with the event-level fallback — see `market_metrics`).
+    builder.record_market_metrics(market_metrics(gm, event));
+}
+
+/// Build the Phase-5 [`MarketMetrics`] for a market, falling back to its EVENT's
+/// figures for any metric the market omits.
+///
+/// This fallback is load-bearing on LIVE data: the Gamma feed carries `volume`
+/// per market but reports `liquidity` ONLY at the event level (the market's
+/// `liquidity` is `null`). Without the fallback every live market scores
+/// liquidity 0 → classifies [`Illiquid`](pm_registry::segment::MarketSegment::Illiquid)
+/// → the market maker (which quotes only liquid segments) gets an EMPTY market
+/// set and never quotes. Liquidity prefers the event's CLOB book depth
+/// (`liquidity_clob`) over the broader `liquidity`. Per-market `volume` is kept
+/// as the primary signal (so a thin outcome inside a liquid event — low own
+/// volume — still classifies Illiquid and is not quoted).
+fn market_metrics(gm: &GammaMarket, event: &GammaEvent) -> MarketMetrics {
+    MarketMetrics {
+        volume: gm.volume.or(event.volume),
+        volume_24hr: gm.volume_24hr.or(event.volume_24hr),
+        liquidity: gm
+            .liquidity
+            .or(event.liquidity_clob)
+            .or(event.liquidity),
         category: gm.category.clone(),
-    });
+    }
 }
 
 /// Assemble a [`Registry`] from gamma event groupings joined with CLOB market
@@ -421,12 +441,9 @@ fn assemble_prioritized<'a>(
             };
 
             // ---- rank inputs: classify the segment, build the priority key ---
-            let metrics = MarketMetrics {
-                volume: gm.volume,
-                volume_24hr: gm.volume_24hr,
-                liquidity: gm.liquidity,
-                category: gm.category.clone(),
-            };
+            // Event-level fallback (see `market_metrics`) so live markets — whose
+            // own `liquidity` is null — inherit their event's liquidity and rank.
+            let metrics = market_metrics(gm, event);
             let segment = classify(&metrics, &filter.segment_thresholds);
             let priority = market_priority(&metrics, segment);
 
@@ -1307,13 +1324,53 @@ mod tests {
         assert!(spain_metrics.liquidity.unwrap() > 1_000_000.0);
         assert_eq!(reg.segment(spain, &t), MarketSegment::LiquidStable);
 
-        // Iran: volume present but liquidity ABSENT in the fixture → None →
-        // Illiquid (conservative: unknown liquidity is never MM-eligible).
+        // Iran: the MARKET-level liquidity is absent (null on the wire, as on the
+        // LIVE feed), but the market now INHERITS its EVENT's liquidity (~1.8M)
+        // via the `market_metrics` fallback — so it classifies LiquidStable
+        // rather than being wrongly dropped to Illiquid. This is the fix for the
+        // live bug where every market scored liquidity 0 and the MM never quoted.
         let iran = reg.market_by_condition(IRAN).unwrap().id;
         let iran_metrics = reg.metrics(iran).unwrap();
         assert!(iran_metrics.volume.is_some());
-        assert!(iran_metrics.liquidity.is_none());
-        assert_eq!(reg.segment(iran, &t), MarketSegment::Illiquid);
+        assert!(
+            iran_metrics.liquidity.unwrap() > 1_000_000.0,
+            "market liquidity is null → must inherit the event's liquidity"
+        );
+        assert_eq!(reg.segment(iran, &t), MarketSegment::LiquidStable);
+    }
+
+    /// Regression for the LIVE Gamma shape: the market object carries `volume`
+    /// but its `liquidity` is `null` (only the EVENT exposes liquidity). The
+    /// market must inherit the event's liquidity — preferring `liquidityClob`
+    /// (CLOB book depth) over the broader `liquidity` — so it does not collapse
+    /// to Illiquid (the bug that left the market maker with an empty market set).
+    #[test]
+    fn live_shaped_market_inherits_event_liquidity() {
+        let event: GammaEvent = serde_json::from_str(
+            r#"{
+                "id": "1",
+                "negRisk": false,
+                "volume": 1577270.29,
+                "liquidity": 3163.22,
+                "liquidityClob": 9000.0,
+                "markets": [
+                    {"conditionId":"0xabc","clobTokenIds":"[\"1\",\"2\"]",
+                     "active":true,"closed":false,"volume":"494516.53","question":"Q"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let gm = &event.markets[0];
+        // The live market really does omit liquidity.
+        assert_eq!(gm.liquidity, None, "live market object carries no liquidity");
+
+        let m = market_metrics(gm, &event);
+        assert_eq!(m.volume, Some(494516.53), "per-market volume stays primary");
+        assert_eq!(
+            m.liquidity,
+            Some(9000.0),
+            "inherits the event's liquidityClob (preferred over the broader liquidity)"
+        );
     }
 
     // ---- Test 7: keyset envelope parser ------------------------------------

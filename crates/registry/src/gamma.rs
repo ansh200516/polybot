@@ -173,6 +173,27 @@ pub struct GammaEvent {
     pub markets: Vec<GammaMarket>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Event-level lifetime volume, USD. Phase-5 segmentation fallback: the LIVE
+    /// Gamma feed reports `volume` at the market level, but if a market omits it
+    /// the event aggregate stands in. Bare float on the wire.
+    #[serde(default, deserialize_with = "de_flexible_f64")]
+    pub volume: Option<f64>,
+    /// Event-level trailing-24h volume, USD (`volume24hr`).
+    #[serde(default, rename = "volume24hr", deserialize_with = "de_flexible_f64")]
+    pub volume_24hr: Option<f64>,
+    /// Event-level resting liquidity, USD. CRUCIAL Phase-5 fallback: the LIVE
+    /// Gamma feed does NOT carry `liquidity` on the market object (it is `null`
+    /// there) — only the EVENT exposes it. Each member market inherits the
+    /// event's liquidity when its own is absent, so markets actually classify
+    /// above Illiquid. Bare float on the wire.
+    #[serde(default, deserialize_with = "de_flexible_f64")]
+    pub liquidity: Option<f64>,
+    /// Event-level CLOB order-book liquidity, USD (`liquidityClob`). Preferred
+    /// over `liquidity` for the market-making segmentation signal: it is the
+    /// resting CLOB book depth (what a maker quotes against), not the broader
+    /// liquidity figure. Bare float on the wire.
+    #[serde(default, rename = "liquidityClob", deserialize_with = "de_flexible_f64")]
+    pub liquidity_clob: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------

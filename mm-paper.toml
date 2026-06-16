@@ -1,0 +1,62 @@
+# mm-paper.toml — PAPER market-making demo (no real money).
+#
+# Runs the new market-maker strategy alongside arbitrage, with SIMULATED fills
+# against the live book. Nothing here can place a real order: `live = false`
+# everywhere and the binary is not started with `--live`. Only the sections
+# below are overridden; every other config value uses its built-in default
+# (same mechanism as canary.toml).
+#
+#   cargo build --release --bin arb
+#   ./target/release/arb --config mm-paper.toml --max-markets 60 --db /tmp/mm-paper.sqlite
+#
+# Stop with `q` (TUI), `touch kill.switch`, or `kill -USR1 <pid>`.
+
+# ---------------------------------------------------------------------------
+# Market maker (paper)
+# ---------------------------------------------------------------------------
+[strategies.mm]
+enabled          = true     # turn the market-maker ON (default is off)
+live             = false    # PAPER: fills come from the simulator, never the venue
+capital_usd      = 50.0     # MM's slice of the bankroll; arb's risk cap shrinks to match
+max_markets      = 20       # quote at most this many (the most-liquid eligible) markets
+spread_bps       = 200      # total quoted spread: 200 bps = 0.02 → bid 0.49 / ask 0.51 at a 0.50 mid
+quote_refresh_ms = 1500     # re-quote cadence
+max_quote_usd    = 5.0      # max notional per single quote (one side)
+inventory_skew_bps = 150    # lean quotes against inventory (long → quote lower to offload)
+rebate_bps       = 0        # maker-rebate ESTIMATE (bps of filled notional). 0 = none assumed;
+                            # set your real CLOB maker-rewards rate to see accrual in paper.
+# live_fills_source only matters when live = true ("ws" = low-latency user feed, "rest" = poll).
+
+# ---------------------------------------------------------------------------
+# Inventory risk (caps the MM takes on; halts latch and pull/cancel quotes)
+# ---------------------------------------------------------------------------
+[inventory]
+max_inventory_usd       = 50.0    # per-market signed inventory cap (quotes beyond this are rejected)
+max_gross_inventory_usd = 150.0   # total gross inventory across all markets
+inventory_stop_loss_usd = 25.0    # unrealized loss that latches a stop (cancels quotes)
+daily_loss_usd          = 50.0    # total (realized+unrealized) daily floor
+vol_pull_ticks          = 5       # a mid move ≥ this many ticks within the window pulls quotes
+vol_window_ms           = 2000    # volatility-hint window
+
+# ---------------------------------------------------------------------------
+# Segmentation — which markets the MM is allowed to quote.
+# Arb always runs on ALL markets; the MM only quotes the segments listed below.
+# NOTE: these thresholds are LOWERED for a small paper demo so markets actually
+# qualify. For production, raise them (defaults: LiquidStable vol>=100k/liq>=50k,
+# Liquid vol>=10k/liq>=5k) so the MM only touches genuinely deep books.
+# ---------------------------------------------------------------------------
+[segments]
+liquid_stable_min_volume    = 50000.0
+liquid_stable_min_liquidity = 10000.0
+liquid_min_volume           = 2000.0
+liquid_min_liquidity        = 1000.0
+mm_segments         = ["LiquidStable", "Liquid"]  # never quote Illiquid markets
+mm_exclude_fee_free = true                         # skip 0-fee markets (rebate MM earns nothing there)
+
+# ---------------------------------------------------------------------------
+# Universe — keep the most-liquid markets when capped (so the MM has deep books
+# to quote). Opt-in; default sync order is arbitrary (Gamma keyset order).
+# ---------------------------------------------------------------------------
+[universe]
+prioritize_by_liquidity = true
+candidate_pool          = 300    # rank up to this many candidates, keep the top max_markets
