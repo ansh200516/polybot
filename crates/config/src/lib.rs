@@ -353,11 +353,13 @@ pub struct Inventory {
     pub max_inventory_usd: f64,
     /// Gross inventory cap summed across markets, USD.
     pub max_gross_inventory_usd: f64,
-    /// MtM loss that latches the tighter inventory stop-loss halt + flatten, USD.
+    /// Open-inventory UNREALIZED mark-to-market loss that latches the inventory
+    /// stop-loss halt + flatten, USD. Keys off unrealized P&L only.
     pub inventory_stop_loss_usd: f64,
-    /// Broader per-strategy session realized+unrealized floor, USD. Operationally
-    /// `>= inventory_stop_loss_usd` (validated): the stop is the inner trigger,
-    /// this is the wider backstop.
+    /// Per-strategy TOTAL (realized + unrealized) P&L floor that latches the
+    /// daily-loss halt, USD. A SESSION floor — there is no calendar-day reset yet;
+    /// it accumulates over the whole run. Independent of `inventory_stop_loss_usd`
+    /// (no ordering constraint): each floor can fire without the other.
     pub daily_loss_usd: f64,
     /// Volatility "pull-quotes" hint threshold, in ticks (1 tick = 1 cent): a mid
     /// move beyond this many ticks within `vol_window_ms` advises pulling quotes.
@@ -516,8 +518,9 @@ impl Config {
             return Err(ConfigError::BadMoney("risk.mid_spread_cap_ticks must be ≥ 1"));
         }
         // Inventory-risk caps (Phase 2; inert until a strategy opts in). All money
-        // must be positive + finite; the broader daily floor must not sit tighter
-        // than the stop-loss (mark checks the stop first, then the daily floor).
+        // must be positive + finite. The stop-loss (open-inventory unrealized) and
+        // the daily floor (total session P&L) are INDEPENDENT measures, so there
+        // is no ordering constraint between them.
         if self.inventory.max_inventory_usd <= 0.0 || !self.inventory.max_inventory_usd.is_finite() {
             return Err(ConfigError::BadMoney(
                 "inventory.max_inventory_usd must be > 0",
@@ -540,10 +543,8 @@ impl Config {
         if self.inventory.daily_loss_usd <= 0.0 || !self.inventory.daily_loss_usd.is_finite() {
             return Err(ConfigError::BadMoney("inventory.daily_loss_usd must be > 0"));
         }
-        if self.inventory.daily_loss_usd < self.inventory.inventory_stop_loss_usd {
-            return Err(ConfigError::BadMoney(
-                "inventory.daily_loss_usd must be ≥ inventory_stop_loss_usd",
-            ));
+        if self.inventory.vol_pull_ticks == 0 {
+            return Err(ConfigError::BadMoney("inventory.vol_pull_ticks must be ≥ 1"));
         }
         if self.inventory.vol_window_ms < 1 {
             return Err(ConfigError::BadMoney("inventory.vol_window_ms must be ≥ 1"));
@@ -889,19 +890,25 @@ mod tests {
     fn inventory_validation_rejects_bad_values() {
         // stop-loss must be > 0
         assert!(Config::from_toml_str("[inventory]\ninventory_stop_loss_usd = 0.0\n").is_err());
-        // daily floor must be ≥ stop-loss (20 < 25 default stop → reject)
-        assert!(Config::from_toml_str("[inventory]\ndaily_loss_usd = 20.0\n").is_err());
+        // daily floor must be > 0
+        assert!(Config::from_toml_str("[inventory]\ndaily_loss_usd = 0.0\n").is_err());
+        // vol_pull_ticks must be ≥ 1
+        assert!(Config::from_toml_str("[inventory]\nvol_pull_ticks = 0\n").is_err());
         // vol_window_ms must be ≥ 1
         assert!(Config::from_toml_str("[inventory]\nvol_window_ms = 0\n").is_err());
         // caps must be positive + finite
         assert!(Config::from_toml_str("[inventory]\nmax_inventory_usd = 0.0\n").is_err());
         assert!(Config::from_toml_str("[inventory]\nmax_gross_inventory_usd = -1.0\n").is_err());
-        // a daily floor exactly equal to the stop is allowed (inclusive)
+
+        // The stop-loss (unrealized) and daily (total) floors are INDEPENDENT
+        // now — daily < stop is a valid config (no ordering constraint), so it
+        // must parse rather than be rejected.
         let c = Config::from_toml_str(
-            "[inventory]\ninventory_stop_loss_usd = 40.0\ndaily_loss_usd = 40.0\n",
+            "[inventory]\ninventory_stop_loss_usd = 40.0\ndaily_loss_usd = 30.0\n",
         )
         .unwrap();
-        assert!((c.inventory.daily_loss_usd - 40.0).abs() < 1e-9);
+        assert!((c.inventory.inventory_stop_loss_usd - 40.0).abs() < 1e-9);
+        assert!((c.inventory.daily_loss_usd - 30.0).abs() < 1e-9);
     }
 
     #[test]

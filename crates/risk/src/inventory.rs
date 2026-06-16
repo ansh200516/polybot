@@ -24,9 +24,12 @@ use pm_core::num::{div_ceil_i128, TickSize, Usdc, ONE_SHARE_MICRO};
 
 /// Tick basis for the volatility hint: 1 tick = 1 cent = 10_000 µUSDC, the
 /// dominant Polymarket increment (`TickSize::Cent`). `pm-risk` is pure and holds
-/// no per-token tick size, so [`InventoryRisk::vol_hint`] assumes the cent grid
-/// the Phase-4 market-making strategy quotes on; a finer-grid strategy can
-/// pre-scale its `vol_pull_ticks` to match.
+/// no per-token tick size, so [`InventoryRisk::vol_hint`] measures moves in whole
+/// cents on the cent grid the Phase-4 market-making strategy quotes on. The
+/// threshold is a whole number of cents (`vol_pull_ticks` is an integer): on a
+/// finer (e.g. 0.001) grid this cent basis is COARSER than the native tick, so
+/// the hint only catches cent-scale moves there — a sub-cent threshold is not
+/// expressible.
 const VOL_TICK_MICRO: u64 = TickSize::Cent.unit_microusdc();
 
 /// Per-strategy inventory caps (spec §5, all µUSDC). Defined now so the type is
@@ -40,16 +43,20 @@ pub struct InventoryConfig {
     /// Gross inventory cap, summed across markets. Enforced by `check_quote`
     /// (Task 2.2).
     pub max_gross_inventory_usd: Usdc,
-    /// Mark-to-market loss that latches the TIGHTER `StopLoss` halt + flatten:
-    /// `mark` trips it when `mtm_pnl ≤ −inventory_stop_loss_usd` (Task 2.4,
-    /// checked FIRST). Operationally the inner of the two MtM floors
-    /// (`≤ daily_loss_usd`).
+    /// Open-inventory mark-to-market bleed that latches the urgent `StopLoss`
+    /// halt + flatten: `mark` trips it when the UNREALIZED P&L alone
+    /// `unrealized ≤ −inventory_stop_loss_usd` (Task 2.4, checked FIRST). Keys
+    /// off `unrealized` only — banked realized losses do NOT count here (those
+    /// feed `daily_loss_usd`). Independent of `daily_loss_usd`: no ordering
+    /// constraint between them.
     pub inventory_stop_loss_usd: Usdc,
-    /// Per-strategy session realized+unrealized floor — the BROADER backstop that
-    /// latches `DailyLoss` when `mtm_pnl ≤ −daily_loss_usd` and the tighter stop
-    /// has not already tripped (Task 2.4). SAME `mtm_pnl = realized + unrealized`
-    /// measure as the stop-loss (Task 2.3); operationally `≥ inventory_stop_loss_usd`,
-    /// so in normal config the stop binds first and `DailyLoss` is the wider net.
+    /// Per-strategy TOTAL session realized+unrealized floor that latches
+    /// `DailyLoss`: `mark` trips it when `mtm_pnl = realized + unrealized
+    /// ≤ −daily_loss_usd` (Task 2.4). A SESSION floor — there is no calendar-day
+    /// reset yet; it accumulates over the whole run. Independent of the
+    /// unrealized-only `inventory_stop_loss_usd`: either can fire without the
+    /// other (a fresh open position bleeding unrealized → `StopLoss`; banked
+    /// realized losses while near-flat → `DailyLoss`).
     pub daily_loss_usd: Usdc,
     /// Volatility "pull-quotes" hint threshold in TICKS: a mid move of more than
     /// this many ticks within `vol_window` makes [`InventoryRisk::vol_hint`]
@@ -134,20 +141,19 @@ pub type Marks = HashMap<TokenId, u64>;
 /// `SessionLoss`") — mirrors `lib.rs`'s `HaltReason`: there is no clear path,
 /// the strategy restarts to clear it.
 ///
-/// Both variants key off the SAME `mtm_pnl = realized + unrealized` measure
-/// `mark` computes (Task 2.3); they differ only in threshold and in which is
-/// checked first. `StopLoss` is the tighter, flatten-triggering floor and is
-/// checked FIRST; `DailyLoss` is the broader session backstop. With the
-/// operational invariant `daily_loss_usd ≥ inventory_stop_loss_usd`, the stop
-/// binds before the daily floor — so `DailyLoss` is the wider net for configs
-/// where the two floors are deliberately ordered the other way.
+/// The two variants key off DISTINCT, independently-meaningful measures (spec
+/// §5), so each is reachable on its own: `StopLoss` watches the open inventory's
+/// unrealized mark-to-market bleed, `DailyLoss` watches total session P&L. `mark`
+/// checks the urgent `StopLoss` FIRST, so it wins the reason when both fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvHalt {
-    /// `mtm_pnl ≤ −inventory_stop_loss_usd`. The tighter MtM floor; checked
-    /// first in `mark` so it wins the reason when both floors are crossed.
+    /// Open-inventory unrealized bleed: `unrealized ≤ −inventory_stop_loss_usd`.
+    /// The urgent mark-to-market loss on the standing position → flatten. Checked
+    /// FIRST, so it wins the reason when both floors fire. Ignores realized P&L.
     StopLoss,
-    /// `mtm_pnl ≤ −daily_loss_usd` while the tighter `StopLoss` was NOT crossed
-    /// this cycle. The broader per-strategy session floor (Task 2.4).
+    /// Total session floor: `mtm_pnl (= realized + unrealized) ≤ −daily_loss_usd`.
+    /// The broader per-strategy backstop → halt — e.g. banked realized losses
+    /// with little open inventory trip this WITHOUT crossing the unrealized stop.
     DailyLoss,
 }
 
@@ -174,10 +180,12 @@ pub struct InventoryStatus {
     pub net_by_token: Vec<(TokenId, i128)>,
     /// Σ realized P&L across all tokens, µUSDC.
     pub realized: Usdc,
-    /// Σ unrealized (marked) P&L across all tokens, µUSDC. Each token's
-    /// `net·mark/1e6` value term is rounded against us (see `mark`).
+    /// Σ unrealized (marked) P&L across all tokens, µUSDC — the open-inventory
+    /// bleed the `StopLoss` floor keys off. Each token's `net·mark/1e6` value
+    /// term is rounded against us (see `mark`).
     pub unrealized: Usdc,
-    /// `realized + unrealized`, µUSDC — the measure the stop-loss keys off.
+    /// `realized + unrealized`, µUSDC — the total session P&L the `DailyLoss`
+    /// floor keys off.
     pub mtm_pnl: Usdc,
     /// Held (non-flat) tokens that had NO real entry in `marks` this cycle,
     /// sorted by `TokenId` (deterministic). Non-empty means the marks set was
@@ -367,14 +375,15 @@ impl InventoryRisk {
     /// entry (e.g. a resolved-worthless token) and does NOT count as omitted.
     ///
     /// **Latch:** when `unmarked` is empty and not already halted, `mark` checks
-    /// the two MtM floors against `mtm_pnl` in priority order — the tighter
-    /// `inventory_stop_loss_usd` FIRST (it is the flatten trigger), then the
-    /// broader `daily_loss_usd`. `mtm_pnl ≤ −inventory_stop_loss_usd` latches
-    /// `StopLoss`; otherwise `mtm_pnl ≤ −daily_loss_usd` latches `DailyLoss`, so
-    /// when both are crossed `StopLoss` wins the reason. First halt wins and
+    /// the two DISTINCT floors in priority order. FIRST the urgent open-inventory
+    /// stop: `unrealized ≤ −inventory_stop_loss_usd` latches `StopLoss` (the
+    /// flatten trigger). Otherwise the total session floor:
+    /// `mtm_pnl (= realized + unrealized) ≤ −daily_loss_usd` latches `DailyLoss`.
+    /// They are independent measures (the stop ignores realized P&L), so each is
+    /// reachable alone; when both fire `StopLoss` wins. First halt wins and
     /// recovery never clears it (sticky), mirroring `RiskEngine::update_session_pnl`;
     /// each boundary is inclusive (exactly `−cap` trips), matching the
-    /// session-loss cap. Both floors use the one `mtm_pnl` measure above.
+    /// session-loss cap.
     pub fn mark(&mut self, marks: &Marks) -> InventoryStatus {
         let mut realized: i128 = 0;
         let mut unrealized: i128 = 0;
@@ -415,12 +424,14 @@ impl InventoryRisk {
         // Sticky halt latch — ONLY when every held token was really marked
         // (`unmarked` empty): incomplete marks report the worst-case loss but
         // must NOT permanently halt on a transient data gap. First halt wins and
-        // recovery never clears it (mirrors update_session_pnl). Both floors key
-        // off the same `mtm`; the TIGHTER stop-loss is checked FIRST (it is the
-        // flatten trigger), then the broader daily floor — so when both are
-        // crossed the latched reason is StopLoss.
+        // recovery never clears it (mirrors update_session_pnl). Two DISTINCT,
+        // independently-reachable floors: the urgent open-inventory stop keys off
+        // UNREALIZED alone and is checked FIRST (it is the flatten trigger); the
+        // broader daily floor keys off TOTAL session `mtm` — so when both fire
+        // StopLoss wins, yet banked realized losses can trip DailyLoss with the
+        // unrealized stop untouched.
         if self.halted.is_none() && unmarked.is_empty() {
-            if mtm <= -self.cfg.inventory_stop_loss_usd.0 {
+            if unrealized <= -self.cfg.inventory_stop_loss_usd.0 {
                 self.halted = Some(InvHalt::StopLoss);
             } else if mtm <= -self.cfg.daily_loss_usd.0 {
                 self.halted = Some(InvHalt::DailyLoss);
@@ -467,6 +478,12 @@ impl InventoryRisk {
     /// longer than the window (ordinary drift), returns `false`. The first
     /// observation for a token has nothing to compare against and returns
     /// `false`. Every call records `(mid_micro, now)` as the new last.
+    ///
+    /// Measured POINT-TO-POINT between consecutive observations (this call's mid
+    /// vs the immediately previous one), NOT a rolling window max/min — so the
+    /// Phase-4 caller must sample at the cadence over which it wants to detect a
+    /// move: sparser sampling can straddle and miss a fast spike, denser sampling
+    /// sees smaller per-step deltas.
     ///
     /// Purely advisory: it never latches and never touches the sticky halt — the
     /// strategy pulls quotes that later cycle back in once the move settles. It
@@ -967,7 +984,9 @@ mod tests {
         inv.on_fill(t, 1000 * SHARE, Usdc(-500_000_000));
 
         // Mark $0.39: value = 1000·0.39 = $390; unrealized = 390 − 500 = −$110.
-        // mtm = 0 + (−110) = −$110 ≤ −$100 → StopLoss latches.
+        // StopLoss keys off UNREALIZED: −$110 ≤ −$100 → latches (realized 0 here,
+        // so unrealized == mtm; `stop_loss_keys_on_unrealized_not_total_pnl`
+        // separates them).
         let st = inv.mark(&Marks::from([(t, 390_000)]));
         assert_eq!(st.realized, Usdc(0));
         assert_eq!(st.unrealized, Usdc(-110_000_000));
@@ -1089,9 +1108,9 @@ mod tests {
 
     #[test]
     fn mark_stop_loss_boundary_is_inclusive() {
-        // Mirrors the `*_boundary_is_inclusive` convention: exactly at −cap
-        // latches, one µUSDC above (−cap + 1) does not. A $0.10 stop and a
-        // 1-share long give 1-µUSDC mtm granularity via the mark.
+        // StopLoss keys off UNREALIZED; exactly at −cap latches, one µUSDC above
+        // does not. A $0.10 stop + a 1-share long give 1-µUSDC granularity via
+        // the mark; realized stays 0, so unrealized is the whole story here.
         let mut c = cfg();
         c.inventory_stop_loss_usd = Usdc(100_000); // $0.10
         let t = TokenId(1);
@@ -1101,7 +1120,7 @@ mod tests {
         // mark $0.400001 → value 400_001; unrealized = 400_001 − 500_000 =
         // −99_999 = −cap + 1 → just inside, NOT halted.
         let just_above = inv.mark(&Marks::from([(t, 400_001)]));
-        assert_eq!(just_above.mtm_pnl, Usdc(-99_999), "−cap + 1 µUSDC");
+        assert_eq!(just_above.unrealized, Usdc(-99_999), "−cap + 1 µUSDC");
         assert_eq!(
             just_above.halted, None,
             "one µUSDC above the cap must not latch"
@@ -1109,7 +1128,7 @@ mod tests {
 
         // mark $0.40 → value 400_000; unrealized = −100_000 = −cap exactly → latches.
         let at_cap = inv.mark(&Marks::from([(t, 400_000)]));
-        assert_eq!(at_cap.mtm_pnl, Usdc(-100_000), "exactly −cap");
+        assert_eq!(at_cap.unrealized, Usdc(-100_000), "exactly −cap");
         assert_eq!(
             at_cap.halted,
             Some(InvHalt::StopLoss),
@@ -1128,7 +1147,7 @@ mod tests {
         assert_eq!(inv.flatten_directive(), None, "unhalted → no flatten");
 
         // Drive a stop-loss latch via mark: long 1000 sh @ $0.50 → basis $500;
-        // mark $0.39 → value $390, mtm = −$110 ≤ −$100 → StopLoss latches.
+        // mark $0.39 → unrealized = 390 − 500 = −$110 ≤ −$100 → StopLoss latches.
         inv.on_fill(t, 1000 * SHARE, Usdc(-500_000_000));
         let st = inv.mark(&Marks::from([(t, 390_000)]));
         assert_eq!(st.halted, Some(InvHalt::StopLoss));
@@ -1142,41 +1161,131 @@ mod tests {
     }
 
     #[test]
-    fn daily_loss_latches_when_below_floor_but_not_stop() {
-        let t = TokenId(1);
-
-        // (a) ONLY the daily floor is crossed. Invert the operational ordering so
-        //     the stop sits DEEPER than the daily floor: stop $100, daily $50.
-        //     Long 1000 sh @ $0.50 → basis $500; mark $0.44 → value $440,
-        //     mtm = −$60. −$60 ≤ −$50 (daily) but −$60 > −$100 (stop) → DailyLoss.
+    fn stop_loss_keys_on_unrealized_not_total_pnl() {
+        // StopLoss watches the OPEN position's unrealized bleed ALONE — it must
+        // fire even when banked realized gains keep total session P&L positive.
+        // Valid config: stop $25, daily $50 (daily ≥ stop).
         let mut c = cfg();
-        c.inventory_stop_loss_usd = Usdc(100_000_000); // $100 (deeper)
+        c.inventory_stop_loss_usd = Usdc(25_000_000); // $25
         c.daily_loss_usd = Usdc(50_000_000); // $50
+        let t = TokenId(1);
         let mut inv = InventoryRisk::new(c);
-        inv.on_fill(t, 1000 * SHARE, Usdc(-500_000_000));
-        let st = inv.mark(&Marks::from([(t, 440_000)]));
-        assert_eq!(st.mtm_pnl, Usdc(-60_000_000), "mtm −$60");
+
+        // Bank +$40 realized via a round-trip: buy 100 @ $0.20, sell 100 @ $0.60
+        // → realized +$40, flat.
+        inv.on_fill(t, 100 * SHARE, Usdc(-20_000_000));
+        inv.on_fill(t, -100 * SHARE, Usdc(60_000_000));
+        // Fresh long 100 @ $0.50 → basis $50; mark $0.20 → value $20,
+        // unrealized = 20 − 50 = −$30.
+        inv.on_fill(t, 100 * SHARE, Usdc(-50_000_000));
+        let st = inv.mark(&Marks::from([(t, 200_000)]));
+
+        assert_eq!(st.realized, Usdc(40_000_000), "+$40 banked");
+        assert_eq!(st.unrealized, Usdc(-30_000_000), "open position bleeds −$30");
+        assert_eq!(st.mtm_pnl, Usdc(10_000_000), "total session P&L still +$10");
+        // unrealized −$30 ≤ −$25 stop → StopLoss, even though mtm is +$10 (daily
+        // floor nowhere near). Proves the stop ignores realized P&L.
+        assert_eq!(st.halted, Some(InvHalt::StopLoss));
+
+        // Sticky: a recovery mark back above the stop does not clear it.
+        let st2 = inv.mark(&Marks::from([(t, 600_000)]));
+        assert!(st2.unrealized > Usdc(0), "open position recovered");
+        assert_eq!(st2.halted, Some(InvHalt::StopLoss), "sticky: never cleared");
+    }
+
+    #[test]
+    fn daily_loss_latches_on_total_pnl_without_stop() {
+        // DailyLoss watches TOTAL session P&L: banked realized losses can trip it
+        // while the open position's unrealized stays well inside the stop. Valid
+        // config: stop $25, daily $50 (daily ≥ stop).
+        let mut c = cfg();
+        c.inventory_stop_loss_usd = Usdc(25_000_000); // $25
+        c.daily_loss_usd = Usdc(50_000_000); // $50
+        let t = TokenId(1);
+        let mut inv = InventoryRisk::new(c);
+
+        // Bank −$60 realized via a round-trip: buy 200 @ $0.50, sell 200 @ $0.20
+        // → realized = 40 − 100 = −$60, flat.
+        inv.on_fill(t, 200 * SHARE, Usdc(-100_000_000));
+        inv.on_fill(t, -200 * SHARE, Usdc(40_000_000));
+        // Small open long 10 @ $0.50 → basis $5; mark $0.45 → value $4.50,
+        // unrealized = 4.5 − 5 = −$0.50 (well inside the −$25 stop).
+        inv.on_fill(t, 10 * SHARE, Usdc(-5_000_000));
+        let st = inv.mark(&Marks::from([(t, 450_000)]));
+
+        assert_eq!(st.realized, Usdc(-60_000_000), "−$60 banked");
+        assert_eq!(st.unrealized, Usdc(-500_000), "open bleed only −$0.50");
+        assert_eq!(st.mtm_pnl, Usdc(-60_500_000), "total session P&L −$60.50");
+        // unrealized −$0.50 > −$25 (no stop) but mtm −$60.50 ≤ −$50 → DailyLoss.
         assert_eq!(
             st.halted,
             Some(InvHalt::DailyLoss),
-            "only the broader daily floor was crossed"
+            "the total-P&L floor, not the unrealized stop"
         );
-        // A daily-loss latch flattens too.
         assert_eq!(inv.flatten_directive(), Some(Flatten { unwind: false }));
+    }
 
-        // (b) BOTH floors cross → the tighter stop-loss is checked FIRST and wins
-        //     the reason. stop $25, daily $50, mtm −$60 (≤ both) → StopLoss.
-        let mut c2 = cfg();
-        c2.inventory_stop_loss_usd = Usdc(25_000_000); // $25 (tighter)
-        c2.daily_loss_usd = Usdc(50_000_000); // $50
-        let mut inv2 = InventoryRisk::new(c2);
-        inv2.on_fill(t, 1000 * SHARE, Usdc(-500_000_000));
-        let st2 = inv2.mark(&Marks::from([(t, 440_000)])); // mtm −$60 ≤ −$25 and ≤ −$50
-        assert_eq!(st2.mtm_pnl, Usdc(-60_000_000), "mtm −$60");
+    #[test]
+    fn stop_loss_wins_when_both_floors_cross() {
+        // When the unrealized stop AND the total daily floor are BOTH crossed,
+        // the urgent StopLoss is checked first and wins the reason.
+        let mut c = cfg();
+        c.inventory_stop_loss_usd = Usdc(25_000_000); // $25
+        c.daily_loss_usd = Usdc(50_000_000); // $50
+        let t = TokenId(1);
+        let mut inv = InventoryRisk::new(c);
+
+        // Bank −$40 realized (buy 100 @ $0.50, sell 100 @ $0.10), then a fresh
+        // long 100 @ $0.50 marked to $0.20 → unrealized −$30, mtm −$70.
+        inv.on_fill(t, 100 * SHARE, Usdc(-50_000_000));
+        inv.on_fill(t, -100 * SHARE, Usdc(10_000_000));
+        inv.on_fill(t, 100 * SHARE, Usdc(-50_000_000));
+        let st = inv.mark(&Marks::from([(t, 200_000)]));
+
+        assert_eq!(st.unrealized, Usdc(-30_000_000), "−$30 ≤ −$25 stop");
+        assert_eq!(st.mtm_pnl, Usdc(-70_000_000), "−$70 ≤ −$50 daily too");
         assert_eq!(
-            st2.halted,
+            st.halted,
             Some(InvHalt::StopLoss),
-            "stop-loss is the tighter/flatten trigger; checked first when both cross"
+            "both cross → the urgent stop is checked first and wins"
+        );
+    }
+
+    #[test]
+    fn daily_loss_boundary_is_inclusive() {
+        // The DailyLoss (total-P&L) floor: exactly at −daily latches, one µUSDC
+        // above does not. A high stop keeps the unrealized floor out of the way
+        // so only the daily floor is in play. daily $50, stop $100.
+        let mut c = cfg();
+        c.inventory_stop_loss_usd = Usdc(100_000_000); // $100 (out of the way)
+        c.daily_loss_usd = Usdc(50_000_000); // $50
+        let t = TokenId(1);
+        let mut inv = InventoryRisk::new(c);
+
+        // Bank −$30 realized (buy 100 @ $0.50, sell 100 @ $0.20), then open 100 @
+        // $0.50 (basis $50) so the mark sets unrealized at 1-µUSDC granularity.
+        inv.on_fill(t, 100 * SHARE, Usdc(-50_000_000));
+        inv.on_fill(t, -100 * SHARE, Usdc(20_000_000));
+        inv.on_fill(t, 100 * SHARE, Usdc(-50_000_000));
+
+        // mark $0.300001 → value 30_000_100; unrealized = −19_999_900;
+        // mtm = −30M + (−19_999_900) = −49_999_900 = −daily + 100 → just inside.
+        let just_above = inv.mark(&Marks::from([(t, 300_001)]));
+        assert_eq!(just_above.mtm_pnl, Usdc(-49_999_900), "−daily + 100 µUSDC");
+        assert_eq!(just_above.halted, None, "just inside the daily floor");
+
+        // mark $0.30 → value 30_000_000; unrealized = −$20; mtm = −$50 exactly → latches.
+        let at_cap = inv.mark(&Marks::from([(t, 300_000)]));
+        assert_eq!(at_cap.mtm_pnl, Usdc(-50_000_000), "exactly −daily");
+        assert_eq!(
+            at_cap.unrealized,
+            Usdc(-20_000_000),
+            "unrealized −$20 > −$100 stop, so only the daily floor is in play"
+        );
+        assert_eq!(
+            at_cap.halted,
+            Some(InvHalt::DailyLoss),
+            "exactly at −daily must latch (inclusive boundary)"
         );
     }
 
