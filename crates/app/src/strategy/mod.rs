@@ -65,9 +65,14 @@ pub fn allocate(envs: &[StrategyEnvelope], bankroll: Usdc) -> Result<(), String>
 /// mirroring the columns `publisher.rs` reads — `cash_micro`, `equity_micro`
 /// (bid-marked, reporting), `equity_mid_micro` (mid-marked, risk/halt feed),
 /// `realized_micro`, `unrealized_micro` — plus the latched halt reason and the
-/// pause flag. Field order matches `CoordStatus` (minus the process-wide gates
-/// `killed`/`live`/`busy`, which stay on the host/coordinator) so the host's
-/// Task-1.7 aggregation maps 1:1.
+/// pause flag. That prefix's field order matches `CoordStatus` (minus the
+/// process-wide gates `killed`/`live`/`busy`, which stay on the host/coordinator)
+/// so the host's Task-1.7 aggregation maps 1:1.
+///
+/// `rebate_micro` is appended (Task 4.4) and has NO `CoordStatus` analogue: it
+/// is an MM-specific maker-rebate ESTIMATE (µUSDC), surfaced SEPARATELY and
+/// never folded into the money fields above (arb/heartbeat leave it 0). The
+/// publisher sums it like the other money fields but keeps it distinct.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StrategyStatus {
     pub paused: bool,
@@ -78,6 +83,10 @@ pub struct StrategyStatus {
     pub realized_micro: i64,
     pub unrealized_micro: i64,
     pub open_positions: usize,
+    /// Maker-rebate ESTIMATE accrued so far (µUSDC), Task 4.4. Display-only and
+    /// kept SEPARATE from `cash`/`equity`/`realized` (an unverified, out-of-band
+    /// estimate). `0` for strategies that earn no rebate (arb, the heartbeat).
+    pub rebate_micro: i64,
 }
 
 /// Neutral per-strategy control command from the host (TUI-translated),

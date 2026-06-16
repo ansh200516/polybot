@@ -45,6 +45,12 @@ pub struct AggregatedMoney {
     pub equity_mid_micro: i64,
     pub realized_micro: i64,
     pub unrealized_micro: i64,
+    /// Σ per-strategy maker-rebate ESTIMATE (Task 4.4), µUSDC. Summed like the
+    /// other money fields but kept DISTINCT — it is an unverified, out-of-band
+    /// estimate and is never folded into `equity`/`cash`/`realized` (which would
+    /// inflate position P&L). Only the MM strategy contributes; arb/heartbeat
+    /// leave it 0.
+    pub rebate_micro: i64,
 }
 
 /// Sum every strategy's money fields across the host's aggregated view. Pure.
@@ -58,6 +64,9 @@ pub fn aggregate_money(view: &[(StrategyId, StrategyStatus)]) -> AggregatedMoney
         m.equity_mid_micro = m.equity_mid_micro.saturating_add(s.equity_mid_micro);
         m.realized_micro = m.realized_micro.saturating_add(s.realized_micro);
         m.unrealized_micro = m.unrealized_micro.saturating_add(s.unrealized_micro);
+        // The maker-rebate estimate sums alongside the others but stays a
+        // SEPARATE field (never added into equity/cash/realized).
+        m.rebate_micro = m.rebate_micro.saturating_add(s.rebate_micro);
     }
     m
 }
@@ -364,6 +373,9 @@ pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
                     equity_mid_micro: status.equity_mid_micro,
                     realized_micro: status.realized_micro,
                     unrealized_micro: status.unrealized_micro,
+                    // `CoordStatus` (arb's single-strategy feed) has no rebate
+                    // estimate — that is MM-specific. 0 on the legacy path.
+                    rebate_micro: 0,
                 };
                 (
                     money,
@@ -743,6 +755,46 @@ mod tests {
         assert_eq!(state.health.live_rej, 5, "live_rej from AppStats");
         assert_eq!(state.health.live_held, 3, "live_held from AppStats");
         drop(_status_tx);
+    }
+
+    /// Task 4.4: `aggregate_money` sums the maker-rebate estimate across
+    /// strategies alongside the other money — but as a SEPARATE field, never
+    /// folded into equity/cash/realized. Only MM contributes; arb leaves it 0.
+    #[test]
+    fn aggregate_money_sums_rebate_separately() {
+        let view: Vec<(StrategyId, StrategyStatus)> = vec![
+            (
+                StrategyId("arb"),
+                StrategyStatus {
+                    equity_micro: 7_000_000,
+                    cash_micro: 1_000_000,
+                    realized_micro: 2_000_000,
+                    // arb earns no maker rebate.
+                    rebate_micro: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                StrategyId("mm"),
+                StrategyStatus {
+                    equity_micro: 3_000_000,
+                    cash_micro: 500_000,
+                    realized_micro: 1_000_000,
+                    rebate_micro: 25_000,
+                    ..Default::default()
+                },
+            ),
+        ];
+        let m = aggregate_money(&view);
+        assert_eq!(m.equity_micro, 10_000_000, "equity sums the two strategies");
+        assert_eq!(m.cash_micro, 1_500_000);
+        assert_eq!(m.realized_micro, 3_000_000);
+        // The rebate is summed on its OWN field and is NOT mixed into equity etc.
+        assert_eq!(m.rebate_micro, 25_000, "rebate summed across strategies");
+        assert_eq!(
+            m.equity_micro, 10_000_000,
+            "rebate must not inflate the summed equity"
+        );
     }
 
     /// Task 1.7: fed the host's aggregated per-strategy view, the publisher

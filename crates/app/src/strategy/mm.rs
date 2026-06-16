@@ -18,7 +18,7 @@
 //!   kill cancels and exits cleanly.
 //! - **Paper only**: runs over the [`PaperMakerVenue`]; the live arm is Task 4.5.
 //!
-//! # Scope (Task 4.3 — skew + volatility pull, this task)
+//! # Scope (Task 4.3 — skew + volatility pull)
 //! - **Inventory SKEW**: [`skew_fair`] shifts `fair` (= mid) against inventory
 //!   inside [`compute_quotes`] — a long lowers BOTH quotes, a short raises them,
 //!   scaled by `clamp(net / inventory_cap, ±1)` up to `inventory_skew_bps`.
@@ -26,8 +26,14 @@
 //!   mid move in [`MmLoop::quote`], excluding that token from the desired set so
 //!   `reconcile` cancels its resting quotes without replacing (a pull).
 //!
+//! # Scope (Task 4.4 — maker-rebate accrual, this task)
+//! - **Rebate accrual** (estimate): [`MmLoop::consume_fills`] accrues
+//!   `rebate_bps · fill_notional / 10_000` per maker fill into a running
+//!   `rebate_accrued_micro`, surfaced as the SEPARATE [`StrategyStatus::rebate_micro`].
+//!   Deliberately NOT folded into cash/equity/realized — it is an unverified,
+//!   paid-out-of-band ESTIMATE; folding it would inflate position P&L (spec §7).
+//!
 //! # Deferred (left as clean seams — do NOT implement here)
-//! - **Rebate accrual** (Task 4.4) — plugs in at fill consumption.
 //! - **Live venue + host wiring** (Task 4.5): `run` builds a concrete
 //!   [`PaperMakerVenue`], but the loop is generic over any
 //!   `MakerVenue + UserFillSource`, so 4.5 passes a live venue unchanged.
@@ -80,6 +86,11 @@ pub struct MmParams {
     /// inventory, bps of $1 (1 bp = 100 µUSDC/share). `0` disables skew. See
     /// [`skew_fair`].
     pub inventory_skew_bps: u32,
+    /// Maker-rebate ESTIMATE (Task 4.4): bps of each maker fill's NOTIONAL
+    /// accrued as an estimated rebate. `0` assumes no rebate. Surfaced as a
+    /// SEPARATE display quantity — never folded into cash/equity/realized (it is
+    /// an unverified, out-of-band estimate). See [`MmLoop::consume_fills`].
+    pub rebate_bps: u32,
 }
 
 impl MmParams {
@@ -91,6 +102,7 @@ impl MmParams {
             quote_refresh: Duration::from_millis(mm.quote_refresh_ms),
             max_quote_micro: pm_config::usd_to_microusdc(mm.max_quote_usd)?,
             inventory_skew_bps: mm.inventory_skew_bps,
+            rebate_bps: mm.rebate_bps,
         })
     }
 }
@@ -351,6 +363,11 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     /// `order_id → resting-order metadata`, for fill→side resolution and the
     /// write-ahead order row. Grows as ids churn; old ids are harmless.
     placed: HashMap<OrderId, Placed>,
+    /// Running maker-rebate ESTIMATE (Task 4.4), µUSDC: `Σ rebate_bps ·
+    /// fill_notional / 10_000` over every maker fill. Tracked SEPARATELY and
+    /// published in [`StrategyStatus::rebate_micro`] — never added to
+    /// cash/equity/realized (an unverified, out-of-band estimate).
+    rebate_accrued_micro: i128,
     paused: bool,
     /// Latched once an inventory halt fires — quoting never resumes this session.
     halted: bool,
@@ -498,7 +515,17 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             let cost_delta = Usdc(basis_after - basis_before);
             self.positions
                 .apply(&[(f.token, f.qty, cost_delta)], cash, &self.token_market);
-            // REBATE ACCRUAL (Task 4.4) plugs in here.
+            // REBATE ACCRUAL (Task 4.4): makers EARN an estimated rebate on the
+            // filled NOTIONAL. fill_notional = price · qty (µUSDC): price_micro
+            // µUSDC/share × qty µshares ÷ 1e6 µshares/share (side-agnostic, so we
+            // recompute it here rather than reuse the signed `cash`). Accrue
+            // `rebate_bps · notional / 10_000` into the running estimate. Kept
+            // SEPARATE — never added to cash/equity/realized (it is an unverified,
+            // out-of-band estimate; folding it would inflate position P&L).
+            let fill_notional_micro =
+                i128::from(px_micro) * i128::from(f.qty.0) / 1_000_000;
+            self.rebate_accrued_micro +=
+                i128::from(self.params.rebate_bps) * fill_notional_micro / 10_000;
             let row = FillRow {
                 order_id: f.order_id.0.clone(),
                 ts_ms: now_ms(),
@@ -601,6 +628,9 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             realized_micro: usdc_to_i64(pnl.realized).unwrap_or(i64::MAX),
             unrealized_micro: usdc_to_i64(pnl.unrealized).unwrap_or(i64::MAX),
             open_positions,
+            // SEPARATE maker-rebate estimate (Task 4.4): published distinctly,
+            // NOT folded into the marked equity/cash/realized above.
+            rebate_micro: usdc_to_i64(Usdc(self.rebate_accrued_micro)).unwrap_or(i64::MAX),
         });
     }
 
@@ -650,6 +680,7 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
         token_market,
         notional_micro,
         placed: HashMap::new(),
+        rebate_accrued_micro: 0,
         paused: false,
         halted: false,
     };
@@ -763,6 +794,9 @@ mod tests {
             quote_refresh: Duration::from_millis(10),
             max_quote_micro: pm_config::usd_to_microusdc(max_quote_usd).unwrap(),
             inventory_skew_bps,
+            // Rebate OFF by default so the Task-4.2/4.3 tests are unaffected; the
+            // rebate / e2e tests set it explicitly.
+            rebate_bps: 0,
         }
     }
 
@@ -812,6 +846,7 @@ mod tests {
             token_market,
             notional_micro,
             placed: HashMap::new(),
+            rebate_accrued_micro: 0,
             paused: false,
             halted: false,
         };
@@ -1343,6 +1378,140 @@ mod tests {
 
         // It published at least one status while running (loop was live).
         let _ = status_rx;
+    }
+
+    // ── Paper END-TO-END: full MM cycle, ZERO live orders (Task 4.4) ──────────
+
+    /// The centerpiece (spec §7/§11): drive the WHOLE market-making cycle —
+    /// quote → fill → inventory → MtM → rebate — over a synthetic, controllable
+    /// book through several ticks against the [`PaperMakerVenue`], asserting the
+    /// captured spread, net-flat round-trip, tracked equity, and a positive
+    /// maker-rebate accrual, with the rebate kept SEPARATE from equity.
+    ///
+    /// ZERO-LIVE INVARIANT (what this test guards): the only execution venue in
+    /// the path is the `PaperMakerVenue` that [`build_loop`] constructs — the
+    /// loop's `venue` field is statically `PaperMakerVenue<BookFetcher>`, so a
+    /// `LiveVenue` is unrepresentable here. As a runtime witness, every persisted
+    /// fill carries a `paper-…` order id (the paper venue's mint), proving no
+    /// live order was ever placed.
+    ///
+    /// Fill-driving approach: place a symmetric bid+ask once, then rewrite the
+    /// shared book between ticks so the paper sim crosses to ONE resting side per
+    /// tick — best ask down to our bid, then best bid up to our ask — exactly as
+    /// the Task-4.2 fill tests do (we drive `consume_fills` directly so the
+    /// resting orders stay put at their posted prices rather than being re-quoted
+    /// away). The crossing-liquidity CAP is set to a fixed 5 shares on each side
+    /// so the buy and the equal sell net inventory back to zero.
+    ///
+    /// The risk-stop arm of the cycle is covered by
+    /// [`inventory_stop_loss_halts_and_cancels_quotes`] above (drives an
+    /// unrealized loss past `inventory_stop_loss_usd` → quotes cancelled +
+    /// `status.halted` set); it is referenced here rather than duplicated.
+    #[tokio::test]
+    async fn paper_end_to_end_quote_fill_inventory_mtm_rebate() {
+        const FIVE_SH: u64 = 5 * SH; // the fixed per-side crossing-liquidity cap
+
+        let tokens = vec![TokenId(1)];
+        let (fetcher, shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        // spread 200 bps → bid 0.49 / ask 0.51 around the 0.50 mid; a non-zero
+        // rebate estimate (50 bps of filled notional) so the accrual is visible.
+        let mut params = mk_params(200, 5.0);
+        params.rebate_bps = 50;
+        // Generous caps: this arm proves the happy-path cycle, NOT the halt
+        // (which `inventory_stop_loss_halts_and_cancels_quotes` owns).
+        let (mut mm, mut store_rx, status_rx) =
+            build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+
+        // ── Tick 1: QUOTE — a symmetric postOnly Gtc bid 0.49 + ask 0.51. ──
+        mm.quote().await;
+        assert!(mm.qm.tracked().contains_key(&(TokenId(1), Side::Bid)), "bid placed");
+        assert!(mm.qm.tracked().contains_key(&(TokenId(1), Side::Ask)), "ask placed");
+        assert_eq!(mm.venue.open_orders().await.unwrap().len(), 2, "two resting quotes");
+
+        // ── Tick 2: a SELLER crosses down to our bid (best_ask ≤ 0.49), with
+        // exactly 5 shares of crossing liquidity → the BID fills 5 sh @ 0.49. The
+        // resting ask (no buyer at ≥ 0.51) does not fill this tick. ──
+        shared
+            .lock()
+            .unwrap()
+            .insert(TokenId(1), (cent_book(&[(48, 100 * SH)], &[(49, FIVE_SH)]), true));
+        mm.consume_fills().await;
+        assert_eq!(mm.inv.net(TokenId(1)), FIVE_SH as i128, "bid fill → long 5 sh");
+
+        // MtM: the live mark runs and stays benign under the generous stop.
+        mm.mark_and_check().await;
+        assert!(!mm.halted, "a 5-sh long marked near cost does not halt");
+
+        // Status after the buy: one open long, marked at the 0.48 bid → a small
+        // unrealized loss vs the 0.49 basis, no realized yet, and the rebate has
+        // begun to accrue (50 bps × $2.45 notional = 12_250 µUSDC).
+        mm.publish_status().await;
+        {
+            let st = status_rx.borrow();
+            assert_eq!(st.open_positions, 1, "one open long");
+            assert_eq!(st.cash_micro, -2_450_000, "paid 5 sh × $0.49");
+            assert_eq!(st.realized_micro, 0, "no realized while still open");
+            assert_eq!(st.unrealized_micro, -50_000, "bid-marked at 0.48 vs 0.49 basis");
+            assert_eq!(st.equity_micro, -50_000, "equity = cash + bid mark");
+            assert_eq!(st.rebate_micro, 12_250, "rebate accrued on the bid fill");
+        }
+
+        // ── Tick 3: a BUYER crosses up to our ask (best_bid ≥ 0.51), again with
+        // exactly 5 shares → the ASK fills 5 sh @ 0.51. The (reduced) resting bid
+        // has no seller at ≤ 0.49, so it does not fill. ──
+        shared
+            .lock()
+            .unwrap()
+            .insert(TokenId(1), (cent_book(&[(51, FIVE_SH)], &[(52, 100 * SH)]), true));
+        mm.consume_fills().await;
+
+        // Inventory nets back to ZERO (bought 5 sh, sold 5 sh).
+        assert_eq!(mm.inv.net(TokenId(1)), 0, "buy then equal sell → net flat");
+        // Realized reflects the CAPTURED SPREAD: sold $0.51 − bought $0.49 over
+        // 5 sh = +$0.10 (the authoritative inventory realized).
+        assert_eq!(mm.inv.realized(TokenId(1)), Usdc(100_000), "captured spread +$0.10");
+
+        mm.mark_and_check().await;
+        assert!(!mm.halted, "flat + profitable → no halt");
+
+        mm.publish_status().await;
+        let st = status_rx.borrow();
+        assert_eq!(st.open_positions, 0, "flat → no open positions");
+        assert_eq!(st.unrealized_micro, 0, "nothing open to mark");
+        assert_eq!(st.realized_micro, 100_000, "captured spread shows as realized");
+        assert_eq!(st.equity_micro, 100_000, "equity tracks the booked spread");
+        // REBATE is accrued and POSITIVE: 50 bps × ($2.45 + $2.55) notional =
+        // 12_250 + 12_750 = 25_000 µUSDC ($0.025).
+        assert_eq!(st.rebate_micro, 25_000, "rebate accrued across both fills");
+        assert!(st.rebate_micro > 0, "a non-zero maker rebate accrued");
+        // SEPARATION INVARIANT: equity is the booked spread ($0.10) ALONE. Had
+        // the unverified, out-of-band rebate been folded in, equity would read
+        // $0.125 (125_000) and inflate position P&L — assert it did NOT.
+        assert_eq!(st.equity_micro, st.realized_micro, "equity is the spread alone");
+        assert_ne!(
+            st.equity_micro,
+            st.realized_micro + st.rebate_micro,
+            "the rebate must NOT be folded into equity"
+        );
+        drop(st);
+
+        // ── ZERO-LIVE witness: exactly two fills persisted, BOTH via the paper
+        // venue (paper-… order ids), a Buy then a Sell, makers paying 0 fee. ──
+        let mut fills = Vec::new();
+        while let Ok(msg) = store_rx.try_recv() {
+            if let StoreMsg::FillSigned(row, _) = msg {
+                fills.push(row);
+            }
+        }
+        assert_eq!(fills.len(), 2, "exactly the bid fill + the ask fill persisted");
+        assert!(
+            fills.iter().all(|f| f.order_id.starts_with("paper-")),
+            "every fill came from the PaperMakerVenue — no live order in the path"
+        );
+        assert!(fills.iter().all(|f| f.fee_micro == 0), "makers pay 0 fee on CLOB V2");
+        assert_eq!(fills[0].action, "Buy", "first the bid fill");
+        assert_eq!(fills[1].action, "Sell", "then the ask fill");
     }
 
     #[tokio::test]

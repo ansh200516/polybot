@@ -255,6 +255,8 @@ fn coord_status_to_strategy(cs: &CoordStatus) -> StrategyStatus {
         realized_micro: cs.realized_micro,
         unrealized_micro: cs.unrealized_micro,
         open_positions: cs.open_positions,
+        // Arb harvests no maker rebate — the estimate is MM-specific (Task 4.4).
+        rebate_micro: 0,
     }
 }
 

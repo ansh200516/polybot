@@ -426,6 +426,16 @@ pub struct Mm {
     /// disables skew (the Task-4.2 symmetric quoting); any `u32` is valid (a
     /// value large enough to push a side out of range just skips that quote).
     pub inventory_skew_bps: u32,
+    /// Maker-rebate ESTIMATE (Task 4.4, spec §7): bps of each maker fill's
+    /// NOTIONAL credited as an estimated rebate. Makers pay 0 fees on CLOB V2
+    /// and may EARN a rebate from the maker-rewards program, but the live rate
+    /// varies by category (Phase 5 can refine per-segment), so this is a flat,
+    /// operator-set ESTIMATE. `0` (default) assumes NO rebate — conservative,
+    /// the operator opts in by setting the real program rate. The accrued
+    /// estimate is displayed SEPARATELY and is never folded into cash/equity/
+    /// realized P&L (it is paid out-of-band and unverified — folding it would
+    /// inflate position P&L). Any `u32` is a valid estimate rate.
+    pub rebate_bps: u32,
 }
 
 impl Default for Mm {
@@ -437,6 +447,9 @@ impl Default for Mm {
             quote_refresh_ms: 1500,
             max_quote_usd: 5.0,
             inventory_skew_bps: 150,
+            // Conservative: assume NO maker rebate unless the operator sets the
+            // real (category-dependent) program rate.
+            rebate_bps: 0,
         }
     }
 }
@@ -634,6 +647,12 @@ impl Config {
         // disables skew), and the quote loop clamps the skewed fair to the
         // interior tick range — an over-large skew just skips that side rather
         // than producing an invalid or crossed quote. Documented, not checked.
+        //
+        // `rebate_bps` likewise needs no bound: as a `u32` it is always ≥ 0 (0
+        // assumes no rebate), and it only scales a SEPARATE, display-only rebate
+        // estimate that is never folded into cash/equity/realized — an unrealistic
+        // value inflates only that out-of-band estimate, never real accounting.
+        // Documented, not checked.
         Ok(())
     }
 }
@@ -1020,13 +1039,14 @@ mod tests {
         assert_eq!(c.strategies.mm.quote_refresh_ms, 1500);
         assert!((c.strategies.mm.max_quote_usd - 5.0).abs() < 1e-9);
         assert_eq!(c.strategies.mm.inventory_skew_bps, 150);
+        assert_eq!(c.strategies.mm.rebate_bps, 0, "no assumed rebate by default");
         c.validate().unwrap();
     }
 
     #[test]
     fn mm_strategy_section_parses() {
         let c = Config::from_toml_str(
-            "[strategies.mm]\nenabled = true\nlive = false\nspread_bps = 300\nquote_refresh_ms = 1000\nmax_quote_usd = 7.5\ninventory_skew_bps = 250\n",
+            "[strategies.mm]\nenabled = true\nlive = false\nspread_bps = 300\nquote_refresh_ms = 1000\nmax_quote_usd = 7.5\ninventory_skew_bps = 250\nrebate_bps = 20\n",
         )
         .unwrap();
         assert!(c.strategies.mm.enabled);
@@ -1035,6 +1055,8 @@ mod tests {
         assert_eq!(c.strategies.mm.quote_refresh_ms, 1000);
         assert!((c.strategies.mm.max_quote_usd - 7.5).abs() < 1e-9);
         assert_eq!(c.strategies.mm.inventory_skew_bps, 250);
+        assert_eq!(c.strategies.mm.rebate_bps, 20);
+        c.validate().unwrap();
     }
 
     #[test]
@@ -1045,6 +1067,16 @@ mod tests {
         assert_eq!(c.strategies.mm.spread_bps, 200, "untouched field stays default");
         assert_eq!(c.strategies.mm.quote_refresh_ms, 1500);
         assert_eq!(c.strategies.mm.inventory_skew_bps, 150, "untouched field stays default");
+        assert_eq!(c.strategies.mm.rebate_bps, 0, "untouched field stays default");
+    }
+
+    #[test]
+    fn mm_rebate_bps_parses_and_validates() {
+        // A non-zero operator-set estimate parses and validates (any u32 is a
+        // valid estimate rate — documented, not bounded).
+        let c = Config::from_toml_str("[strategies.mm]\nrebate_bps = 25\n").unwrap();
+        assert_eq!(c.strategies.mm.rebate_bps, 25);
+        c.validate().unwrap();
     }
 
     #[test]
