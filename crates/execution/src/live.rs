@@ -13,7 +13,7 @@
 //! split/merge are on-chain ops deferred to M6; they return
 //! `VenueError::NotSupportedLive`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +30,7 @@ use pm_engine::Action;
 
 use crate::Order;
 use crate::auth::l2_headers;
+use crate::fills::{MakerFill, UserFillSource, parse_maker_fills};
 use crate::maker::{MakerOrder, MakerVenue, OpenOrder, OrderId, OrderType};
 use crate::secrets::ApiCreds;
 use crate::sign::{CHAIN_ID, ClobOrder, Side, clob_amounts, sign_order_1271};
@@ -101,7 +102,7 @@ impl RateLimiter {
 // malformed / out-of-range input (caller maps to a VenueError).
 // ---------------------------------------------------------------------------
 
-fn decimal_to_micro(s: &str) -> Option<u64> {
+pub(crate) fn decimal_to_micro(s: &str) -> Option<u64> {
     let (int_part, frac_part) = match s.split_once('.') {
         Some((i, f)) => (i, f),
         None => (s, ""),
@@ -141,7 +142,7 @@ fn decimal_to_micro(s: &str) -> Option<u64> {
 /// Convert a venue price decimal string ("0.33") to a tick `Px` for `ts`.
 /// The price must be tick-aligned (µUSDC divisible by the tick unit) and an
 /// interior tick — both hold for prices our engine ever trades.
-fn px_from_decimal(s: &str, ts: TickSize) -> Option<Px> {
+pub(crate) fn px_from_decimal(s: &str, ts: TickSize) -> Option<Px> {
     let micro = decimal_to_micro(s)?;
     let unit = ts.unit_microusdc();
     if unit == 0 || micro % unit != 0 {
@@ -205,6 +206,12 @@ pub struct LiveVenue {
     /// the FIRST submitted order so the operator run is decisive without
     /// spamming every order. Set false after the first submit.
     log_first_order: bool,
+    /// Dedup state for the [`UserFillSource`] maker-fill poll (Task 3.4):
+    /// `"{trade_id}:{order_id}"` keys already emitted. `/data/trades` rows recur
+    /// across polls until they scroll off the cursor window, so this guarantees
+    /// each maker fill is reported exactly once. Lives on the venue because the
+    /// poll reuses the venue's single rate-limit budget + token registry.
+    seen_trades: HashSet<String>,
 }
 
 impl LiveVenue {
@@ -227,6 +234,7 @@ impl LiveVenue {
             salt_src: Box::new(default_salt),
             limiter: RateLimiter::new(rate_capacity, rate_per_sec),
             log_first_order: true,
+            seen_trades: HashSet::new(),
         })
     }
 
@@ -249,9 +257,7 @@ impl LiveVenue {
     /// [`TokenId`] and its [`TickSize`]. Used by the typed `open_orders` to type
     /// a reported row's price; `None` for an asset id we never registered.
     fn token_for_venue_id(&self, venue_id: &str) -> Option<(TokenId, TickSize)> {
-        self.tokens
-            .iter()
-            .find_map(|(tok, (vid, _neg, ts))| (vid == venue_id).then_some((*tok, *ts)))
+        token_for_venue_id_in(&self.tokens, venue_id)
     }
 
     /// Build + sign the shared V2 deposit-wallet order struct used by BOTH the
@@ -531,6 +537,20 @@ impl LiveVenue {
             .min_by_key(|px| px.get());
         Ok(best)
     }
+}
+
+/// Reverse-map a venue decimal token id to our [`TokenId`] + [`TickSize`] over a
+/// token registry. A free function (not just the `&self` method) so the
+/// [`UserFillSource`] poll can pass it as the `resolve` closure while holding a
+/// DISJOINT `&mut` borrow of `seen_trades` — a `&self` method would borrow all
+/// of `self` and conflict with that mutable field borrow.
+fn token_for_venue_id_in(
+    tokens: &HashMap<TokenId, (String, bool, TickSize)>,
+    venue_id: &str,
+) -> Option<(TokenId, TickSize)> {
+    tokens
+        .iter()
+        .find_map(|(tok, (vid, _neg, ts))| (vid == venue_id).then_some((*tok, *ts)))
 }
 
 /// Default salt: wall-clock nanos XOR a process-monotonic counter.
@@ -986,6 +1006,50 @@ impl MakerVenue for LiveVenue {
 }
 
 // ===========================================================================
+// UserFillSource (Task 3.4): maker-fill poll over GET /data/trades
+//
+// Tells the (Phase-4) market-making strategy when its RESTING maker orders
+// fill, so it can update inventory and re-quote. Reuses the SAME auth'd,
+// rate-limited, cursor-paginated `data_rows("trades")` walk as the taker
+// `poll_fills`, but selects the MAKER side: a trade where WE were the maker
+// (`trader_side == "MAKER"`) carries our resting-order fills in `maker_orders[]`.
+//
+// REST poll (vs the lower-latency user WS) is the Phase-3 choice — it reuses the
+// proven infra and is fully testable against the in-crate HTTP mock. The user
+// WS is a drop-in latency upgrade behind this SAME trait; see `fills.rs`.
+//
+// Placed as an impl ON LiveVenue (not a standalone `LiveUserFills`) so the poll
+// shares the venue's ONE token registry, rate limiter, and account-wide
+// rate-limit budget, and reuses `data_rows`/`token_for_venue_id` verbatim with
+// zero duplicated auth/limiter logic. INERT until Phase 4 wires the MM strategy.
+// ===========================================================================
+
+impl UserFillSource for LiveVenue {
+    /// One `GET /data/trades` walk → the NEW (deduped) maker fills. `shadow`
+    /// returns `Ok(vec![])` with no network I/O (no limiter, no GET). Dedup state
+    /// (`seen_trades`) persists on the venue, so each maker fill is emitted
+    /// exactly once across polls even though trade rows recur until they scroll
+    /// off the cursor window.
+    async fn poll(&mut self) -> Result<Vec<MakerFill>, VenueError> {
+        if self.cfg.shadow {
+            return Ok(Vec::new());
+        }
+        let rows = self.data_rows("trades", "").await?;
+        // Disjoint field borrows: the `resolve` closure reads `self.tokens` while
+        // `parse_maker_fills` mutably borrows `self.seen_trades`. Routing the
+        // lookup through the free `token_for_venue_id_in` (not the `&self`
+        // method) keeps the two borrows non-overlapping.
+        let tokens = &self.tokens;
+        let fills = parse_maker_fills(
+            &rows,
+            |aid| token_for_venue_id_in(tokens, aid),
+            &mut self.seen_trades,
+        );
+        Ok(fills)
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1116,6 +1180,9 @@ mod tests {
         include_str!("../tests/fixtures/clob_responses/cancel_idempotent.json");
     const OPEN_ORDERS_MIXED: &str =
         include_str!("../tests/fixtures/clob_responses/open_orders_mixed.json");
+    // -- user fills (Task 3.4) response fixture ----------------------------
+    const TRADES_MAKER_FILLS: &str =
+        include_str!("../tests/fixtures/clob_responses/trades_maker_fills.json");
     /// The `orderID` the placed / cancel fixtures carry.
     const PLACED_ID: &str =
         "0xa1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4";
@@ -1543,6 +1610,47 @@ mod tests {
         assert!(id.0.starts_with("shadow-"), "sentinel id: {}", id.0);
         assert_eq!(id, OrderId("shadow-42".into()), "salt-derived sentinel (test salt 42)");
         assert_eq!(mock.hits.load(Ordering::SeqCst), 0, "shadow made a network call");
+    }
+
+    // -- user fills (Task 3.4) ---------------------------------------------
+
+    #[tokio::test]
+    async fn live_user_fills_poll_maps_rows() {
+        // Two copies of the SAME trades page: the first poll maps the maker
+        // fills; the second re-serves the identical page and returns NOTHING —
+        // dedup state persists on the venue (`seen_trades`).
+        let mock = spawn_mock(vec![
+            (200, TRADES_MAKER_FILLS.to_string()),
+            (200, TRADES_MAKER_FILLS.to_string()),
+        ]);
+        let mut v = test_venue(format!("http://{}", mock.addr), false);
+
+        let fills = v.poll().await.unwrap();
+        assert_eq!(fills.len(), 2, "two maker fills; the TAKER row is skipped");
+        // In appearance order: resting-A (10 sh @ 0.33), resting-B (5 sh @ 0.34).
+        assert_eq!(fills[0].order_id, OrderId("0xresting-A".into()));
+        assert_eq!(fills[0].token, TokenId(7), "asset 123456789 → token 7");
+        assert_eq!(fills[0].qty, Qty(10_000_000), "'10' shares → 10e6 µshares");
+        assert_eq!(fills[0].px.get(), 33, "'0.33' → 33 Cent ticks");
+        assert_eq!(fills[0].trade_id, "trade-aaa");
+        assert_eq!(fills[1].order_id, OrderId("0xresting-B".into()));
+        assert_eq!(fills[1].qty, Qty(5_000_000));
+        assert_eq!(fills[1].px.get(), 34, "'0.34' → 34 Cent ticks");
+
+        // Second poll re-serves the same page → all keys seen → empty.
+        let again = v.poll().await.unwrap();
+        assert!(again.is_empty(), "dedup persists across polls: {again:?}");
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 2, "one GET per poll");
+    }
+
+    #[tokio::test]
+    async fn shadow_poll_no_network() {
+        // Shadow venue: poll short-circuits with no network call at all.
+        let mock = spawn_mock(vec![]);
+        let mut v = test_venue(format!("http://{}", mock.addr), true);
+        let fills = v.poll().await.unwrap();
+        assert!(fills.is_empty());
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 0, "shadow polled the network");
     }
 
     // -- decimal helper unit test ------------------------------------------

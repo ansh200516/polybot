@@ -22,6 +22,7 @@
 
 pub mod auth;
 pub mod basket;
+pub mod fills;
 pub mod live;
 pub mod maker;
 pub mod quote_manager;
