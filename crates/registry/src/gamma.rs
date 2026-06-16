@@ -27,6 +27,60 @@ pub enum GammaError {
 }
 
 // ---------------------------------------------------------------------------
+// Flexible numeric metric deserializer
+// ---------------------------------------------------------------------------
+
+/// Deserialize a Gamma numeric metric that may arrive as a JSON number OR a
+/// stringified number.
+///
+/// Venue quirk (fixture-verified): at the **market** level `volume` and
+/// `liquidity` are JSON *strings* (e.g. `"824997.24"`, `"21274.49"`) while
+/// `volume24hr` is a bare float; at the **event** level all three are bare
+/// floats. This accepts either shape.
+///
+/// Returns `None` for JSON `null`, an empty/whitespace string, or a string that
+/// does not parse — an advisory liquidity metric must never fail the whole
+/// parse (and a missing metric is treated conservatively as 0 downstream).
+fn de_flexible_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct FlexF64;
+
+    impl serde::de::Visitor<'_> for FlexF64 {
+        type Value = Option<f64>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a float, a stringified float, or null")
+        }
+
+        fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v as f64))
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v as f64))
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+            let t = v.trim();
+            Ok(if t.is_empty() { None } else { t.parse::<f64>().ok() })
+        }
+
+        // JSON `null` arrives here via `deserialize_any`.
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(FlexF64)
+}
+
+// ---------------------------------------------------------------------------
 // Gamma market
 // ---------------------------------------------------------------------------
 
@@ -60,6 +114,28 @@ pub struct GammaMarket {
     /// Protocol fee in basis points.
     #[serde(default)]
     pub taker_base_fee: i64,
+    /// Lifetime traded volume, USD. Venue quirk: at the market level Gamma sends
+    /// this as a *stringified* float (e.g. `"824997.24"`); [`de_flexible_f64`]
+    /// also accepts a bare number. `None` when the field is absent. Captured for
+    /// Phase-5 market segmentation only — never gates/orders the universe.
+    #[serde(default, deserialize_with = "de_flexible_f64")]
+    pub volume: Option<f64>,
+    /// Trailing-24h traded volume, USD (`volume24hr`). Market-level Gamma reports
+    /// this as a bare float; `None` when absent. Phase-5 segmentation signal.
+    #[serde(default, rename = "volume24hr", deserialize_with = "de_flexible_f64")]
+    pub volume_24hr: Option<f64>,
+    /// Resting book liquidity, USD. Market-level `liquidity` is a *stringified*
+    /// float; `None` when absent (e.g. a resolved/closed market — see the Iran
+    /// market in the events fixture). Phase-5 segmentation signal.
+    #[serde(default, deserialize_with = "de_flexible_f64")]
+    pub liquidity: Option<f64>,
+    /// Optional category / tag signal. NOTE: the committed Gamma fixtures carry
+    /// NO explicit `category` (or `tags`) field at the market or event level, so
+    /// this is `None` in practice today. Kept as forward-compatible capture so a
+    /// future Gamma response that includes it threads through without a schema
+    /// change. The v1 classifier does not consume it (it uses volume+liquidity).
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 impl GammaMarket {
@@ -263,6 +339,67 @@ mod tests {
             "fixture must contain a negRisk event"
         );
         assert!(events.iter().any(|e| !e.markets.is_empty()));
+    }
+
+    /// The market-level liquidity metrics are captured from the committed
+    /// fixtures despite the venue's string-vs-number quirk: market-level
+    /// `volume`/`liquidity` are stringified floats, `volume24hr` is a bare float.
+    #[test]
+    fn captures_market_metrics_from_markets_fixture() {
+        let markets: Vec<GammaMarket> =
+            serde_json::from_str(&fixture("gamma_markets.json")).unwrap();
+        // First fixture market: "New Rihanna Album before GTA VI?"
+        let m = &markets[0];
+        // volume / liquidity arrive as JSON strings — must parse to floats.
+        assert!((m.volume.unwrap() - 824_997.240_332_004_8).abs() < 1e-6);
+        assert!((m.liquidity.unwrap() - 21_274.491_1).abs() < 1e-6);
+        // volume24hr arrives as a bare float.
+        assert!((m.volume_24hr.unwrap() - 1_159.799_728).abs() < 1e-6);
+        // No category field in the fixtures.
+        assert!(m.category.is_none());
+    }
+
+    /// Inside the events fixture, member markets carry the same metrics, and a
+    /// closed/resolved market (US x Iran) is missing `liquidity`/`volume24hr`
+    /// entirely — which must deserialize to `None`, never a parse error.
+    #[test]
+    fn captures_member_market_metrics_and_tolerates_missing() {
+        let events: Vec<GammaEvent> = serde_json::from_str(&fixture("gamma_events.json")).unwrap();
+
+        let spain = events
+            .iter()
+            .flat_map(|e| &e.markets)
+            .find(|m| m.condition_id.contains("7976b8db"))
+            .unwrap();
+        assert!((spain.volume.unwrap() - 39_975_679.106_692_575).abs() < 1.0);
+        assert!((spain.liquidity.unwrap() - 3_645_429.866_74).abs() < 1.0);
+        assert!(spain.volume_24hr.is_some());
+
+        let iran = events
+            .iter()
+            .flat_map(|e| &e.markets)
+            .find(|m| m.condition_id.contains("bbc6689d"))
+            .unwrap();
+        // volume present (string), but liquidity & volume24hr absent → None.
+        assert!(iran.volume.is_some());
+        assert!(
+            iran.liquidity.is_none(),
+            "missing liquidity must be None, not an error"
+        );
+        assert!(iran.volume_24hr.is_none());
+    }
+
+    /// A stringified empty value or an unparseable string yields `None` rather
+    /// than failing the parse (advisory metric, conservative downstream).
+    #[test]
+    fn flexible_metric_tolerates_empty_and_garbage_strings() {
+        let m: GammaMarket = serde_json::from_str(
+            r#"{"conditionId":"0xa","volume":"","liquidity":"n/a","volume24hr":null}"#,
+        )
+        .unwrap();
+        assert!(m.volume.is_none());
+        assert!(m.liquidity.is_none());
+        assert!(m.volume_24hr.is_none());
     }
 
     #[test]

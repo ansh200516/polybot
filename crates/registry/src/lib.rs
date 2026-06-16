@@ -3,6 +3,7 @@ pub mod gamma;
 pub mod intern;
 pub mod partitions;
 pub mod relationships;
+pub mod segment;
 
 use std::collections::HashMap;
 
@@ -13,6 +14,7 @@ use crate::components::{ComponentId, Components};
 use crate::intern::Interner;
 use crate::partitions::{ExclusionReason, MemberMarket, derive_partition};
 use crate::relationships::{LoadedRelationships, RelationshipError, load_relationships};
+use crate::segment::{MarketMetrics, MarketSegment, SegmentThresholds};
 
 // ---------------------------------------------------------------------------
 // Public error type
@@ -74,6 +76,9 @@ pub struct Registry {
     pending_relationship_count: usize,
     /// Display question text per market (Gamma `question`), indexed by MarketId.
     questions: Vec<Option<String>>,
+    /// Per-market Gamma liquidity metrics (Phase 5 segmentation), indexed by
+    /// MarketId. Purely additive capture — never affects gating/order.
+    metrics: Vec<MarketMetrics>,
 }
 
 // Compile-time Send + Sync assertion.
@@ -175,6 +180,22 @@ impl Registry {
     pub fn question(&self, id: MarketId) -> Option<&str> {
         self.questions.get(id.0 as usize)?.as_deref()
     }
+
+    /// Per-market Gamma liquidity metrics (Phase 5 segmentation). `None` only
+    /// for an out-of-range `MarketId`; a valid market always has metrics (all
+    /// fields default to `None` when Gamma did not report them).
+    pub fn metrics(&self, id: MarketId) -> Option<&MarketMetrics> {
+        self.metrics.get(id.0 as usize)
+    }
+
+    /// Liquidity segment for a market under `thresholds` (Phase 5). An
+    /// out-of-range `MarketId` (or a market with no reported metrics) classifies
+    /// as [`MarketSegment::Illiquid`] — the conservative default.
+    pub fn segment(&self, id: MarketId, thresholds: &SegmentThresholds) -> MarketSegment {
+        self.metrics(id)
+            .map(|m| segment::classify(m, thresholds))
+            .unwrap_or(MarketSegment::Illiquid)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +206,9 @@ struct MarketMeta {
     question: Option<String>,
     active: bool,
     closed: bool,
+    /// Phase-5 segmentation metrics; default (all `None`) until recorded via
+    /// [`RegistryBuilder::record_market_metrics`].
+    metrics: MarketMetrics,
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +280,23 @@ impl RegistryBuilder {
             question,
             active,
             closed,
+            metrics: MarketMetrics::default(),
         });
+    }
+
+    /// Record the Phase-5 segmentation [`MarketMetrics`] for the market most
+    /// recently added via [`add_market`].
+    ///
+    /// Kept separate from `add_market` (rather than adding a parameter) so the
+    /// many existing callers — and their tests — stay untouched: metric capture
+    /// is purely additive and must not change any existing behaviour. A market
+    /// for which this is never called keeps the default (all `None`) metrics,
+    /// which classify as [`segment::MarketSegment::Illiquid`]. No-op if no market
+    /// has been added yet.
+    pub fn record_market_metrics(&mut self, metrics: MarketMetrics) {
+        if let Some(meta) = self.meta.last_mut() {
+            meta.metrics = metrics;
+        }
     }
 
     /// Finalise the registry with the relationship TOML source.
@@ -273,8 +313,9 @@ impl RegistryBuilder {
             event_members,
         } = self;
 
-        // ---- 0. Capture question texts before meta is consumed -------------
+        // ---- 0. Capture question texts + metrics before meta is consumed ---
         let questions: Vec<Option<String>> = meta.iter().map(|m| m.question.clone()).collect();
+        let metrics: Vec<MarketMetrics> = meta.iter().map(|m| m.metrics.clone()).collect();
 
         // ---- 1. Derive partitions per event --------------------------------
         let mut partitions: Vec<Partition> = Vec::new();
@@ -346,6 +387,7 @@ impl RegistryBuilder {
             unresolved_relationships,
             pending_relationship_count,
             questions,
+            metrics,
         })
     }
 }
@@ -559,5 +601,45 @@ mod tests {
         let r = b.finish("").unwrap();
         let q = r.market_by_condition("0xq").unwrap().id;
         assert_eq!(r.question(q), None);
+    }
+
+    #[test]
+    fn metrics_are_recorded_and_classified() {
+        use crate::segment::{MarketMetrics, MarketSegment, SegmentThresholds, classify_registry};
+
+        let mut b = RegistryBuilder::default();
+        // Deep market.
+        b.add_market(
+            "0xdeep", "yd", "nd", TickSize::Cent, 0, false, None, true, false, None,
+        );
+        b.record_market_metrics(MarketMetrics {
+            volume: Some(500_000.0),
+            volume_24hr: Some(40_000.0),
+            liquidity: Some(250_000.0),
+            category: None,
+        });
+        // Thin market (no metrics recorded → all None).
+        b.add_market(
+            "0xthin", "yt", "nt", TickSize::Cent, 0, false, None, true, false, None,
+        );
+        let r = b.finish("").unwrap();
+
+        let deep = r.market_by_condition("0xdeep").unwrap().id;
+        let thin = r.market_by_condition("0xthin").unwrap().id;
+
+        // Accessor returns the recorded metrics.
+        assert_eq!(r.metrics(deep).unwrap().volume, Some(500_000.0));
+        // Unrecorded market keeps the default (all None) metrics.
+        assert_eq!(r.metrics(thin).unwrap().volume, None);
+
+        let t = SegmentThresholds::default();
+        assert_eq!(r.segment(deep, &t), MarketSegment::LiquidStable);
+        assert_eq!(r.segment(thin, &t), MarketSegment::Illiquid);
+
+        // The free map function agrees with the per-market accessor.
+        let map = classify_registry(&r, &t);
+        assert_eq!(map.get(&deep), Some(&MarketSegment::LiquidStable));
+        assert_eq!(map.get(&thin), Some(&MarketSegment::Illiquid));
+        assert_eq!(map.len(), 2);
     }
 }

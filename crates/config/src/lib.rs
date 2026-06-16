@@ -22,6 +22,7 @@ pub struct Config {
     pub live: Live,
     pub inventory: Inventory,
     pub strategies: Strategies,
+    pub segments: Segments,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -487,6 +488,39 @@ impl Default for Mm {
     }
 }
 
+/// Market-segmentation thresholds (`[segments]`, spec Phase 5 / Task 5.1). Each
+/// market is classified `LiquidStable` / `Liquid` / `Illiquid` from its static
+/// Gamma volume + liquidity; these are the USD cutoffs (mirrors
+/// `pm_registry::segment::SegmentThresholds`, wired up in Task 5.2). Bounds are
+/// INCLUSIVE (`metric >= threshold` clears the bar).
+///
+/// Opt-in / forward-only: producing a classification changes NO existing
+/// behaviour. The defaults match the registry classifier's defaults, and this
+/// section is the seat that Task 5.2's per-segment routing rules will grow into.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Segments {
+    /// Minimum lifetime volume (USD) for the `LiquidStable` tier.
+    pub liquid_stable_min_volume: f64,
+    /// Minimum resting liquidity (USD) for the `LiquidStable` tier.
+    pub liquid_stable_min_liquidity: f64,
+    /// Minimum lifetime volume (USD) for the `Liquid` tier.
+    pub liquid_min_volume: f64,
+    /// Minimum resting liquidity (USD) for the `Liquid` tier.
+    pub liquid_min_liquidity: f64,
+}
+
+impl Default for Segments {
+    fn default() -> Self {
+        Segments {
+            liquid_stable_min_volume: 100_000.0,
+            liquid_stable_min_liquidity: 50_000.0,
+            liquid_min_volume: 10_000.0,
+            liquid_min_liquidity: 5_000.0,
+        }
+    }
+}
+
 impl Config {
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
         let cfg: Self = toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
@@ -733,6 +767,35 @@ impl Config {
         // estimate that is never folded into cash/equity/realized — an unrealistic
         // value inflates only that out-of-band estimate, never real accounting.
         // Documented, not checked.
+        //
+        // Market segmentation (`[segments]`, Task 5.1; inert until 5.2 wires
+        // routing). All thresholds must be finite and ≥ 0, and the high
+        // (`LiquidStable`) bar must sit at or above the low (`Liquid`) bar on
+        // each axis — otherwise the tiers would be incoherent (a market could
+        // clear the high bar but not the low one).
+        let seg = &self.segments;
+        for v in [
+            seg.liquid_stable_min_volume,
+            seg.liquid_stable_min_liquidity,
+            seg.liquid_min_volume,
+            seg.liquid_min_liquidity,
+        ] {
+            if v < 0.0 || !v.is_finite() {
+                return Err(ConfigError::BadMoney(
+                    "segments thresholds must be finite and ≥ 0",
+                ));
+            }
+        }
+        if seg.liquid_stable_min_volume < seg.liquid_min_volume {
+            return Err(ConfigError::BadMoney(
+                "segments.liquid_stable_min_volume must be ≥ liquid_min_volume",
+            ));
+        }
+        if seg.liquid_stable_min_liquidity < seg.liquid_min_liquidity {
+            return Err(ConfigError::BadMoney(
+                "segments.liquid_stable_min_liquidity must be ≥ liquid_min_liquidity",
+            ));
+        }
         Ok(())
     }
 }
@@ -1290,5 +1353,69 @@ mod tests {
         assert!((c.strategies.mm.capital_usd - 25.0).abs() < 1e-9);
         // Default config (mm.live = false) is unaffected.
         Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn segments_defaults_are_sane() {
+        let c = Config::default();
+        assert!((c.segments.liquid_stable_min_volume - 100_000.0).abs() < 1e-6);
+        assert!((c.segments.liquid_stable_min_liquidity - 50_000.0).abs() < 1e-6);
+        assert!((c.segments.liquid_min_volume - 10_000.0).abs() < 1e-6);
+        assert!((c.segments.liquid_min_liquidity - 5_000.0).abs() < 1e-6);
+        // High bar ≥ low bar on each axis.
+        assert!(c.segments.liquid_stable_min_volume >= c.segments.liquid_min_volume);
+        assert!(c.segments.liquid_stable_min_liquidity >= c.segments.liquid_min_liquidity);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn segments_section_parses_and_round_trips() {
+        // A full-config slice that overrides [segments] alongside another section
+        // round-trips, and untouched segment fields keep their defaults.
+        let c = Config::from_toml_str(
+            "[capital]\nbankroll_usd = 5000.0\n[segments]\nliquid_stable_min_volume = 250000.0\nliquid_min_volume = 20000.0\n",
+        )
+        .unwrap();
+        assert!((c.segments.liquid_stable_min_volume - 250_000.0).abs() < 1e-6);
+        assert!((c.segments.liquid_min_volume - 20_000.0).abs() < 1e-6);
+        // Untouched liquidity fields keep their defaults.
+        assert!((c.segments.liquid_stable_min_liquidity - 50_000.0).abs() < 1e-6);
+        assert!((c.segments.liquid_min_liquidity - 5_000.0).abs() < 1e-6);
+        assert!((c.capital.bankroll_usd - 5000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn segments_validation_rejects_bad_values() {
+        // Negative threshold rejected.
+        assert!(Config::from_toml_str("[segments]\nliquid_min_volume = -1.0\n").is_err());
+        // High bar below low bar (volume axis) rejected.
+        assert!(
+            Config::from_toml_str(
+                "[segments]\nliquid_stable_min_volume = 5000.0\nliquid_min_volume = 10000.0\n"
+            )
+            .is_err()
+        );
+        // High bar below low bar (liquidity axis) rejected.
+        assert!(
+            Config::from_toml_str(
+                "[segments]\nliquid_stable_min_liquidity = 1000.0\nliquid_min_liquidity = 5000.0\n"
+            )
+            .is_err()
+        );
+        // Non-finite rejected.
+        let mut c = Config::default();
+        c.segments.liquid_min_liquidity = f64::NAN;
+        assert!(c.validate().is_err());
+        // Equal high == low bars are allowed (inclusive).
+        let c = Config::from_toml_str(
+            "[segments]\nliquid_stable_min_volume = 10000.0\nliquid_min_volume = 10000.0\n",
+        )
+        .unwrap();
+        assert!((c.segments.liquid_stable_min_volume - 10_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn segments_unknown_field_is_rejected() {
+        assert!(Config::from_toml_str("[segments]\nbogus = 1.0\n").is_err());
     }
 }

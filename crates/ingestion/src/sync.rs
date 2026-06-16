@@ -23,6 +23,7 @@ use std::time::SystemTime;
 
 use pm_core::num::TickSize;
 use pm_registry::gamma::{ClobMarket, GammaEvent};
+use pm_registry::segment::MarketMetrics;
 use pm_registry::{RegistryBuilder, RegistryError};
 
 use crate::IngestError;
@@ -244,6 +245,16 @@ pub fn assemble_registry(
                 clob.closed,
                 event_key,
             );
+            // Phase-5 segmentation: capture the per-market Gamma liquidity
+            // metrics. Purely additive — this records data about the market that
+            // was just accepted and never affects which markets are accepted,
+            // capped, or in what order.
+            builder.record_market_metrics(MarketMetrics {
+                volume: gm.volume,
+                volume_24hr: gm.volume_24hr,
+                liquidity: gm.liquidity,
+                category: gm.category.clone(),
+            });
 
             count += 1;
         }
@@ -990,6 +1001,86 @@ mod tests {
             !exclusion_log.is_empty(),
             "TooFewMembers exclusions expected for single-member negRisk events"
         );
+    }
+
+    // ---- Test 6b: Phase-5 metric capture is threaded + classified -----------
+
+    /// Assembling the committed events fixture threads the per-market Gamma
+    /// liquidity metrics into the registry and classifies them, WITHOUT changing
+    /// which markets are accepted or their order (purely additive capture).
+    #[test]
+    fn fixture_metrics_are_threaded_and_classified() {
+        use pm_registry::segment::{MarketSegment, SegmentThresholds};
+
+        const SPAIN: &str = "0x7976b8dbacf9077eb1453a62bcefd6ab2df199acd28aad276ff0d920d6992892";
+        const FED: &str = "0xdde06286a7b9464d344f410ab0b3d2ebc6469904e72c27fd982f65fdbf78768d";
+        const IRAN: &str = "0xbbc6689d0f6d57ea42168836712237c7308b3e0118c8914d31b6126d0f3254c5";
+
+        let events_json =
+            std::fs::read_to_string("../registry/tests/fixtures/gamma_events.json").unwrap();
+        let events: Vec<GammaEvent> = serde_json::from_str(&events_json).unwrap();
+
+        // Synthetic, all-active CLOB for every member market (same approach as
+        // `fixture_events_assemble`) so the activity gate accepts them all.
+        let mut clob_by_condition = HashMap::new();
+        for event in &events {
+            for gm in &event.markets {
+                if gm.condition_id.is_empty() {
+                    continue;
+                }
+                let toks = gm.clob_token_ids().unwrap_or_default();
+                let (yes_tok, no_tok) = if toks.len() >= 2 {
+                    (toks[0].clone(), toks[1].clone())
+                } else {
+                    ("yes_tok".to_string(), "no_tok".to_string())
+                };
+                clob_by_condition.insert(
+                    gm.condition_id.clone(),
+                    make_clob(ClobSpec {
+                        condition_id: &gm.condition_id,
+                        tick: 0.001,
+                        taker_fee: 0,
+                        active: true,
+                        closed: false,
+                        neg_risk: gm.neg_risk,
+                        yes_token: &yes_tok,
+                        no_token: &no_tok,
+                    }),
+                );
+            }
+        }
+
+        let universe =
+            assemble_registry(&events, &clob_by_condition, "", &UniverseFilter::default()).unwrap();
+        let reg = &universe.registry;
+
+        // Invariance: all three fixture markets assemble, in event order, none
+        // skipped — metric capture changed nothing about acceptance/order.
+        let conditions: Vec<&str> = reg
+            .markets()
+            .iter()
+            .map(|m| reg.market_condition(m.id).unwrap())
+            .collect();
+        assert_eq!(conditions, vec![SPAIN, FED, IRAN]);
+        assert!(universe.skipped.is_empty());
+
+        let t = SegmentThresholds::default();
+
+        // Spain: huge volume + liquidity (both arrive as JSON strings) → captured
+        // non-None and classified LiquidStable.
+        let spain = reg.market_by_condition(SPAIN).unwrap().id;
+        let spain_metrics = reg.metrics(spain).unwrap();
+        assert!(spain_metrics.volume.unwrap() > 1_000_000.0);
+        assert!(spain_metrics.liquidity.unwrap() > 1_000_000.0);
+        assert_eq!(reg.segment(spain, &t), MarketSegment::LiquidStable);
+
+        // Iran: volume present but liquidity ABSENT in the fixture → None →
+        // Illiquid (conservative: unknown liquidity is never MM-eligible).
+        let iran = reg.market_by_condition(IRAN).unwrap().id;
+        let iran_metrics = reg.metrics(iran).unwrap();
+        assert!(iran_metrics.volume.is_some());
+        assert!(iran_metrics.liquidity.is_none());
+        assert_eq!(reg.segment(iran, &t), MarketSegment::Illiquid);
     }
 
     // ---- Test 7: keyset envelope parser ------------------------------------
