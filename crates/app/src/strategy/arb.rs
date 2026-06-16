@@ -503,7 +503,7 @@ mod tests {
     use crate::coordinator::{LiveParams, run_execution};
     use crate::detector::DetectedOpp;
     use crate::stats::AppStats;
-    use crate::strategy::host::{HostShared, StrategyHost, StrategyStatusView};
+    use crate::strategy::host::{HostShared, StrategyHost};
     use crate::strategy::stub::HeartbeatStrategy;
     use crate::strategy::{
         Strategy, StrategyCommand, StrategyCtx, StrategyEnvelope, StrategyId, StrategyStatus,
