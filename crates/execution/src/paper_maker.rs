@@ -51,6 +51,15 @@
 //! so we allow the place (and likewise skip — never fill — a resting order whose
 //! book is unavailable on [`poll`](UserFillSource::poll)).
 //!
+//! # Optional passive taker flow (demo aid)
+//! The trade-through model above only fills on a book CROSS (adverse selection),
+//! so in a calm market the MM never fills and looks idle in paper. The opt-in
+//! [`with_taker_fill_pct`](PaperMakerVenue::with_taker_fill_pct) adds a simulated
+//! steady taker flow (a fraction of each resting quote lifted per `poll`, at the
+//! maker's own price) so the full quote → fill → inventory → skew → P&L loop is
+//! exercisable in paper. It is OFF by default and deliberately optimistic (no
+//! queue-position modelling); realistic fills come from a live canary.
+//!
 //! # YAGNI / out of scope
 //! No latency (the taker `PaperVenue` models latency; the maker sim omits it for
 //! simplicity), no queue-position modelling, no GTC/GTD expiry, no inventory, no
@@ -89,6 +98,10 @@ pub struct PaperMakerVenue<B: BookSource> {
     /// Monotonic fill counter; pre-incremented so the first trade id is
     /// `paper-fill-1`.
     next_fill: u64,
+    /// OPTIONAL passive-taker-flow rate, percent of a resting order's remaining
+    /// size hit by simulated takers each `poll` (0 = OFF, the default). See
+    /// [`with_taker_fill_pct`](Self::with_taker_fill_pct).
+    taker_fill_pct: u32,
 }
 
 impl<B: BookSource> PaperMakerVenue<B> {
@@ -98,7 +111,27 @@ impl<B: BookSource> PaperMakerVenue<B> {
             resting: HashMap::new(),
             next_id: 0,
             next_fill: 0,
+            taker_fill_pct: 0,
         }
+    }
+
+    /// Enable the optional PASSIVE-TAKER-FLOW fill model (Task: paper MM demo).
+    ///
+    /// The default sim (pct 0) fills a resting quote ONLY when the live book
+    /// crosses it — i.e. it models adverse selection, NOT the steady taker flow
+    /// that actually fills a market maker. In a calm market that means ~zero
+    /// fills, so the MM looks idle in paper. With `pct > 0`, each [`poll`] also
+    /// fills `pct`% of every resting order's remaining size at the maker's OWN
+    /// price, simulating takers arriving and lifting/hitting resting quotes — so
+    /// the full quote → fill → inventory → skew → P&L loop runs in paper.
+    ///
+    /// This is deliberately OPTIMISTIC: it does not model queue position or
+    /// whether the quote is at the touch, so paper fills (and thus paper P&L)
+    /// are a best case. It is a DEMO/validation aid only; realistic fills come
+    /// from real taker flow in a live canary. `pct` is clamped to `100`.
+    pub fn with_taker_fill_pct(mut self, pct: u32) -> Self {
+        self.taker_fill_pct = pct.min(100);
+        self
     }
 
     /// Resting orders in deterministic placement order (`seq` ascending), as
@@ -138,6 +171,18 @@ fn crossing_liquidity(book: &Book, side: Side, price: Px) -> u64 {
             .map(|(_, q)| q.0)
             .sum(),
     }
+}
+
+/// Passive-taker-flow fill for one poll: `pct`% of `remaining` µshares, at
+/// least 1 µshare so a held quote always makes progress, capped at `remaining`.
+/// `pct == 0` (the default) yields 0 — the model is off. Computed in u128 to
+/// avoid overflow on large µshare counts.
+fn taker_fill_qty(remaining: u64, pct: u32) -> u64 {
+    if pct == 0 || remaining == 0 {
+        return 0;
+    }
+    let q = (u128::from(remaining) * u128::from(pct) / 100) as u64;
+    q.max(1).min(remaining)
 }
 
 impl<B: BookSource> MakerVenue for PaperMakerVenue<B> {
@@ -227,7 +272,16 @@ impl<B: BookSource> UserFillSource for PaperMakerVenue<B> {
             let Some(book) = self.books.book(token).await else {
                 continue;
             };
-            let filled = crossing_liquidity(&book, side, price).min(remaining.0);
+            // Adverse / trade-through takes priority: if the book crosses our
+            // price, fill the crossing liquidity. Otherwise, the optional passive
+            // taker-flow model lifts a fraction of the resting size (a calm-market
+            // demo aid; 0 = off — see `with_taker_fill_pct`).
+            let adverse = crossing_liquidity(&book, side, price).min(remaining.0);
+            let filled = if adverse > 0 {
+                adverse
+            } else {
+                taker_fill_qty(remaining.0, self.taker_fill_pct)
+            };
             if filled == 0 {
                 continue;
             }
@@ -504,5 +558,38 @@ mod tests {
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, id);
         assert_eq!(open[0].size, Qty(100 * SH));
+    }
+
+    #[tokio::test]
+    async fn taker_flow_fills_resting_quote_without_a_cross() {
+        // Calm book: best ask 0.50, best bid 0.45 — a bid @0.48 NEVER crosses
+        // (0.50 > 0.48), so the default adverse-only sim would never fill it.
+        let book = cent_book(&[(50, 100 * SH)], &[(45, 100 * SH)]);
+
+        // pct 0 (default): no fill on this calm book — the conservative model.
+        let mut off = venue(book.clone());
+        off.place(&bid(48, 100 * SH)).await.unwrap();
+        assert!(
+            off.poll().await.unwrap().is_empty(),
+            "adverse-only sim must not fill an uncrossed quote"
+        );
+
+        // 25% taker flow: the resting bid is lifted 25% of remaining per poll,
+        // at ITS OWN price (0.48), even though the book never crosses.
+        let mut v = venue(book).with_taker_fill_pct(25);
+        let id = v.place(&bid(48, 100 * SH)).await.unwrap();
+
+        let f1 = v.poll().await.unwrap();
+        assert_eq!(f1.len(), 1);
+        assert_eq!(f1[0].order_id, id);
+        assert_eq!(f1[0].px.get(), 48, "maker fills at its own price, not the touch");
+        assert_eq!(f1[0].qty.0, 25 * SH, "25% of 100 shares");
+
+        // Next poll lifts 25% of the REMAINING 75 shares.
+        let f2 = v.poll().await.unwrap();
+        assert_eq!(f2.len(), 1);
+        assert_eq!(f2[0].qty.0, 75 * SH * 25 / 100, "25% of the remaining 75");
+        // Still resting (partials decay, never fully clears in one poll).
+        assert_eq!(v.open_orders().await.unwrap().len(), 1);
     }
 }

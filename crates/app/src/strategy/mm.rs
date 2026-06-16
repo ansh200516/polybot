@@ -109,6 +109,10 @@ pub struct MmParams {
     /// SEPARATE display quantity — never folded into cash/equity/realized (it is
     /// an unverified, out-of-band estimate). See [`MmLoop::consume_fills`].
     pub rebate_bps: u32,
+    /// PAPER-only passive-taker-flow fill rate (% of remaining per poll) for the
+    /// `PaperMakerVenue` demo aid. `0` = conservative adverse-only sim. Ignored
+    /// on the live path (live fills come from the real user feed).
+    pub paper_taker_fill_pct: u32,
 }
 
 impl MmParams {
@@ -121,6 +125,7 @@ impl MmParams {
             max_quote_micro: pm_config::usd_to_microusdc(mm.max_quote_usd)?,
             inventory_skew_bps: mm.inventory_skew_bps,
             rebate_bps: mm.rebate_bps,
+            paper_taker_fill_pct: mm.paper_taker_fill_pct,
         })
     }
 }
@@ -282,7 +287,10 @@ impl Strategy for MmStrategy {
                     .await;
                 }
                 None => {
-                    let venue = PaperMakerVenue::new(ctx.fetcher.clone());
+                    // Paper: optionally enable the passive-taker-flow demo aid so
+                    // resting quotes actually fill in a calm market (0 = off).
+                    let venue = PaperMakerVenue::new(ctx.fetcher.clone())
+                        .with_taker_fill_pct(params.paper_taker_fill_pct);
                     run_mm_loop(
                         venue, qm, inv, positions, ctx, params, tokens, token_market, capital,
                     )
@@ -908,6 +916,9 @@ mod tests {
             // Rebate OFF by default so the Task-4.2/4.3 tests are unaffected; the
             // rebate / e2e tests set it explicitly.
             rebate_bps: 0,
+            // Paper taker-flow OFF by default (conservative adverse-only sim);
+            // the demo / fill tests opt in.
+            paper_taker_fill_pct: 0,
         }
     }
 

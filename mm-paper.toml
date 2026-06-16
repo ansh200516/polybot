@@ -25,6 +25,10 @@ max_quote_usd    = 5.0      # max notional per single quote (one side)
 inventory_skew_bps = 150    # lean quotes against inventory (long → quote lower to offload)
 rebate_bps       = 0        # maker-rebate ESTIMATE (bps of filled notional). 0 = none assumed;
                             # set your real CLOB maker-rewards rate to see accrual in paper.
+paper_taker_fill_pct = 30   # PAPER demo aid: simulate takers lifting 30% of each resting quote
+                            # per cycle so you SEE fills → inventory → skew → P&L. 0 = the
+                            # conservative adverse-only sim (idle in a calm market). Optimistic
+                            # (no queue modelling); ignored on the live path.
 # live_fills_source only matters when live = true ("ws" = low-latency user feed, "rest" = poll).
 
 # ---------------------------------------------------------------------------

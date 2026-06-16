@@ -483,6 +483,16 @@ pub struct Mm {
     ///
     /// Validated to exactly `"ws"` or `"rest"` (mirrors `execution.redeem_strategy`).
     pub live_fills_source: String,
+    /// PAPER-only demo aid: simulated passive-taker-flow fill rate, percent of
+    /// each resting quote's remaining size lifted per quote cycle (`0`–`100`).
+    /// `0` (default) = the conservative sim that fills ONLY on an adverse book
+    /// cross — so in a calm market the MM never fills and looks idle in paper.
+    /// A positive value makes the `PaperMakerVenue` simulate takers hitting the
+    /// resting quotes (at the maker's own price), exercising the full quote →
+    /// fill → inventory → skew → P&L loop in paper. DELIBERATELY OPTIMISTIC (no
+    /// queue-position modelling) and IGNORED on the live path — realistic fills
+    /// come from real taker flow in a live canary.
+    pub paper_taker_fill_pct: u32,
 }
 
 impl Default for Mm {
@@ -505,6 +515,9 @@ impl Default for Mm {
             // upgrade); operators can pin "rest" to fall back to the
             // offline-verified Task-4.5 REST poll.
             live_fills_source: "ws".into(),
+            // OFF by default → the conservative adverse-only paper sim (no
+            // synthetic fills); a paper-MM demo sets this > 0.
+            paper_taker_fill_pct: 0,
         }
     }
 }
@@ -783,6 +796,12 @@ impl Config {
         if !matches!(self.strategies.mm.live_fills_source.as_str(), "ws" | "rest") {
             return Err(ConfigError::BadMoney(
                 "strategies.mm.live_fills_source must be \"ws\" or \"rest\"",
+            ));
+        }
+        // Paper-only taker-flow demo aid: a percentage (0–100). Inert on live.
+        if self.strategies.mm.paper_taker_fill_pct > 100 {
+            return Err(ConfigError::BadMoney(
+                "strategies.mm.paper_taker_fill_pct must be 0–100",
             ));
         }
         // MM capital must be finite + non-negative always; when ENABLED it is
