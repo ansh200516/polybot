@@ -2,7 +2,7 @@
 
 use crate::num::{Px, Qty, TickSize};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Side {
     Bid,
     Ask,
