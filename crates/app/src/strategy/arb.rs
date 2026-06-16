@@ -481,6 +481,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::collections::HashMap;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -492,6 +494,7 @@ mod tests {
     use pm_execution::Order;
     use pm_execution::basket::ExecParams;
     use pm_execution::venue::{ExecutionVenue, Fill, SubmitOutcome, VenueError};
+    use pm_ingestion::supervisor::OnApplyFn;
     use pm_store::Store;
     use pm_store::writer::run_writer;
     use tokio::sync::{mpsc, oneshot, watch};
@@ -500,7 +503,11 @@ mod tests {
     use crate::coordinator::{LiveParams, run_execution};
     use crate::detector::DetectedOpp;
     use crate::stats::AppStats;
-    use crate::strategy::{Strategy, StrategyCommand, StrategyCtx, StrategyId, StrategyStatus};
+    use crate::strategy::host::{HostShared, StrategyHost, StrategyStatusView};
+    use crate::strategy::stub::HeartbeatStrategy;
+    use crate::strategy::{
+        Strategy, StrategyCommand, StrategyCtx, StrategyEnvelope, StrategyId, StrategyStatus,
+    };
     use crate::wiring::{BookFetcher, ComponentIndex, engine_params, risk_config};
 
     /// A venue that records every dispatched basket and blocks the FIRST
@@ -784,6 +791,323 @@ mod tests {
         assert_eq!(final_status.equity_micro, 5_990_000, "flat after merge → equity == cash");
         assert_eq!(final_status.open_positions, 0);
 
+        drop(writer);
+    }
+
+    // ====================================================================
+    // Task 1.9 — StrategyHost integration: the REAL `ArbStrategy` (#1) and
+    // `HeartbeatStrategy` (#2) running together under the host, proving
+    // parallelism + status aggregation + fault isolation.
+    //
+    // These live in arb.rs's test module (not a `tests/` integration crate or a
+    // sibling `#[cfg(test)]` module) ON PURPOSE: the arb harness they reuse —
+    // `GatedVenue`, `build_arb`, `c1long_opp`, `empty_registry` — is
+    // crate-private to THIS module, so a sibling/external test could not see it.
+    // Opps are driven straight into the arb's `opp_tx` exactly as
+    // `arb_strategy_dispatches_like_coordinator` does (the channel a supervisor's
+    // `on_apply` hook feeds), so no production signature changes are needed.
+    // ====================================================================
+
+    /// A per-strategy envelope with the default test risk config. The host's
+    /// startup capital guard only sums `capital`, so the risk config is inert
+    /// here (the strategies carry their own).
+    fn strat_envelope(id: StrategyId, capital_micro: i128) -> StrategyEnvelope {
+        StrategyEnvelope::new(
+            id,
+            Usdc(capital_micro),
+            risk_config(&Config::default(), None).unwrap(),
+        )
+    }
+
+    /// Build the shared host handles backed by a REAL in-memory store + writer
+    /// (the arb's coordinator/execution path writes opp/pnl/halt rows, so unlike
+    /// the host's fake-strategy tests this must drain a live writer rather than a
+    /// dropped receiver). Returns the kill flag and the writer join handle to
+    /// keep alive for the test's duration.
+    fn host_shared_with_store() -> (
+        HostShared,
+        Arc<AtomicBool>,
+        tokio::task::JoinHandle<Store>,
+    ) {
+        let kill = Arc::new(AtomicBool::new(false));
+        let store = Store::open_in_memory().unwrap();
+        let (store_tx, store_rx) = mpsc::channel(256);
+        let writer = tokio::spawn(run_writer(store, store_rx));
+        let shared = HostShared {
+            registry: empty_registry(),
+            fetcher: BookFetcher::new(HashMap::new()),
+            store_tx,
+            kill: Arc::clone(&kill),
+        };
+        (shared, kill, writer)
+    }
+
+    /// The legs the approved `c1long_opp(50)` basket must reach the recording
+    /// venue as (token-sorted): tok1 buy @44¢ + tok2 buy @50¢, 100 shares each.
+    fn expected_basket_legs() -> Vec<(TokenId, Action, u16, u64)> {
+        vec![
+            (TokenId(1), Action::Buy, 44, 100_000_000),
+            (TokenId(2), Action::Buy, 50, 100_000_000),
+        ]
+    }
+
+    /// A sibling that panics the instant it runs — the "failing strategy" half of
+    /// the isolation test. (`host::tests::PanicStrategy` is private to that
+    /// module, so this defines its own minimal panicker to run alongside the real
+    /// arb.)
+    struct BoomStrategy {
+        id: StrategyId,
+    }
+
+    impl Strategy for BoomStrategy {
+        fn id(&self) -> StrategyId {
+            self.id
+        }
+
+        fn make_on_apply(&self) -> Option<OnApplyFn> {
+            None
+        }
+
+        fn run(self: Box<Self>, _ctx: StrategyCtx) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async move {
+                panic!("BoomStrategy::run panics to exercise host fault isolation beside the real arb");
+            })
+        }
+    }
+
+    /// **Parallelism + aggregation.** Register the REAL `ArbStrategy` and a real
+    /// `HeartbeatStrategy` in one `StrategyHost` and assert, all bounded by
+    /// `tokio::time::timeout`:
+    ///
+    /// (a) the arb dispatches the approved C1Long basket to its recording venue;
+    /// (b) the heartbeat is genuinely live and publishing in parallel — pausing
+    ///     it flips `paused` in the host aggregate (a seeded-but-dead heartbeat
+    ///     could never process the command and republish), its money at zero;
+    /// (c) the host aggregate (`RunningHost::status()`) lists BOTH strategies with
+    ///     the arb's settled 5_990_000 cash reflected and the heartbeat at zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_runs_real_arb_and_heartbeat_in_parallel_and_aggregates() {
+        // Real arb over a recording venue; no gate → the basket settles clean
+        // immediately (the standalone arb test gates only to prove busy
+        // suppression, which the coordinator tests already cover).
+        let (dispatched_tx, mut dispatched_rx) = mpsc::unbounded_channel();
+        let arb = build_arb(GatedVenue {
+            dispatched: dispatched_tx,
+            gate: None,
+        });
+        // Grab the arb's opp sender (what a supervisor's on_apply hook feeds) +
+        // its stats BEFORE the host consumes the strategy.
+        let opp_tx = arb.opp_tx.clone();
+        let stats = Arc::clone(&arb.stats);
+
+        let mut host = StrategyHost::new(Usdc(10_000_000));
+        // allocate: arb gets the whole bankroll, heartbeat nothing → Σ == bankroll.
+        host.add(Box::new(arb), strat_envelope(StrategyId("arb"), 10_000_000));
+        host.add(
+            Box::new(HeartbeatStrategy::with_interval(
+                StrategyId("heartbeat"),
+                Duration::from_millis(5),
+            )),
+            strat_envelope(StrategyId("heartbeat"), 0),
+        );
+
+        // The startup capital guard passes (arb=bankroll + heartbeat=0 ≤ bankroll).
+        host.validate_capital()
+            .expect("arb (=bankroll) + heartbeat (0) must allocate within the bankroll");
+
+        // The combined per-supervisor hook builds with the arb's detector hook
+        // present (the heartbeat contributes none). We drive opps directly down
+        // the channel below (like the arb test), so DROP the hook — holding it
+        // would pin the arb's lp_tx/opp_tx clones and block clean shutdown.
+        let on_apply = host.make_on_apply();
+        assert!(
+            on_apply.is_some(),
+            "combined on_apply must be Some — the real arb installs a per-supervisor detector hook"
+        );
+        drop(on_apply);
+
+        let (shared, kill, writer) = host_shared_with_store();
+        let running = host.run(shared).expect("capital validates → run spawns the strategies");
+        let mut status = running.status();
+
+        // (a) The real arb dispatches the approved basket to its recording venue.
+        opp_tx
+            .send(DetectedOpp {
+                opp: c1long_opp(50),
+                at: Instant::now(),
+            })
+            .await
+            .expect("arb opp channel must be open");
+        let mut legs = tokio::time::timeout(Duration::from_secs(5), dispatched_rx.recv())
+            .await
+            .expect("timeout waiting for the real arb to dispatch under the host")
+            .expect("dispatch channel closed before the arb dispatched");
+        legs.sort_by_key(|&(t, _, _, _)| t.0);
+        assert_eq!(
+            legs,
+            expected_basket_legs(),
+            "the arb must dispatch the approved basket while the heartbeat runs in parallel"
+        );
+        assert_eq!(stats.dispatched.load(Ordering::Relaxed), 1);
+
+        // (b) The heartbeat is live + publishing in parallel: pause it and watch
+        // `paused` flip in the aggregate, money still zero.
+        assert!(
+            running.pause(StrategyId("heartbeat"), true).await,
+            "the heartbeat's control channel must be live"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let hb_alive = {
+                    let view = status.borrow_and_update();
+                    view.iter().any(|(id, s)| {
+                        *id == StrategyId("heartbeat")
+                            && s.paused
+                            && s.equity_micro == 0
+                            && s.cash_micro == 0
+                    })
+                };
+                if hb_alive {
+                    break;
+                }
+                if status.changed().await.is_err() {
+                    panic!("aggregate closed before the heartbeat reflected its pause");
+                }
+            }
+        })
+        .await
+        .expect("timeout waiting for the heartbeat's (zero) status to reach the aggregate");
+
+        // (c) Close the arb's opp channel so its coordinator drains and takes the
+        // final P&L snapshot (the only sub-pnl-interval one) — its 5_990_000
+        // settled cash then reaches the aggregate. The heartbeat keeps running.
+        drop(opp_tx);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let both = {
+                    let view = status.borrow_and_update();
+                    view.len() == 2
+                        && view.iter().any(|(id, s)| {
+                            *id == StrategyId("arb")
+                                && s.cash_micro == 5_990_000
+                                && s.equity_micro == 5_990_000
+                                && s.open_positions == 0
+                        })
+                        && view.iter().any(|(id, s)| {
+                            *id == StrategyId("heartbeat")
+                                && s.equity_micro == 0
+                                && s.cash_micro == 0
+                        })
+                };
+                if both {
+                    break;
+                }
+                if status.changed().await.is_err() {
+                    panic!("aggregate closed before the arb's settled cash reached it");
+                }
+            }
+        })
+        .await
+        .expect("timeout waiting for the aggregate to reflect arb=5_990_000 + heartbeat=0");
+        assert!(
+            stats.baskets_clean.load(Ordering::Relaxed) >= 1,
+            "the dispatched basket must have settled clean"
+        );
+
+        // Clean shutdown: the global kill stops the heartbeat (the arb already
+        // finished when its opp channel closed); join is bounded.
+        kill.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(5), running.join())
+            .await
+            .expect("host did not finish after the global kill");
+        drop(writer);
+    }
+
+    /// **Fault isolation.** A panicking sibling registered ALONGSIDE the real
+    /// arb: the host catches the panic at the task boundary, and the arb must
+    /// keep running — it still dispatches its basket AND its settled cash still
+    /// reaches the aggregate. (The existing `host::tests` panic test proves the
+    /// same for a *fake* survivor; this proves it for the real arb pipeline.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_isolates_a_failing_sibling_from_the_real_arb() {
+        let (dispatched_tx, mut dispatched_rx) = mpsc::unbounded_channel();
+        let arb = build_arb(GatedVenue {
+            dispatched: dispatched_tx,
+            gate: None,
+        });
+        let opp_tx = arb.opp_tx.clone();
+        let stats = Arc::clone(&arb.stats);
+
+        let mut host = StrategyHost::new(Usdc(10_000_000));
+        host.add(
+            Box::new(BoomStrategy {
+                id: StrategyId("boom"),
+            }),
+            strat_envelope(StrategyId("boom"), 0),
+        );
+        host.add(Box::new(arb), strat_envelope(StrategyId("arb"), 10_000_000));
+
+        let on_apply = host.make_on_apply();
+        assert!(
+            on_apply.is_some(),
+            "the real arb still installs its detector hook beside the panicking sibling"
+        );
+        drop(on_apply);
+
+        let (shared, kill, writer) = host_shared_with_store();
+        let running = host.run(shared).expect("capital validates → run spawns the strategies");
+        let mut status = running.status();
+
+        // The real arb dispatches its basket despite the sibling having panicked.
+        opp_tx
+            .send(DetectedOpp {
+                opp: c1long_opp(50),
+                at: Instant::now(),
+            })
+            .await
+            .expect("arb opp channel must be open");
+        let mut legs = tokio::time::timeout(Duration::from_secs(5), dispatched_rx.recv())
+            .await
+            .expect("timeout: the arb must dispatch even though its sibling panicked")
+            .expect("dispatch channel closed before the arb dispatched");
+        legs.sort_by_key(|&(t, _, _, _)| t.0);
+        assert_eq!(
+            legs,
+            expected_basket_legs(),
+            "the surviving real arb must still dispatch the approved basket"
+        );
+        assert_eq!(stats.dispatched.load(Ordering::Relaxed), 1);
+
+        // ...and the aggregate still updates for the arb (the host's status
+        // pipeline survives the sibling's panic). Close the opp channel to force
+        // the final snapshot.
+        drop(opp_tx);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let arb_settled = {
+                    let view = status.borrow_and_update();
+                    view.iter().any(|(id, s)| {
+                        *id == StrategyId("arb")
+                            && s.cash_micro == 5_990_000
+                            && s.open_positions == 0
+                    })
+                };
+                if arb_settled {
+                    break;
+                }
+                if status.changed().await.is_err() {
+                    panic!("aggregate closed before the surviving arb's cash reached it");
+                }
+            }
+        })
+        .await
+        .expect("timeout: the aggregate must still update for the arb after the sibling panicked");
+        assert!(stats.baskets_clean.load(Ordering::Relaxed) >= 1);
+
+        // Standard shutdown signal (the arb already drained via its closed opp
+        // channel; the panicked sibling is long gone); join is bounded.
+        kill.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(Duration::from_secs(5), running.join()).await;
         drop(writer);
     }
 }
