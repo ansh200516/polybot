@@ -29,11 +29,12 @@ use pm_app::kill::spawn_kill_watch;
 use pm_app::stats::AppStats;
 use pm_app::strategy::arb::{ArbStrategy, ExecTaskBuilder};
 use pm_app::strategy::host::{HostShared, StrategyHost};
+use pm_app::strategy::mm::{MmParams, MmStrategy};
 use pm_app::strategy::stub::HeartbeatStrategy;
-use pm_app::strategy::{StrategyEnvelope, StrategyId};
+use pm_app::strategy::StrategyId;
 use pm_app::wiring::{
-    BookFetcher, build_component_index, engine_params, fee_map, pack_components, risk_config,
-    token_maps,
+    BookFetcher, PlatformEnvelopes, build_component_index, engine_params, fee_map,
+    inventory_config, pack_components, risk_config, strategy_envelopes, token_maps,
 };
 use pm_config::Config;
 use pm_core::instrument::Relationship;
@@ -947,21 +948,35 @@ async fn main() {
                 .unwrap_or_else(|e| fatal(format!("live.min_leg_value_usd: {e}"))),
         ),
     };
-    // Platform bankroll = today's configured bankroll. Arb's envelope claims the
-    // whole bankroll (its RiskEngine global cap IS the bankroll); the heartbeat
-    // claims zero — so Σcapital == bankroll and the startup allocator passes.
+    // Platform bankroll = today's configured bankroll. The capital carve-out
+    // (Task 4.4b, `strategy_envelopes`) splits it between arb and the OPTIONAL
+    // market maker:
+    //  - MM OFF (default): BYTE-IDENTICAL to before — arb's envelope AND its
+    //    enforced RiskEngine cap claim the WHOLE bankroll, the heartbeat claims
+    //    zero, `mm_envelope` is None, so only arb + heartbeat are added. This is
+    //    the live arb path the user runs today; nothing about it changes.
+    //  - MM ON: `mm.capital_usd` is carved OUT and arb's RiskEngine cap
+    //    (`arb_risk.bankroll`) is REDUCED to `bankroll − mm_capital`, so arb +
+    //    MM SHARE the bankroll without overlapping real funds.
+    // Σcapital == bankroll either way → the startup allocator passes.
     let bankroll = risk_cfg.bankroll;
-    let arb_envelope = StrategyEnvelope::new(StrategyId("arb"), bankroll, risk_cfg.clone());
-    let hb_envelope =
-        StrategyEnvelope::new(StrategyId("heartbeat"), pm_core::num::Usdc(0), risk_cfg.clone());
+    let PlatformEnvelopes {
+        arb: arb_envelope,
+        heartbeat: hb_envelope,
+        mm: mm_envelope,
+        arb_risk,
+    } = strategy_envelopes(&config, &risk_cfg, bankroll)
+        .unwrap_or_else(|e| fatal(format!("strategy capital carve-out: {e}")));
 
     // Arb keeps every Coordinator/Detector/LP-pool/execution input it has today
-    // (byte-identical); the venue arrives as the ExecTaskBuilder captured above,
-    // and `starts` is forwarded to the coordinator's restart-storm guard inside
-    // arb's run (note_session_starts).
+    // (byte-identical); ONLY its RiskEngine `bankroll` differs — unchanged when
+    // MM is off, reduced to arb's slice (`arb_risk`) when MM is on so it trades
+    // within it. The venue arrives as the ExecTaskBuilder captured above, and
+    // `starts` is forwarded to the coordinator's restart-storm guard inside arb's
+    // run (note_session_starts).
     let arb = ArbStrategy::new(
         config.clone(),
-        risk_cfg,
+        arb_risk,
         params,
         token_market,
         index,
@@ -988,6 +1003,50 @@ async fn main() {
         Box::new(HeartbeatStrategy::new(StrategyId("heartbeat"))),
         hb_envelope,
     );
+
+    // ---- market maker (#3): DEFAULT-OFF, behind [strategies.mm] enabled -----
+    // Present only when the carve-out produced an `mm_envelope` (i.e. MM is
+    // enabled). PAPER only: `MmStrategy::run` builds a PaperMakerVenue internally
+    // regardless of `mm.live` — the live CLOB arm is Task 4.5. When MM is
+    // disabled this whole block is skipped, leaving the arb path untouched.
+    if let Some(mm_envelope) = mm_envelope {
+        let mm_capital = mm_envelope.capital;
+        let arb_capital_micro = bankroll.0 - mm_capital.0;
+        // A pre-set `mm.live` has NO effect yet — warn loudly rather than
+        // silently routing real maker orders (that wiring is Task 4.5).
+        if config.strategies.mm.live {
+            warn!(
+                "strategies.mm.live = true, but live MM is not wired yet (Task 4.5); \
+                 quoting on the PAPER maker venue"
+            );
+        }
+        // MM's universe: the FIRST `max_markets` registry markets (both YES+NO
+        // sides) plus their `token → MarketId` map, reusing the same registry
+        // market fields the arb token maps are built from. Phase 5 replaces this
+        // "first N" cap with liquid-segment selection.
+        let mut mm_tokens = Vec::new();
+        let mut mm_token_market = HashMap::new();
+        for m in reg.markets().iter().take(config.strategies.mm.max_markets) {
+            for tok in [m.yes, m.no] {
+                mm_tokens.push(tok);
+                mm_token_market.insert(tok, m.id);
+            }
+        }
+        let mm_market_count = mm_token_market.len() / 2;
+        let mm_params = MmParams::from_config(&config.strategies.mm)
+            .unwrap_or_else(|e| fatal(format!("MmParams::from_config: {e}")));
+        let mm_inv_cfg =
+            inventory_config(&config).unwrap_or_else(|e| fatal(format!("inventory_config: {e}")));
+        let mm = MmStrategy::new(mm_tokens, mm_token_market, mm_params, mm_inv_cfg, mm_capital);
+        host.add(Box::new(mm), mm_envelope);
+        info!(
+            mm_capital_usd = config.strategies.mm.capital_usd,
+            mm_capital_micro = mm_capital.0,
+            markets = mm_market_count,
+            arb_capital_micro,
+            "market maker enabled (paper): bankroll carved between arb and MM"
+        );
+    }
 
     // ---- spawn supervisors with the host's combined inline hook ------------
     // host.make_on_apply rebuilds the combined hook per call, constructing FRESH

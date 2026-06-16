@@ -15,6 +15,8 @@ use pm_registry::components::ComponentId;
 use pm_risk::RiskConfig;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::strategy::{StrategyEnvelope, StrategyId};
+
 pub fn engine_params(cfg: &Config) -> Result<EngineParams, ConfigError> {
     Ok(EngineParams {
         floor_c12: Bps(cfg.edges.min_edge_class12_bps),
@@ -69,6 +71,92 @@ pub fn inventory_config(cfg: &Config) -> Result<pm_risk::inventory::InventoryCon
         daily_loss_usd: Usdc(usd_to_microusdc(cfg.inventory.daily_loss_usd)?),
         vol_pull_ticks: cfg.inventory.vol_pull_ticks,
         vol_window: std::time::Duration::from_millis(cfg.inventory.vol_window_ms),
+    })
+}
+
+/// The platform's per-strategy capital envelopes plus the RiskConfig arb's
+/// `RiskEngine` enforces — the pure capital carve-out (Task 4.4b), factored out
+/// of `main`'s host-build block so it is unit-testable.
+///
+/// `mm` is `Some` only when `[strategies.mm] enabled`. The risk field on each
+/// envelope is allocator/record metadata (the host only sums `capital`); MM's
+/// real risk enforcement is its [`InventoryConfig`](pm_risk::inventory::InventoryConfig),
+/// not `mm`'s envelope `RiskConfig`.
+pub struct PlatformEnvelopes {
+    /// Arb's envelope: the WHOLE bankroll when MM is off, else `bankroll −
+    /// mm_capital`. Its `risk` is [`arb_risk`](Self::arb_risk).
+    pub arb: StrategyEnvelope,
+    /// The heartbeat's envelope: always zero capital (it takes no risk).
+    pub heartbeat: StrategyEnvelope,
+    /// The MM's envelope — `Some` only when the MM is enabled.
+    pub mm: Option<StrategyEnvelope>,
+    /// The RiskConfig arb's `RiskEngine` enforces. Byte-identical to the input
+    /// `risk_cfg` when MM is off; when MM is on its `bankroll` is REDUCED to
+    /// arb's slice so arb genuinely trades within its reduced capital (the crux
+    /// of sharing real funds without overlap).
+    pub arb_risk: RiskConfig,
+}
+
+/// Carve the platform `bankroll` into per-strategy envelopes (Task 4.4b). Pure
+/// (no I/O), so it is unit-tested directly.
+///
+/// * **MM disabled (default):** byte-identical to pre-4.4b — arb claims the
+///   WHOLE bankroll (its `RiskEngine` cap stays `risk_cfg.bankroll`), the
+///   heartbeat claims zero, and there is no MM envelope. Σ capital == bankroll.
+/// * **MM enabled:** `mm_capital = usd→µUSDC(mm.capital_usd)` is carved OUT, so
+///   `arb_capital = bankroll − mm_capital`. Arb's enforced `RiskConfig.bankroll`
+///   is reduced to `arb_capital` ([`arb_risk`](PlatformEnvelopes::arb_risk)) so
+///   the two strategies SHARE the bankroll without overlapping real funds. Σ
+///   capital (arb + mm + heartbeat 0) == bankroll, so the startup allocator
+///   passes exactly.
+///
+/// `bankroll` is the platform bankroll the host validates against (the caller
+/// passes `risk_cfg.bankroll`). Errors if `mm.capital_usd` is unconvertible or
+/// (when enabled) exceeds the bankroll — the latter is also rejected at config
+/// validation, but guarded here too since this fn is the real-money carve.
+pub fn strategy_envelopes(
+    config: &Config,
+    risk_cfg: &RiskConfig,
+    bankroll: Usdc,
+) -> Result<PlatformEnvelopes, ConfigError> {
+    let mm = &config.strategies.mm;
+    // The heartbeat always claims zero capital; its risk is record-only.
+    let heartbeat = StrategyEnvelope::new(StrategyId("heartbeat"), Usdc(0), risk_cfg.clone());
+
+    if !mm.enabled {
+        // DEFAULT path — change NOTHING: arb claims the whole bankroll and its
+        // enforced risk cap is the unmodified `risk_cfg`.
+        return Ok(PlatformEnvelopes {
+            arb: StrategyEnvelope::new(StrategyId("arb"), bankroll, risk_cfg.clone()),
+            heartbeat,
+            mm: None,
+            arb_risk: risk_cfg.clone(),
+        });
+    }
+
+    // MM ON: carve its slice out of the bankroll (real funds — no overlap).
+    let mm_capital = Usdc(usd_to_microusdc(mm.capital_usd)?);
+    if mm_capital.0 > bankroll.0 {
+        return Err(ConfigError::BadMoney(
+            "strategies.mm.capital_usd exceeds the platform bankroll",
+        ));
+    }
+    let arb_capital = Usdc(bankroll.0 - mm_capital.0);
+    // Arb's RiskEngine cap shrinks to its slice so it trades within it.
+    let arb_risk = RiskConfig {
+        bankroll: arb_capital,
+        ..risk_cfg.clone()
+    };
+    // MM's envelope risk records its slice; MM enforces via InventoryConfig.
+    let mm_risk = RiskConfig {
+        bankroll: mm_capital,
+        ..risk_cfg.clone()
+    };
+    Ok(PlatformEnvelopes {
+        arb: StrategyEnvelope::new(StrategyId("arb"), arb_capital, arb_risk.clone()),
+        heartbeat,
+        mm: Some(StrategyEnvelope::new(StrategyId("mm"), mm_capital, mm_risk)),
+        arb_risk,
     })
 }
 
@@ -324,6 +412,81 @@ mod tests {
         assert_eq!(inv.daily_loss_usd, Usdc(50_000_000)); // $50
         assert_eq!(inv.vol_pull_ticks, 5);
         assert_eq!(inv.vol_window, std::time::Duration::from_millis(2000));
+    }
+
+    // ── Capital carve-out (Task 4.4b) ──────────────────────────────────────
+
+    /// MM OFF (default): arb claims the WHOLE bankroll, there is no MM envelope,
+    /// arb's enforced risk cap is unchanged, and Σ capital == bankroll — i.e.
+    /// byte-identical to pre-4.4b (the live arb path the user runs today).
+    #[test]
+    fn strategy_envelopes_default_off_keeps_arb_whole_bankroll() {
+        let cfg = Config::default(); // mm.enabled == false
+        let risk = risk_config(&cfg, None).unwrap();
+        let bankroll = risk.bankroll;
+        let env = strategy_envelopes(&cfg, &risk, bankroll).unwrap();
+
+        assert!(env.mm.is_none(), "no MM envelope when disabled");
+        assert_eq!(env.arb.id, StrategyId("arb"));
+        assert_eq!(env.arb.capital, bankroll, "arb claims the whole bankroll");
+        assert_eq!(env.heartbeat.capital, Usdc(0), "heartbeat takes no capital");
+        assert_eq!(
+            env.arb_risk.bankroll, bankroll,
+            "arb's enforced risk cap is unchanged when MM is off"
+        );
+        // Σ capital == bankroll → the startup allocator passes.
+        let all = [env.arb.clone(), env.heartbeat.clone()];
+        assert_eq!(all.iter().map(|e| e.capital.0).sum::<i128>(), bankroll.0);
+        assert!(crate::strategy::allocate(&all, bankroll).is_ok());
+    }
+
+    /// MM ON: the bankroll is carved between arb and MM. The host gains an "mm"
+    /// envelope, arb's envelope (and enforced risk cap) drop to `bankroll −
+    /// mm_capital`, the heartbeat stays zero, and Σ envelopes == bankroll so the
+    /// allocator passes with no overlapping real funds.
+    #[test]
+    fn strategy_envelopes_mm_on_carves_capital_and_reduces_arb() {
+        let mut cfg = Config::default();
+        cfg.strategies.mm.enabled = true;
+        cfg.strategies.mm.capital_usd = 25.0;
+        let risk = risk_config(&cfg, None).unwrap();
+        let bankroll = risk.bankroll; // $10_000 → 10_000_000_000 µUSDC
+        let mm_capital = Usdc(usd_to_microusdc(25.0).unwrap());
+
+        let env = strategy_envelopes(&cfg, &risk, bankroll).unwrap();
+        let mm = env.mm.clone().unwrap(); // present when enabled
+        assert_eq!(mm.id, StrategyId("mm"));
+        assert_eq!(mm.capital, mm_capital, "MM gets exactly its configured slice");
+
+        let arb_slice = Usdc(bankroll.0 - mm_capital.0);
+        assert_eq!(env.arb.capital, arb_slice, "arb's envelope = bankroll − mm");
+        assert_eq!(
+            env.arb_risk.bankroll, arb_slice,
+            "arb's RiskEngine cap is REDUCED to its slice (genuinely shares funds)"
+        );
+        assert_eq!(env.heartbeat.capital, Usdc(0));
+
+        // Σ envelopes == bankroll EXACTLY → allocator passes, no overlap.
+        let all = [env.arb.clone(), env.heartbeat.clone(), mm];
+        assert_eq!(
+            all.iter().map(|e| e.capital.0).sum::<i128>(),
+            bankroll.0,
+            "arb + mm + heartbeat == bankroll"
+        );
+        assert!(crate::strategy::allocate(&all, bankroll).is_ok());
+    }
+
+    /// An enabled MM whose slice exceeds the bankroll is a fatal carve error
+    /// (can't share funds that don't exist) — guarded in the helper, not just at
+    /// config validation.
+    #[test]
+    fn strategy_envelopes_rejects_mm_capital_over_bankroll() {
+        let mut cfg = Config::default();
+        cfg.strategies.mm.enabled = true;
+        cfg.strategies.mm.capital_usd = 20_000.0; // > $10_000 default bankroll
+        let risk = risk_config(&cfg, None).unwrap();
+        let bankroll = risk.bankroll;
+        assert!(strategy_envelopes(&cfg, &risk, bankroll).is_err());
     }
 
     #[test]

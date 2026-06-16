@@ -436,6 +436,17 @@ pub struct Mm {
     /// realized P&L (it is paid out-of-band and unverified — folding it would
     /// inflate position P&L). Any `u32` is a valid estimate rate.
     pub rebate_bps: u32,
+    /// Bankroll slice allocated to the MM, USD. When `enabled`, this is carved
+    /// OUT of the platform bankroll and arb's risk cap is reduced by the same
+    /// amount, so the two strategies SHARE the bankroll without overlapping real
+    /// funds (Σ capital == bankroll). Must be ≥ 0 and, when `enabled`, ≤ the
+    /// platform bankroll (`capital.bankroll_usd`). Inert while disabled.
+    pub capital_usd: f64,
+    /// Cap on how many markets the MM quotes on first enablement: the MM takes
+    /// the first `max_markets` markets of the registry universe (both sides).
+    /// Phase 5 replaces this "first N" cap with liquid-segment selection. `0`
+    /// quotes nothing (inert); any `usize` is valid — documented, not bounded.
+    pub max_markets: usize,
 }
 
 impl Default for Mm {
@@ -450,6 +461,10 @@ impl Default for Mm {
             // Conservative: assume NO maker rebate unless the operator sets the
             // real (category-dependent) program rate.
             rebate_bps: 0,
+            // A small slice of the bankroll (the rest stays with arb), and a
+            // conservative market cap for the first enablement (Phase 5 refines).
+            capital_usd: 25.0,
+            max_markets: 20,
         }
     }
 }
@@ -643,6 +658,24 @@ impl Config {
                 "strategies.mm.max_quote_usd must be > 0",
             ));
         }
+        // MM capital must be finite + non-negative always; when ENABLED it is
+        // carved out of the bankroll (arb's cap shrinks by it), so it can never
+        // exceed the bankroll. Disabled → inert, so the bankroll bound is
+        // skipped (mirrors the per_market ≤ bankroll style above).
+        if self.strategies.mm.capital_usd < 0.0 || !self.strategies.mm.capital_usd.is_finite() {
+            return Err(ConfigError::BadMoney(
+                "strategies.mm.capital_usd must be finite and ≥ 0",
+            ));
+        }
+        if self.strategies.mm.enabled
+            && self.strategies.mm.capital_usd > self.capital.bankroll_usd
+        {
+            return Err(ConfigError::BadMoney(
+                "strategies.mm.capital_usd must be ≤ capital.bankroll_usd when enabled",
+            ));
+        }
+        // `max_markets` (usize) needs no bound: it is always ≥ 0; `0` simply
+        // quotes nothing (inert). Documented, not checked.
         // `inventory_skew_bps` needs no bound: as a `u32` it is always ≥ 0 (0
         // disables skew), and the quote loop clamps the skewed fair to the
         // interior tick range — an over-large skew just skips that side rather
@@ -1040,13 +1073,15 @@ mod tests {
         assert!((c.strategies.mm.max_quote_usd - 5.0).abs() < 1e-9);
         assert_eq!(c.strategies.mm.inventory_skew_bps, 150);
         assert_eq!(c.strategies.mm.rebate_bps, 0, "no assumed rebate by default");
+        assert!((c.strategies.mm.capital_usd - 25.0).abs() < 1e-9, "default MM slice $25");
+        assert_eq!(c.strategies.mm.max_markets, 20, "default first-N market cap");
         c.validate().unwrap();
     }
 
     #[test]
     fn mm_strategy_section_parses() {
         let c = Config::from_toml_str(
-            "[strategies.mm]\nenabled = true\nlive = false\nspread_bps = 300\nquote_refresh_ms = 1000\nmax_quote_usd = 7.5\ninventory_skew_bps = 250\nrebate_bps = 20\n",
+            "[strategies.mm]\nenabled = true\nlive = false\nspread_bps = 300\nquote_refresh_ms = 1000\nmax_quote_usd = 7.5\ninventory_skew_bps = 250\nrebate_bps = 20\ncapital_usd = 100.0\nmax_markets = 8\n",
         )
         .unwrap();
         assert!(c.strategies.mm.enabled);
@@ -1056,6 +1091,8 @@ mod tests {
         assert!((c.strategies.mm.max_quote_usd - 7.5).abs() < 1e-9);
         assert_eq!(c.strategies.mm.inventory_skew_bps, 250);
         assert_eq!(c.strategies.mm.rebate_bps, 20);
+        assert!((c.strategies.mm.capital_usd - 100.0).abs() < 1e-9);
+        assert_eq!(c.strategies.mm.max_markets, 8);
         c.validate().unwrap();
     }
 
@@ -1068,6 +1105,49 @@ mod tests {
         assert_eq!(c.strategies.mm.quote_refresh_ms, 1500);
         assert_eq!(c.strategies.mm.inventory_skew_bps, 150, "untouched field stays default");
         assert_eq!(c.strategies.mm.rebate_bps, 0, "untouched field stays default");
+        assert!((c.strategies.mm.capital_usd - 25.0).abs() < 1e-9, "untouched field stays default");
+        assert_eq!(c.strategies.mm.max_markets, 20, "untouched field stays default");
+    }
+
+    #[test]
+    fn mm_capital_carve_out_parses_and_validates() {
+        // An enabled MM with a capital slice well within the bankroll round-trips.
+        let c = Config::from_toml_str(
+            "[capital]\nbankroll_usd = 1000.0\n[strategies.mm]\nenabled = true\ncapital_usd = 250.0\nmax_markets = 5\n",
+        )
+        .unwrap();
+        assert!(c.strategies.mm.enabled);
+        assert!((c.strategies.mm.capital_usd - 250.0).abs() < 1e-9);
+        assert_eq!(c.strategies.mm.max_markets, 5);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn mm_capital_must_be_finite_and_nonnegative() {
+        // Negative capital is rejected even when disabled.
+        assert!(Config::from_toml_str("[strategies.mm]\ncapital_usd = -1.0\n").is_err());
+        let mut c = Config::default();
+        c.strategies.mm.capital_usd = f64::NAN;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn mm_capital_over_bankroll_rejected_only_when_enabled() {
+        // Disabled: a capital slice over the bankroll is inert → still parses.
+        // (per_market_usd is set ≤ bankroll so the unrelated capital check passes.)
+        let c = Config::from_toml_str(
+            "[capital]\nbankroll_usd = 100.0\nper_market_usd = 50.0\n[strategies.mm]\nenabled = false\ncapital_usd = 500.0\n",
+        )
+        .unwrap();
+        assert!((c.strategies.mm.capital_usd - 500.0).abs() < 1e-9);
+        // Enabled: the same over-bankroll slice can't be carved out → rejected.
+        assert!(
+            Config::from_toml_str(
+                "[capital]\nbankroll_usd = 100.0\nper_market_usd = 50.0\n[strategies.mm]\nenabled = true\ncapital_usd = 500.0\n",
+            )
+            .is_err(),
+            "an enabled MM slice above the bankroll must be rejected"
+        );
     }
 
     #[test]
