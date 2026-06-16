@@ -34,8 +34,8 @@ use pm_app::strategy::stub::HeartbeatStrategy;
 use pm_app::strategy::StrategyId;
 use pm_app::wiring::{
     BookFetcher, PlatformEnvelopes, build_component_index, engine_params, fee_map,
-    inventory_config, mm_use_live, pack_components, risk_config, strategy_envelopes, token_maps,
-    user_ws_url,
+    inventory_config, mm_allowed_segments, mm_market_selection, mm_use_live, pack_components,
+    risk_config, segment_thresholds, strategy_envelopes, token_maps, user_ws_url,
 };
 use pm_config::Config;
 use pm_core::instrument::Relationship;
@@ -1115,13 +1115,56 @@ async fn main() {
             None
         };
 
-        // MM's universe: the FIRST `max_markets` registry markets (both YES+NO
-        // sides) plus their `token → MarketId` map. When live, register each
-        // token on MM's venue in the SAME pass (the same
-        // `register_token(tok, vid, neg_risk, tick)` shape arb uses) — an order
-        // for an unregistered token is rejected before any I/O, so MM can only
-        // ever place orders within its own carved universe. Phase 5 replaces this
-        // "first N" cap with liquid-segment selection.
+        // MM's universe (Task 5.2 — PER-SEGMENT ROUTING): instead of the first
+        // `max_markets` registry markets, the MM quotes only the markets in its
+        // allowed liquidity segments (`[segments].mm_segments`, default
+        // LiquidStable + Liquid — NEVER Illiquid), skipping fee-free markets when
+        // `[segments].mm_exclude_fee_free` (default true; the rebate-driven MM
+        // earns no rebate on a fee-free market). The eligible markets are RANKED
+        // by liquidity (then volume) so the `max_markets` cap keeps the DEEPEST
+        // markets. ARB IS UNAFFECTED — it runs on every market unconditionally as
+        // the universal safety net; this routing is MM-only and only takes effect
+        // because the MM is enabled in this block.
+        //
+        // For each selected market we build the token set + `token → MarketId`
+        // map and (when live) register each token on MM's venue in the SAME pass
+        // (the same `register_token(tok, vid, neg_risk, tick)` shape arb uses) —
+        // an order for an unregistered token is rejected before any I/O, so MM
+        // can only ever place orders within its own carved universe.
+        let mm_thresholds = segment_thresholds(&config);
+        let mm_allowed = mm_allowed_segments(&config);
+        let mm_markets = mm_market_selection(
+            &reg,
+            &mm_thresholds,
+            &mm_allowed,
+            config.segments.mm_exclude_fee_free,
+            config.strategies.mm.max_markets,
+        );
+        // Eligible-before-cap count, for the routing log only (how many markets
+        // qualified vs. how many we actually quote after `max_markets`). The
+        // selection is a cheap startup-time filter+rank over the registry, so
+        // recomputing it uncapped (`usize::MAX`) here is negligible.
+        let mm_eligible = mm_market_selection(
+            &reg,
+            &mm_thresholds,
+            &mm_allowed,
+            config.segments.mm_exclude_fee_free,
+            usize::MAX,
+        )
+        .len();
+        info!(
+            "MM segment routing: {} eligible markets (segments={:?}, exclude_fee_free={}), \
+             quoting top {} by liquidity",
+            mm_eligible,
+            mm_allowed,
+            config.segments.mm_exclude_fee_free,
+            mm_markets.len(),
+        );
+        // MarketId → Market lookup for the selected ids (registry is dense, but a
+        // map keeps the call site independent of that invariant).
+        let mm_market_by_id: HashMap<pm_core::instrument::MarketId, pm_core::instrument::Market> =
+            reg.markets().iter().map(|m| (m.id, *m)).collect();
+
         let mut mm_tokens = Vec::new();
         let mut mm_token_market = HashMap::new();
         // Task 4.6 user-WS inputs (live only): the markets' condition_ids to
@@ -1133,7 +1176,8 @@ async fn main() {
             String,
             (pm_core::instrument::TokenId, pm_core::num::TickSize),
         > = HashMap::new();
-        for m in reg.markets().iter().take(config.strategies.mm.max_markets) {
+        for &mid in &mm_markets {
+            let m = mm_market_by_id[&mid];
             // Subscribe by condition_id (market), NOT token id (Task 4.6).
             if mm_live && let Some(cid) = reg.market_condition(m.id) {
                 mm_condition_ids.push(cid.to_string());

@@ -12,6 +12,7 @@ use pm_engine::{EngineParams, GasTable, RedeemStrategy};
 use pm_ingestion::supervisor::SupervisorCommand;
 use pm_registry::Registry;
 use pm_registry::components::ComponentId;
+use pm_registry::segment::{MarketSegment, SegmentThresholds};
 use pm_risk::RiskConfig;
 use tokio::sync::{mpsc, oneshot};
 
@@ -193,6 +194,106 @@ pub fn user_ws_url(market_ws_url: &str) -> String {
         Some(base) => format!("{base}/user"),
         None => "wss://ws-subscriptions-clob.polymarket.com/ws/user".to_string(),
     }
+}
+
+/// Task 5.2 — map the `[segments]` threshold config into the registry's pure
+/// [`SegmentThresholds`]. The two crates stay decoupled (Task 5.1): `pm-config`
+/// owns the USD cutoffs as plain `f64`s and never depends on `pm-registry`, so
+/// this app-level shim copies them field-for-field. Pure.
+pub fn segment_thresholds(config: &Config) -> SegmentThresholds {
+    SegmentThresholds {
+        liquid_stable_min_volume: config.segments.liquid_stable_min_volume,
+        liquid_stable_min_liquidity: config.segments.liquid_stable_min_liquidity,
+        liquid_min_volume: config.segments.liquid_min_volume,
+        liquid_min_liquidity: config.segments.liquid_min_liquidity,
+    }
+}
+
+/// Task 5.2 — the [`MarketSegment`]s the market maker may quote, parsed from
+/// `[segments].mm_segments`. `Config::validate` has already rejected any
+/// unknown name, so every entry maps; a stray unparseable entry is skipped
+/// defensively (never panics). The accepted spellings (case-insensitive,
+/// underscores ignored) are owned by [`pm_config::normalize_segment_name`], so
+/// canonicalisation is defined ONCE and this is just the canonical-name → enum
+/// step (keeping `pm-config` decoupled from `pm-registry`).
+pub fn mm_allowed_segments(config: &Config) -> Vec<MarketSegment> {
+    config
+        .segments
+        .mm_segments
+        .iter()
+        .filter_map(|s| parse_segment(s))
+        .collect()
+}
+
+/// Canonical-name → [`MarketSegment`]. Defers spelling normalisation to
+/// [`pm_config::normalize_segment_name`] so the accepted aliases live in one
+/// place; this only matches the three canonical names it returns.
+fn parse_segment(s: &str) -> Option<MarketSegment> {
+    match pm_config::normalize_segment_name(s)? {
+        "LiquidStable" => Some(MarketSegment::LiquidStable),
+        "Liquid" => Some(MarketSegment::Liquid),
+        "Illiquid" => Some(MarketSegment::Illiquid),
+        _ => None,
+    }
+}
+
+/// Task 5.2 — choose the markets the MARKET MAKER quotes (per-segment routing).
+/// PURE (reads only the registry + the config-derived inputs), so it is
+/// unit-tested directly.
+///
+/// A market is KEPT iff BOTH hold:
+///  * its [`MarketSegment`] (from [`Registry::segment`] under `thresholds`) is in
+///    `allowed`, AND
+///  * it survives the fee filter — `exclude_fee_free` drops markets with
+///    `fee_bps == 0` (the rebate-driven MM earns no rebate there; its spread
+///    economics differ), while `!exclude_fee_free` keeps every fee level.
+///
+/// Kept markets are RANKED most-attractive first: liquidity DESC, then volume
+/// DESC, then `MarketId` ASC as a deterministic tiebreak — so when the universe
+/// is capped the MM quotes the DEEPEST eligible markets. The top `max_markets`
+/// ids are returned in that rank order (`max_markets == 0` → empty; a missing
+/// metric counts as `0.0` for ranking, matching the Task-5.1 classifier).
+///
+/// ARB IS NOT ROUTED HERE: arb runs on EVERY market unconditionally (the
+/// universal safety net). This governs ONLY the MM's quoting universe, and only
+/// matters when the MM is enabled. Task 5.3 generalises scaling/prioritisation.
+pub fn mm_market_selection(
+    reg: &Registry,
+    thresholds: &SegmentThresholds,
+    allowed: &[MarketSegment],
+    exclude_fee_free: bool,
+    max_markets: usize,
+) -> Vec<MarketId> {
+    // Liquidity / volume for ranking; a market with no captured metric ranks as
+    // 0.0 (it would also classify Illiquid, so it is rarely even kept).
+    let liquidity = |id: MarketId| reg.metrics(id).and_then(|m| m.liquidity).unwrap_or(0.0);
+    let volume = |id: MarketId| reg.metrics(id).and_then(|m| m.volume).unwrap_or(0.0);
+
+    let mut kept: Vec<MarketId> = reg
+        .markets()
+        .iter()
+        .filter(|m| {
+            allowed.contains(&reg.segment(m.id, thresholds))
+                && (!exclude_fee_free || m.fee_bps.0 != 0)
+        })
+        .map(|m| m.id)
+        .collect();
+
+    // liquidity DESC, then volume DESC, then MarketId ASC (deterministic).
+    kept.sort_by(|&a, &b| {
+        liquidity(b)
+            .partial_cmp(&liquidity(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                volume(b)
+                    .partial_cmp(&volume(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then(a.cmp(&b))
+    });
+
+    kept.truncate(max_markets);
+    kept
 }
 
 /// Everything a detector needs about one connected component.
@@ -559,6 +660,203 @@ mod tests {
         assert_eq!(
             user_ws_url("wss://staging.example/feed"),
             "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+        );
+    }
+
+    // ── Per-segment MM routing (Task 5.2) ──────────────────────────────────
+
+    /// Add a binary market with recorded Phase-5 metrics (volume + liquidity).
+    fn add_metric_market(
+        b: &mut RegistryBuilder,
+        cond: &str,
+        yes: &str,
+        no: &str,
+        fee_bps: i32,
+        volume: f64,
+        liquidity: f64,
+    ) {
+        b.add_market(
+            cond,
+            yes,
+            no,
+            TickSize::Cent,
+            fee_bps,
+            false,
+            None,
+            true,
+            false,
+            None,
+        );
+        b.record_market_metrics(pm_registry::segment::MarketMetrics {
+            volume: Some(volume),
+            volume_24hr: None,
+            liquidity: Some(liquidity),
+            category: None,
+        });
+    }
+
+    /// Registry of markets spanning every segment + fee shape under the DEFAULT
+    /// thresholds (LiquidStable: vol≥100k ∧ liq≥50k; Liquid: vol≥10k ∧ liq≥5k):
+    ///  - `0xs1` LiquidStable, deepest (liq 300k), fee 200
+    ///  - `0xs2` LiquidStable, shallower (liq 100k), fee 100
+    ///  - `0xlq` Liquid (liq 20k), fee 50
+    ///  - `0xil` Illiquid (thin), fee 200
+    ///  - `0xff` LiquidStable but FEE-FREE (fee 0)
+    fn seg_reg() -> Registry {
+        let mut b = RegistryBuilder::default();
+        add_metric_market(&mut b, "0xs1", "ys1", "ns1", 200, 500_000.0, 300_000.0);
+        add_metric_market(&mut b, "0xs2", "ys2", "ns2", 100, 200_000.0, 100_000.0);
+        add_metric_market(&mut b, "0xlq", "ylq", "nlq", 50, 50_000.0, 20_000.0);
+        add_metric_market(&mut b, "0xil", "yil", "nil", 200, 100.0, 50.0);
+        add_metric_market(&mut b, "0xff", "yff", "nff", 0, 400_000.0, 250_000.0);
+        b.finish("").unwrap()
+    }
+
+    #[test]
+    fn segment_thresholds_mirror_config() {
+        let t = segment_thresholds(&Config::default());
+        let d = SegmentThresholds::default();
+        assert!((t.liquid_stable_min_volume - d.liquid_stable_min_volume).abs() < 1e-9);
+        assert!((t.liquid_stable_min_liquidity - d.liquid_stable_min_liquidity).abs() < 1e-9);
+        assert!((t.liquid_min_volume - d.liquid_min_volume).abs() < 1e-9);
+        assert!((t.liquid_min_liquidity - d.liquid_min_liquidity).abs() < 1e-9);
+        // A custom config threshold flows through field-for-field.
+        let mut cfg = Config::default();
+        cfg.segments.liquid_min_volume = 12_345.0;
+        assert!((segment_thresholds(&cfg).liquid_min_volume - 12_345.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mm_allowed_segments_parses_config_names() {
+        // Default: the liquid tiers, NOT Illiquid.
+        assert_eq!(
+            mm_allowed_segments(&Config::default()),
+            vec![MarketSegment::LiquidStable, MarketSegment::Liquid]
+        );
+        // Case-insensitive / underscore spellings map to the same enum set,
+        // preserving order.
+        let mut cfg = Config::default();
+        cfg.segments.mm_segments = vec!["liquid_stable".into(), "ILLIQUID".into()];
+        assert_eq!(
+            mm_allowed_segments(&cfg),
+            vec![MarketSegment::LiquidStable, MarketSegment::Illiquid]
+        );
+    }
+
+    #[test]
+    fn mm_selection_keeps_only_allowed_segments() {
+        let r = seg_reg();
+        let t = SegmentThresholds::default();
+        let il = r.market_by_condition("0xil").unwrap().id;
+        // LiquidStable + Liquid allowed; fee filter off so it can't interfere.
+        let sel = mm_market_selection(
+            &r,
+            &t,
+            &[MarketSegment::LiquidStable, MarketSegment::Liquid],
+            false,
+            usize::MAX,
+        );
+        assert!(
+            !sel.contains(&il),
+            "an Illiquid market must never be selected"
+        );
+        for cond in ["0xs1", "0xs2", "0xlq", "0xff"] {
+            let id = r.market_by_condition(cond).unwrap().id;
+            assert!(sel.contains(&id), "{cond} (allowed segment) should be kept");
+        }
+        // Narrowing to LiquidStable-only drops the Liquid market.
+        let only_stable =
+            mm_market_selection(&r, &t, &[MarketSegment::LiquidStable], false, usize::MAX);
+        let lq = r.market_by_condition("0xlq").unwrap().id;
+        assert!(
+            !only_stable.contains(&lq),
+            "the Liquid market is excluded when only LiquidStable is allowed"
+        );
+    }
+
+    #[test]
+    fn mm_selection_fee_free_filter() {
+        let r = seg_reg();
+        let t = SegmentThresholds::default();
+        let ff = r.market_by_condition("0xff").unwrap().id;
+        let allowed = [MarketSegment::LiquidStable, MarketSegment::Liquid];
+        // exclude_fee_free = true → the fee-free market is dropped.
+        let excl = mm_market_selection(&r, &t, &allowed, true, usize::MAX);
+        assert!(
+            !excl.contains(&ff),
+            "fee-free market dropped when exclude_fee_free=true"
+        );
+        // exclude_fee_free = false → it is kept.
+        let incl = mm_market_selection(&r, &t, &allowed, false, usize::MAX);
+        assert!(
+            incl.contains(&ff),
+            "fee-free market kept when exclude_fee_free=false"
+        );
+    }
+
+    #[test]
+    fn mm_selection_ranks_by_liquidity_then_caps() {
+        let r = seg_reg();
+        let t = SegmentThresholds::default();
+        let allowed = [MarketSegment::LiquidStable, MarketSegment::Liquid];
+        let s1 = r.market_by_condition("0xs1").unwrap().id; // liq 300k
+        let s2 = r.market_by_condition("0xs2").unwrap().id; // liq 100k
+        let lq = r.market_by_condition("0xlq").unwrap().id; // liq 20k
+        // Fee present (fee-free excluded) → eligible = s1, s2, lq, ranked by
+        // liquidity DESC — the most-liquid eligible market first.
+        let sel = mm_market_selection(&r, &t, &allowed, true, usize::MAX);
+        assert_eq!(sel, vec![s1, s2, lq], "ranked by liquidity DESC");
+        // The cap takes the top-N most-liquid.
+        assert_eq!(
+            mm_market_selection(&r, &t, &allowed, true, 2),
+            vec![s1, s2],
+            "cap keeps the two deepest"
+        );
+        assert_eq!(mm_market_selection(&r, &t, &allowed, true, 1), vec![s1]);
+    }
+
+    #[test]
+    fn mm_selection_tiebreaks_volume_then_market_id() {
+        // Three markets with IDENTICAL liquidity to exercise the secondary keys.
+        let mut b = RegistryBuilder::default();
+        add_metric_market(&mut b, "0xt1", "y1", "n1", 100, 60_000.0, 100_000.0);
+        add_metric_market(&mut b, "0xt2", "y2", "n2", 100, 90_000.0, 100_000.0);
+        add_metric_market(&mut b, "0xt3", "y3", "n3", 100, 90_000.0, 100_000.0);
+        let r = b.finish("").unwrap();
+        let t = SegmentThresholds::default();
+        let t1 = r.market_by_condition("0xt1").unwrap().id;
+        let t2 = r.market_by_condition("0xt2").unwrap().id;
+        let t3 = r.market_by_condition("0xt3").unwrap().id;
+        let sel = mm_market_selection(
+            &r,
+            &t,
+            &[MarketSegment::LiquidStable, MarketSegment::Liquid],
+            true,
+            usize::MAX,
+        );
+        // Equal liquidity → higher volume first (t2, t3 before t1); equal volume
+        // → MarketId ASC (t2 before t3, in insertion order).
+        assert_eq!(sel, vec![t2, t3, t1]);
+    }
+
+    #[test]
+    fn mm_selection_empty_when_nothing_qualifies() {
+        let r = seg_reg();
+        let t = SegmentThresholds::default();
+        let allowed = [MarketSegment::LiquidStable, MarketSegment::Liquid];
+        // No allowed segments → nothing.
+        assert!(mm_market_selection(&r, &t, &[], true, usize::MAX).is_empty());
+        // A zero cap → nothing, even with eligible markets.
+        assert!(mm_market_selection(&r, &t, &allowed, true, 0).is_empty());
+        // Only Illiquid allowed, but the one thin market is the only Illiquid one
+        // and it IS returned — so to get "nothing" via segment, exclude it: a
+        // registry whose only allowed-segment markets are all fee-free + excluded.
+        let mut b = RegistryBuilder::default();
+        add_metric_market(&mut b, "0xz", "yz", "nz", 0, 400_000.0, 250_000.0); // fee-free LiquidStable
+        let only_feefree = b.finish("").unwrap();
+        assert!(
+            mm_market_selection(&only_feefree, &t, &allowed, true, usize::MAX).is_empty(),
+            "all eligible-segment markets fee-free + excluded → empty"
         );
     }
 

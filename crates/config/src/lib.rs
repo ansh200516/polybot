@@ -443,10 +443,13 @@ pub struct Mm {
     /// funds (Σ capital == bankroll). Must be ≥ 0 and, when `enabled`, ≤ the
     /// platform bankroll (`capital.bankroll_usd`). Inert while disabled.
     pub capital_usd: f64,
-    /// Cap on how many markets the MM quotes on first enablement: the MM takes
-    /// the first `max_markets` markets of the registry universe (both sides).
-    /// Phase 5 replaces this "first N" cap with liquid-segment selection. `0`
-    /// quotes nothing (inert); any `usize` is valid — documented, not bounded.
+    /// Cap on how many markets the MM quotes (both YES+NO sides). Per-segment
+    /// routing (Task 5.2, `pm_app::wiring::mm_market_selection`) first filters
+    /// the universe to the MM's allowed liquidity segments (`[segments]
+    /// .mm_segments`, fee-free markets skipped per `mm_exclude_fee_free`) and
+    /// ranks them by liquidity; the MM then quotes the top `max_markets` of that
+    /// ranked, eligible set. `0` quotes nothing (inert); any `usize` is valid —
+    /// documented, not bounded.
     pub max_markets: usize,
     /// LIVE maker-fill source (Task 4.6): `"ws"` (default) | `"rest"`. INERT
     /// unless the MM is cleared for live (process `--live` AND
@@ -508,6 +511,34 @@ pub struct Segments {
     pub liquid_min_volume: f64,
     /// Minimum resting liquidity (USD) for the `Liquid` tier.
     pub liquid_min_liquidity: f64,
+    /// Liquidity segments the MARKET MAKER may quote (Task 5.2 routing). Each
+    /// entry names a `MarketSegment`; default `["LiquidStable", "Liquid"]` —
+    /// deliberately NOT `Illiquid`, the conservative arb-only tier (thin or
+    /// unknown-liquidity markets must never be quoted). Names are matched
+    /// CASE-INSENSITIVELY with underscores IGNORED, so `"LiquidStable"`,
+    /// `"liquid_stable"`, and `"liquidstable"` all select the LiquidStable tier;
+    /// the CANONICAL form is the PascalCase enum name (`LiquidStable` / `Liquid`
+    /// / `Illiquid`). `Config::validate` rejects any unrecognised name (see
+    /// [`normalize_segment_name`]). An empty list routes the MM to NO markets
+    /// (inert). The string→`MarketSegment` mapping lives in
+    /// `pm_app::wiring::mm_allowed_segments`, keeping this crate decoupled from
+    /// `pm-registry` (Task 5.1): config validates the spellings, the app maps
+    /// them to the enum.
+    ///
+    /// ARB IS NOT ROUTED BY THIS — it runs on EVERY market unconditionally as
+    /// the universal safety net; segment routing is MM-only.
+    pub mm_segments: Vec<String>,
+    /// Skip fee-free markets (`fee_bps == 0`) when routing the MARKET MAKER.
+    /// Default `true`: the MM is rebate-driven, so a fee-free market earns it no
+    /// rebate and its spread economics differ — quoting it is off the strategy's
+    /// edge. This is the fee signal that ACTUALLY EXISTS standing in for the
+    /// spec's "fee-free Geopolitics excluded from rebate-driven MM" rule: the
+    /// Gamma feed carries no category yet (`MarketMetrics::category` is always
+    /// `None`), so the exclusion is expressed via the fee we do have rather than
+    /// a category we don't. Set `false` to let the MM quote fee-free markets too.
+    ///
+    /// MM-ONLY — arb is unaffected (it never filters on fees for routing).
+    pub mm_exclude_fee_free: bool,
 }
 
 impl Default for Segments {
@@ -517,6 +548,10 @@ impl Default for Segments {
             liquid_stable_min_liquidity: 50_000.0,
             liquid_min_volume: 10_000.0,
             liquid_min_liquidity: 5_000.0,
+            // MM quotes the liquid tiers only (never Illiquid), and skips
+            // fee-free markets (no maker rebate there) — see field docs.
+            mm_segments: vec!["LiquidStable".to_string(), "Liquid".to_string()],
+            mm_exclude_fee_free: true,
         }
     }
 }
@@ -796,7 +831,39 @@ impl Config {
                 "segments.liquid_stable_min_liquidity must be ≥ liquid_min_liquidity",
             ));
         }
+        // Per-segment routing (Task 5.2): every `mm_segments` entry must name a
+        // known `MarketSegment` (case-insensitive, underscores ignored). An
+        // empty list is allowed (the MM then quotes nothing — inert). Only the
+        // MM list is validated: arb runs on ALL markets unconditionally (the
+        // universal safety net) and takes no routing config. `mm_exclude_fee_free`
+        // is a plain bool — no validation needed.
+        for name in &seg.mm_segments {
+            if normalize_segment_name(name).is_none() {
+                return Err(ConfigError::BadMoney(
+                    "segments.mm_segments contains an unknown segment name \
+                     (expected LiquidStable, Liquid, or Illiquid)",
+                ));
+            }
+        }
         Ok(())
+    }
+}
+
+/// Canonical `MarketSegment` name for a `[segments].mm_segments` entry, or
+/// `None` if unrecognised. Matching is CASE-INSENSITIVE and ignores underscores,
+/// so `"LiquidStable"`, `"liquid_stable"`, `"LIQUID_STABLE"`, and `"liquidstable"`
+/// all canonicalise to `"LiquidStable"`.
+///
+/// Kept string-only here so `pm-config` stays decoupled from `pm-registry`'s
+/// `MarketSegment` enum (Task 5.1): this crate validates the accepted spellings,
+/// and `pm_app::wiring` does the final canonical-name → `MarketSegment` mapping.
+/// The accepted spellings are the shared contract between the two crates.
+pub fn normalize_segment_name(s: &str) -> Option<&'static str> {
+    match s.trim().to_ascii_lowercase().replace('_', "").as_str() {
+        "liquidstable" => Some("LiquidStable"),
+        "liquid" => Some("Liquid"),
+        "illiquid" => Some("Illiquid"),
+        _ => None,
     }
 }
 
@@ -1365,7 +1432,82 @@ mod tests {
         // High bar ≥ low bar on each axis.
         assert!(c.segments.liquid_stable_min_volume >= c.segments.liquid_min_volume);
         assert!(c.segments.liquid_stable_min_liquidity >= c.segments.liquid_min_liquidity);
+        // MM routing defaults (Task 5.2): liquid tiers only (never Illiquid),
+        // fee-free markets skipped.
+        assert_eq!(
+            c.segments.mm_segments,
+            vec!["LiquidStable".to_string(), "Liquid".to_string()],
+            "MM defaults to the liquid tiers, NOT Illiquid"
+        );
+        assert!(
+            c.segments.mm_exclude_fee_free,
+            "fee-free markets are excluded from the rebate-driven MM by default"
+        );
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn mm_routing_segments_parse_and_round_trip() {
+        // Override mm_segments + mm_exclude_fee_free alongside another section.
+        let c = Config::from_toml_str(
+            "[capital]\nbankroll_usd = 5000.0\n[segments]\nmm_segments = [\"LiquidStable\"]\nmm_exclude_fee_free = false\n",
+        )
+        .unwrap();
+        assert_eq!(c.segments.mm_segments, vec!["LiquidStable".to_string()]);
+        assert!(!c.segments.mm_exclude_fee_free);
+        // Untouched threshold fields keep their defaults.
+        assert!((c.segments.liquid_min_volume - 10_000.0).abs() < 1e-6);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn mm_segment_names_are_case_and_underscore_insensitive() {
+        // snake_case, lowercase, and mixed-case spellings all validate.
+        let c = Config::from_toml_str(
+            "[segments]\nmm_segments = [\"liquid_stable\", \"LIQUID\", \"illiquid\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.segments.mm_segments.len(), 3);
+        c.validate().unwrap();
+        // The canonicaliser maps every accepted spelling to one canonical name.
+        assert_eq!(normalize_segment_name("liquid_stable"), Some("LiquidStable"));
+        assert_eq!(normalize_segment_name("LiquidStable"), Some("LiquidStable"));
+        assert_eq!(normalize_segment_name("  liquidstable "), Some("LiquidStable"));
+        assert_eq!(normalize_segment_name("LIQUID"), Some("Liquid"));
+        assert_eq!(normalize_segment_name("Illiquid"), Some("Illiquid"));
+        assert_eq!(normalize_segment_name("bogus"), None);
+    }
+
+    #[test]
+    fn mm_segments_unknown_name_is_rejected() {
+        // An unrecognised segment name fails validation.
+        assert!(
+            Config::from_toml_str("[segments]\nmm_segments = [\"Liquid\", \"Sparkling\"]\n")
+                .is_err(),
+            "an unknown segment name must be rejected"
+        );
+        // A single bad name is enough to reject.
+        assert!(Config::from_toml_str("[segments]\nmm_segments = [\"deep\"]\n").is_err());
+    }
+
+    #[test]
+    fn mm_segments_empty_list_is_allowed() {
+        // An empty allow-list is valid (the MM then quotes nothing — inert).
+        let c = Config::from_toml_str("[segments]\nmm_segments = []\n").unwrap();
+        assert!(c.segments.mm_segments.is_empty());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn mm_partial_segments_keeps_other_defaults() {
+        // Setting only mm_exclude_fee_free leaves mm_segments at its default.
+        let c = Config::from_toml_str("[segments]\nmm_exclude_fee_free = false\n").unwrap();
+        assert!(!c.segments.mm_exclude_fee_free);
+        assert_eq!(
+            c.segments.mm_segments,
+            vec!["LiquidStable".to_string(), "Liquid".to_string()],
+            "untouched mm_segments stays default"
+        );
     }
 
     #[test]
