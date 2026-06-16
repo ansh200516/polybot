@@ -34,6 +34,7 @@ use pm_ingestion::{
     sync::{AssembledUniverse, SyncTask, UniverseFilter},
     ws::TungsteniteTransport,
 };
+use pm_registry::segment::SegmentThresholds;
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing (plain std::env::args)
@@ -175,6 +176,16 @@ async fn main() {
     let filter = UniverseFilter {
         max_markets: config.universe.max_markets,
         require_active: config.universe.require_active,
+        // Task 5.3 universe scaling knobs (opt-in; defaults keep keyset order).
+        prioritize_by_liquidity: config.universe.prioritize_by_liquidity,
+        candidate_pool: config.universe.candidate_pool,
+        // Mirror `[segments]` thresholds (kept inline to avoid a pm-app dep).
+        segment_thresholds: SegmentThresholds {
+            liquid_stable_min_volume: config.segments.liquid_stable_min_volume,
+            liquid_stable_min_liquidity: config.segments.liquid_stable_min_liquidity,
+            liquid_min_volume: config.segments.liquid_min_volume,
+            liquid_min_liquidity: config.segments.liquid_min_liquidity,
+        },
     };
 
     let mut sync_task = match SyncTask::new(

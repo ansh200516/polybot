@@ -971,6 +971,111 @@ mod tests {
         assert!(chunks.iter().all(|c| c.len() == 4));
     }
 
+    /// Task 5.3 — "sharding respects ws_chunk_size at scale". A much larger
+    /// universe (many components) still packs into chunks each within the token
+    /// budget, with EVERY component intact (never split across chunks), and a
+    /// single component that itself exceeds the budget ships whole in its own
+    /// oversized chunk. No code change is expected vs. `pack_components` — this
+    /// pins the guarantee under scale.
+    #[test]
+    fn pack_components_respects_chunk_size_at_scale() {
+        use std::collections::HashSet;
+
+        let mut b = RegistryBuilder::default();
+        // Many small independent binary markets → each is its own component
+        // (2 tokens): exercises the first-fit packing across lots of components.
+        let n_small = 60;
+        for i in 0..n_small {
+            b.add_market(
+                &format!("0xsmall{i}"),
+                &format!("ys{i}"),
+                &format!("ns{i}"),
+                TickSize::Cent,
+                0,
+                false,
+                None,
+                true,
+                false,
+                None,
+            );
+        }
+        // One OVERSIZED component: a NegRisk event whose members all union into a
+        // single component (30 markets → 60 tokens), exceeding the 50-token chunk.
+        let big_members = 30;
+        for i in 0..big_members {
+            b.add_market(
+                &format!("0xbig{i}"),
+                &format!("yb{i}"),
+                &format!("nb{i}"),
+                TickSize::Cent,
+                0,
+                true,
+                Some(format!("Will candidate {i} win?")),
+                true,
+                false,
+                Some("bigEvent"),
+            );
+        }
+        let r = b.finish("").unwrap();
+
+        let chunk_size = 50;
+        let chunks = pack_components(&r, chunk_size);
+        let idx = build_component_index(&r, false);
+
+        // 1. No component is split: each component's tokens live in exactly one chunk.
+        let mut comp_chunks: HashMap<ComponentId, HashSet<usize>> = HashMap::new();
+        for (ci, chunk) in chunks.iter().enumerate() {
+            for t in chunk {
+                comp_chunks.entry(idx.by_token[t]).or_default().insert(ci);
+            }
+        }
+        for (cid, set) in &comp_chunks {
+            assert_eq!(set.len(), 1, "component {cid:?} was split across chunks");
+        }
+
+        // 2. Every chunk is within budget UNLESS it is a single whole component
+        //    that is itself oversized.
+        for chunk in &chunks {
+            if chunk.len() > chunk_size {
+                let cid = idx.by_token[&chunk[0]];
+                assert!(
+                    chunk.iter().all(|t| idx.by_token[t] == cid),
+                    "an oversized chunk must hold exactly one component"
+                );
+                assert_eq!(
+                    chunk.len(),
+                    idx.entries[&cid].tokens.len(),
+                    "the oversized chunk is that whole component, nothing more"
+                );
+            }
+        }
+
+        // 3. The big NegRisk component IS the oversized one and ships whole.
+        let big0 = r.market_by_condition("0xbig0").unwrap().id;
+        let big_cid = r.component_of(big0);
+        let big_tokens = idx.entries[&big_cid].tokens.len();
+        assert!(
+            big_tokens > chunk_size,
+            "the big component must exceed the budget ({big_tokens} > {chunk_size})"
+        );
+        let big_chunk = chunks
+            .iter()
+            .find(|c| idx.by_token[&c[0]] == big_cid)
+            .unwrap();
+        assert_eq!(
+            big_chunk.len(),
+            big_tokens,
+            "oversized component ships whole in its own chunk"
+        );
+
+        // 4. Token conservation: every token appears exactly once across chunks.
+        let total_tokens: usize = idx.entries.values().map(|e| e.tokens.len()).sum();
+        let packed: usize = chunks.iter().map(|c| c.len()).sum();
+        assert_eq!(packed, total_tokens, "no tokens dropped or duplicated");
+        let unique: HashSet<TokenId> = chunks.iter().flatten().copied().collect();
+        assert_eq!(unique.len(), total_tokens, "no token packed twice");
+    }
+
     #[test]
     fn token_maps_cover_both_sides() {
         let r = reg();

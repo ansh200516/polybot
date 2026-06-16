@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use pm_core::num::TickSize;
-use pm_registry::gamma::{ClobMarket, GammaEvent};
-use pm_registry::segment::MarketMetrics;
+use pm_registry::gamma::{ClobMarket, GammaEvent, GammaMarket};
+use pm_registry::segment::{MarketMetrics, MarketPriority, SegmentThresholds, classify, market_priority};
 use pm_registry::{RegistryBuilder, RegistryError};
 
 use crate::IngestError;
@@ -40,6 +40,24 @@ pub struct UniverseFilter {
     /// When `true`, skip markets where CLOB reports `active == false` or
     /// `closed == true`. Default: `true`.
     pub require_active: bool,
+    /// Task 5.3 — opt-in universe prioritization. **Default `false`** ⇒ the
+    /// universe cap keeps the first `max_markets` ACCEPTED markets in Gamma
+    /// keyset order (historical, byte-identical behaviour). `true` ⇒ a candidate
+    /// pool is gathered in keyset order and ranked by [`market_priority`]
+    /// (segment tier, then liquidity, then volume); the top `max_markets`
+    /// survive. The entire ranking path is guarded behind this flag, so the
+    /// default code path is unchanged.
+    pub prioritize_by_liquidity: bool,
+    /// Task 5.3 — candidate pool size for prioritization. **Default `0`**, the
+    /// sentinel for "= `max_markets`" (no extra fetching). A non-zero value must
+    /// be ≥ `max_markets`; it is the number of ACCEPTED candidates gathered (in
+    /// keyset order) before ranking. Clamped to [`MAX_CANDIDATE_POOL`] to bound
+    /// CLOB API cost. Inert unless `prioritize_by_liquidity`.
+    pub candidate_pool: usize,
+    /// Task 5.3 — segment thresholds used to classify each candidate for the
+    /// tier component of [`market_priority`]. Only consulted on the prioritized
+    /// path; ignored entirely when `prioritize_by_liquidity` is `false`.
+    pub segment_thresholds: SegmentThresholds,
 }
 
 impl Default for UniverseFilter {
@@ -47,6 +65,10 @@ impl Default for UniverseFilter {
         UniverseFilter {
             max_markets: 200,
             require_active: true,
+            // Task 5.3 defaults keep the historical keyset-order cap unchanged.
+            prioritize_by_liquidity: false,
+            candidate_pool: 0,
+            segment_thresholds: SegmentThresholds::default(),
         }
     }
 }
@@ -68,6 +90,11 @@ pub enum SkippedReason {
     MissingTokens,
     /// CLOB lookup returned no record for this condition id.
     ClobLookupFailed,
+    /// Task 5.3 — a gated-OK candidate that ranked below the top `max_markets`
+    /// by [`market_priority`] (segment tier, liquidity, volume) and was dropped.
+    /// ONLY ever produced on the opt-in prioritized path; the default keyset
+    /// path never emits it.
+    BelowPriorityCut,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +187,83 @@ fn gate_market(
     Ok((tick, yes_id, no_id))
 }
 
+/// Hard ceiling on the prioritization candidate pool (Task 5.3). Caps the
+/// number of CLOB lookups when scaling toward broad coverage so a large
+/// `candidate_pool` can never make startup fetch an unbounded number of markets.
+pub const MAX_CANDIDATE_POOL: usize = 5000;
+
+/// Resolve the effective candidate-pool size for the prioritized path.
+///
+/// `candidate_pool == 0` is the sentinel for "= `max_markets`" (no extra
+/// fetching). The result is clamped to [`MAX_CANDIDATE_POOL`] to bound API cost,
+/// but never below `max_markets` (the operator asked to KEEP that many, so the
+/// pool must be able to fill them even past the ceiling). Only meaningful when
+/// `filter.prioritize_by_liquidity` is set.
+fn effective_candidate_pool(filter: &UniverseFilter) -> usize {
+    let requested = if filter.candidate_pool == 0 {
+        filter.max_markets
+    } else {
+        filter.candidate_pool
+    };
+    requested.min(MAX_CANDIDATE_POOL).max(filter.max_markets)
+}
+
+/// Build one gated, accepted market into the registry builder.
+///
+/// Shared by [`assemble_keyset`] and [`assemble_prioritized`] so the two paths
+/// cannot drift (mirrors the [`gate_market`] sharing). Reproduces the original
+/// inline block exactly: CLOB `taker_base_fee` is authoritative, `neg_risk` is
+/// the defensive OR of the CLOB and gamma flags, an empty event id means "no
+/// grouping", and the Phase-5 metrics are captured for the accepted market.
+fn add_accepted_market(
+    builder: &mut RegistryBuilder,
+    event: &GammaEvent,
+    gm: &GammaMarket,
+    clob: &ClobMarket,
+    tick: TickSize,
+    yes_id: &str,
+    no_id: &str,
+) {
+    // ---- fee (CLOB taker_base_fee is authoritative) ----------------
+    let fee_bps = i32::try_from(clob.taker_base_fee).unwrap_or_else(|_| {
+        if clob.taker_base_fee > i64::from(i32::MAX) {
+            i32::MAX
+        } else {
+            i32::MIN
+        }
+    });
+
+    // ---- negRisk (defensive or) ------------------------------------
+    let neg_risk = clob.neg_risk || gm.neg_risk;
+
+    // ---- event key (skip grouping when empty) ----------------------
+    let event_key: Option<&str> = if event.id.is_empty() {
+        None
+    } else {
+        Some(&event.id)
+    };
+
+    builder.add_market(
+        &gm.condition_id,
+        yes_id,
+        no_id,
+        tick,
+        fee_bps,
+        neg_risk,
+        gm.question.clone(),
+        clob.active,
+        clob.closed,
+        event_key,
+    );
+    // Phase-5 segmentation: capture the per-market Gamma liquidity metrics.
+    builder.record_market_metrics(MarketMetrics {
+        volume: gm.volume,
+        volume_24hr: gm.volume_24hr,
+        liquidity: gm.liquidity,
+        category: gm.category.clone(),
+    });
+}
+
 /// Assemble a [`Registry`] from gamma event groupings joined with CLOB market
 /// metadata.
 ///
@@ -172,8 +276,20 @@ fn gate_market(
 ///
 /// # Capping behaviour
 ///
-/// Once `filter.max_markets` markets have been added the remaining gamma
-/// markets are simply not visited — they do **not** produce skip entries.
+/// **Default (`filter.prioritize_by_liquidity == false`):** markets are accepted
+/// in gamma keyset order and once `filter.max_markets` have been added the
+/// remaining gamma markets are simply not visited — they do **not** produce skip
+/// entries. This is the historical behaviour, byte-identical to before Task 5.3.
+///
+/// **Prioritized (opt-in, `filter.prioritize_by_liquidity == true`):** candidates
+/// are accepted in keyset order up to a pool of [`effective_candidate_pool`]
+/// markets, ranked by [`market_priority`] (segment tier, then liquidity, then
+/// volume, with condition id + keyset position as a stable tiebreak), and the top
+/// `filter.max_markets` are kept. Candidates ranked below the cut are dropped and
+/// recorded as [`SkippedReason::BelowPriorityCut`]. Kept markets are assembled in
+/// keyset order, so event grouping is preserved — ranking only decides *which*
+/// markets survive, not their assembly order. The whole ranking path is guarded
+/// behind the flag, leaving the default code path unchanged.
 pub fn assemble_registry(
     events: &[GammaEvent],
     clob_by_condition: &HashMap<String, ClobMarket>,
@@ -182,6 +298,29 @@ pub fn assemble_registry(
 ) -> Result<AssembledUniverse, RegistryError> {
     let mut builder = RegistryBuilder::default();
     let mut skipped: Vec<(String, SkippedReason)> = Vec::new();
+
+    if filter.prioritize_by_liquidity {
+        assemble_prioritized(&mut builder, &mut skipped, events, clob_by_condition, filter);
+    } else {
+        assemble_keyset(&mut builder, &mut skipped, events, clob_by_condition, filter);
+    }
+
+    let registry = builder.finish(relationship_toml)?;
+    Ok(AssembledUniverse {
+        registry: Arc::new(registry),
+        skipped,
+    })
+}
+
+/// DEFAULT capping path: accept in keyset order, stop at `filter.max_markets`.
+/// Byte-identical in behaviour to the pre-Task-5.3 `assemble_registry` loop.
+fn assemble_keyset(
+    builder: &mut RegistryBuilder,
+    skipped: &mut Vec<(String, SkippedReason)>,
+    events: &[GammaEvent],
+    clob_by_condition: &HashMap<String, ClobMarket>,
+    filter: &UniverseFilter,
+) {
     let mut count = 0usize;
 
     'outer: for event in events {
@@ -214,57 +353,129 @@ pub fn assemble_registry(
                 }
             };
 
-            // ---- fee (CLOB taker_base_fee is authoritative) ----------------
-            let fee_bps = i32::try_from(clob.taker_base_fee).unwrap_or_else(|_| {
-                if clob.taker_base_fee > i64::from(i32::MAX) {
-                    i32::MAX
-                } else {
-                    i32::MIN
+            add_accepted_market(builder, event, gm, clob, tick, &yes_id, &no_id);
+            count += 1;
+        }
+    }
+}
+
+/// OPT-IN prioritized capping path (Task 5.3). Gathers accepted candidates in
+/// keyset order up to [`effective_candidate_pool`], ranks them by
+/// [`market_priority`], keeps the top `filter.max_markets`, and records the rest
+/// as [`SkippedReason::BelowPriorityCut`].
+///
+/// Phase 1 visits the SAME prefix of markets that [`fetch_clob_bounded`] fetches
+/// (both share `effective_candidate_pool` + [`gate_market`]), so every CLOB
+/// record assembly needs was fetched, and skip reasons for gate failures within
+/// the visited prefix match the keyset path exactly.
+fn assemble_prioritized<'a>(
+    builder: &mut RegistryBuilder,
+    skipped: &mut Vec<(String, SkippedReason)>,
+    events: &'a [GammaEvent],
+    clob_by_condition: &'a HashMap<String, ClobMarket>,
+    filter: &UniverseFilter,
+) {
+    /// An accepted candidate: enough state to rank it and (if kept) build it.
+    struct Candidate<'a> {
+        event: &'a GammaEvent,
+        gm: &'a GammaMarket,
+        clob: &'a ClobMarket,
+        tick: TickSize,
+        yes_id: String,
+        no_id: String,
+        priority: MarketPriority,
+    }
+
+    let pool_cap = effective_candidate_pool(filter);
+    let mut candidates: Vec<Candidate<'a>> = Vec::new();
+
+    // ---- Phase 1: gather accepted candidates in keyset order, up to pool_cap.
+    'outer: for event in events {
+        for gm in &event.markets {
+            if candidates.len() >= pool_cap {
+                break 'outer;
+            }
+
+            // ---- condition id check -----------------------------------------
+            if gm.condition_id.is_empty() {
+                skipped.push((gm.condition_id.clone(), SkippedReason::EmptyConditionId));
+                continue;
+            }
+
+            // ---- CLOB lookup ------------------------------------------------
+            let clob = match clob_by_condition.get(&gm.condition_id) {
+                Some(c) => c,
+                None => {
+                    skipped.push((gm.condition_id.clone(), SkippedReason::ClobLookupFailed));
+                    continue;
                 }
-            });
-
-            // ---- negRisk (defensive or) ------------------------------------
-            let neg_risk = clob.neg_risk || gm.neg_risk;
-
-            // ---- event key (skip grouping when empty) ----------------------
-            let event_key: Option<&str> = if event.id.is_empty() {
-                None
-            } else {
-                Some(&event.id)
             };
 
-            builder.add_market(
-                &gm.condition_id,
-                &yes_id,
-                &no_id,
-                tick,
-                fee_bps,
-                neg_risk,
-                gm.question.clone(),
-                clob.active,
-                clob.closed,
-                event_key,
-            );
-            // Phase-5 segmentation: capture the per-market Gamma liquidity
-            // metrics. Purely additive — this records data about the market that
-            // was just accepted and never affects which markets are accepted,
-            // capped, or in what order.
-            builder.record_market_metrics(MarketMetrics {
+            // ---- shared gate: active/closed, tick size, tokens ---------------
+            let (tick, yes_id, no_id) = match gate_market(clob, filter) {
+                Ok(parsed) => parsed,
+                Err(reason) => {
+                    skipped.push((gm.condition_id.clone(), reason));
+                    continue;
+                }
+            };
+
+            // ---- rank inputs: classify the segment, build the priority key ---
+            let metrics = MarketMetrics {
                 volume: gm.volume,
                 volume_24hr: gm.volume_24hr,
                 liquidity: gm.liquidity,
                 category: gm.category.clone(),
-            });
+            };
+            let segment = classify(&metrics, &filter.segment_thresholds);
+            let priority = market_priority(&metrics, segment);
 
-            count += 1;
+            candidates.push(Candidate {
+                event,
+                gm,
+                clob,
+                tick,
+                yes_id,
+                no_id,
+                priority,
+            });
         }
     }
 
-    let registry = builder.finish(relationship_toml)?;
-    Ok(AssembledUniverse {
-        registry: Arc::new(registry),
-        skipped,
-    })
+    // ---- Phase 2: rank best-first, keep the top max_markets ------------------
+    let candidate_count = candidates.len();
+    // Rank candidate indices: priority DESC, then condition id ASC, then keyset
+    // position ASC — a total, deterministic order even for duplicate ids.
+    let mut order: Vec<usize> = (0..candidate_count).collect();
+    order.sort_by(|&a, &b| {
+        candidates[b]
+            .priority
+            .cmp(&candidates[a].priority)
+            .then_with(|| candidates[a].gm.condition_id.cmp(&candidates[b].gm.condition_id))
+            .then(a.cmp(&b))
+    });
+    let keep = filter.max_markets.min(candidate_count);
+    let kept: std::collections::HashSet<usize> = order[..keep].iter().copied().collect();
+
+    // Build kept markets in keyset (candidate insertion) order so event grouping
+    // is preserved; record dropped candidates as BelowPriorityCut.
+    for (i, cand) in candidates.iter().enumerate() {
+        if kept.contains(&i) {
+            add_accepted_market(
+                builder, cand.event, cand.gm, cand.clob, cand.tick, &cand.yes_id, &cand.no_id,
+            );
+        } else {
+            skipped.push((cand.gm.condition_id.clone(), SkippedReason::BelowPriorityCut));
+        }
+    }
+
+    tracing::info!(
+        candidates = candidate_count,
+        kept = keep,
+        max_markets = filter.max_markets,
+        candidate_pool = pool_cap,
+        "universe prioritization: ranked {candidate_count} candidates → kept top {keep} by (segment, liquidity)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -506,13 +717,24 @@ impl ClobFetch for ClobRest {
 }
 
 /// Fetch CLOB metadata for the markets in `events`, visiting them in exactly
-/// the order [`assemble_registry`] does and stopping once
-/// `filter.max_markets` markets *would be accepted* by assembly.
+/// the order [`assemble_registry`] does and stopping once the visit cap of
+/// would-be-accepted markets is reached.
+///
+/// The cap depends on the prioritization mode (Task 5.3):
+/// - **Default (`!prioritize_by_liquidity`):** `filter.max_markets` — assembly
+///   never visits markets past its cap, so neither does the fetch.
+/// - **Prioritized:** [`effective_candidate_pool`] — assembly ranks the whole
+///   candidate pool down to `max_markets`, so the fetch must cover the pool.
+///   This is the documented API-cost tradeoff: up to `candidate_pool` CLOB
+///   lookups happen even though only `max_markets` end up in the registry. CLOB
+///   metadata carries no ranking signal (liquidity/volume come from gamma), so
+///   the pool cannot be pre-trimmed before fetching: a candidate must clear the
+///   CLOB-backed [`gate_market`] to be rankable at all.
 ///
 /// Acceptance mirrors `assemble_registry`'s per-market gating (shared via
-/// [`gate_market`]), so assembling from the bounded map yields a registry
-/// identical to one assembled from an exhaustive fetch: assembly never visits
-/// markets past its cap, and every market it does visit is fetched here.
+/// [`gate_market`] + `effective_candidate_pool`), so the fetch and assembly
+/// visit the identical prefix: every CLOB record assembly needs was fetched,
+/// and no record outside the pool is fetched.
 ///
 /// This bound matters for startup latency: a single gamma keyset page can
 /// carry 1000+ member markets, and the CLOB client is rate-limited — an
@@ -523,6 +745,14 @@ pub async fn fetch_clob_bounded<F: ClobFetch>(
     events: &[GammaEvent],
     filter: &UniverseFilter,
 ) -> (HashMap<String, ClobMarket>, Vec<(String, SkippedReason)>) {
+    // Shared with assembly: prioritization fetches the whole candidate pool,
+    // the default path fetches exactly up to max_markets.
+    let cap = if filter.prioritize_by_liquidity {
+        effective_candidate_pool(filter)
+    } else {
+        filter.max_markets
+    };
+
     let mut by_condition: HashMap<String, ClobMarket> = HashMap::new();
     let mut failures: Vec<(String, SkippedReason)> = Vec::new();
     let mut accepted = 0usize;
@@ -532,7 +762,7 @@ pub async fn fetch_clob_bounded<F: ClobFetch>(
             // Mirror assemble_registry's cap check: it breaks at the TOP of
             // the loop for the market AFTER the last accepted one, so nothing
             // past this point is ever visited by assembly either.
-            if accepted >= filter.max_markets {
+            if accepted >= cap {
                 break 'outer;
             }
             if gm.condition_id.is_empty() {
@@ -879,6 +1109,7 @@ mod tests {
         let filter = UniverseFilter {
             max_markets: 2,
             require_active: true,
+            ..UniverseFilter::default()
         };
         let universe = assemble_registry(&[ev1, ev2], &clob, "", &filter).unwrap();
 
@@ -917,6 +1148,7 @@ mod tests {
         let filter_strict = UniverseFilter {
             max_markets: 200,
             require_active: true,
+            ..UniverseFilter::default()
         };
         let strict =
             assemble_registry(std::slice::from_ref(&ev), &clob, "", &filter_strict).unwrap();
@@ -928,6 +1160,7 @@ mod tests {
         let filter_lax = UniverseFilter {
             max_markets: 200,
             require_active: false,
+            ..UniverseFilter::default()
         };
         let lax = assemble_registry(&[ev], &clob, "", &filter_lax).unwrap();
         assert_eq!(lax.registry.markets().len(), 1);
@@ -1282,6 +1515,7 @@ mod tests {
         let filter = UniverseFilter {
             max_markets: 2,
             require_active: true,
+            ..UniverseFilter::default()
         };
 
         let (map, failures) = fetch_clob_bounded(&mut stub, &events, &filter).await;
@@ -1328,6 +1562,7 @@ mod tests {
         let filter = UniverseFilter {
             max_markets: 2,
             require_active: true,
+            ..UniverseFilter::default()
         };
 
         let (map, _failures) = fetch_clob_bounded(&mut stub, &events, &filter).await;
@@ -1355,6 +1590,7 @@ mod tests {
         let filter = UniverseFilter {
             max_markets: 1,
             require_active: true,
+            ..UniverseFilter::default()
         };
 
         let (map, failures) = fetch_clob_bounded(&mut stub, &events, &filter).await;
@@ -1384,6 +1620,7 @@ mod tests {
         let filter = UniverseFilter {
             max_markets: 2,
             require_active: true,
+            ..UniverseFilter::default()
         };
 
         let (map, _failures) = fetch_clob_bounded(&mut stub, &events, &filter).await;
@@ -1425,6 +1662,7 @@ mod tests {
         let filter = UniverseFilter {
             max_markets: 2,
             require_active: true,
+            ..UniverseFilter::default()
         };
 
         let full_map: HashMap<String, ClobMarket> = full
@@ -1447,5 +1685,257 @@ mod tests {
         assert_eq!(conditions(&from_full), vec!["c2", "c3"]);
         assert_eq!(conditions(&from_bounded), conditions(&from_full));
         assert_eq!(from_bounded.skipped, from_full.skipped);
+    }
+
+    // ---- Task 5.3: universe prioritization ---------------------------------
+
+    /// Build a single-market gamma event carrying Phase-5 liquidity metrics.
+    fn make_event_metrics(
+        event_id: &str,
+        cond: &str,
+        yes: &str,
+        no: &str,
+        volume: f64,
+        liquidity: f64,
+    ) -> GammaEvent {
+        let json = format!(
+            r#"{{
+                "id": {eid:?},
+                "negRisk": false,
+                "markets": [{{
+                    "conditionId": {cid:?},
+                    "clobTokenIds": "[\"{yes}\", \"{no}\"]",
+                    "negRisk": false,
+                    "active": true,
+                    "closed": false,
+                    "question": "Q?",
+                    "volume": {volume},
+                    "liquidity": {liquidity}
+                }}]
+            }}"#,
+            eid = event_id,
+            cid = cond,
+            yes = yes,
+            no = no,
+            volume = volume,
+            liquidity = liquidity,
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// 4 markets whose keyset order (c1, c2 thin Illiquid; then c3, c4 deep
+    /// LiquidStable) is the OPPOSITE of liquidity order — so the default keyset
+    /// cap keeps the thin pair while prioritization keeps the deep pair.
+    fn priority_fixture() -> (Vec<GammaEvent>, HashMap<String, ClobMarket>) {
+        let events = vec![
+            make_event_metrics("e1", "c1", "y1", "n1", 100.0, 50.0), // Illiquid
+            make_event_metrics("e2", "c2", "y2", "n2", 200.0, 60.0), // Illiquid
+            make_event_metrics("e3", "c3", "y3", "n3", 500_000.0, 300_000.0), // LiquidStable
+            make_event_metrics("e4", "c4", "y4", "n4", 400_000.0, 250_000.0), // LiquidStable
+        ];
+        let clob: HashMap<String, ClobMarket> = [
+            ("c1", "y1", "n1"),
+            ("c2", "y2", "n2"),
+            ("c3", "y3", "n3"),
+            ("c4", "y4", "n4"),
+        ]
+        .iter()
+        .map(|&(c, y, n)| (c.to_string(), ok_clob(c, y, n)))
+        .collect();
+        (events, clob)
+    }
+
+    fn conditions_of(u: &AssembledUniverse) -> Vec<String> {
+        u.registry
+            .markets()
+            .iter()
+            .map(|m| u.registry.market_condition(m.id).unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn default_path_keeps_keyset_order_not_priority() {
+        // DEFAULT (prioritize_by_liquidity = false): the cap keeps the FIRST
+        // max_markets in keyset order — the THIN c1, c2 — byte-identically to
+        // pre-Task-5.3. Capped markets are never visited, so there are no skips.
+        let (events, clob) = priority_fixture();
+        let filter = UniverseFilter {
+            max_markets: 2,
+            require_active: true,
+            ..UniverseFilter::default()
+        };
+        let u = assemble_registry(&events, &clob, "", &filter).unwrap();
+        assert_eq!(
+            conditions_of(&u),
+            vec!["c1", "c2"],
+            "default keeps the first max_markets in keyset order"
+        );
+        assert!(
+            u.skipped.is_empty(),
+            "capped markets are never visited → no skip entries"
+        );
+    }
+
+    #[test]
+    fn prioritized_keeps_deep_markets_and_drops_thin() {
+        // OPT-IN prioritization with a pool covering all 4 candidates keeps the
+        // DEEP LiquidStable markets (c3, c4) and drops the thin c1, c2 — the
+        // OPPOSITE of the keyset default — capped at max_markets.
+        let (events, clob) = priority_fixture();
+        let filter = UniverseFilter {
+            max_markets: 2,
+            require_active: true,
+            prioritize_by_liquidity: true,
+            candidate_pool: 4,
+            ..UniverseFilter::default()
+        };
+        let u = assemble_registry(&events, &clob, "", &filter).unwrap();
+        // Kept markets are assembled in keyset order; the deep pair wins.
+        assert_eq!(
+            conditions_of(&u),
+            vec!["c3", "c4"],
+            "prioritization keeps the deep LiquidStable markets"
+        );
+        // The thin markets are recorded as dropped below the priority cut.
+        let dropped: Vec<&str> = u
+            .skipped
+            .iter()
+            .filter(|(_, r)| *r == SkippedReason::BelowPriorityCut)
+            .map(|(c, _)| c.as_str())
+            .collect();
+        assert_eq!(
+            dropped,
+            vec!["c1", "c2"],
+            "thin markets dropped as BelowPriorityCut"
+        );
+    }
+
+    #[test]
+    fn candidate_pool_bounds_candidates_considered() {
+        let (events, clob) = priority_fixture();
+        // A wide pool (4) considers every candidate → keeps the two deepest.
+        let wide = UniverseFilter {
+            max_markets: 2,
+            require_active: true,
+            prioritize_by_liquidity: true,
+            candidate_pool: 4,
+            ..UniverseFilter::default()
+        };
+        let u_wide = assemble_registry(&events, &clob, "", &wide).unwrap();
+        assert!(
+            conditions_of(&u_wide).contains(&"c4".to_string()),
+            "c4 is considered (and kept) with a wide pool"
+        );
+
+        // A narrow pool (3) stops gathering after c1, c2, c3 — c4 is NEVER even
+        // considered, even though it is deep. The cap then keeps c3 + the best of
+        // the thin pair (c2, liquidity 60 > c1 liquidity 50).
+        let narrow = UniverseFilter {
+            max_markets: 2,
+            require_active: true,
+            prioritize_by_liquidity: true,
+            candidate_pool: 3,
+            ..UniverseFilter::default()
+        };
+        let u_narrow = assemble_registry(&events, &clob, "", &narrow).unwrap();
+        let kept = conditions_of(&u_narrow);
+        assert!(
+            !kept.contains(&"c4".to_string()),
+            "c4 is beyond the candidate pool → never considered"
+        );
+        assert_eq!(
+            kept,
+            vec!["c2", "c3"],
+            "kept (keyset order) = c2 (best thin in pool) + c3 (deep)"
+        );
+    }
+
+    #[test]
+    fn effective_candidate_pool_sentinel_clamp_and_floor() {
+        // 0 sentinel → equals max_markets (no extra fetching).
+        let f = UniverseFilter {
+            max_markets: 50,
+            candidate_pool: 0,
+            ..UniverseFilter::default()
+        };
+        assert_eq!(effective_candidate_pool(&f), 50);
+        // An explicit pool ≥ max_markets (under the ceiling) is used as-is.
+        let f = UniverseFilter {
+            max_markets: 50,
+            candidate_pool: 500,
+            ..UniverseFilter::default()
+        };
+        assert_eq!(effective_candidate_pool(&f), 500);
+        // Clamped down to the ceiling to bound API cost.
+        let f = UniverseFilter {
+            max_markets: 50,
+            candidate_pool: 10_000,
+            ..UniverseFilter::default()
+        };
+        assert_eq!(effective_candidate_pool(&f), MAX_CANDIDATE_POOL);
+        // Never below max_markets, even when max_markets exceeds the ceiling.
+        let f = UniverseFilter {
+            max_markets: MAX_CANDIDATE_POOL + 100,
+            candidate_pool: 0,
+            ..UniverseFilter::default()
+        };
+        assert_eq!(effective_candidate_pool(&f), MAX_CANDIDATE_POOL + 100);
+    }
+
+    #[tokio::test]
+    async fn bounded_fetch_covers_candidate_pool_when_prioritizing() {
+        // Prioritization must fetch the WHOLE candidate pool so assembly can rank
+        // over it; the default path still stops at max_markets. This is the
+        // CLOB-fetch consistency / API-cost tradeoff in action.
+        let events = vec![make_event_multi(
+            "e1",
+            false,
+            &[
+                ("c1", "y1", "n1"),
+                ("c2", "y2", "n2"),
+                ("c3", "y3", "n3"),
+                ("c4", "y4", "n4"),
+            ],
+        )];
+        let mut stub = StubClob::new(vec![
+            ok_clob("c1", "y1", "n1"),
+            ok_clob("c2", "y2", "n2"),
+            ok_clob("c3", "y3", "n3"),
+            ok_clob("c4", "y4", "n4"),
+        ]);
+        let filter = UniverseFilter {
+            max_markets: 2,
+            require_active: true,
+            prioritize_by_liquidity: true,
+            candidate_pool: 4,
+            ..UniverseFilter::default()
+        };
+        let (map, failures) = fetch_clob_bounded(&mut stub, &events, &filter).await;
+        assert_eq!(
+            stub.calls,
+            vec!["c1", "c2", "c3", "c4"],
+            "fetch covers the whole candidate pool when prioritizing"
+        );
+        assert_eq!(map.len(), 4);
+        assert!(failures.is_empty());
+
+        // Contrast: the DEFAULT path still stops at max_markets.
+        let mut stub_default = StubClob::new(vec![
+            ok_clob("c1", "y1", "n1"),
+            ok_clob("c2", "y2", "n2"),
+            ok_clob("c3", "y3", "n3"),
+            ok_clob("c4", "y4", "n4"),
+        ]);
+        let default_filter = UniverseFilter {
+            max_markets: 2,
+            require_active: true,
+            ..UniverseFilter::default()
+        };
+        let (_m, _f) = fetch_clob_bounded(&mut stub_default, &events, &default_filter).await;
+        assert_eq!(
+            stub_default.calls,
+            vec!["c1", "c2"],
+            "default fetch still stops at max_markets"
+        );
     }
 }

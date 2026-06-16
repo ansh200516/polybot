@@ -506,6 +506,11 @@ async fn main() {
     let filter = UniverseFilter {
         max_markets: config.universe.max_markets,
         require_active: config.universe.require_active,
+        // Task 5.3 universe scaling knobs (opt-in; defaults keep keyset order).
+        prioritize_by_liquidity: config.universe.prioritize_by_liquidity,
+        candidate_pool: config.universe.candidate_pool,
+        // Rank by the same `[segments]` thresholds the MM routing uses.
+        segment_thresholds: segment_thresholds(&config),
     };
     let mut sync_task = SyncTask::new(
         clob_for_sync,

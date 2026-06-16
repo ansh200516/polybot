@@ -143,6 +143,79 @@ pub fn classify_registry(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Priority ranking (Task 5.3 — universe prioritization)
+// ---------------------------------------------------------------------------
+
+/// A market's universe-prioritization ranking key (Task 5.3).
+///
+/// `Ord` means **more valuable is greater**, composed lexicographically:
+/// 1. segment tier — `LiquidStable` > `Liquid` > `Illiquid`;
+/// 2. then resting `liquidity` (USD), higher first;
+/// 3. then lifetime `volume` (USD), higher first.
+///
+/// A missing metric counts as `0.0` (matching the conservative [`classify`]
+/// rule), so an unknown-liquidity market ranks below any known one. Floats are
+/// compared with [`f64::total_cmp`], so the order is **total and deterministic**
+/// (no `NaN` surprises) — `Eq`/`PartialEq` agree with `Ord` for the same reason.
+/// Callers rank "best first" by sorting in DESCENDING key order and should apply
+/// a stable tiebreak (e.g. condition id) on equal keys.
+#[derive(Debug, Clone, Copy)]
+pub struct MarketPriority {
+    /// Segment tier rank (higher = more valuable): LiquidStable 2, Liquid 1,
+    /// Illiquid 0.
+    tier: u8,
+    /// Resting book liquidity (USD); missing → `0.0`.
+    liquidity: f64,
+    /// Lifetime traded volume (USD); missing → `0.0`.
+    volume: f64,
+}
+
+impl PartialEq for MarketPriority {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for MarketPriority {}
+
+impl PartialOrd for MarketPriority {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MarketPriority {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.tier
+            .cmp(&other.tier)
+            .then(self.liquidity.total_cmp(&other.liquidity))
+            .then(self.volume.total_cmp(&other.volume))
+    }
+}
+
+/// Rank value (higher = more valuable) for a segment tier.
+fn segment_rank(segment: MarketSegment) -> u8 {
+    match segment {
+        MarketSegment::LiquidStable => 2,
+        MarketSegment::Liquid => 1,
+        MarketSegment::Illiquid => 0,
+    }
+}
+
+/// The pure priority key for one market (Task 5.3): ranks by segment tier, then
+/// liquidity, then volume — see [`MarketPriority`]. PURE — a function only of the
+/// market's [`MarketMetrics`] and its already-computed [`MarketSegment`] (the
+/// caller computes the segment via [`classify`], so the thresholds live in one
+/// place). A missing metric counts as `0.0`.
+pub fn market_priority(metrics: &MarketMetrics, segment: MarketSegment) -> MarketPriority {
+    MarketPriority {
+        tier: segment_rank(segment),
+        liquidity: metrics.liquidity.unwrap_or(0.0),
+        volume: metrics.volume.unwrap_or(0.0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -235,5 +308,53 @@ mod tests {
         };
         let m = metrics(Some(1_500.0), Some(1_200.0));
         assert_eq!(classify(&m, &t), MarketSegment::LiquidStable);
+    }
+
+    // ---- Priority ranking (Task 5.3) ----------------------------------------
+
+    #[test]
+    fn priority_ranks_segment_tier_first() {
+        let t = SegmentThresholds::default();
+        // A LiquidStable market that only just clears the high bars...
+        let stable = metrics(Some(100_000.0), Some(50_000.0));
+        // ...still outranks a Liquid market with far MORE liquidity, because the
+        // segment tier is the primary key.
+        let liquid = metrics(Some(50_000.0), Some(40_000.0));
+        let p_stable = market_priority(&stable, classify(&stable, &t));
+        let p_liquid = market_priority(&liquid, classify(&liquid, &t));
+        assert_eq!(classify(&stable, &t), MarketSegment::LiquidStable);
+        assert_eq!(classify(&liquid, &t), MarketSegment::Liquid);
+        assert!(
+            p_stable > p_liquid,
+            "segment tier dominates raw liquidity in the ranking"
+        );
+    }
+
+    #[test]
+    fn priority_then_liquidity_then_volume() {
+        // Hold the tier fixed to exercise the secondary/tertiary keys.
+        let seg = MarketSegment::LiquidStable;
+        // Higher liquidity wins even when its volume is much smaller.
+        let deep = market_priority(&metrics(Some(100.0), Some(300_000.0)), seg);
+        let shallow = market_priority(&metrics(Some(9_000_000.0), Some(100_000.0)), seg);
+        assert!(deep > shallow, "liquidity outranks volume within a tier");
+        // Equal liquidity → higher volume breaks the tie.
+        let hi_vol = market_priority(&metrics(Some(500.0), Some(100_000.0)), seg);
+        let lo_vol = market_priority(&metrics(Some(100.0), Some(100_000.0)), seg);
+        assert!(hi_vol > lo_vol, "volume breaks an equal-liquidity tie");
+    }
+
+    #[test]
+    fn priority_missing_metrics_count_as_zero() {
+        let seg = MarketSegment::Illiquid;
+        let known = market_priority(&metrics(Some(1.0), Some(1.0)), seg);
+        let unknown = market_priority(&metrics(None, None), seg);
+        assert!(
+            known > unknown,
+            "an unknown-liquidity market ranks below any known one"
+        );
+        // Two fully-unknown markets in the same tier compare equal (total order).
+        let unknown2 = market_priority(&metrics(None, None), seg);
+        assert_eq!(unknown, unknown2);
     }
 }

@@ -96,6 +96,21 @@ pub struct Endpoints {
 pub struct Universe {
     pub max_markets: usize,
     pub require_active: bool,
+    /// Task 5.3 — opt-in universe prioritization. **Default `false`** ⇒ the
+    /// universe cap keeps the first `max_markets` markets in Gamma keyset order
+    /// (historical, byte-identical behaviour). `true` ⇒ sync gathers a candidate
+    /// pool, ranks it by (segment tier, then liquidity, then volume), and keeps
+    /// the highest-priority `max_markets`. OFF by default because it changes
+    /// which markets the LIVE sync selects, so it must be opted into deliberately.
+    pub prioritize_by_liquidity: bool,
+    /// Task 5.3 — candidate pool size for prioritization. **Default `0`**, the
+    /// sentinel for "= `max_markets`" (no extra fetching ⇒ identical market set,
+    /// just internally ranked). A non-zero value MUST be ≥ `max_markets`: sync
+    /// gathers up to this many ACCEPTED candidates (in keyset order), ranks them,
+    /// and keeps the top `max_markets`. Bounded at sync time by
+    /// `pm_ingestion::sync::MAX_CANDIDATE_POOL` (5000) to cap CLOB API cost.
+    /// Inert unless `prioritize_by_liquidity`.
+    pub candidate_pool: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -196,6 +211,9 @@ impl Default for Universe {
         Universe {
             max_markets: 200,
             require_active: true,
+            // Task 5.3 defaults keep the historical keyset-order cap unchanged.
+            prioritize_by_liquidity: false,
+            candidate_pool: 0,
         }
     }
 }
@@ -612,6 +630,21 @@ impl Config {
                 "backoff_base_ms must be ≤ backoff_cap_ms",
             ));
         }
+        // Universe scaling (Task 5.3). A non-zero candidate pool must be able to
+        // fill the cap, so it must be ≥ max_markets — you cannot rank fewer
+        // candidates than you intend to keep. `0` is the sentinel for
+        // "= max_markets" (no extra fetching). Values above the sync-time ceiling
+        // (`pm_ingestion::sync::MAX_CANDIDATE_POOL`) are CLAMPED there, not
+        // rejected, so they need no bound here. Defaults
+        // (prioritize_by_liquidity = false, candidate_pool = 0) keep the
+        // historical keyset-order cap unchanged.
+        if self.universe.candidate_pool != 0
+            && self.universe.candidate_pool < self.universe.max_markets
+        {
+            return Err(ConfigError::BadMoney(
+                "universe.candidate_pool must be 0 (= max_markets) or ≥ max_markets",
+            ));
+        }
         // Endpoints validation
         if self.endpoints.gamma_base.is_empty() {
             return Err(ConfigError::BadMoney("gamma_base must be non-empty"));
@@ -984,6 +1017,60 @@ mod tests {
         let c = Config::from_toml_str("[universe]\nmax_markets = 100\n").unwrap();
         assert_eq!(c.universe.max_markets, 100);
         assert!(c.universe.require_active);
+    }
+
+    // ---- Task 5.3: universe scaling knobs ----------------------------------
+
+    #[test]
+    fn universe_scaling_knobs_default_and_parse() {
+        // Defaults: prioritization OFF, candidate_pool sentinel 0 — the live
+        // sync path is unchanged unless the operator opts in.
+        let c = Config::default();
+        assert!(!c.universe.prioritize_by_liquidity);
+        assert_eq!(c.universe.candidate_pool, 0);
+        c.validate().unwrap();
+
+        // Parse + round-trip alongside another section; untouched field defaults.
+        let c = Config::from_toml_str(
+            "[capital]\nbankroll_usd = 5000.0\n[universe]\nmax_markets = 300\nprioritize_by_liquidity = true\ncandidate_pool = 1500\n",
+        )
+        .unwrap();
+        assert!(c.universe.prioritize_by_liquidity);
+        assert_eq!(c.universe.max_markets, 300);
+        assert_eq!(c.universe.candidate_pool, 1500);
+        assert!(c.universe.require_active, "untouched field keeps its default");
+        assert!((c.capital.bankroll_usd - 5000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn universe_candidate_pool_zero_and_boundary_allowed() {
+        // 0 (= max_markets) is always valid, regardless of max_markets.
+        let c = Config::from_toml_str("[universe]\nmax_markets = 1000\ncandidate_pool = 0\n").unwrap();
+        assert_eq!(c.universe.candidate_pool, 0);
+        // candidate_pool == max_markets is the boundary and is allowed.
+        let c =
+            Config::from_toml_str("[universe]\nmax_markets = 200\ncandidate_pool = 200\n").unwrap();
+        assert_eq!(c.universe.candidate_pool, 200);
+        // candidate_pool > max_markets is allowed (the intended scaling case).
+        let c =
+            Config::from_toml_str("[universe]\nmax_markets = 200\ncandidate_pool = 2000\n").unwrap();
+        assert_eq!(c.universe.candidate_pool, 2000);
+    }
+
+    #[test]
+    fn universe_candidate_pool_below_max_markets_is_rejected() {
+        // A non-zero pool below max_markets cannot fill the cap → rejected.
+        assert!(
+            Config::from_toml_str("[universe]\nmax_markets = 200\ncandidate_pool = 100\n").is_err(),
+            "candidate_pool < max_markets (non-zero) must be rejected"
+        );
+        // Default max_markets is 200; a pool of 1 is below it → rejected.
+        assert!(Config::from_toml_str("[universe]\ncandidate_pool = 1\n").is_err());
+    }
+
+    #[test]
+    fn universe_scaling_unknown_field_is_rejected() {
+        assert!(Config::from_toml_str("[universe]\nbogus = 1\n").is_err());
     }
 
     #[test]
