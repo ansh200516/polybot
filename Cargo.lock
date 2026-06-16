@@ -2707,6 +2707,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "base64 0.22.1",
+ "futures-util",
  "hmac",
  "pm-core",
  "pm-engine",
@@ -2715,6 +2716,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "uuid",
 ]

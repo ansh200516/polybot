@@ -30,6 +30,8 @@ pub mod quote_manager;
 pub mod reconcile;
 pub mod secrets;
 pub mod sign;
+pub mod split_venue;
+pub mod user_ws;
 pub mod venue;
 
 use pm_core::instrument::TokenId;

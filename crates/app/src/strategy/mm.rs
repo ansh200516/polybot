@@ -34,17 +34,24 @@
 //!   Deliberately NOT folded into cash/equity/realized — it is an unverified,
 //!   paid-out-of-band ESTIMATE; folding it would inflate position P&L (spec §7).
 //!
-//! # Scope (Task 4.5 — gated live arm, this task)
-//! - **Default-off live venue**: [`MmStrategy`] carries an `Option<LiveVenue>`
-//!   set by main ONLY when cleared for live by
+//! # Scope (Task 4.5 — gated live arm)
+//! - **Default-off live venue**: [`MmStrategy`] carries an `Option<MmLive>` set
+//!   by main ONLY when cleared for live by
 //!   [`mm_use_live`](crate::wiring::mm_use_live) (process `--live` AND
 //!   `[strategies.mm].live`, which implies the startup confirmation ran). `run`
-//!   drives the SAME generic [`run_mm_loop`] with the live
-//!   [`LiveVenue`](pm_execution::live::LiveVenue) (`MakerVenue + UserFillSource`;
-//!   REST `/data/trades` fills — the user-WS latency upgrade is Task 4.6) when
-//!   present, else the [`PaperMakerVenue`]. PAPER is the default and the paper
-//!   arm NEVER constructs or holds a `LiveVenue`. Live MM's safety is the capital
-//!   carve + inventory caps + postOnly + the confirmation — no new mechanism.
+//!   drives the SAME generic [`run_mm_loop`] over the live venue when present,
+//!   else the [`PaperMakerVenue`]. PAPER is the default and the paper arm NEVER
+//!   constructs or holds a live venue. Live MM's safety is the capital carve +
+//!   inventory caps + postOnly + the confirmation — no new mechanism.
+//!
+//! # Scope (Task 4.6 — user-WS fills source, this task)
+//! - **Low-latency live fills**: the live arm is now an [`MmLive`] enum — either
+//!   the Task-4.5 [`LiveVenue`] REST poll ([`Rest`](MmLive::Rest)) OR the
+//!   user-WS feed ([`Ws`](MmLive::Ws)): the live `LiveVenue` (the `MakerVenue`)
+//!   paired via a [`SplitVenue`] with [`LiveUserWsFills`] (the `UserFillSource`).
+//!   main picks the variant from `[strategies.mm].live_fills_source` (default
+//!   `"ws"`). BOTH are `MakerVenue + UserFillSource`, so the SAME `run_mm_loop`
+//!   drives either with zero loop changes — they differ ONLY in fill latency.
 //!
 //! # Accounting note (why InventoryRisk is authoritative)
 //! [`InventoryRisk`] tracks SIGNED net inventory + realized/unrealized P&L and
@@ -68,6 +75,8 @@ use pm_execution::live::LiveVenue;
 use pm_execution::maker::{MakerOrder, MakerVenue, OrderId, OrderType};
 use pm_execution::paper_maker::PaperMakerVenue;
 use pm_execution::quote_manager::QuoteManager;
+use pm_execution::split_venue::SplitVenue;
+use pm_execution::user_ws::LiveUserWsFills;
 use pm_ingestion::supervisor::OnApplyFn;
 use pm_risk::inventory::{InventoryConfig, InventoryRisk, Marks, QuoteIntent, QuoteVerdict};
 use pm_store::writer::StoreMsg;
@@ -116,10 +125,53 @@ impl MmParams {
     }
 }
 
+/// The LIVE market-maker venue variant (Task 4.6), built by main from
+/// `[strategies.mm].live_fills_source` when the MM is cleared for live. Both
+/// variants are `MakerVenue + UserFillSource`, so `run` drives the SAME generic
+/// [`run_mm_loop`] over either — they differ ONLY in where fills come from:
+///
+/// * [`Rest`](MmLive::Rest) — the Task-4.5 [`LiveVenue`]: live maker orders AND
+///   the REST `/data/trades` fill poll on ONE object (the offline-verified
+///   fallback if the WS misbehaves in canary).
+/// * [`Ws`](MmLive::Ws) — the low-latency scalping upgrade: the live
+///   [`LiveVenue`] as the `MakerVenue`, paired via a [`SplitVenue`] with the
+///   user-WS [`LiveUserWsFills`] as the `UserFillSource`.
+pub enum MmLive {
+    /// Live maker orders + REST `/data/trades` fill poll (one [`LiveVenue`]).
+    Rest(LiveVenue),
+    /// Live maker orders + low-latency user-WS fills.
+    Ws(SplitVenue<LiveVenue, LiveUserWsFills>),
+}
+
+/// Which live fills source the MM uses, parsed from the VALIDATED
+/// `[strategies.mm].live_fills_source` config string (Task 4.6). A pure decision
+/// (no venue construction), so main's `"ws"`-vs-`"rest"` branch is unit-tested
+/// directly without any network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmFillsSource {
+    /// Low-latency user-WS feed (the default; the scalping upgrade).
+    Ws,
+    /// REST `/data/trades` poll (the Task-4.5 offline-verified fallback).
+    Rest,
+}
+
+impl MmFillsSource {
+    /// Map the (config-validated) string to the source: `"rest"` → [`Rest`](Self::Rest);
+    /// anything else → [`Ws`](Self::Ws). Config validation already pins the value
+    /// to `"ws"` | `"rest"` and `"ws"` is the default, so the catch-all is the WS
+    /// feed.
+    pub fn from_config(s: &str) -> Self {
+        match s {
+            "rest" => MmFillsSource::Rest,
+            _ => MmFillsSource::Ws,
+        }
+    }
+}
+
 /// Market-making strategy (spec §7). Constructed by main; `run` builds the
 /// inventory risk + position book + quote manager and drives [`run_mm_loop`]
 /// over either the PAPER maker venue (default) or — when main clears MM for live
-/// (Task 4.5) — a [`LiveVenue`].
+/// — an [`MmLive`] venue (REST poll or user-WS fills).
 pub struct MmStrategy {
     id: StrategyId,
     /// Markets to quote (provided; Phase 5 refines the universe per segment).
@@ -129,14 +181,15 @@ pub struct MmStrategy {
     params: MmParams,
     inv_cfg: InventoryConfig,
     capital: Usdc,
-    /// Live venue selection (Task 4.5). `None` (the default produced by
-    /// [`MmStrategy::new`]) → the PAPER maker venue. `Some` ONLY when main called
-    /// [`with_live_venue`](MmStrategy::with_live_venue) after
+    /// Live venue selection (Task 4.5 / 4.6). `None` (the default produced by
+    /// [`MmStrategy::new`]) → the PAPER maker venue. `Some(MmLive::…)` ONLY when
+    /// main called [`with_live_venue`](MmStrategy::with_live_venue) after
     /// [`mm_use_live`](crate::wiring::mm_use_live) cleared MM for live (process
     /// `--live` AND `[strategies.mm].live`, which implies the startup
-    /// confirmation ran). The paper arm therefore never constructs or holds a
-    /// [`LiveVenue`].
-    live_venue: Option<LiveVenue>,
+    /// confirmation ran). The variant ([`Rest`](MmLive::Rest) vs [`Ws`](MmLive::Ws))
+    /// is chosen from `[strategies.mm].live_fills_source`. The paper arm
+    /// therefore never constructs or holds a live venue.
+    live_venue: Option<MmLive>,
 }
 
 impl MmStrategy {
@@ -164,13 +217,14 @@ impl MmStrategy {
         }
     }
 
-    /// Attach a live [`LiveVenue`] (Task 4.5), switching `run` from the paper
-    /// maker venue to real maker orders. main calls this ONLY when
+    /// Attach a live venue (Task 4.5 / 4.6), switching `run` from the paper maker
+    /// venue to real maker orders. The [`MmLive`] variant selects the fill source
+    /// (REST poll vs user-WS). main calls this ONLY when
     /// [`mm_use_live`](crate::wiring::mm_use_live) is true (process `--live` AND
     /// `[strategies.mm].live`), so the live path is a deliberate, doubly-gated
     /// opt-in on top of the startup confirmation.
-    pub fn with_live_venue(mut self, venue: LiveVenue) -> Self {
-        self.live_venue = Some(venue);
+    pub fn with_live_venue(mut self, live: MmLive) -> Self {
+        self.live_venue = Some(live);
         self
     }
 }
@@ -201,22 +255,29 @@ impl Strategy for MmStrategy {
             let qm = QuoteManager::new();
             let inv = InventoryRisk::new(inv_cfg);
             let positions = PositionBook::default();
-            // VENUE SELECTION (Task 4.5): the live venue is present ONLY when main
-            // cleared MM for live (process `--live` AND `[strategies.mm].live` →
-            // `mm_use_live`, which implies the startup confirmation ran).
-            // Otherwise build the CONCRETE paper venue here — the unchanged 4.4
-            // default. BOTH arms drive the SAME generic `run_mm_loop`, so there is
-            // ZERO quoting-logic duplication; they differ only in the concrete
-            // `V` (`LiveVenue` is `MakerVenue + UserFillSource` — REST fills for
-            // now, the user-WS upgrade is Task 4.6). Building the concrete venue
-            // in this non-generic context keeps the returned future provably
-            // `Send` even though `run_mm_loop` is generic (the pattern arb uses
-            // for `run_execution`). Each value below is moved into exactly one
-            // arm; the arms are mutually exclusive, so this is a clean move.
+            // VENUE SELECTION (Task 4.5 / 4.6): the live venue is present ONLY when
+            // main cleared MM for live (process `--live` AND `[strategies.mm].live`
+            // → `mm_use_live`, which implies the startup confirmation ran), and its
+            // variant (`MmLive::Rest` REST poll vs `MmLive::Ws` user-WS fills) was
+            // chosen from `[strategies.mm].live_fills_source`. Otherwise build the
+            // CONCRETE paper venue here — the unchanged 4.4 default. ALL THREE arms
+            // drive the SAME generic `run_mm_loop`, so there is ZERO quoting-logic
+            // duplication; they differ only in the concrete `V` (each is
+            // `MakerVenue + UserFillSource`). Building the concrete venue in this
+            // non-generic context keeps the returned future provably `Send` even
+            // though `run_mm_loop` is generic (the pattern arb uses for
+            // `run_execution`). Each value below is moved into exactly one arm; the
+            // arms are mutually exclusive, so this is a clean move.
             match live_venue {
-                Some(live) => {
+                Some(MmLive::Rest(live)) => {
                     run_mm_loop(
                         live, qm, inv, positions, ctx, params, tokens, token_market, capital,
+                    )
+                    .await;
+                }
+                Some(MmLive::Ws(split)) => {
+                    run_mm_loop(
+                        split, qm, inv, positions, ctx, params, tokens, token_market, capital,
                     )
                     .await;
                 }
@@ -965,9 +1026,10 @@ mod tests {
     }
 
     /// Only `(process --live, mm.live)` clears MM for live, and the live path
-    /// attaches the [`LiveVenue`] via `with_live_venue` — the call main makes
-    /// ONLY behind `mm_use_live` — so `run` drives the SAME loop over the live
-    /// venue rather than the paper one.
+    /// attaches an [`MmLive`] via `with_live_venue` — the call main makes ONLY
+    /// behind `mm_use_live` — so `run` drives the SAME loop over the live venue
+    /// rather than the paper one. (REST variant; the WS variant is covered by
+    /// `ws_vs_rest_selection_picks_the_right_live_variant`.)
     #[test]
     fn cleared_for_live_attaches_live_venue() {
         use crate::wiring::mm_use_live;
@@ -980,10 +1042,80 @@ mod tests {
             generous_inv(),
             Usdc(1_000_000),
         )
-        .with_live_venue(shadow_live_venue());
+        .with_live_venue(MmLive::Rest(shadow_live_venue()));
         assert!(
-            mm.live_venue.is_some(),
+            matches!(mm.live_venue, Some(MmLive::Rest(_))),
             "with_live_venue (set only when mm_use_live) puts MM on the live venue"
+        );
+    }
+
+    /// Task 4.6 venue SELECTION: `MmFillsSource::from_config` maps the validated
+    /// config string to the source, and main builds the matching [`MmLive`]
+    /// variant — `"ws"` → [`MmLive::Ws`] (the live maker venue paired with the
+    /// user-WS fills via a [`SplitVenue`]), `"rest"` → [`MmLive::Rest`] (the
+    /// Task-4.5 `LiveVenue` REST poll). NO network: the WS source is built over a
+    /// parked MOCK transport, and the maker venue is a shadow `LiveVenue`.
+    #[tokio::test]
+    async fn ws_vs_rest_selection_picks_the_right_live_variant() {
+        use pm_execution::secrets::{ApiCreds, Secret};
+        use pm_execution::venue::VenueError;
+
+        // The pure selection: validated string → source.
+        assert_eq!(MmFillsSource::from_config("ws"), MmFillsSource::Ws);
+        assert_eq!(MmFillsSource::from_config("rest"), MmFillsSource::Rest);
+
+        // A WsTransport that never sends/receives (parks) — ZERO network.
+        struct ParkTransport;
+        impl pm_execution::user_ws::WsTransport for ParkTransport {
+            async fn recv(&mut self) -> Option<Result<String, VenueError>> {
+                std::future::pending().await
+            }
+            async fn send(&mut self, _text: &str) -> Result<(), VenueError> {
+                Ok(())
+            }
+        }
+        let creds = ApiCreds {
+            key: "k".into(),
+            secret: Secret::new("s".into()),
+            passphrase: Secret::new("p".into()),
+        };
+
+        let tokens = vec![TokenId(1)];
+
+        // "ws" → build the user-WS source over the mock + pair it with the live
+        // maker venue in a SplitVenue → MmLive::Ws.
+        let ws_fills = LiveUserWsFills::with_transport_factory(
+            creds,
+            vec!["0xcond".into()],
+            HashMap::new(),
+            || async { Ok::<_, VenueError>(ParkTransport) },
+        );
+        let split = SplitVenue::new(shadow_live_venue(), ws_fills);
+        let mm_ws = MmStrategy::new(
+            tokens.clone(),
+            token_market_for(&tokens),
+            mk_params(200, 5.0),
+            generous_inv(),
+            Usdc(1_000_000),
+        )
+        .with_live_venue(MmLive::Ws(split));
+        assert!(
+            matches!(mm_ws.live_venue, Some(MmLive::Ws(_))),
+            "live_fills_source=\"ws\" must select the user-WS SplitVenue variant"
+        );
+
+        // "rest" → the Task-4.5 LiveVenue REST poll → MmLive::Rest.
+        let mm_rest = MmStrategy::new(
+            tokens.clone(),
+            token_market_for(&tokens),
+            mk_params(200, 5.0),
+            generous_inv(),
+            Usdc(1_000_000),
+        )
+        .with_live_venue(MmLive::Rest(shadow_live_venue()));
+        assert!(
+            matches!(mm_rest.live_venue, Some(MmLive::Rest(_))),
+            "live_fills_source=\"rest\" must select the REST LiveVenue variant"
         );
     }
 

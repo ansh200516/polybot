@@ -177,6 +177,24 @@ pub fn mm_use_live(process_live: bool, mm_live: bool) -> bool {
     process_live && mm_live
 }
 
+/// Task 4.6 — derive the user-channel WS URL from the configured MARKET WS URL.
+///
+/// The market feed lives at `…/ws/market`; the user (private fills) feed is its
+/// sibling `…/ws/user` (spike-confirmed:
+/// `wss://ws-subscriptions-clob.polymarket.com/ws/user`). Deriving it from the
+/// existing `endpoints.ws_market_url` avoids a second config field while keeping
+/// a custom/staging host working. If the configured market URL is NOT the
+/// expected `…/market` shape, fall back to the spike-confirmed absolute URL
+/// (the user feed is on the production host regardless).
+///
+/// Pure + total, so the derivation is unit-tested directly.
+pub fn user_ws_url(market_ws_url: &str) -> String {
+    match market_ws_url.strip_suffix("/market") {
+        Some(base) => format!("{base}/user"),
+        None => "wss://ws-subscriptions-clob.polymarket.com/ws/user".to_string(),
+    }
+}
+
 /// Everything a detector needs about one connected component.
 pub struct ComponentEntry {
     pub markets: Vec<Market>,
@@ -520,6 +538,28 @@ mod tests {
         assert!(!mm_use_live(true, false), "process --live, mm paper → paper");
         assert!(!mm_use_live(false, true), "mm.live but process paper → paper");
         assert!(!mm_use_live(false, false), "neither → paper");
+    }
+
+    /// Task 4.6: the user-WS URL is the sibling of the configured market WS URL
+    /// (`…/ws/market` → `…/ws/user`), and a non-`/market` host falls back to the
+    /// spike-confirmed absolute user URL.
+    #[test]
+    fn user_ws_url_derives_sibling_user_feed() {
+        assert_eq!(
+            user_ws_url("wss://ws-subscriptions-clob.polymarket.com/ws/market"),
+            "wss://ws-subscriptions-clob.polymarket.com/ws/user",
+            "the default market URL yields the sibling /ws/user feed"
+        );
+        // The default config's market URL maps to the spike-confirmed user URL.
+        assert_eq!(
+            user_ws_url(&Config::default().endpoints.ws_market_url),
+            "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+        );
+        // A non-/market endpoint falls back to the spike-confirmed absolute URL.
+        assert_eq!(
+            user_ws_url("wss://staging.example/feed"),
+            "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+        );
     }
 
     #[test]

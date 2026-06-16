@@ -29,12 +29,13 @@ use pm_app::kill::spawn_kill_watch;
 use pm_app::stats::AppStats;
 use pm_app::strategy::arb::{ArbStrategy, ExecTaskBuilder};
 use pm_app::strategy::host::{HostShared, StrategyHost};
-use pm_app::strategy::mm::{MmParams, MmStrategy};
+use pm_app::strategy::mm::{MmFillsSource, MmLive, MmParams, MmStrategy};
 use pm_app::strategy::stub::HeartbeatStrategy;
 use pm_app::strategy::StrategyId;
 use pm_app::wiring::{
     BookFetcher, PlatformEnvelopes, build_component_index, engine_params, fee_map,
     inventory_config, mm_use_live, pack_components, risk_config, strategy_envelopes, token_maps,
+    user_ws_url,
 };
 use pm_config::Config;
 use pm_core::instrument::Relationship;
@@ -1070,6 +1071,14 @@ async fn main() {
         let arb_capital_micro = bankroll.0 - mm_capital.0;
         let mm_live = mm_use_live(args.live, config.strategies.mm.live);
 
+        // Task 4.6 — the LIVE maker-fill source: `"ws"` (default; low-latency
+        // user-WS feed) or `"rest"` (the Task-4.5 REST poll). Decided once from
+        // the validated config; the variant is built after token registration.
+        let mm_fills_source = MmFillsSource::from_config(&config.strategies.mm.live_fills_source);
+        // The user-WS URL is the sibling of the market WS URL (…/ws/market →
+        // …/ws/user); derived once so no second config field is needed.
+        let mm_user_ws_url = user_ws_url(&config.endpoints.ws_market_url);
+
         // Build MM's OWN LiveVenue up front when cleared, so its token set is
         // registered in the SAME loop that selects MM's universe. It reuses the
         // EXACT arb live inputs (creds/signer/deposit_wallet/auth_address/base)
@@ -1080,10 +1089,14 @@ async fn main() {
         // LiveVenue, so arb + MM each own an INDEPENDENT REST limiter against the
         // SAME Polymarket account budget. Acceptable for a tiny canary; prefer
         // conservative `ingestion.rest_rate_*` (a shared limiter is future work).
+        // `mm_ws_creds` keeps a CLONE of the creds for the user-WS subscribe auth
+        // (the WS source owns them by value), captured before the cfg moves them.
+        let mut mm_ws_creds: Option<pm_execution::secrets::ApiCreds> = None;
         let mut mm_live_venue: Option<pm_execution::live::LiveVenue> = if mm_live {
             let inputs = mm_live_inputs.take().unwrap_or_else(|| {
                 fatal("internal: MM cleared for live but live inputs were not stashed")
             });
+            mm_ws_creds = Some(inputs.creds.clone());
             let venue = pm_execution::live::LiveVenue::new(pm_execution::live::LiveVenueCfg {
                 base: inputs.base,
                 creds: inputs.creds,
@@ -1111,14 +1124,30 @@ async fn main() {
         // "first N" cap with liquid-segment selection.
         let mut mm_tokens = Vec::new();
         let mut mm_token_market = HashMap::new();
+        // Task 4.6 user-WS inputs (live only): the markets' condition_ids to
+        // subscribe to, and the asset_id→(TokenId, TickSize) map the WS fills
+        // source resolves each trade's `asset_id` against (the SAME shape the
+        // LiveVenue's REST poll resolves internally).
+        let mut mm_condition_ids: Vec<String> = Vec::new();
+        let mut mm_ws_resolve: HashMap<
+            String,
+            (pm_core::instrument::TokenId, pm_core::num::TickSize),
+        > = HashMap::new();
         for m in reg.markets().iter().take(config.strategies.mm.max_markets) {
+            // Subscribe by condition_id (market), NOT token id (Task 4.6).
+            if mm_live && let Some(cid) = reg.market_condition(m.id) {
+                mm_condition_ids.push(cid.to_string());
+            }
             for tok in [m.yes, m.no] {
                 mm_tokens.push(tok);
                 mm_token_market.insert(tok, m.id);
-                if let Some(v) = mm_live_venue.as_mut()
-                    && let Some(vid) = reg.token_venue_id(tok)
-                {
-                    v.register_token(tok, vid.to_owned(), m.neg_risk, m.tick);
+                if let Some(vid) = reg.token_venue_id(tok) {
+                    if mm_live {
+                        mm_ws_resolve.insert(vid.to_owned(), (tok, m.tick));
+                    }
+                    if let Some(v) = mm_live_venue.as_mut() {
+                        v.register_token(tok, vid.to_owned(), m.neg_risk, m.tick);
+                    }
                 }
             }
         }
@@ -1144,6 +1173,44 @@ async fn main() {
         let mut mm = MmStrategy::new(mm_tokens, mm_token_market, mm_params, mm_inv_cfg, mm_capital);
 
         if let Some(venue) = mm_live_venue {
+            // Task 4.6 — choose the live FILLS source and build the matching
+            // `MmLive` variant:
+            //  * `"ws"` (default, NOT shadow) → the LOW-LATENCY user-WS feed:
+            //    pair the live `LiveVenue` (the `MakerVenue`) with a
+            //    `LiveUserWsFills` (the `UserFillSource`) in a `SplitVenue`. The
+            //    WS source spawns a background reader that connects + subscribes.
+            //  * `"rest"` (or ANY `--shadow` run) → the Task-4.5 `LiveVenue` REST
+            //    poll on the SAME object. SHADOW deliberately skips the WS: a
+            //    shadow venue places no real orders, so there are no fills to read
+            //    and the REST poll short-circuits to empty with NO network — so a
+            //    `--shadow` dry run NEVER opens a live socket.
+            let use_ws = mm_fills_source == MmFillsSource::Ws && !args.shadow;
+            let mm_live_variant = if use_ws {
+                let creds = mm_ws_creds.take().unwrap_or_else(|| {
+                    fatal("internal: MM cleared for live WS but creds were not stashed")
+                });
+                let ws = pm_execution::user_ws::LiveUserWsFills::connect(
+                    mm_user_ws_url.clone(),
+                    creds,
+                    mm_condition_ids,
+                    mm_ws_resolve,
+                );
+                info!(
+                    url = %mm_user_ws_url,
+                    markets = mm_market_count,
+                    "live MM fills source: USER WS (low-latency scalping feed)"
+                );
+                MmLive::Ws(pm_execution::split_venue::SplitVenue::new(venue, ws))
+            } else {
+                if mm_fills_source == MmFillsSource::Ws && args.shadow {
+                    info!(
+                        "live MM fills source: REST poll (--shadow skips the user WS: no live socket)"
+                    );
+                } else {
+                    info!("live MM fills source: REST poll (Task-4.5 offline-verified fallback)");
+                }
+                MmLive::Rest(venue)
+            };
             // Attach the live venue — the ONLY path that puts MM on real money.
             // CANARY SAFETY (no new mechanism; all pre-existing): (a) the tiny
             // `capital_usd` slice carved by `strategy_envelopes`; (b)
@@ -1151,7 +1218,7 @@ async fn main() {
             // (per-market / gross / stop-loss / daily) enforced by `InventoryRisk`
             // inside the loop; (d) postOnly maker orders; (e) the startup live
             // confirmation. Surface the canary LOUDLY.
-            mm = mm.with_live_venue(venue);
+            mm = mm.with_live_venue(mm_live_variant);
             warn!(
                 capital_usd = config.strategies.mm.capital_usd,
                 markets = mm_market_count,
@@ -1160,6 +1227,7 @@ async fn main() {
                 max_gross_inventory_usd = config.inventory.max_gross_inventory_usd,
                 inventory_stop_loss_usd = config.inventory.inventory_stop_loss_usd,
                 daily_loss_usd = config.inventory.daily_loss_usd,
+                fills_source = config.strategies.mm.live_fills_source.as_str(),
                 shadow = args.shadow,
                 "LIVE MM ENABLED — real maker orders (canary): safety = capital carve + \
                  inventory caps + postOnly + confirmation; SHARED account rate budget with arb"

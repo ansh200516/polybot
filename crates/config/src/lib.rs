@@ -447,6 +447,20 @@ pub struct Mm {
     /// Phase 5 replaces this "first N" cap with liquid-segment selection. `0`
     /// quotes nothing (inert); any `usize` is valid — documented, not bounded.
     pub max_markets: usize,
+    /// LIVE maker-fill source (Task 4.6): `"ws"` (default) | `"rest"`. INERT
+    /// unless the MM is cleared for live (process `--live` AND
+    /// `[strategies.mm].live`); paper always uses the `PaperMakerVenue` sim.
+    ///
+    /// * `"ws"` — the LOW-LATENCY user-WS feed (`pm_execution`'s
+    ///   `LiveUserWsFills`, paired with the live maker venue via a `SplitVenue`).
+    ///   The scalping upgrade: fills arrive with WS latency instead of a REST
+    ///   poll's.
+    /// * `"rest"` — the Task-4.5 `LiveVenue` REST `/data/trades` poll. The
+    ///   offline-verified FALLBACK if the WS misbehaves in canary (the REST path
+    ///   is fully testable against the in-crate HTTP mock).
+    ///
+    /// Validated to exactly `"ws"` or `"rest"` (mirrors `execution.redeem_strategy`).
+    pub live_fills_source: String,
 }
 
 impl Default for Mm {
@@ -465,6 +479,10 @@ impl Default for Mm {
             // conservative market cap for the first enablement (Phase 5 refines).
             capital_usd: 25.0,
             max_markets: 20,
+            // Default to the low-latency user-WS fills feed (the scalping
+            // upgrade); operators can pin "rest" to fall back to the
+            // offline-verified Task-4.5 REST poll.
+            live_fills_source: "ws".into(),
         }
     }
 }
@@ -656,6 +674,13 @@ impl Config {
         if self.strategies.mm.max_quote_usd <= 0.0 || !self.strategies.mm.max_quote_usd.is_finite() {
             return Err(ConfigError::BadMoney(
                 "strategies.mm.max_quote_usd must be > 0",
+            ));
+        }
+        // Live maker-fill source (Task 4.6): exactly "ws" or "rest" (mirrors
+        // execution.redeem_strategy). Inert unless the MM is cleared for live.
+        if !matches!(self.strategies.mm.live_fills_source.as_str(), "ws" | "rest") {
+            return Err(ConfigError::BadMoney(
+                "strategies.mm.live_fills_source must be \"ws\" or \"rest\"",
             ));
         }
         // MM capital must be finite + non-negative always; when ENABLED it is
@@ -1097,13 +1122,14 @@ mod tests {
         assert_eq!(c.strategies.mm.rebate_bps, 0, "no assumed rebate by default");
         assert!((c.strategies.mm.capital_usd - 25.0).abs() < 1e-9, "default MM slice $25");
         assert_eq!(c.strategies.mm.max_markets, 20, "default first-N market cap");
+        assert_eq!(c.strategies.mm.live_fills_source, "ws", "default fills source is the WS feed");
         c.validate().unwrap();
     }
 
     #[test]
     fn mm_strategy_section_parses() {
         let c = Config::from_toml_str(
-            "[strategies.mm]\nenabled = true\nlive = false\nspread_bps = 300\nquote_refresh_ms = 1000\nmax_quote_usd = 7.5\ninventory_skew_bps = 250\nrebate_bps = 20\ncapital_usd = 100.0\nmax_markets = 8\n",
+            "[strategies.mm]\nenabled = true\nlive = false\nspread_bps = 300\nquote_refresh_ms = 1000\nmax_quote_usd = 7.5\ninventory_skew_bps = 250\nrebate_bps = 20\ncapital_usd = 100.0\nmax_markets = 8\nlive_fills_source = \"rest\"\n",
         )
         .unwrap();
         assert!(c.strategies.mm.enabled);
@@ -1115,7 +1141,27 @@ mod tests {
         assert_eq!(c.strategies.mm.rebate_bps, 20);
         assert!((c.strategies.mm.capital_usd - 100.0).abs() < 1e-9);
         assert_eq!(c.strategies.mm.max_markets, 8);
+        assert_eq!(c.strategies.mm.live_fills_source, "rest");
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn mm_live_fills_source_parses_validates_and_defaults() {
+        // Default (Task 4.6): the low-latency WS feed.
+        assert_eq!(Config::default().strategies.mm.live_fills_source, "ws");
+        // Both accepted values parse + validate.
+        let ws = Config::from_toml_str("[strategies.mm]\nlive_fills_source = \"ws\"\n").unwrap();
+        assert_eq!(ws.strategies.mm.live_fills_source, "ws");
+        let rest = Config::from_toml_str("[strategies.mm]\nlive_fills_source = \"rest\"\n").unwrap();
+        assert_eq!(rest.strategies.mm.live_fills_source, "rest");
+        // Anything else is rejected (mirrors execution.redeem_strategy).
+        assert!(
+            Config::from_toml_str("[strategies.mm]\nlive_fills_source = \"grpc\"\n").is_err(),
+            "an unknown fills source must be rejected"
+        );
+        // An omitted field keeps the WS default.
+        let partial = Config::from_toml_str("[strategies.mm]\nenabled = true\n").unwrap();
+        assert_eq!(partial.strategies.mm.live_fills_source, "ws");
     }
 
     #[test]
