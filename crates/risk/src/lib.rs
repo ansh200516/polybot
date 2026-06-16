@@ -1,6 +1,10 @@
 //! Pure risk engine (spec §15): caps, halts, kill switch. No I/O, no async,
 //! no engine types — callers convert baskets to plain `BasketCheck` data.
 
+/// Per-strategy inventory risk for inventory-bearing strategies (Phase 2).
+/// SEPARATE from the risk-free-basket `RiskEngine` below; arb is unchanged.
+pub mod inventory;
+
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
