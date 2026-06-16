@@ -21,6 +21,7 @@ use crate::wiring::BookFetcher;
 
 pub mod arb;
 pub mod host;
+pub mod mm;
 pub mod stub;
 
 /// Stable identity for a strategy (e.g. `"arb"`, `"mm"`). A `&'static str`

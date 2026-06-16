@@ -21,6 +21,7 @@ pub struct Config {
     pub tui: Tui,
     pub live: Live,
     pub inventory: Inventory,
+    pub strategies: Strategies,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -381,6 +382,56 @@ impl Default for Inventory {
     }
 }
 
+/// Per-strategy configuration for the risk-taking strategies the platform runs
+/// alongside arb (Phase 4+). Each strategy is its own sub-table so they stay
+/// independent; today only the market maker (`[strategies.mm]`) exists. Every
+/// risk-taking strategy ships DEFAULT-OFF (`enabled = false`), matching the
+/// cross-cutting safety model.
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct Strategies {
+    pub mm: Mm,
+}
+
+/// Market-making strategy config (`[strategies.mm]`, spec §7). Maps into the
+/// Phase-4 `MmStrategy` via `pm_app`'s wiring. DEFAULT-OFF and paper-only until
+/// an operator flips both `enabled` and (later, Task 4.5) `live`; the inventory
+/// caps come from the shared `[inventory]` section.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Mm {
+    /// Master switch. `false` (default) → the MM strategy never quotes; the
+    /// platform behaves exactly as before. Mirrors the established default-off
+    /// flag pattern (`lp.nonexhaustive_negrisk_worlds`).
+    pub enabled: bool,
+    /// Live arm. `false` (default) → quotes only on the PAPER maker venue
+    /// (`PaperMakerVenue`); the live CLOB arm is Task 4.5. Inert until then.
+    pub live: bool,
+    /// Total quoted spread around fair (= mid), in bps of $1 (100 bps = $0.01 =
+    /// one Cent tick). Split half each side; the loop rounds the bid DOWN and the
+    /// ask UP to ticks (maker-favorable / never narrower) and bumps them apart if
+    /// they collapse to one tick.
+    pub spread_bps: u32,
+    /// Quote-loop cadence: how often the strategy re-evaluates books, reconciles
+    /// resting quotes, polls fills, and marks/halts.
+    pub quote_refresh_ms: u64,
+    /// Max notional per single quote (one side), USD. Per-side size =
+    /// notional / price; the inventory caps then clamp it further.
+    pub max_quote_usd: f64,
+}
+
+impl Default for Mm {
+    fn default() -> Self {
+        Mm {
+            enabled: false,
+            live: false,
+            spread_bps: 200,
+            quote_refresh_ms: 1500,
+            max_quote_usd: 5.0,
+        }
+    }
+}
+
 impl Config {
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
         let cfg: Self = toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
@@ -548,6 +599,27 @@ impl Config {
         }
         if self.inventory.vol_window_ms < 1 {
             return Err(ConfigError::BadMoney("inventory.vol_window_ms must be ≥ 1"));
+        }
+        // Market-making strategy (`[strategies.mm]`; inert until `enabled`). The
+        // spread must be at least 1 bp (a sub-bp spread is meaningless; the loop
+        // additionally enforces a ≥1-tick non-crossing quote at runtime), the
+        // refresh cadence must be ≥ 100 ms (a tighter loop would churn the book /
+        // burn rate-limit budget for no benefit), and the per-quote notional must
+        // be positive + finite.
+        if self.strategies.mm.spread_bps < 1 {
+            return Err(ConfigError::BadMoney(
+                "strategies.mm.spread_bps must be ≥ 1",
+            ));
+        }
+        if self.strategies.mm.quote_refresh_ms < 100 {
+            return Err(ConfigError::BadMoney(
+                "strategies.mm.quote_refresh_ms must be ≥ 100",
+            ));
+        }
+        if self.strategies.mm.max_quote_usd <= 0.0 || !self.strategies.mm.max_quote_usd.is_finite() {
+            return Err(ConfigError::BadMoney(
+                "strategies.mm.max_quote_usd must be > 0",
+            ));
         }
         Ok(())
     }
@@ -924,5 +996,59 @@ mod tests {
         let mut c = Config::default();
         c.inventory.max_inventory_usd = f64::NAN;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn mm_strategy_defaults_are_off_and_paper() {
+        let c = Config::default();
+        assert!(!c.strategies.mm.enabled, "MM is OFF by default");
+        assert!(!c.strategies.mm.live, "MM is paper by default");
+        assert_eq!(c.strategies.mm.spread_bps, 200);
+        assert_eq!(c.strategies.mm.quote_refresh_ms, 1500);
+        assert!((c.strategies.mm.max_quote_usd - 5.0).abs() < 1e-9);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn mm_strategy_section_parses() {
+        let c = Config::from_toml_str(
+            "[strategies.mm]\nenabled = true\nlive = false\nspread_bps = 300\nquote_refresh_ms = 1000\nmax_quote_usd = 7.5\n",
+        )
+        .unwrap();
+        assert!(c.strategies.mm.enabled);
+        assert!(!c.strategies.mm.live);
+        assert_eq!(c.strategies.mm.spread_bps, 300);
+        assert_eq!(c.strategies.mm.quote_refresh_ms, 1000);
+        assert!((c.strategies.mm.max_quote_usd - 7.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mm_partial_section_keeps_other_defaults() {
+        // Enabling MM without restating every field keeps the rest at defaults.
+        let c = Config::from_toml_str("[strategies.mm]\nenabled = true\n").unwrap();
+        assert!(c.strategies.mm.enabled);
+        assert_eq!(c.strategies.mm.spread_bps, 200, "untouched field stays default");
+        assert_eq!(c.strategies.mm.quote_refresh_ms, 1500);
+    }
+
+    #[test]
+    fn mm_validation_rejects_bad_values() {
+        // spread_bps must be ≥ 1
+        assert!(Config::from_toml_str("[strategies.mm]\nspread_bps = 0\n").is_err());
+        // quote_refresh_ms floor
+        assert!(Config::from_toml_str("[strategies.mm]\nquote_refresh_ms = 50\n").is_err());
+        // max_quote_usd must be > 0 and finite
+        assert!(Config::from_toml_str("[strategies.mm]\nmax_quote_usd = 0.0\n").is_err());
+        assert!(Config::from_toml_str("[strategies.mm]\nmax_quote_usd = -1.0\n").is_err());
+
+        let mut c = Config::default();
+        c.strategies.mm.max_quote_usd = f64::NAN;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn mm_strategy_unknown_field_is_rejected() {
+        assert!(Config::from_toml_str("[strategies.mm]\nbogus = 1\n").is_err());
+        assert!(Config::from_toml_str("[strategies]\nbogus = 1\n").is_err());
     }
 }
