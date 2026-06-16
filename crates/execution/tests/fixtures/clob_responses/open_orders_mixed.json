@@ -1,0 +1,27 @@
+{
+  "data": [
+    {
+      "id": "0xresting11111111111111111111111111111111111111111111111111111111",
+      "asset_id": "123456789",
+      "side": "BUY",
+      "price": "0.33",
+      "original_size": "10",
+      "size_matched": "4",
+      "order_type": "GTC",
+      "status": "LIVE"
+    },
+    {
+      "id": "0xresting22222222222222222222222222222222222222222222222222222222",
+      "asset_id": "999999999",
+      "side": "SELL",
+      "price": "0.50",
+      "original_size": "20",
+      "size_matched": "0",
+      "order_type": "GTC",
+      "status": "LIVE"
+    }
+  ],
+  "next_cursor": "LTE=",
+  "limit": 100,
+  "count": 2
+}

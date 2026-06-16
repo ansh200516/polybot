@@ -22,6 +22,7 @@ use alloy_signer_local::PrivateKeySigner;
 use serde_json::json;
 use tracing::info;
 
+use pm_core::book::Side as BookSide;
 use pm_core::fees::fee_microusdc;
 use pm_core::instrument::TokenId;
 use pm_core::num::{Px, Qty, TickSize, Usdc, buy_cost, sell_proceeds};
@@ -29,6 +30,7 @@ use pm_engine::Action;
 
 use crate::Order;
 use crate::auth::l2_headers;
+use crate::maker::{MakerOrder, MakerVenue, OpenOrder, OrderId, OrderType};
 use crate::secrets::ApiCreds;
 use crate::sign::{CHAIN_ID, ClobOrder, Side, clob_amounts, sign_order_1271};
 use crate::venue::{ExecutionVenue, Fill, SubmitOutcome, VenueError};
@@ -189,8 +191,12 @@ pub struct LiveVenueCfg {
 pub struct LiveVenue {
     http: reqwest::Client,
     cfg: LiveVenueCfg,
-    /// token → (venue decimal token id, neg_risk).
-    tokens: HashMap<TokenId, (String, bool)>,
+    /// token → (venue decimal token id, neg_risk, tick size). The tick size is
+    /// required by the maker path: `MakerOrder.price`/`OpenOrder.price` are bare
+    /// tick indices ([`Px`]) carrying no scale, so signing maker `place` amounts
+    /// and parsing `open_orders` prices both need the per-token [`TickSize`].
+    /// (The taker `submit_fak` path keeps using `order.ts` — see there.)
+    tokens: HashMap<TokenId, (String, bool, TickSize)>,
     /// Order salt source. Default: SystemTime nanos XOR a bumped counter;
     /// overridable in tests for determinism. `FnMut` so the counter can bump.
     pub salt_src: Box<dyn FnMut() -> u64 + Send>,
@@ -224,10 +230,133 @@ impl LiveVenue {
         })
     }
 
-    /// Register a token's venue decimal id and neg-risk flag. Orders for an
-    /// unregistered token are rejected before any I/O.
-    pub fn register_token(&mut self, token: TokenId, venue_id: String, neg_risk: bool) {
-        self.tokens.insert(token, (venue_id, neg_risk));
+    /// Register a token's venue decimal id, neg-risk flag, and market tick size.
+    /// Orders for an unregistered token are rejected before any I/O. The `ts`
+    /// must be the token's true market tick size: the maker path uses it to
+    /// scale `place` amounts and to parse `open_orders` prices (the taker
+    /// `submit_fak` path uses the `Order.ts` carried on each order instead).
+    pub fn register_token(
+        &mut self,
+        token: TokenId,
+        venue_id: String,
+        neg_risk: bool,
+        ts: TickSize,
+    ) {
+        self.tokens.insert(token, (venue_id, neg_risk, ts));
+    }
+
+    /// Reverse-map a venue decimal token id (`asset_id`) back to our interned
+    /// [`TokenId`] and its [`TickSize`]. Used by the typed `open_orders` to type
+    /// a reported row's price; `None` for an asset id we never registered.
+    fn token_for_venue_id(&self, venue_id: &str) -> Option<(TokenId, TickSize)> {
+        self.tokens
+            .iter()
+            .find_map(|(tok, (vid, _neg, ts))| (vid == venue_id).then_some((*tok, *ts)))
+    }
+
+    /// Build + sign the shared V2 deposit-wallet order struct used by BOTH the
+    /// taker FAK path (`submit_fak`) and the maker resting path
+    /// (`MakerVenue::place`). Returns the signed [`ClobOrder`] (carrying the
+    /// salt), its `0x`-hex wire signature, and the `"BUY"`/`"SELL"` side string.
+    ///
+    /// V2 deposit-wallet flow (POLY_1271 / sigType 3), matching the OFFICIAL
+    /// working Polymarket Rust SDK (`rs-clob-client-v2` order_builder.rs): for a
+    /// Poly1271 order BOTH `maker` AND `signer` are the deposit wallet (funder).
+    /// `order.signer` is the deposit wallet, NOT the EOA — even though the API key
+    /// is bound to the EOA and L2 POLY_ADDRESS = the EOA (cfg.auth_address). The
+    /// inner ECDSA is produced by the EOA inside the ERC-7739 wrap and validated
+    /// on-chain by the deposit wallet's ERC-1271 isValidSignature. The signed
+    /// struct is time-in-force-agnostic: the resting `orderType`/`postOnly` and
+    /// the `expiration` are WIRE-ONLY top-level fields (see `order_wire_body`),
+    /// so GTC maker orders are signing-identical to the proven taker order.
+    fn sign_v2_order(
+        &mut self,
+        venue_token: &str,
+        neg_risk: bool,
+        action: Action,
+        ts: TickSize,
+        price: Px,
+        qty: Qty,
+    ) -> Result<(ClobOrder, String, &'static str), VenueError> {
+        let (maker_amount, taker_amount) = clob_amounts(action, ts, price, qty);
+        let side = match action {
+            Action::Buy => Side::Buy,
+            Action::Sell => Side::Sell,
+        };
+        // V2 signed struct (RECON-M5-V2): timestamp in ms; metadata/builder zero.
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let clob_order = ClobOrder {
+            salt: (self.salt_src)(),
+            maker: self.cfg.deposit_wallet,
+            signer: self.cfg.deposit_wallet,
+            token_id: venue_token.to_string(),
+            maker_amount,
+            taker_amount,
+            side,
+            signature_type: 3,
+            timestamp,
+            metadata: [0u8; 32].into(),
+            builder: [0u8; 32].into(),
+        };
+        let signature = sign_order_1271(
+            &self.cfg.signer,
+            &clob_order,
+            neg_risk,
+            CHAIN_ID,
+            self.cfg.deposit_wallet,
+        )
+        .map_err(|e| VenueError::Live(e.to_string()))?;
+        let side_str = match side {
+            Side::Buy => "BUY",
+            Side::Sell => "SELL",
+        };
+        Ok((clob_order, signature, side_str))
+    }
+
+    /// Serialise the V2 wire body (RECON-M5-V2 order_to_json_v2): salt &
+    /// signatureType are JSON NUMBERS, every other order field a STRING; side is
+    /// "BUY"/"SELL"; metadata/builder are 0x-prefixed 32-byte hex; top-level
+    /// `deferExec`. V2 drops taker/nonce/feeRateBps from the wire; `expiration`
+    /// stays on the wire though it is NOT in the signed struct.
+    ///
+    /// The taker FAK path and the maker resting path share this builder and
+    /// differ in EXACTLY the three top-level fields passed here: `order_type`
+    /// (`"FAK"` vs `"GTC"`/`"GTD"`), `post_only`, and `expiration` (`"0"` for
+    /// FAK/GTC; a UTC-seconds string for GTD). Reusing one builder keeps
+    /// `submit_fak`'s emitted bytes byte-identical to the proven taker wire.
+    fn order_wire_body(
+        &self,
+        clob_order: &ClobOrder,
+        signature: &str,
+        side_str: &str,
+        expiration: &str,
+        order_type: &str,
+        post_only: bool,
+    ) -> serde_json::Value {
+        json!({
+            "order": {
+                "salt": clob_order.salt,
+                "maker": format!("{:#x}", clob_order.maker),
+                "signer": format!("{:#x}", clob_order.signer),
+                "tokenId": clob_order.token_id,
+                "makerAmount": clob_order.maker_amount.to_string(),
+                "takerAmount": clob_order.taker_amount.to_string(),
+                "side": side_str,
+                "expiration": expiration,
+                "signatureType": clob_order.signature_type,
+                "timestamp": clob_order.timestamp.to_string(),
+                "metadata": format!("{:#x}", clob_order.metadata),
+                "builder": format!("{:#x}", clob_order.builder),
+                "signature": signature,
+            },
+            "owner": self.cfg.creds.key,
+            "orderType": order_type,
+            "deferExec": false,
+            "postOnly": post_only,
+        })
     }
 
     /// Walk a `GET /data/{kind}` cursor-paginated endpoint, returning raw rows.
@@ -371,7 +500,7 @@ impl LiveVenue {
         token: TokenId,
         ts: TickSize,
     ) -> Result<Option<Px>, VenueError> {
-        let (venue_token, _neg) = self
+        let (venue_token, _neg, _ts) = self
             .tokens
             .get(&token)
             .cloned()
@@ -425,79 +554,32 @@ fn unix_seconds_string() -> String {
 
 impl ExecutionVenue for LiveVenue {
     async fn submit_fak(&mut self, order: &Order) -> Result<SubmitOutcome, VenueError> {
-        // Unknown token → reject BEFORE any signing or I/O.
-        let (venue_token, neg_risk) = self
+        // Unknown token → reject BEFORE any signing or I/O. The taker path signs
+        // amounts from the per-ORDER tick size (`order.ts`), NOT the registry's
+        // tick size, so its emitted wire stays byte-identical now that the
+        // registry also carries a tick size (used only by the maker path).
+        let (venue_token, neg_risk, _ts) = self
             .tokens
             .get(&order.token)
             .cloned()
             .ok_or_else(|| VenueError::Live(format!("unregistered token {}", order.token.0)))?;
 
-        let (maker_amount, taker_amount) =
-            clob_amounts(order.action, order.ts, order.limit_px, order.qty);
-        let side = match order.action {
-            Action::Buy => Side::Buy,
-            Action::Sell => Side::Sell,
-        };
-        // V2 signed struct (RECON-M5-V2): timestamp in ms; metadata/builder zero.
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        // V2 deposit-wallet flow (POLY_1271 / sigType 3), matching the OFFICIAL
-        // working Polymarket Rust SDK (`rs-clob-client-v2` order_builder.rs): for a
-        // Poly1271 order BOTH `maker` AND `signer` are the deposit wallet (funder).
-        // order.signer is the deposit wallet, NOT the EOA — even though the API key
-        // is bound to the EOA and L2 POLY_ADDRESS = the EOA (cfg.auth_address). The
-        // inner ECDSA is produced by the EOA inside the ERC-7739 wrap and validated
-        // on-chain by the deposit wallet's ERC-1271 isValidSignature.
-        let clob_order = ClobOrder {
-            salt: (self.salt_src)(),
-            maker: self.cfg.deposit_wallet,
-            signer: self.cfg.deposit_wallet,
-            token_id: venue_token.clone(),
-            maker_amount,
-            taker_amount,
-            side,
-            signature_type: 3,
-            timestamp,
-            metadata: [0u8; 32].into(),
-            builder: [0u8; 32].into(),
-        };
-        let signature =
-            sign_order_1271(&self.cfg.signer, &clob_order, neg_risk, CHAIN_ID, self.cfg.deposit_wallet)
-                .map_err(|e| VenueError::Live(e.to_string()))?;
+        // Sign the shared V2 deposit-wallet (POLY_1271, sigType 3) order struct.
+        // This is the SAME signing the maker `place` path uses — see
+        // `sign_v2_order`; the two differ only in the three top-level wire fields.
+        let (clob_order, signature, side_str) = self.sign_v2_order(
+            &venue_token,
+            neg_risk,
+            order.action,
+            order.ts,
+            order.limit_px,
+            order.qty,
+        )?;
 
-        // Build the V2 wire body ONCE (RECON-M5-V2 order_to_json_v2): salt &
-        // signatureType are JSON NUMBERS, every other field a STRING; side is
-        // "BUY"/"SELL"; metadata/builder are 0x-prefixed 32-byte hex; new
-        // top-level `deferExec`. V2 drops taker/nonce/feeRateBps from the wire;
-        // `expiration` stays on the wire ("0") though it is NOT in the signed
-        // struct. serde_json::to_string is compact, matching the V2 client.
-        let side_str = match side {
-            Side::Buy => "BUY",
-            Side::Sell => "SELL",
-        };
-        let body_value = json!({
-            "order": {
-                "salt": clob_order.salt,
-                "maker": format!("{:#x}", clob_order.maker),
-                "signer": format!("{:#x}", clob_order.signer),
-                "tokenId": clob_order.token_id,
-                "makerAmount": clob_order.maker_amount.to_string(),
-                "takerAmount": clob_order.taker_amount.to_string(),
-                "side": side_str,
-                "expiration": "0",
-                "signatureType": clob_order.signature_type,
-                "timestamp": clob_order.timestamp.to_string(),
-                "metadata": format!("{:#x}", clob_order.metadata),
-                "builder": format!("{:#x}", clob_order.builder),
-                "signature": signature,
-            },
-            "owner": self.cfg.creds.key,
-            "orderType": "FAK",
-            "deferExec": false,
-            "postOnly": false,
-        });
+        // FAK taker wire: orderType "FAK", postOnly false, expiration "0" — the
+        // proven RECON-M5-V2 shape. `order_wire_body` emits the byte-identical
+        // body (verified by this module's submit_fak_* assertions).
+        let body_value = self.order_wire_body(&clob_order, &signature, side_str, "0", "FAK", false);
         let body = serde_json::to_string(&body_value)
             .map_err(|e| VenueError::Live(e.to_string()))?;
 
@@ -523,7 +605,7 @@ impl ExecutionVenue for LiveVenue {
             info!(
                 order = %order.id,
                 token = %venue_token,
-                side = ?side,
+                side = side_str,
                 limit_ticks = order.limit_px.get(),
                 qty_micro = order.qty.0,
                 "SHADOW: signed, not submitted"
@@ -638,6 +720,268 @@ impl ExecutionVenue for LiveVenue {
         Err(VenueError::NotSupportedLive(
             "on-chain ops deferred to M6 (pure-buy live)",
         ))
+    }
+}
+
+// ===========================================================================
+// MakerVenue (Task 3.3): resting postOnly GTC/GTD orders on CLOB V2
+//
+// SEPARATE from the taker ExecutionVenue: `place` rests a signed limit order
+// (reusing POST /order with the SAME signed struct + wire body as `submit_fak`,
+// differing only in orderType/postOnly/expiration), `cancel` issues DELETE
+// /order, `replace` is cancel-then-place (CLOB V2 has no native amend), and
+// `open_orders` is the typed, registered-token-only view over GET /data/orders.
+//
+// This code is INERT until Phase 4 wires the MM strategy behind a default-off
+// flag, but it WILL place real orders, so it faithfully mirrors the proven
+// taker signing/auth/wire path.
+// ===========================================================================
+
+impl MakerVenue for LiveVenue {
+    /// Place a resting `postOnly` GTC/GTD order. Reuses POST `/order` with the
+    /// SAME signed V2 order + wire body as `submit_fak`; only `orderType`,
+    /// `postOnly`, and `expiration` differ.
+    ///
+    /// `postOnly` guarantees maker-only: the venue REJECTS the order
+    /// (`INVALID_POST_ONLY_ORDER`) if it would cross, or if combined with
+    /// FOK/FAK. A resting postOnly order normally comes back `status: "live"`;
+    /// we do NOT poll fills here (fills arrive via Task 3.4).
+    ///
+    /// GTD note: `expiration` is the order's UTC-SECONDS expiry (`expiry_ms /
+    /// 1000`). In this V2 signing path `expiration` is WIRE-ONLY (not in the
+    /// signed struct), exactly as `submit_fak` already sends `"0"` — so GTC is
+    /// signing-identical to the proven taker path. GTD's expiration is therefore
+    /// UNSIGNED and UNVERIFIED against the live venue; revisit in canary.
+    async fn place(&mut self, o: &MakerOrder) -> Result<OrderId, VenueError> {
+        // Unknown token → reject BEFORE any signing or I/O (mirrors submit_fak).
+        // The registry tick size types the maker price into signed amounts.
+        let (venue_token, neg_risk, ts) = self
+            .tokens
+            .get(&o.token)
+            .cloned()
+            .ok_or_else(|| VenueError::Live(format!("unregistered token {}", o.token.0)))?;
+
+        // Side map: Bid → Buy, Ask → Sell (same as the taker action map).
+        let action = match o.side {
+            BookSide::Bid => Action::Buy,
+            BookSide::Ask => Action::Sell,
+        };
+        let (clob_order, signature, side_str) =
+            self.sign_v2_order(&venue_token, neg_risk, action, ts, o.price, o.size)?;
+
+        // The three top-level wire fields that distinguish a resting maker order
+        // from a FAK taker: orderType, postOnly, expiration. GTC → "0"; GTD →
+        // UTC seconds (ms / 1000), wire-only / unsigned (see the doc note above).
+        let (order_type_str, expiration) = match o.order_type {
+            OrderType::Gtc => ("GTC", "0".to_string()),
+            OrderType::Gtd { expiry_ms } => ("GTD", (expiry_ms / 1000).to_string()),
+        };
+        let body_value = self.order_wire_body(
+            &clob_order,
+            &signature,
+            side_str,
+            &expiration,
+            order_type_str,
+            o.post_only,
+        );
+        let body = serde_json::to_string(&body_value)
+            .map_err(|e| VenueError::Live(e.to_string()))?;
+
+        // SHADOW: signed + logged, never submitted (no limiter, no network).
+        // Return a deterministic sentinel id so a dry-run MM strategy can track
+        // the "order" without a venue round-trip.
+        if self.cfg.shadow {
+            info!(
+                token = %venue_token,
+                side = side_str,
+                order_type = order_type_str,
+                post_only = o.post_only,
+                limit_ticks = o.price.get(),
+                qty_micro = o.size.0,
+                "SHADOW: maker order signed, not submitted"
+            );
+            return Ok(OrderId(format!("shadow-{}", clob_order.salt)));
+        }
+
+        // The L2 HMAC must sign the EXACT wire body string (byte-identical to the
+        // request body). POLY_ADDRESS = the key's bound address (auth_address).
+        self.limiter.acquire().await;
+        let ts_hdr = unix_seconds_string();
+        let auth_address = self.cfg.auth_address.to_string();
+        let headers =
+            l2_headers(&self.cfg.creds, &auth_address, &ts_hdr, "POST", "/order", Some(&body))
+                .map_err(|e| VenueError::Live(e.to_string()))?;
+        let url = format!("{}/order", self.cfg.base);
+        let mut req = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(body);
+        for (k, v) in &headers {
+            req = req.header(*k, v);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| VenueError::Live(e.to_string()))?;
+        let status = resp.status();
+        let resp_body = resp
+            .text()
+            .await
+            .map_err(|e| VenueError::Live(e.to_string()))?;
+        if !status.is_success() {
+            return Err(VenueError::Live(format!("{status}: {resp_body}")));
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&resp_body).map_err(|e| VenueError::Live(e.to_string()))?;
+        // HTTP 200 with success:false is a processing failure (e.g. a postOnly
+        // order that would cross → INVALID_POST_ONLY_ORDER).
+        if parsed.get("success").and_then(|v| v.as_bool()) != Some(true) {
+            let msg = parsed
+                .get("errorMsg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown processing failure");
+            return Err(VenueError::Live(msg.to_string()));
+        }
+        let order_id = parsed
+            .get("orderID")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        Ok(OrderId(order_id))
+    }
+
+    /// Cancel a resting order via DELETE `/order` with body `{"orderID":"0x.."}`.
+    ///
+    /// IDEMPOTENT by design: any HTTP 200 is `Ok(())`, whether the venue reports
+    /// the id under `canceled` or under `not_canceled` (already filled/expired/
+    /// never resting). This satisfies the QuoteManager's double-cancel-safe
+    /// contract — a cancel of an order that is already gone is success, not an
+    /// error. Only transport / non-200 HTTP failures return `Err`.
+    async fn cancel(&mut self, id: &OrderId) -> Result<(), VenueError> {
+        // SHADOW: local no-op (nothing was ever placed on the venue).
+        if self.cfg.shadow {
+            return Ok(());
+        }
+        // Serialise the body ONCE and reuse the SAME string for the HMAC and the
+        // request — they must be byte-identical (like submit_fak's POST body).
+        let body = serde_json::to_string(&json!({ "orderID": id.0 }))
+            .map_err(|e| VenueError::Live(e.to_string()))?;
+        self.limiter.acquire().await;
+        let ts_hdr = unix_seconds_string();
+        let auth_address = self.cfg.auth_address.to_string();
+        let headers =
+            l2_headers(&self.cfg.creds, &auth_address, &ts_hdr, "DELETE", "/order", Some(&body))
+                .map_err(|e| VenueError::Live(e.to_string()))?;
+        let url = format!("{}/order", self.cfg.base);
+        let mut req = self
+            .http
+            .delete(&url)
+            .header("Content-Type", "application/json")
+            .body(body);
+        for (k, v) in &headers {
+            req = req.header(*k, v);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| VenueError::Live(e.to_string()))?;
+        let status = resp.status();
+        let resp_body = resp
+            .text()
+            .await
+            .map_err(|e| VenueError::Live(e.to_string()))?;
+        if !status.is_success() {
+            return Err(VenueError::Live(format!("{status}: {resp_body}")));
+        }
+        // Any 200 → Ok: the order is gone (canceled) or was never resting
+        // (not_canceled). Both are the desired post-condition for a cancel.
+        Ok(())
+    }
+
+    /// Replace = cancel-then-place. CLOB V2 has NO native replace/amend, so this
+    /// cancels `id` then places `o`, returning the NEW venue id.
+    ///
+    /// NON-ATOMIC: cancel-then-place leaves a brief no-quote gap between the two
+    /// calls. This is the DELIBERATE choice over place-then-cancel, whose brief
+    /// double-exposure (two live quotes) is worse for inventory caps. The
+    /// QuoteManager on-error contract plus Task 3.5 reconciliation are the safety
+    /// net for the gap (and for a cancel that succeeds but place that fails).
+    async fn replace(&mut self, id: &OrderId, o: &MakerOrder) -> Result<OrderId, VenueError> {
+        self.cancel(id).await?;
+        self.place(o).await
+    }
+
+    /// Typed open orders: reuse the cursor-paginated `GET /data/orders` walk and
+    /// map each row to an [`OpenOrder`].
+    ///
+    /// REGISTERED-TOKEN-ONLY: a row whose `asset_id` is not in our registry is
+    /// SKIPPED with a warning — we cannot type its `Px` without the token's tick
+    /// size. The raw `LiveVenue::open_orders` (Vec<Value>) remains for the full
+    /// startup sweep that must see every resting order regardless of registration.
+    ///
+    /// `size` is the REMAINING size (`original_size − size_matched`): what is
+    /// still resting on the book, which is what a quote-reconciler cares about.
+    async fn open_orders(&mut self) -> Result<Vec<OpenOrder>, VenueError> {
+        let rows = self.data_rows("orders", "").await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let Some(asset_id) = row.get("asset_id").and_then(|v| v.as_str()) else {
+                tracing::warn!("open order row missing asset_id; skipping");
+                continue;
+            };
+            // Reverse-map asset_id → (TokenId, TickSize); skip unregistered.
+            let Some((token, ts)) = self.token_for_venue_id(asset_id) else {
+                tracing::warn!(
+                    asset_id,
+                    "open order for unregistered token; skipping (cannot type Px without tick size)"
+                );
+                continue;
+            };
+            let side = match row.get("side").and_then(|v| v.as_str()) {
+                Some("BUY") => BookSide::Bid,
+                Some("SELL") => BookSide::Ask,
+                other => {
+                    tracing::warn!(?other, asset_id, "open order row has unknown side; skipping");
+                    continue;
+                }
+            };
+            let Some(price_s) = row.get("price").and_then(|v| v.as_str()) else {
+                tracing::warn!(asset_id, "open order row missing price; skipping");
+                continue;
+            };
+            let Some(price) = px_from_decimal(price_s, ts) else {
+                tracing::warn!(asset_id, price = price_s, "open order row has bad/unaligned price; skipping");
+                continue;
+            };
+            let original = row
+                .get("original_size")
+                .and_then(|v| v.as_str())
+                .and_then(decimal_to_micro);
+            let Some(original) = original else {
+                tracing::warn!(asset_id, "open order row missing/bad original_size; skipping");
+                continue;
+            };
+            // size_matched is optional / may be absent for a brand-new order.
+            let matched = row
+                .get("size_matched")
+                .and_then(|v| v.as_str())
+                .and_then(decimal_to_micro)
+                .unwrap_or(0);
+            let id = row
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            out.push(OpenOrder {
+                id: OrderId(id),
+                token,
+                side,
+                price,
+                size: Qty(original.saturating_sub(matched)),
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -763,6 +1107,18 @@ mod tests {
     const PROC_ERR: &str =
         include_str!("../tests/fixtures/clob_responses/order_processing_error.json");
     const TRADES: &str = include_str!("../tests/fixtures/clob_responses/trades_for_order.json");
+    // -- maker (Task 3.3) response fixtures --------------------------------
+    const PLACED: &str = include_str!("../tests/fixtures/clob_responses/order_placed_live.json");
+    const POST_ONLY_REJECTED: &str =
+        include_str!("../tests/fixtures/clob_responses/order_post_only_rejected.json");
+    const CANCEL_OK: &str = include_str!("../tests/fixtures/clob_responses/cancel_ok.json");
+    const CANCEL_IDEMPOTENT: &str =
+        include_str!("../tests/fixtures/clob_responses/cancel_idempotent.json");
+    const OPEN_ORDERS_MIXED: &str =
+        include_str!("../tests/fixtures/clob_responses/open_orders_mixed.json");
+    /// The `orderID` the placed / cancel fixtures carry.
+    const PLACED_ID: &str =
+        "0xa1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4";
 
     fn test_venue(base: String, shadow: bool) -> LiveVenue {
         // 64 hex chars (no 0x): the throwaway "0xadad…ad" key.
@@ -797,7 +1153,7 @@ mod tests {
         };
         let mut v = LiveVenue::new(cfg).unwrap();
         v.salt_src = Box::new(|| 42);
-        v.register_token(TokenId(7), "123456789".into(), false);
+        v.register_token(TokenId(7), "123456789".into(), false, TickSize::Cent);
         v
     }
 
@@ -1000,6 +1356,193 @@ mod tests {
             other => panic!("expected Live, got {other:?}"),
         }
         assert_eq!(mock.hits.load(Ordering::SeqCst), 0, "no network before token check");
+    }
+
+    // -- maker venue (Task 3.3) --------------------------------------------
+
+    /// A resting BID on token 7 at 0.33 (tick 33 Cent), 10 shares. Bid → BUY,
+    /// so amounts match the taker fixtures (makerAmount 3300000 µUSDC, taker
+    /// 10000000 µshares) — lets the place test reuse the submit_fak assertions.
+    fn maker_bid(order_type: OrderType, post_only: bool) -> MakerOrder {
+        MakerOrder {
+            token: TokenId(7),
+            side: BookSide::Bid,
+            price: Px::new(33, TickSize::Cent).unwrap(),
+            size: Qty(10_000_000),
+            order_type,
+            post_only,
+        }
+    }
+
+    #[tokio::test]
+    async fn place_gtc_postonly_builds_correct_wire() {
+        let mock = spawn_mock(vec![(200, PLACED.to_string())]);
+        let mut v = test_venue(format!("http://{}", mock.addr), false);
+        let id = v.place(&maker_bid(OrderType::Gtc, true)).await.unwrap();
+        assert_eq!(id, OrderId(PLACED_ID.into()), "returns the fixture orderID");
+
+        let reqs = mock.requests.lock().await;
+        assert_eq!(reqs.len(), 1, "place is a single POST, no fill polling");
+        assert!(reqs[0].starts_with("POST /order"), "req: {}", reqs[0]);
+        // The THREE maker-distinguishing top-level fields.
+        assert!(reqs[0].contains("\"orderType\":\"GTC\""), "{}", reqs[0]);
+        assert!(reqs[0].contains("\"postOnly\":true"), "{}", reqs[0]);
+        assert!(reqs[0].contains("\"expiration\":\"0\""), "GTC expiration is 0: {}", reqs[0]);
+        assert!(
+            !reqs[0].contains("\"orderType\":\"FAK\""),
+            "a maker order is not FAK: {}",
+            reqs[0]
+        );
+        // Side map Bid → BUY.
+        assert!(reqs[0].contains("\"side\":\"BUY\""), "Bid → BUY: {}", reqs[0]);
+        // Reuse the submit_fak wire assertions: the signed struct is identical to
+        // the proven taker path (sigType 3, salt #, against-us amounts).
+        assert!(reqs[0].contains("\"signatureType\":3"), "{}", reqs[0]);
+        assert!(reqs[0].contains("\"salt\":42"), "salt is a number: {}", reqs[0]);
+        assert!(reqs[0].contains("\"makerAmount\":\"3300000\""), "{}", reqs[0]);
+        // maker AND signer are BOTH the deposit wallet (0x2222…), sigType-3 shape.
+        assert!(
+            reqs[0].contains(&format!("\"maker\":\"0x{}\"", "22".repeat(20))),
+            "maker must be the deposit wallet: {}",
+            reqs[0]
+        );
+        assert!(
+            reqs[0].contains(&format!("\"signer\":\"0x{}\"", "22".repeat(20))),
+            "signer must be the deposit wallet (funder), NOT the EOA: {}",
+            reqs[0]
+        );
+        // L2 POLY_ADDRESS == auth_address == the EOA the key binds to (0x3333…),
+        // DISTINCT from the deposit wallet — identical binding to the taker path.
+        let lower = reqs[0].to_ascii_lowercase();
+        assert!(lower.contains("poly_api_key"), "auth header present: {}", reqs[0]);
+        assert!(
+            lower.contains(&format!("poly_address: 0x{}", "33".repeat(20))),
+            "L2 POLY_ADDRESS must be the EOA (auth_address): {}",
+            reqs[0]
+        );
+        // ERC-7739 wrapped sig (> 132 hex chars), as on the taker path.
+        let sig_hex = {
+            let m = "\"signature\":\"0x";
+            let start = reqs[0].find(m).unwrap() + m.len();
+            let rest = &reqs[0][start..];
+            &rest[..rest.find('"').unwrap()]
+        };
+        assert!(sig_hex.len() > 132, "ERC-7739 wrapped sig expected, got {}", sig_hex.len());
+    }
+
+    #[tokio::test]
+    async fn place_gtd_sets_expiration_seconds() {
+        let mock = spawn_mock(vec![(200, PLACED.to_string())]);
+        let mut v = test_venue(format!("http://{}", mock.addr), false);
+        // expiry 1_750_000_000_000 ms → "1750000000" UTC seconds (ms / 1000).
+        let o = maker_bid(OrderType::Gtd { expiry_ms: 1_750_000_000_000 }, true);
+        let id = v.place(&o).await.unwrap();
+        assert_eq!(id, OrderId(PLACED_ID.into()));
+
+        let reqs = mock.requests.lock().await;
+        assert!(reqs[0].contains("\"orderType\":\"GTD\""), "{}", reqs[0]);
+        assert!(
+            reqs[0].contains("\"expiration\":\"1750000000\""),
+            "GTD expiration is the seconds string: {}",
+            reqs[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn place_rejected_postonly_cross_is_error() {
+        let mock = spawn_mock(vec![(200, POST_ONLY_REJECTED.to_string())]);
+        let mut v = test_venue(format!("http://{}", mock.addr), false);
+        let err = v.place(&maker_bid(OrderType::Gtc, true)).await.unwrap_err();
+        match err {
+            VenueError::Live(msg) => {
+                assert!(msg.contains("INVALID_POST_ONLY_ORDER"), "{msg}")
+            }
+            other => panic!("expected Live, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_success_and_idempotent() {
+        // First DELETE: id reported under "canceled". Second DELETE: id reported
+        // under "not_canceled" (already filled/expired/never resting). BOTH 200.
+        let mock = spawn_mock(vec![
+            (200, CANCEL_OK.to_string()),
+            (200, CANCEL_IDEMPOTENT.to_string()),
+        ]);
+        let mut v = test_venue(format!("http://{}", mock.addr), false);
+        let id = OrderId(PLACED_ID.into());
+
+        v.cancel(&id).await.unwrap(); // canceled → Ok
+        v.cancel(&id).await.unwrap(); // not_canceled → ALSO Ok (idempotent)
+
+        let reqs = mock.requests.lock().await;
+        assert_eq!(reqs.len(), 2, "two DELETE calls");
+        assert!(reqs[0].starts_with("DELETE /order"), "req0: {}", reqs[0]);
+        assert!(reqs[1].starts_with("DELETE /order"), "req1: {}", reqs[1]);
+        assert!(
+            reqs[0].contains(&format!("\"orderID\":\"{PLACED_ID}\"")),
+            "cancel body carries the id: {}",
+            reqs[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_is_cancel_then_place() {
+        // Script a DELETE 200 (cancel) THEN a POST 200 (place), in order.
+        let mock = spawn_mock(vec![
+            (200, CANCEL_OK.to_string()),
+            (200, PLACED.to_string()),
+        ]);
+        let mut v = test_venue(format!("http://{}", mock.addr), false);
+        let old = OrderId("0xoldrestingid".into());
+        let new_id = v
+            .replace(&old, &maker_bid(OrderType::Gtc, true))
+            .await
+            .unwrap();
+        assert_eq!(new_id, OrderId(PLACED_ID.into()), "returns the NEW (placed) id");
+
+        let reqs = mock.requests.lock().await;
+        assert_eq!(reqs.len(), 2, "cancel-then-place = exactly two requests");
+        // Order is load-bearing: cancel the OLD order BEFORE placing the new one.
+        assert!(reqs[0].starts_with("DELETE /order"), "first must be the cancel: {}", reqs[0]);
+        assert!(
+            reqs[0].contains("\"orderID\":\"0xoldrestingid\""),
+            "cancel targets the OLD id: {}",
+            reqs[0]
+        );
+        assert!(reqs[1].starts_with("POST /order"), "second must be the place: {}", reqs[1]);
+        assert!(reqs[1].contains("\"orderType\":\"GTC\""), "place body: {}", reqs[1]);
+    }
+
+    #[tokio::test]
+    async fn open_orders_maps_registered_and_skips_unknown() {
+        let mock = spawn_mock(vec![(200, OPEN_ORDERS_MIXED.to_string())]);
+        let mut v = test_venue(format!("http://{}", mock.addr), false);
+        // The TRAIT method (inherent `open_orders` returns the raw Vec<Value>).
+        let open = MakerVenue::open_orders(&mut v).await.unwrap();
+        assert_eq!(open.len(), 1, "only the registered-token order is returned");
+        let o = &open[0];
+        assert_eq!(
+            o.id,
+            OrderId("0xresting11111111111111111111111111111111111111111111111111111111".into())
+        );
+        assert_eq!(o.token, TokenId(7), "asset_id 123456789 reverse-maps to token 7");
+        assert_eq!(o.side, BookSide::Bid, "BUY → Bid");
+        assert_eq!(o.price.get(), 33, "0.33 → 33 Cent ticks");
+        // remaining = original 10 − matched 4 = 6 shares = 6e6 µshares.
+        assert_eq!(o.size, Qty(6_000_000), "size is remaining = original − matched");
+    }
+
+    #[tokio::test]
+    async fn shadow_place_no_network_returns_sentinel() {
+        // Empty script: any network hit fails the connection. Shadow must not
+        // touch the network and must return the deterministic salt sentinel.
+        let mock = spawn_mock(vec![]);
+        let mut v = test_venue(format!("http://{}", mock.addr), true);
+        let id = v.place(&maker_bid(OrderType::Gtc, true)).await.unwrap();
+        assert!(id.0.starts_with("shadow-"), "sentinel id: {}", id.0);
+        assert_eq!(id, OrderId("shadow-42".into()), "salt-derived sentinel (test salt 42)");
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 0, "shadow made a network call");
     }
 
     // -- decimal helper unit test ------------------------------------------

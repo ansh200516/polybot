@@ -770,7 +770,7 @@ async fn main() {
             if let Some(&(yes, no)) = market_tokens_for_registration.get(&m.id) {
                 for tok in [yes, no] {
                     if let Some(vid) = reg.token_venue_id(tok) {
-                        venue.register_token(tok, vid.to_owned(), m.neg_risk);
+                        venue.register_token(tok, vid.to_owned(), m.neg_risk, m.tick);
                     }
                 }
             }
