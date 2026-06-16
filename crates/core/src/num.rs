@@ -62,8 +62,9 @@ impl Px {
     }
 }
 
-/// ceil(n/d) for n >= 0, d > 0.
-const fn div_ceil_i128(n: i128, d: i128) -> i128 {
+/// ceil(n/d) for n >= 0, d > 0. Public so risk caps can round exposure UP
+/// (against us) using the same helper as the cash math below.
+pub const fn div_ceil_i128(n: i128, d: i128) -> i128 {
     (n + d - 1) / d
 }
 

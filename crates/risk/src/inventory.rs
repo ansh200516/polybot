@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use pm_core::instrument::TokenId;
-use pm_core::num::{Usdc, ONE_SHARE_MICRO};
+use pm_core::num::{div_ceil_i128, Usdc, ONE_SHARE_MICRO};
 
 /// Per-strategy inventory caps (spec §5, all µUSDC). Defined now so the type is
 /// stable across Phase 2, but this task only STORES it — the cap CHECKS land in
@@ -165,18 +165,19 @@ impl InventoryRisk {
     /// plain-data, inclusive-boundary style of `RiskEngine::pre_check`.
     ///
     /// Units & rounding (all i128, µUSDC): a token's `net` is µshares and a
-    /// `notional` is `|net|·price/1e6` µUSDC (µshares × µUSDC/share ÷ 1e6
-    /// µshares/share), the same scaling as the `basis = net·avg_price/1e6`
-    /// identity on `TokenInventory`. The `/1e6` truncates toward zero; the
-    /// discarded dust is sub-µUSDC.
+    /// `notional` is `ceil(|net|·price / 1e6)` µUSDC (µshares × µUSDC/share ÷
+    /// 1e6 µshares/share), the same scaling as the `basis = net·avg_price/1e6`
+    /// identity on `TokenInventory`. The `/1e6` rounds UP (against us, per
+    /// `num.rs`'s `div_ceil_i128`) so a cap OVERSTATES exposure and binds on the
+    /// safe side; the overstatement is sub-µUSDC.
     ///
     /// Policy:
     /// - **De-risking is never blocked.** If the quote does not grow the token's
     ///   net magnitude (`|proj_net| ≤ |net|`) it is always `Approve`, even when
     ///   the position is already over a cap — moving toward flat must not gate.
     /// - Otherwise the quote INCREASES exposure and both caps apply:
-    ///   - Per-market: projected token notional `|proj_net|·price/1e6`. Over
-    ///     `max_inventory_usd` → `Reject(PerMarketInventory)`.
+    ///   - Per-market: projected token notional `ceil(|proj_net|·price/1e6)`.
+    ///     Over `max_inventory_usd` → `Reject(PerMarketInventory)`.
     ///   - Gross: that projected notional + Σ `|basis|` of every OTHER token.
     ///     Other tokens use their cost-basis magnitude as the exposure proxy —
     ///     this module holds no live marks for them, and the quote carries the
@@ -195,8 +196,13 @@ impl InventoryRisk {
             return QuoteVerdict::Approve;
         }
 
-        // Increasing exposure: value the quote's token at its own quote price.
-        let proj_notional = proj_net.abs() * i128::from(q.price_micro) / i128::from(ONE_SHARE_MICRO);
+        // Increasing exposure: value the quote's token at its own quote price,
+        // rounding the notional UP (against us) so the cap binds on the safe
+        // side. This same `proj_notional` also feeds the gross sum below.
+        let proj_notional = div_ceil_i128(
+            proj_net.abs() * i128::from(q.price_micro),
+            i128::from(ONE_SHARE_MICRO),
+        );
         if proj_notional > self.cfg.max_inventory_usd.0 {
             return QuoteVerdict::Reject(InvReason::PerMarketInventory);
         }
@@ -622,6 +628,53 @@ mod tests {
         assert_eq!(
             inv.check_quote(&at),
             QuoteVerdict::Reject(InvReason::GrossInventory)
+        );
+    }
+
+    #[test]
+    fn check_quote_rejects_flip_to_larger_opposite() {
+        // Holding a small long, a sell big enough to flip THROUGH flat into a
+        // LARGER short (|proj_net| > |net|) is an INCREASE in exposure, not a
+        // reduce — so it must face the per-market cap, NOT be auto-approved by
+        // the reduce rule.
+        let mut inv = InventoryRisk::new(cfg()); // max_inventory_usd = $500
+        let t = TokenId(1);
+        inv.on_fill(t, 100 * SHARE, Usdc(-100_000_000)); // net +100 sh, basis $100
+        // Sell 700 sh → proj_net = −600 sh; |−600| > |+100|, notional 600·$1 =
+        // $600 > $500.
+        let flip_bigger = QuoteIntent {
+            token: t,
+            signed_qty: -700 * SHARE,
+            price_micro: PRICE_1USD,
+        };
+        assert_eq!(
+            inv.check_quote(&flip_bigger),
+            QuoteVerdict::Reject(InvReason::PerMarketInventory)
+        );
+    }
+
+    #[test]
+    fn check_quote_gross_excludes_quoted_tokens_own_basis() {
+        // The quoted token ALREADY holds inventory. The gross sum must value it
+        // by its PROJECTED notional (not its stale |basis|) and add only OTHER
+        // tokens' |basis| — its own basis must not be double-counted.
+        let mut inv = InventoryRisk::new(cfg()); // per-market $500, gross $2000
+        let (b, a) = (TokenId(1), TokenId(2));
+        inv.on_fill(b, 200 * SHARE, Usdc(-200_000_000)); // quoted B: net +200, basis $200
+        inv.on_fill(a, 1600 * SHARE, Usdc(-1_600_000_000)); // other A: basis $1600
+        // Buy 100 more of B → proj_net_B +300 sh, proj_notional $300 (≤ $500).
+        let q = QuoteIntent {
+            token: b,
+            signed_qty: 100 * SHARE,
+            price_micro: PRICE_1USD,
+        };
+        // Correct gross = 300 (B projected) + 1600 (A basis) = $1900 ≤ $2000 →
+        // Approve. Double-counting B's own $200 basis would give $2100 > $2000 →
+        // Reject; asserting Approve proves the quoted token's basis is excluded.
+        assert_eq!(
+            inv.check_quote(&q),
+            QuoteVerdict::Approve,
+            "quoted token's own basis must be excluded from the gross sum"
         );
     }
 }
