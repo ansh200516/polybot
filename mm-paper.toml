@@ -65,8 +65,9 @@ mm_exclude_fee_free = true                         # skip 0-fee markets (rebate 
 # to quote). Opt-in; default sync order is arbitrary (Gamma keyset order).
 # ---------------------------------------------------------------------------
 [universe]
-max_markets             = 40     # synced universe size (self-contained; no need for --max-markets)
+max_markets             = 100    # synced universe size — wide enough for the MM (max_markets 60,
+                                 # ≤2 per event) to spread across many distinct markets/events.
 prioritize_by_liquidity = true
-candidate_pool          = 80     # rank up to this many candidates, keep the top max_markets.
-                                 # Higher = better market selection but slower startup (each
-                                 # candidate is a rate-limited CLOB fetch at ~5/s). 80 ≈ ~30s sync.
+candidate_pool          = 150    # rank up to this many candidates, keep the top max_markets.
+                                 # Higher = better selection but slower startup (each candidate is
+                                 # a rate-limited CLOB fetch at ~5/s). 150 ≈ ~40s sync.
