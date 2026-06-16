@@ -65,12 +65,14 @@ mm_exclude_fee_free = true                         # skip 0-fee markets (rebate 
 # to quote). Opt-in; default sync order is arbitrary (Gamma keyset order).
 # ---------------------------------------------------------------------------
 [universe]
-max_markets             = 100    # synced universe size — wide enough for the MM (max_markets 60,
-                                 # ≤2 per event) to spread across many distinct markets/events.
+max_markets             = 300    # synced universe size — broad coverage. Arb runs on all 300;
+                                 # the MM (max_markets 60, ≤2/event) spreads across the many
+                                 # events these 300 markets span.
 prioritize_by_liquidity = true
-candidate_pool          = 150    # rank up to this many candidates, keep the top max_markets.
-                                 # Higher = better selection but slower startup (each candidate is
-                                 # a rate-limited CLOB fetch at ~5/s). 150 ≈ ~40s sync.
-auto_restart_secs       = 600    # every 10 min, re-exec for a FRESH universe (new markets appear
-                                 # over time); positions/P&L persist via the store. 0 = off.
-                                 # Lower it to see refreshes sooner (must be ≥ 60).
+candidate_pool          = 400    # rank up to this many candidates, keep the top max_markets.
+                                 # Each candidate is a rate-limited CLOB fetch (~5/s), so this
+                                 # is the startup cost: 400 ≈ ~80-90s sync. Raise both for even
+                                 # broader coverage (e.g. 1000/1200 ≈ ~4 min sync).
+auto_restart_secs       = 1800   # every 30 min, re-exec for a FRESH universe (new markets appear
+                                 # over time); positions/P&L persist via the store. Set well above
+                                 # the sync time so the ~90s re-sync is a small fraction. 0 = off.
