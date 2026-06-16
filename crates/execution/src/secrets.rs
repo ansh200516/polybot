@@ -4,6 +4,13 @@
 //! Debug impl is redacted; there is intentionally NO Display impl.
 
 /// An owned secret string. Debug prints `Secret(<redacted>)`; no Display.
+///
+/// `Clone` is derived so that two consumers can each own the same resolved
+/// credential without re-deriving it (Task 4.5: arb and the market maker each
+/// build a `LiveVenue` for the SAME account, and each venue owns its creds by
+/// value). Cloning duplicates the in-memory owned `String` only — the redacted
+/// `Debug` and the absent `Display` still guarantee the value is never logged.
+#[derive(Clone)]
 pub struct Secret(String);
 
 impl Secret {
@@ -27,7 +34,12 @@ impl std::fmt::Debug for Secret {
 }
 
 /// Pre-derived L2 API credentials (all three or none).
-#[derive(Debug)]
+///
+/// `Clone` (Task 4.5): arb and the market maker each construct a `LiveVenue`
+/// (which owns its `ApiCreds` by value) for the SAME account, so the resolved
+/// creds are cloned once rather than derived twice. The cloned `Secret` fields
+/// stay redacted in `Debug`.
+#[derive(Debug, Clone)]
 pub struct ApiCreds {
     pub key: String,
     pub secret: Secret,

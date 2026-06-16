@@ -160,6 +160,23 @@ pub fn strategy_envelopes(
     })
 }
 
+/// Task 4.5 — the LIVE-gating predicate for the market maker. MM trades REAL
+/// maker orders ONLY when BOTH hold:
+///  * `process_live` — the PROCESS is in real-money mode (`--live`). This is also
+///    what forces the typed `confirm_phrase` at startup, so a `true` here means
+///    the live confirmation already ran (main blocks startup until it is typed
+///    when `--live`). MM therefore CANNOT reach a live venue without it.
+///  * `mm_live` — the operator opted the STRATEGY in (`[strategies.mm].live`).
+///
+/// Pure + total (just `process_live && mm_live`) so the truth table is
+/// unit-tested directly. main builds MM's live venue iff this returns `true`;
+/// EVERY other combination uses the paper maker venue, so paper is the default
+/// and the live path requires deliberate opt-in at BOTH the process and the
+/// strategy level (plus the confirmation the process gate enforces).
+pub fn mm_use_live(process_live: bool, mm_live: bool) -> bool {
+    process_live && mm_live
+}
+
 /// Everything a detector needs about one connected component.
 pub struct ComponentEntry {
     pub markets: Vec<Market>,
@@ -487,6 +504,22 @@ mod tests {
         let risk = risk_config(&cfg, None).unwrap();
         let bankroll = risk.bankroll;
         assert!(strategy_envelopes(&cfg, &risk, bankroll).is_err());
+    }
+
+    // ── Live gating (Task 4.5) ─────────────────────────────────────────────
+
+    /// The LIVE predicate is the conjunction of the PROCESS `--live` flag and the
+    /// STRATEGY `[strategies.mm].live` opt-in: ONLY `(true, true)` is live; all
+    /// three other combinations are paper. The startup confirmation is enforced
+    /// at the process level (main blocks until `confirm_phrase` is typed when
+    /// `--live`), so a `true` result here necessarily means the confirmation ran
+    /// — MM cannot select a live venue without it.
+    #[test]
+    fn mm_use_live_truth_table() {
+        assert!(mm_use_live(true, true), "process --live AND mm.live → LIVE");
+        assert!(!mm_use_live(true, false), "process --live, mm paper → paper");
+        assert!(!mm_use_live(false, true), "mm.live but process paper → paper");
+        assert!(!mm_use_live(false, false), "neither → paper");
     }
 
     #[test]

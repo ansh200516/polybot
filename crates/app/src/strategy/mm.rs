@@ -16,7 +16,8 @@
 //! - **Pause/kill**: mirrors the [`stub`](super::stub) lifecycle — pause cancels
 //!   resting quotes and stops quoting (fills are always consumed); the global
 //!   kill cancels and exits cleanly.
-//! - **Paper only**: runs over the [`PaperMakerVenue`]; the live arm is Task 4.5.
+//! - **Paper by default**: runs over the [`PaperMakerVenue`] unless main clears
+//!   it for live (the gated live arm below — Task 4.5).
 //!
 //! # Scope (Task 4.3 — skew + volatility pull)
 //! - **Inventory SKEW**: [`skew_fair`] shifts `fair` (= mid) against inventory
@@ -33,10 +34,17 @@
 //!   Deliberately NOT folded into cash/equity/realized — it is an unverified,
 //!   paid-out-of-band ESTIMATE; folding it would inflate position P&L (spec §7).
 //!
-//! # Deferred (left as clean seams — do NOT implement here)
-//! - **Live venue + host wiring** (Task 4.5): `run` builds a concrete
-//!   [`PaperMakerVenue`], but the loop is generic over any
-//!   `MakerVenue + UserFillSource`, so 4.5 passes a live venue unchanged.
+//! # Scope (Task 4.5 — gated live arm, this task)
+//! - **Default-off live venue**: [`MmStrategy`] carries an `Option<LiveVenue>`
+//!   set by main ONLY when cleared for live by
+//!   [`mm_use_live`](crate::wiring::mm_use_live) (process `--live` AND
+//!   `[strategies.mm].live`, which implies the startup confirmation ran). `run`
+//!   drives the SAME generic [`run_mm_loop`] with the live
+//!   [`LiveVenue`](pm_execution::live::LiveVenue) (`MakerVenue + UserFillSource`;
+//!   REST `/data/trades` fills — the user-WS latency upgrade is Task 4.6) when
+//!   present, else the [`PaperMakerVenue`]. PAPER is the default and the paper
+//!   arm NEVER constructs or holds a `LiveVenue`. Live MM's safety is the capital
+//!   carve + inventory caps + postOnly + the confirmation — no new mechanism.
 //!
 //! # Accounting note (why InventoryRisk is authoritative)
 //! [`InventoryRisk`] tracks SIGNED net inventory + realized/unrealized P&L and
@@ -56,6 +64,7 @@ use pm_core::book::{Book, Side};
 use pm_core::instrument::{MarketId, TokenId};
 use pm_core::num::{Px, Qty, TickSize, Usdc, buy_cost, sell_proceeds};
 use pm_execution::fills::UserFillSource;
+use pm_execution::live::LiveVenue;
 use pm_execution::maker::{MakerOrder, MakerVenue, OrderId, OrderType};
 use pm_execution::paper_maker::PaperMakerVenue;
 use pm_execution::quote_manager::QuoteManager;
@@ -107,9 +116,10 @@ impl MmParams {
     }
 }
 
-/// Market-making strategy (spec §7). Constructed by the Task-4.5 main wiring
-/// (no host wiring here); `run` builds the paper venue + inventory risk +
-/// position book + quote manager and drives [`run_mm_loop`].
+/// Market-making strategy (spec §7). Constructed by main; `run` builds the
+/// inventory risk + position book + quote manager and drives [`run_mm_loop`]
+/// over either the PAPER maker venue (default) or — when main clears MM for live
+/// (Task 4.5) — a [`LiveVenue`].
 pub struct MmStrategy {
     id: StrategyId,
     /// Markets to quote (provided; Phase 5 refines the universe per segment).
@@ -119,9 +129,23 @@ pub struct MmStrategy {
     params: MmParams,
     inv_cfg: InventoryConfig,
     capital: Usdc,
+    /// Live venue selection (Task 4.5). `None` (the default produced by
+    /// [`MmStrategy::new`]) → the PAPER maker venue. `Some` ONLY when main called
+    /// [`with_live_venue`](MmStrategy::with_live_venue) after
+    /// [`mm_use_live`](crate::wiring::mm_use_live) cleared MM for live (process
+    /// `--live` AND `[strategies.mm].live`, which implies the startup
+    /// confirmation ran). The paper arm therefore never constructs or holds a
+    /// [`LiveVenue`].
+    live_venue: Option<LiveVenue>,
 }
 
 impl MmStrategy {
+    /// Construct the (PAPER-default) market maker: `live_venue` is `None`, so
+    /// `run` builds a [`PaperMakerVenue`]. Live is opt-in via
+    /// [`with_live_venue`](MmStrategy::with_live_venue) — keeping the paper path
+    /// the structural default (the only way to reach a live venue is the explicit
+    /// builder call, which main makes solely behind
+    /// [`mm_use_live`](crate::wiring::mm_use_live)).
     pub fn new(
         tokens: Vec<TokenId>,
         token_market: HashMap<TokenId, MarketId>,
@@ -136,7 +160,18 @@ impl MmStrategy {
             params,
             inv_cfg,
             capital,
+            live_venue: None,
         }
+    }
+
+    /// Attach a live [`LiveVenue`] (Task 4.5), switching `run` from the paper
+    /// maker venue to real maker orders. main calls this ONLY when
+    /// [`mm_use_live`](crate::wiring::mm_use_live) is true (process `--live` AND
+    /// `[strategies.mm].live`), so the live path is a deliberate, doubly-gated
+    /// opt-in on top of the startup confirmation.
+    pub fn with_live_venue(mut self, venue: LiveVenue) -> Self {
+        self.live_venue = Some(venue);
+        self
     }
 }
 
@@ -160,24 +195,39 @@ impl Strategy for MmStrategy {
                 params,
                 inv_cfg,
                 capital,
+                live_venue,
             } = *self;
-            // Build the CONCRETE paper venue here (non-generic context) so the
-            // future is provably `Send` even though `run_mm_loop` is generic —
-            // the same pattern arb uses for `run_execution` (see arb.rs docs).
-            // Task 4.5 swaps in a live venue without touching the loop.
-            let venue = PaperMakerVenue::new(ctx.fetcher.clone());
-            run_mm_loop(
-                venue,
-                QuoteManager::new(),
-                InventoryRisk::new(inv_cfg),
-                PositionBook::default(),
-                ctx,
-                params,
-                tokens,
-                token_market,
-                capital,
-            )
-            .await;
+            // Per-strategy state is identical for both venues; build it once.
+            let qm = QuoteManager::new();
+            let inv = InventoryRisk::new(inv_cfg);
+            let positions = PositionBook::default();
+            // VENUE SELECTION (Task 4.5): the live venue is present ONLY when main
+            // cleared MM for live (process `--live` AND `[strategies.mm].live` →
+            // `mm_use_live`, which implies the startup confirmation ran).
+            // Otherwise build the CONCRETE paper venue here — the unchanged 4.4
+            // default. BOTH arms drive the SAME generic `run_mm_loop`, so there is
+            // ZERO quoting-logic duplication; they differ only in the concrete
+            // `V` (`LiveVenue` is `MakerVenue + UserFillSource` — REST fills for
+            // now, the user-WS upgrade is Task 4.6). Building the concrete venue
+            // in this non-generic context keeps the returned future provably
+            // `Send` even though `run_mm_loop` is generic (the pattern arb uses
+            // for `run_execution`). Each value below is moved into exactly one
+            // arm; the arms are mutually exclusive, so this is a clean move.
+            match live_venue {
+                Some(live) => {
+                    run_mm_loop(
+                        live, qm, inv, positions, ctx, params, tokens, token_market, capital,
+                    )
+                    .await;
+                }
+                None => {
+                    let venue = PaperMakerVenue::new(ctx.fetcher.clone());
+                    run_mm_loop(
+                        venue, qm, inv, positions, ctx, params, tokens, token_market, capital,
+                    )
+                    .await;
+                }
+            }
         })
     }
 }
@@ -816,6 +866,35 @@ mod tests {
         tokens.iter().map(|t| (*t, MarketId(0))).collect()
     }
 
+    /// A SHADOW [`LiveVenue`] for the live-gating tests: shadow mode signs but
+    /// performs NO network I/O, so it can stand in for the real venue when
+    /// asserting the venue-selection plumbing without ever hitting the network.
+    /// Mirrors `live::tests::test_venue` minimally.
+    fn shadow_live_venue() -> LiveVenue {
+        use pm_execution::live::LiveVenueCfg;
+        use pm_execution::secrets::{ApiCreds, Secret};
+        let signer: alloy_signer_local::PrivateKeySigner = "ad".repeat(32).parse().unwrap();
+        let addr =
+            |b: &str| -> alloy_primitives::Address { format!("0x{}", b.repeat(20)).parse().unwrap() };
+        LiveVenue::new(LiveVenueCfg {
+            base: "https://clob.invalid".into(),
+            creds: ApiCreds {
+                key: "test-key".into(),
+                secret: Secret::new("QQ==".into()),
+                passphrase: Secret::new("pass".into()),
+            },
+            signer,
+            proxy: addr("11"),
+            deposit_wallet: addr("22"),
+            auth_address: addr("33"),
+            fill_window: Duration::from_millis(100),
+            rate_per_sec: 1000.0,
+            rate_capacity: 100,
+            shadow: true,
+        })
+        .unwrap()
+    }
+
     #[allow(clippy::type_complexity)]
     fn build_loop(
         fetcher: BookFetcher,
@@ -851,6 +930,61 @@ mod tests {
             halted: false,
         };
         (mm, store_rx, status_rx)
+    }
+
+    // ── Live gating: venue selection (Task 4.5) ────────────────────────────────
+
+    /// PAPER is the default and is NEVER backed by a live venue. For every
+    /// `mm_use_live` combination that is NOT (process `--live`, `mm.live`) the
+    /// predicate is false, so main constructs `MmStrategy` WITHOUT a live venue;
+    /// and the paper constructor [`MmStrategy::new`] holds `live_venue == None`,
+    /// so `run` builds a [`PaperMakerVenue`]. (Selection helper + the venue field
+    /// — `main` is not run.)
+    #[test]
+    fn paper_path_never_selects_live_venue() {
+        use crate::wiring::mm_use_live;
+        for (process_live, mm_live) in [(false, false), (false, true), (true, false)] {
+            assert!(
+                !mm_use_live(process_live, mm_live),
+                "({process_live}, {mm_live}) must NOT clear MM for live"
+            );
+        }
+        // The paper construction main uses in those cases holds no LiveVenue.
+        let tokens = vec![TokenId(1)];
+        let mm = MmStrategy::new(
+            tokens.clone(),
+            token_market_for(&tokens),
+            mk_params(200, 5.0),
+            generous_inv(),
+            Usdc(1_000_000),
+        );
+        assert!(
+            mm.live_venue.is_none(),
+            "the PAPER market maker must never hold a LiveVenue"
+        );
+    }
+
+    /// Only `(process --live, mm.live)` clears MM for live, and the live path
+    /// attaches the [`LiveVenue`] via `with_live_venue` — the call main makes
+    /// ONLY behind `mm_use_live` — so `run` drives the SAME loop over the live
+    /// venue rather than the paper one.
+    #[test]
+    fn cleared_for_live_attaches_live_venue() {
+        use crate::wiring::mm_use_live;
+        assert!(mm_use_live(true, true), "only (--live, mm.live) is live");
+        let tokens = vec![TokenId(1)];
+        let mm = MmStrategy::new(
+            tokens.clone(),
+            token_market_for(&tokens),
+            mk_params(200, 5.0),
+            generous_inv(),
+            Usdc(1_000_000),
+        )
+        .with_live_venue(shadow_live_venue());
+        assert!(
+            mm.live_venue.is_some(),
+            "with_live_venue (set only when mm_use_live) puts MM on the live venue"
+        );
     }
 
     // ── Pure quote math ───────────────────────────────────────────────────────

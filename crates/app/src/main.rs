@@ -34,7 +34,7 @@ use pm_app::strategy::stub::HeartbeatStrategy;
 use pm_app::strategy::StrategyId;
 use pm_app::wiring::{
     BookFetcher, PlatformEnvelopes, build_component_index, engine_params, fee_map,
-    inventory_config, pack_components, risk_config, strategy_envelopes, token_maps,
+    inventory_config, mm_use_live, pack_components, risk_config, strategy_envelopes, token_maps,
 };
 use pm_config::Config;
 use pm_core::instrument::Relationship;
@@ -184,6 +184,30 @@ impl Args {
 fn fatal(msg: impl std::fmt::Display) -> ! {
     eprintln!("error: {msg}");
     std::process::exit(1);
+}
+
+/// Advisory soft ceiling (USD) for a LIVE market-maker capital slice (Task 4.5).
+/// Live MM is a tiny canary, so a slice above this almost certainly is NOT
+/// intended for a first live run and earns a loud WARN. It is NOT a hard cap —
+/// the operator may size deliberately — and the HARD guards remain the capital
+/// carve, the `Σcapital ≤ bankroll` startup allocator, and the inventory caps.
+const MM_LIVE_CANARY_SOFT_CAP_USD: f64 = 100.0;
+
+/// The exact live-venue inputs the market maker reuses to build its OWN
+/// `LiveVenue` (Task 4.5). Cloned from arb's RESOLVED creds/signer in the
+/// live-arming block BELOW, BEFORE they move into arb's venue, so MM's venue is
+/// byte-identical (same account, same key) and NO second API key is derived.
+/// Stashed only when MM is cleared for live (`wiring::mm_use_live`), then
+/// consumed at the MM wiring. SHARED-ACCOUNT NOTE: arb + MM each end up with an
+/// independent REST rate limiter against this one account's budget (documented
+/// at the MM wiring) — acceptable for a tiny canary.
+struct MmLiveInputs {
+    base: String,
+    creds: pm_execution::secrets::ApiCreds,
+    signer: alloy_signer_local::PrivateKeySigner,
+    proxy: alloy_primitives::Address,
+    deposit_wallet: alloy_primitives::Address,
+    auth_address: alloy_primitives::Address,
 }
 
 // ---------------------------------------------------------------------------
@@ -687,6 +711,11 @@ async fn main() {
     // The live arm needs market_tokens for BOTH venue registration and
     // run_execution (which moves it); clone before either arm takes ownership.
     let market_tokens_for_registration = market_tokens.clone();
+    // Task 4.5: stashed inside the live arm below (a CLONE of arb's resolved
+    // creds/signer) iff the market maker is cleared for live, then consumed when
+    // MM is wired — so MM's LiveVenue is identical to arb's with NO second key
+    // derivation. Stays `None` on the paper arm (and whenever MM is paper).
+    let mut mm_live_inputs: Option<MmLiveInputs> = None;
     // Both arms produce the same ExecTaskBuilder so the binding unifies.
     let exec_builder: ExecTaskBuilder = if let Some((secrets, signer, proxy, deposit_wallet)) =
         live_rt
@@ -742,6 +771,27 @@ async fn main() {
         // No secret fields on this line — keep it that way (creds/signer must
         // never be interpolated into logs).
         info!(shadow = args.shadow, "live venue armed (api key ready)");
+        // Task 4.5: if the market maker is cleared for live, stash a CLONE of
+        // these EXACT live inputs BEFORE they move into arb's venue below, so MM
+        // builds a byte-identical LiveVenue (same creds/signer/deposit_wallet/
+        // auth_address/base) for the SAME account with NO second key derivation.
+        // `args.live` is necessarily true in this arm (live_rt is Some iff
+        // --live), so `mm_use_live` reduces to the strategy opt-in; the typed
+        // confirmation already ran at startup. SHARED-ACCOUNT RATE BUDGET: arb +
+        // MM then hold INDEPENDENT REST limiters against the one account budget
+        // (documented at the MM wiring) — fine for a tiny canary.
+        if config.strategies.mm.enabled
+            && mm_use_live(args.live, config.strategies.mm.live)
+        {
+            mm_live_inputs = Some(MmLiveInputs {
+                base: config.endpoints.clob_base.clone(),
+                creds: creds.clone(),
+                signer: signer.clone(),
+                proxy,
+                deposit_wallet,
+                auth_address,
+            });
+        }
         // Capture the EOA before `signer` is moved into the venue cfg (probe diag).
         let eoa = signer.address();
         let mut venue = pm_execution::live::LiveVenue::new(pm_execution::live::LiveVenueCfg {
@@ -1006,23 +1056,58 @@ async fn main() {
 
     // ---- market maker (#3): DEFAULT-OFF, behind [strategies.mm] enabled -----
     // Present only when the carve-out produced an `mm_envelope` (i.e. MM is
-    // enabled). PAPER only: `MmStrategy::run` builds a PaperMakerVenue internally
-    // regardless of `mm.live` — the live CLOB arm is Task 4.5. When MM is
-    // disabled this whole block is skipped, leaving the arb path untouched.
+    // enabled). When MM is disabled this whole block is skipped, leaving the arb
+    // path the user runs today completely untouched.
+    //
+    // Task 4.5 LIVE GATING: MM trades REAL maker orders ONLY when cleared by
+    // `mm_use_live(args.live, mm.live)` — the PROCESS is --live (which ALSO forced
+    // the typed `confirm_phrase` at startup, see the live-arming block above) AND
+    // the operator opted the STRATEGY in (`[strategies.mm].live`). EVERY other
+    // combination uses the PAPER maker venue (the unchanged 4.4b default); the
+    // paper arm never constructs or touches a LiveVenue.
     if let Some(mm_envelope) = mm_envelope {
         let mm_capital = mm_envelope.capital;
         let arb_capital_micro = bankroll.0 - mm_capital.0;
-        // A pre-set `mm.live` has NO effect yet — warn loudly rather than
-        // silently routing real maker orders (that wiring is Task 4.5).
-        if config.strategies.mm.live {
-            warn!(
-                "strategies.mm.live = true, but live MM is not wired yet (Task 4.5); \
-                 quoting on the PAPER maker venue"
-            );
-        }
+        let mm_live = mm_use_live(args.live, config.strategies.mm.live);
+
+        // Build MM's OWN LiveVenue up front when cleared, so its token set is
+        // registered in the SAME loop that selects MM's universe. It reuses the
+        // EXACT arb live inputs (creds/signer/deposit_wallet/auth_address/base)
+        // stashed (cloned) in the live-arming block BEFORE they moved into arb's
+        // venue — so NO second API key is derived — plus `shadow: args.shadow`
+        // (a `--live --shadow` MM run signs but never submits: a dry run, exactly
+        // like arb). SHARED-ACCOUNT RATE BUDGET CAVEAT: this is a SECOND
+        // LiveVenue, so arb + MM each own an INDEPENDENT REST limiter against the
+        // SAME Polymarket account budget. Acceptable for a tiny canary; prefer
+        // conservative `ingestion.rest_rate_*` (a shared limiter is future work).
+        let mut mm_live_venue: Option<pm_execution::live::LiveVenue> = if mm_live {
+            let inputs = mm_live_inputs.take().unwrap_or_else(|| {
+                fatal("internal: MM cleared for live but live inputs were not stashed")
+            });
+            let venue = pm_execution::live::LiveVenue::new(pm_execution::live::LiveVenueCfg {
+                base: inputs.base,
+                creds: inputs.creds,
+                signer: inputs.signer,
+                proxy: inputs.proxy,
+                deposit_wallet: inputs.deposit_wallet,
+                auth_address: inputs.auth_address,
+                fill_window: Duration::from_millis(config.execution.fill_window_ms),
+                rate_per_sec: config.ingestion.rest_rate_per_sec,
+                rate_capacity: config.ingestion.rest_rate_capacity,
+                shadow: args.shadow,
+            })
+            .unwrap_or_else(|e| fatal(format!("MM LiveVenue: {e}")));
+            Some(venue)
+        } else {
+            None
+        };
+
         // MM's universe: the FIRST `max_markets` registry markets (both YES+NO
-        // sides) plus their `token → MarketId` map, reusing the same registry
-        // market fields the arb token maps are built from. Phase 5 replaces this
+        // sides) plus their `token → MarketId` map. When live, register each
+        // token on MM's venue in the SAME pass (the same
+        // `register_token(tok, vid, neg_risk, tick)` shape arb uses) — an order
+        // for an unregistered token is rejected before any I/O, so MM can only
+        // ever place orders within its own carved universe. Phase 5 replaces this
         // "first N" cap with liquid-segment selection.
         let mut mm_tokens = Vec::new();
         let mut mm_token_market = HashMap::new();
@@ -1030,21 +1115,84 @@ async fn main() {
             for tok in [m.yes, m.no] {
                 mm_tokens.push(tok);
                 mm_token_market.insert(tok, m.id);
+                if let Some(v) = mm_live_venue.as_mut()
+                    && let Some(vid) = reg.token_venue_id(tok)
+                {
+                    v.register_token(tok, vid.to_owned(), m.neg_risk, m.tick);
+                }
             }
         }
         let mm_market_count = mm_token_market.len() / 2;
+
+        // Startup venue reconciliation (live only), mirroring arb's check: a
+        // resting/maker path should leave little open, so any open order is worth
+        // a warning. Reads the SAME account as arb's check (shared account).
+        if let Some(v) = mm_live_venue.as_mut() {
+            match v.open_orders().await {
+                Ok(open) if !open.is_empty() => {
+                    warn!(count = open.len(), "MM venue reports open orders at startup")
+                }
+                Ok(_) => {}
+                Err(e) => warn!("MM venue open-orders check failed at startup: {e}"),
+            }
+        }
+
         let mm_params = MmParams::from_config(&config.strategies.mm)
             .unwrap_or_else(|e| fatal(format!("MmParams::from_config: {e}")));
         let mm_inv_cfg =
             inventory_config(&config).unwrap_or_else(|e| fatal(format!("inventory_config: {e}")));
-        let mm = MmStrategy::new(mm_tokens, mm_token_market, mm_params, mm_inv_cfg, mm_capital);
+        let mut mm = MmStrategy::new(mm_tokens, mm_token_market, mm_params, mm_inv_cfg, mm_capital);
+
+        if let Some(venue) = mm_live_venue {
+            // Attach the live venue — the ONLY path that puts MM on real money.
+            // CANARY SAFETY (no new mechanism; all pre-existing): (a) the tiny
+            // `capital_usd` slice carved by `strategy_envelopes`; (b)
+            // `max_quote_usd` per order; (c) the `InventoryConfig` caps
+            // (per-market / gross / stop-loss / daily) enforced by `InventoryRisk`
+            // inside the loop; (d) postOnly maker orders; (e) the startup live
+            // confirmation. Surface the canary LOUDLY.
+            mm = mm.with_live_venue(venue);
+            warn!(
+                capital_usd = config.strategies.mm.capital_usd,
+                markets = mm_market_count,
+                max_quote_usd = config.strategies.mm.max_quote_usd,
+                max_inventory_usd = config.inventory.max_inventory_usd,
+                max_gross_inventory_usd = config.inventory.max_gross_inventory_usd,
+                inventory_stop_loss_usd = config.inventory.inventory_stop_loss_usd,
+                daily_loss_usd = config.inventory.daily_loss_usd,
+                shadow = args.shadow,
+                "LIVE MM ENABLED — real maker orders (canary): safety = capital carve + \
+                 inventory caps + postOnly + confirmation; SHARED account rate budget with arb"
+            );
+            // Advisory canary ceiling (NOT a hard cap; the hard guards are the
+            // capital carve + the Σcapital ≤ bankroll allocator + the inventory
+            // caps): a live slice above the canary guidance is almost certainly
+            // unintended for a first live run.
+            if config.strategies.mm.capital_usd > MM_LIVE_CANARY_SOFT_CAP_USD {
+                warn!(
+                    capital_usd = config.strategies.mm.capital_usd,
+                    soft_cap_usd = MM_LIVE_CANARY_SOFT_CAP_USD,
+                    "live MM capital exceeds the canary soft-cap guidance — confirm this is intended"
+                );
+            }
+        } else if config.strategies.mm.live {
+            // `mm.live` set but the PROCESS is not --live → cannot trade real
+            // money (no confirmation, no live secrets); fall back to PAPER.
+            warn!(
+                "strategies.mm.live set but process not --live; using the PAPER maker venue \
+                 (restart with --live to trade real maker orders)"
+            );
+        }
+
         host.add(Box::new(mm), mm_envelope);
         info!(
             mm_capital_usd = config.strategies.mm.capital_usd,
             mm_capital_micro = mm_capital.0,
             markets = mm_market_count,
             arb_capital_micro,
-            "market maker enabled (paper): bankroll carved between arb and MM"
+            live = mm_live,
+            shadow = args.shadow,
+            "market maker enabled: bankroll carved between arb and MM"
         );
     }
 

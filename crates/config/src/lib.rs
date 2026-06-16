@@ -674,6 +674,28 @@ impl Config {
                 "strategies.mm.capital_usd must be ≤ capital.bankroll_usd when enabled",
             ));
         }
+        // Task 4.5 — LIVE market-maker gating (config half). The live arm trades
+        // REAL maker orders, so it is the tiniest, most-gated canary: arming it
+        // requires the strategy to be ENABLED (a live flag on a disabled strategy
+        // is a silent no-op footgun) and a strictly POSITIVE capital slice to fund
+        // quotes (a $0 slice would carve nothing and quote nothing). The slice is
+        // already bounded ABOVE by the `enabled` over-bankroll check above; live
+        // only tightens the lower bound. Process-level `--live` PLUS the typed
+        // confirmation are ALSO required at runtime (enforced in main) — this is
+        // the config half of the gate; live MM's safety is the capital carve +
+        // the inventory caps + postOnly + the confirmation (no new mechanism).
+        if self.strategies.mm.live {
+            if !self.strategies.mm.enabled {
+                return Err(ConfigError::BadMoney(
+                    "strategies.mm.live requires strategies.mm.enabled",
+                ));
+            }
+            if self.strategies.mm.capital_usd <= 0.0 {
+                return Err(ConfigError::BadMoney(
+                    "strategies.mm.capital_usd must be > 0 when strategies.mm.live",
+                ));
+            }
+        }
         // `max_markets` (usize) needs no bound: it is always ≥ 0; `0` simply
         // quotes nothing (inert). Documented, not checked.
         // `inventory_skew_bps` needs no bound: as a `u32` it is always ≥ 0 (0
@@ -1186,5 +1208,41 @@ mod tests {
     fn mm_strategy_unknown_field_is_rejected() {
         assert!(Config::from_toml_str("[strategies.mm]\nbogus = 1\n").is_err());
         assert!(Config::from_toml_str("[strategies]\nbogus = 1\n").is_err());
+    }
+
+    #[test]
+    fn mm_live_requires_enabled_and_positive_capital() {
+        // live + DISABLED → rejected (a live flag on a disabled strategy is a
+        // silent no-op footgun).
+        assert!(
+            Config::from_toml_str("[strategies.mm]\nlive = true\n").is_err(),
+            "mm.live without mm.enabled must be rejected"
+        );
+        // live + enabled + ZERO capital → rejected (can't fund any quotes).
+        assert!(
+            Config::from_toml_str(
+                "[strategies.mm]\nenabled = true\nlive = true\ncapital_usd = 0.0\n"
+            )
+            .is_err(),
+            "live MM with $0 capital must be rejected"
+        );
+        // live + enabled + OVER-BANKROLL capital → rejected (the enabled
+        // over-bankroll carve guard fires).
+        assert!(
+            Config::from_toml_str(
+                "[capital]\nbankroll_usd = 100.0\nper_market_usd = 50.0\n[strategies.mm]\nenabled = true\nlive = true\ncapital_usd = 500.0\n"
+            )
+            .is_err(),
+            "live MM whose slice exceeds the bankroll must be rejected"
+        );
+        // live + enabled + a tiny POSITIVE slice within the bankroll → OK.
+        let c = Config::from_toml_str(
+            "[strategies.mm]\nenabled = true\nlive = true\ncapital_usd = 25.0\n",
+        )
+        .unwrap();
+        assert!(c.strategies.mm.live && c.strategies.mm.enabled);
+        assert!((c.strategies.mm.capital_usd - 25.0).abs() < 1e-9);
+        // Default config (mm.live = false) is unaffected.
+        Config::default().validate().unwrap();
     }
 }
