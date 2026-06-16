@@ -351,4 +351,38 @@ mod tests {
             );
         }
     }
+
+    /// The "resumable" guarantee across MULTIPLE keys: when an earlier venue
+    /// call in a pass succeeds and a LATER one fails, the earlier mutation must
+    /// persist (the pass is partially applied, not rolled back), so the next
+    /// pass converges from there. Here the stale ask is cancelled (succeeds)
+    /// and then the changed bid's replace fails — the cancel must stick.
+    #[tokio::test]
+    async fn reconcile_partial_progress_persists_when_later_call_fails() {
+        let mut qm = QuoteManager::new();
+        let mut v = MockMakerVenue::new();
+        qm.reconcile(&mut v, &[bid(7, 44, 100_000_000), ask(7, 46, 100_000_000)])
+            .await
+            .unwrap();
+        let ask_id = tracked_id(&qm, 7, Side::Ask).unwrap();
+        let bid_old = tracked_id(&qm, 7, Side::Bid).unwrap();
+
+        // New desired: ask dropped (→ cancel, succeeds first), bid changed
+        // (→ replace, made to fail). reconcile cancels stale keys before
+        // placing/replacing, so the cancel lands before the failing replace.
+        v.fail_replace
+            .push_back(VenueError::Live("replace rejected".into()));
+        let r = qm
+            .reconcile(&mut v, &[bid(7, 45, 100_000_000)])
+            .await;
+        assert!(matches!(r, Err(VenueError::Live(_))));
+
+        // Earlier success persisted: the ask really was cancelled and dropped.
+        assert_eq!(v.cancelled, vec![ask_id]);
+        assert_eq!(tracked_id(&qm, 7, Side::Ask), None);
+        // Later failure left the bid's OLD id tracked for the next pass.
+        assert!(v.replaced.is_empty());
+        assert_eq!(tracked_id(&qm, 7, Side::Bid), Some(bid_old));
+        assert_eq!(qm.tracked().len(), 1);
+    }
 }
