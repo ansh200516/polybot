@@ -293,6 +293,10 @@ impl<B: BookSource> UserFillSource for PaperMakerVenue<B> {
                 // crossing taker's.
                 px: price,
                 qty: Qty(filled),
+                // The paper venue OWNS this resting order, so it stamps the
+                // authoritative side — the consumer never has to resolve it from
+                // its own tracking, so a paper fill can never be dropped.
+                side: Some(side),
                 trade_id: format!("paper-fill-{}", self.next_fill),
             });
             let new_remaining = remaining.0 - filled;

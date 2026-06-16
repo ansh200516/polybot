@@ -482,6 +482,10 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     /// `order_id → resting-order metadata`, for fill→side resolution and the
     /// write-ahead order row. Grows as ids churn; old ids are harmless.
     placed: HashMap<OrderId, Placed>,
+    /// Last-known tick size per token, learned from the books the quote loop
+    /// fetches. Resolves a fill's tick size when its order_id isn't in `placed`
+    /// (a paper fill the venue stamped with its side, so it is still bookable).
+    token_ts: HashMap<TokenId, TickSize>,
     /// Running maker-rebate ESTIMATE (Task 4.4), µUSDC: `Σ rebate_bps ·
     /// fill_notional / 10_000` over every maker fill. Tracked SEPARATELY and
     /// published in [`StrategyStatus::rebate_micro`] — never added to
@@ -514,13 +518,15 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         // once; the skew is otherwise a pure function of the per-token net.
         let max_inventory_micro = self.inv.config().max_inventory_usd.0;
         let mut desired: Vec<MakerOrder> = Vec::new();
-        let mut desired_ts: HashMap<(TokenId, Side), TickSize> = HashMap::new();
         for token in tokens {
             // Need a VALID two-sided book; skip the token otherwise.
             let Some((book, true)) = self.fetcher.fetch(token).await else {
                 continue;
             };
             let ts = book.ts();
+            // Remember this token's tick size so a later fill resolves even when
+            // its order_id never made it into `placed` (a partial-reconcile gap).
+            self.token_ts.insert(token, ts);
             // VOLATILITY PULL (Task 4.3, spec §7): a large + FAST mid move makes
             // `vol_hint` fire — PULL this token's quotes for this tick by leaving
             // them OUT of `desired`, so `reconcile` cancels any resting quotes and
@@ -555,50 +561,56 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 };
                 // Inventory cap gate (Task 2.2): only quote sides it approves.
                 if matches!(self.inv.check_quote(&intent), QuoteVerdict::Approve) {
-                    desired_ts.insert((o.token, o.side), ts);
                     desired.push(o);
                 }
             }
         }
         // QuoteManager leaves consistent state on error and the next tick
-        // retries (reconnect orchestration is the Task-3.5/4.5 seam).
-        if self.qm.reconcile(&mut self.venue, &desired).await.is_err() {
-            return;
-        }
-        self.record_placed(&desired, &desired_ts).await;
+        // retries (reconnect orchestration is the Task-3.5/4.5 seam). Record
+        // placements even on a PARTIAL error: `reconcile` only ever tracks
+        // SUCCESSFULLY-placed orders (its on-error contract), so recording them
+        // now keeps `placed` — and the write-ahead order rows their fills
+        // FK-reference — complete. Otherwise a quote that filled before a later
+        // side's place was rejected (e.g. a skewed quote that crossed) would book
+        // a fill whose FK-parent order row was never written.
+        let _ = self.qm.reconcile(&mut self.venue, &desired).await;
+        self.record_placed(&desired).await;
     }
 
-    /// Record every newly-resting order into `placed` and emit its write-ahead
-    /// order row (so the FK-referencing fill rows persist). Idempotent per id.
-    async fn record_placed(
-        &mut self,
-        desired: &[MakerOrder],
-        desired_ts: &HashMap<(TokenId, Side), TickSize>,
-    ) {
+    /// Record every newly-tracked resting order into `placed` (so a later fill
+    /// always resolves its side + tick size) and emit its write-ahead order row
+    /// (so the FK-referencing fill rows persist). Idempotent per id.
+    ///
+    /// Side comes from the `(token, side)` tracking KEY and the tick size from
+    /// the per-token `token_ts`, so EVERY tracked id is recorded — not only those
+    /// in the current `desired` set. Only the order ROW needs the price/size
+    /// detail the desired quote carries, so it is emitted when the order is
+    /// present in `desired` (the common case).
+    async fn record_placed(&mut self, desired: &[MakerOrder]) {
         for ((token, side), id) in self.qm.tracked() {
             if self.placed.contains_key(&id) {
                 continue;
             }
-            let Some(order) = desired.iter().find(|o| o.token == token && o.side == side) else {
-                continue;
-            };
-            let ts = desired_ts
-                .get(&(token, side))
+            let ts = self
+                .token_ts
+                .get(&token)
                 .copied()
                 .unwrap_or(TickSize::Cent);
             self.placed.insert(id.clone(), Placed { side, ts });
-            let row = OrderRow {
-                id: id.0.clone(),
-                ts_ms: now_ms(),
-                fingerprint: id.0.clone(),
-                token: token.0 as i64,
-                action: side_action(side).into(),
-                limit_ticks: i64::from(order.price.get()),
-                tick_levels: i64::from(ts.levels()),
-                qty_micro: order.size.0 as i64,
-                strategy: "mm".into(),
-            };
-            let _ = self.store_tx.send(StoreMsg::OrderInsert(row, None)).await;
+            if let Some(order) = desired.iter().find(|o| o.token == token && o.side == side) {
+                let row = OrderRow {
+                    id: id.0.clone(),
+                    ts_ms: now_ms(),
+                    fingerprint: id.0.clone(),
+                    token: token.0 as i64,
+                    action: side_action(side).into(),
+                    limit_ticks: i64::from(order.price.get()),
+                    tick_levels: i64::from(ts.levels()),
+                    qty_micro: order.size.0 as i64,
+                    strategy: "mm".into(),
+                };
+                let _ = self.store_tx.send(StoreMsg::OrderInsert(row, None)).await;
+            }
         }
     }
 
@@ -611,14 +623,30 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             Err(_) => return,
         };
         for f in fills {
-            // The fill carries no side (see fills.rs); resolve it from the
-            // order_id→side map we recorded when we PLACED the order.
-            let Some(meta) = self.placed.get(&f.order_id).copied() else {
+            // Resolve the resting SIDE: prefer the side the venue stamped on the
+            // fill (the PAPER sim knows it authoritatively), else the side we
+            // recorded when we PLACED the order (the LIVE path, where the fill
+            // carries none — the MM placed those orders, so `placed` is reliable).
+            // Only a fill with no side AND no `placed` entry is unattributable.
+            let placed = self.placed.get(&f.order_id).copied();
+            let Some(side) = f.side.or_else(|| placed.map(|m| m.side)) else {
                 warn!(order_id = %f.order_id.0, "mm: fill for an unknown resting order; skipping");
                 continue;
             };
-            let px_micro = f.px.microusdc(meta.ts);
-            let (signed_qty, cash) = match meta.side {
+            // Tick size: the recorded one if present, else this token's
+            // last-known ts from the quote loop (all of a token's orders share
+            // its book's tick size) — so a venue-sided fill books even when its
+            // order_id never reached `placed`.
+            let ts = placed
+                .map(|m| m.ts)
+                .or_else(|| self.token_ts.get(&f.token).copied())
+                .unwrap_or(TickSize::Cent);
+            // Keep the QuoteManager in sync with the venue's resting set: a fill
+            // the venue applied (and a full fill it removed) must be reflected, so
+            // reconcile re-quotes a filled market instead of no-oping forever.
+            self.qm.note_fill(&f.order_id, f.qty);
+            let px_micro = f.px.microusdc(ts);
+            let (signed_qty, cash) = match side {
                 // bid → +qty, cash = −buy_cost; ask → −qty, cash = +sell_proceeds.
                 Side::Bid => (f.qty.0 as i128, Usdc(-buy_cost(px_micro, f.qty).0)),
                 Side::Ask => (-(f.qty.0 as i128), sell_proceeds(px_micro, f.qty)),
@@ -649,9 +677,9 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 order_id: f.order_id.0.clone(),
                 ts_ms: now_ms(),
                 token: f.token.0 as i64,
-                action: side_action(meta.side).into(),
+                action: side_action(side).into(),
                 px_ticks: i64::from(f.px.get()),
-                tick_levels: i64::from(meta.ts.levels()),
+                tick_levels: i64::from(ts.levels()),
                 qty_micro: f.qty.0 as i64,
                 cash_micro: usdc_to_i64(cash).unwrap_or(0),
                 fee_micro: 0,
@@ -799,6 +827,7 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
         token_market,
         notional_micro,
         placed: HashMap::new(),
+        token_ts: HashMap::new(),
         rebate_accrued_micro: 0,
         paused: false,
         halted: false,
@@ -997,6 +1026,7 @@ mod tests {
             token_market,
             notional_micro,
             placed: HashMap::new(),
+            token_ts: HashMap::new(),
             rebate_accrued_micro: 0,
             paused: false,
             halted: false,
@@ -1789,6 +1819,247 @@ mod tests {
         assert!(fills.iter().all(|f| f.fee_micro == 0), "makers pay 0 fee on CLOB V2");
         assert_eq!(fills[0].action, "Buy", "first the bid fill");
         assert_eq!(fills[1].action, "Sell", "then the ask fill");
+    }
+
+    // ── Fill-accounting invariant: the MM must NEVER drop a venue fill ─────────
+    //
+    // The market maker books inventory/P&L from the fills its venue produces. If
+    // it ever fails to resolve a fill (and `warn!`s "unknown resting order;
+    // skipping"), that fill's inventory + realized P&L are silently lost — the
+    // accounting bug these two tests guard against (Fix #1: `MakerFill.side`;
+    // Fix #2: `QuoteManager::note_fill`).
+
+    use std::sync::Mutex as StdMutex;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context as LayerContext, Layer, SubscriberExt};
+
+    use pm_execution::fills::MakerFill;
+    use pm_execution::maker::OpenOrder;
+    use pm_execution::venue::VenueError;
+
+    /// A tracing layer that records every emitted event's `message`, so a test
+    /// can assert the "unknown resting order" drop-warning never fired.
+    #[derive(Clone, Default)]
+    struct WarnCapture(Arc<StdMutex<Vec<String>>>);
+
+    struct MsgVisitor<'a>(&'a mut String);
+    impl Visit for MsgVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{value:?}");
+            }
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for WarnCapture {
+        fn on_event(&self, event: &Event<'_>, _ctx: LayerContext<'_, S>) {
+            let mut msg = String::new();
+            event.record(&mut MsgVisitor(&mut msg));
+            self.0.lock().unwrap().push(msg);
+        }
+    }
+
+    /// Pass-through venue that records EVERY [`MakerFill`] the inner venue emits
+    /// on `poll`, so a test can compare what the venue PRODUCED against what the
+    /// MM actually BOOKED — a direct, message-text-independent check of the
+    /// "no fill is dropped" invariant.
+    struct TallyVenue<V> {
+        inner: V,
+        produced: Arc<StdMutex<Vec<(OrderId, u64)>>>,
+    }
+
+    impl<V: MakerVenue> MakerVenue for TallyVenue<V> {
+        async fn place(&mut self, o: &MakerOrder) -> Result<OrderId, VenueError> {
+            self.inner.place(o).await
+        }
+        async fn cancel(&mut self, id: &OrderId) -> Result<(), VenueError> {
+            self.inner.cancel(id).await
+        }
+        async fn replace(&mut self, id: &OrderId, o: &MakerOrder) -> Result<OrderId, VenueError> {
+            self.inner.replace(id, o).await
+        }
+        async fn open_orders(&mut self) -> Result<Vec<OpenOrder>, VenueError> {
+            self.inner.open_orders().await
+        }
+    }
+
+    impl<V: UserFillSource> UserFillSource for TallyVenue<V> {
+        async fn poll(&mut self) -> Result<Vec<MakerFill>, VenueError> {
+            let fills = self.inner.poll().await?;
+            let mut p = self.produced.lock().unwrap();
+            for f in &fills {
+                p.push((f.order_id.clone(), f.qty.0));
+            }
+            Ok(fills)
+        }
+    }
+
+    /// `build_loop` over a [`PaperMakerVenue`] (honoring `paper_taker_fill_pct`)
+    /// WRAPPED in a [`TallyVenue`], returning the produced-fills tally handle so a
+    /// test can assert booked == produced.
+    #[allow(clippy::type_complexity)]
+    fn build_loop_tally(
+        fetcher: BookFetcher,
+        inv_cfg: InventoryConfig,
+        params: MmParams,
+        tokens: Vec<TokenId>,
+        capital: Usdc,
+    ) -> (
+        MmLoop<TallyVenue<PaperMakerVenue<BookFetcher>>>,
+        mpsc::Receiver<StoreMsg>,
+        Arc<StdMutex<Vec<(OrderId, u64)>>>,
+    ) {
+        let (store_tx, store_rx) = mpsc::channel(8192);
+        let (status_tx, _status_rx) = watch::channel(StrategyStatus::default());
+        let produced = Arc::new(StdMutex::new(Vec::new()));
+        let venue = TallyVenue {
+            inner: PaperMakerVenue::new(fetcher.clone())
+                .with_taker_fill_pct(params.paper_taker_fill_pct),
+            produced: Arc::clone(&produced),
+        };
+        let notional_micro = params.max_quote_micro.min(capital.0).max(0);
+        let token_market = token_market_for(&tokens);
+        let mm = MmLoop {
+            venue,
+            qm: QuoteManager::new(),
+            inv: InventoryRisk::new(inv_cfg),
+            positions: PositionBook::default(),
+            fetcher,
+            store_tx,
+            status_tx,
+            params,
+            tokens,
+            token_market,
+            notional_micro,
+            placed: HashMap::new(),
+            token_ts: HashMap::new(),
+            rebate_accrued_micro: 0,
+            paused: false,
+            halted: false,
+        };
+        (mm, store_rx, produced)
+    }
+
+    /// REPRODUCTION (Fix #1): drive the WHOLE loop (`tick`) over the real
+    /// [`PaperMakerVenue`] with taker flow ON, through many ticks on a book that
+    /// moves enough to (a) fully fill resting orders and (b) shift inventory skew
+    /// so quotes get replaced — the churn that happens live. As the asymmetric
+    /// taker flow builds a long, the skew pushes a quote across the live book; the
+    /// post-only place is rejected, so `reconcile` returns `Err` after the OTHER
+    /// side was already (re)placed, and the QM's tracked set drifts from the
+    /// venue's resting set. Pre-fix, `consume_fills` cannot resolve those fills'
+    /// side from `placed` and DROPS them (warn-flood; inventory freezes).
+    ///
+    /// INVARIANT: every fill the venue produces is booked — the MM's booked fills
+    /// (count + qty) equal the venue's emitted fills, and the "unknown resting
+    /// order" warning never fires.
+    #[tokio::test]
+    async fn mm_books_every_venue_fill_under_churn() {
+        let warns = WarnCapture::default();
+        let logs = Arc::clone(&warns.0);
+        let subscriber = tracing_subscriber::registry().with(warns);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let tokens = vec![TokenId(1)];
+        let (fetcher, shared) = controllable_fetcher(
+            &tokens,
+            HashMap::from([(TokenId(1), (cent_book(&[(49, 100 * SH)], &[(51, 100 * SH)]), true))]),
+        );
+        // Tight book + strong skew + a small per-market cap, so the long the
+        // (asymmetric) taker flow accumulates drives the skew hard enough to make
+        // a quote cross the book — exactly the live churn that strands fills.
+        let mut params = mk_params_skew(100, 5.0, 2000);
+        params.paper_taker_fill_pct = 50;
+        let mut inv_cfg = generous_inv();
+        inv_cfg.max_inventory_usd = Usdc(30_000_000);
+        inv_cfg.max_gross_inventory_usd = Usdc(60_000_000);
+        let (mut mm, mut store_rx, produced) =
+            build_loop_tally(fetcher, inv_cfg, params, tokens, Usdc(1_000_000_000));
+
+        let mut booked_count = 0usize;
+        let mut booked_qty: u128 = 0;
+        for i in 0..120u32 {
+            // Oscillate the mid to force re-quotes (replaces) alongside the fills.
+            let (b, a) = if i % 4 < 2 { (49u16, 51u16) } else { (48, 50) };
+            shared
+                .lock()
+                .unwrap()
+                .insert(TokenId(1), (cent_book(&[(b, 100 * SH)], &[(a, 100 * SH)]), true));
+            mm.tick().await;
+            while let Ok(msg) = store_rx.try_recv() {
+                if let StoreMsg::FillSigned(row, _) = msg {
+                    booked_count += 1;
+                    booked_qty += u128::from(row.qty_micro.unsigned_abs());
+                }
+            }
+        }
+
+        let produced = produced.lock().unwrap().clone();
+        let produced_count = produced.len();
+        let produced_qty: u128 = produced.iter().map(|(_, q)| u128::from(*q)).sum();
+        let dropped = logs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.contains("unknown resting order"))
+            .count();
+
+        assert!(
+            produced_count > 0,
+            "the scenario must actually produce fills (else it proves nothing)"
+        );
+        assert_eq!(
+            dropped, 0,
+            "the MM dropped {dropped} venue fills (\"unknown resting order\")"
+        );
+        assert_eq!(
+            booked_count, produced_count,
+            "every venue fill must be booked: venue produced {produced_count}, MM booked {booked_count}"
+        );
+        assert_eq!(
+            booked_qty, produced_qty,
+            "booked fill quantity must equal the venue's produced quantity"
+        );
+    }
+
+    /// REPRODUCTION (Fix #2): after the paper sim FULLY fills a resting order it
+    /// removes it, but the [`QuoteManager`] is unaware of fills — so it keeps
+    /// "tracking" the now-gone id and, on an identical next desired, NO-OPs
+    /// (never re-places). Its tracked set drifts from the venue's empty resting
+    /// set and the market goes dark: the MM stops quoting a filled market.
+    ///
+    /// With `consume_fills` calling `QuoteManager::note_fill`, a fully-filled
+    /// (token, side) is dropped from tracking, so the next `reconcile` RE-PLACES
+    /// it and the MM keeps quoting + filling. Asserts the venue keeps producing
+    /// fills across many ticks (not frozen after the first).
+    #[tokio::test]
+    async fn mm_requotes_after_full_fill() {
+        let tokens = vec![TokenId(1)];
+        let (fetcher, _shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        // Skew OFF (identical desired each tick) + full taker fills each poll, on
+        // a STATIC book: pre-fix this is the canonical drift — fill once, then the
+        // identical-desired no-op never re-places.
+        let mut params = mk_params(200, 5.0);
+        params.paper_taker_fill_pct = 100;
+        let (mut mm, _store_rx, produced) =
+            build_loop_tally(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+
+        for _ in 0..10u32 {
+            mm.tick().await;
+        }
+
+        let produced_count = produced.lock().unwrap().len();
+        // Pre-fix: the venue fills the first quotes once, then the drifted QM
+        // no-ops forever → ~2 fills total. Post-fix: it re-quotes every tick, so
+        // many fills accrue. A threshold well above the frozen count proves the
+        // MM keeps quoting a filled market.
+        assert!(
+            produced_count >= 10,
+            "the MM stopped re-quoting after fills (drift): only {produced_count} fills in 10 ticks"
+        );
     }
 
     #[tokio::test]

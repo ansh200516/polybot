@@ -91,6 +91,7 @@ mod tests {
             token: TokenId(7),
             qty: Qty(1_000_000),
             px: Px::new(33, TickSize::Cent).unwrap(),
+            side: None,
             trade_id: "t1".into(),
         }
     }

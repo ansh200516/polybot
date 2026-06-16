@@ -41,6 +41,7 @@ use std::collections::HashSet;
 
 use tracing::warn;
 
+use pm_core::book::Side;
 use pm_core::instrument::TokenId;
 use pm_core::num::{Px, Qty, TickSize};
 
@@ -56,12 +57,26 @@ use std::collections::VecDeque;
 /// Keyed by [`OrderId`] (the resting order's venue id) and carrying the trade's
 /// `trade_id` for traceability / cross-feed idempotency. `qty` is the maker
 /// entry's `matched_amount` in µshares; `px` is its `price` typed to the token's
-/// tick size. There is deliberately NO side field — see the module docs.
+/// tick size.
+///
+/// # `side`: authoritative when the SOURCE knows it
+/// `side` is the resting order's side (`Bid`/`Ask`) when the fill source can say
+/// it authoritatively, else `None`:
+/// - The PAPER sim ([`PaperMakerVenue`](crate::paper_maker::PaperMakerVenue))
+///   OWNS each resting order, so it sets `Some(side)` — the consumer never has
+///   to guess, so a paper fill is ALWAYS bookable (it cannot be dropped for an
+///   "unknown" order, e.g. one a partial reconcile left unrecorded).
+/// - The LIVE feeds ([`parse_maker_fills`] REST poll and the user-WS
+///   [`parse_ws_trade`](crate::user_ws::parse_ws_trade)) set `None`: the trade
+///   row's `side` is the TAKER's perspective, not the resting order's, so it is
+///   NOT a reliable maker side (see the module docs). The consumer resolves
+///   those from its own quote tracking — it placed the order, so it knows the
+///   side.
 ///
 /// # Consumer on-fill mapping (Phase 4)
 /// The market-making strategy turns a `MakerFill` into an
-/// `InventoryRisk::on_fill(token, signed_qty, cash)` call using the side it
-/// recorded when it PLACED `order_id` (which this event does not carry):
+/// `InventoryRisk::on_fill(token, signed_qty, cash)` call using `side` when set,
+/// else the side it recorded when it PLACED `order_id`:
 /// - `signed_qty` = `qty.0 as i128`, with the sign from the resting order's
 ///   side: `+qty` if it was a bid (buy), `−qty` if it was an ask (sell).
 /// - `px_micro` = `px.microusdc(ts)` — the strategy knows the token's `ts`.
@@ -81,6 +96,10 @@ pub struct MakerFill {
     pub qty: Qty,
     /// Fill price as a tick index for the token's tick size.
     pub px: Px,
+    /// The resting order's side when the source knows it authoritatively (the
+    /// PAPER sim), else `None` (live feeds — the consumer resolves it from its
+    /// own quote tracking). See the type-level docs.
+    pub side: Option<Side>,
     /// The venue trade id (`id`), for traceability + cross-feed dedup.
     pub trade_id: String,
 }
@@ -180,6 +199,9 @@ pub(crate) fn parse_maker_fills(
                 token,
                 qty: Qty(qty_micro),
                 px,
+                // LIVE: the row's side is the taker's perspective, not our
+                // resting order's — the consumer resolves it from quote tracking.
+                side: None,
                 trade_id: trade_id.to_string(),
             });
         }
@@ -327,6 +349,7 @@ mod tests {
             token: TokenId(7),
             qty: Qty(1_000_000),
             px: Px::new(33, TickSize::Cent).unwrap(),
+            side: None,
             trade_id: "t1".into(),
         };
         let f2 = MakerFill {
@@ -334,6 +357,7 @@ mod tests {
             token: TokenId(7),
             qty: Qty(2_000_000),
             px: Px::new(34, TickSize::Cent).unwrap(),
+            side: None,
             trade_id: "t2".into(),
         };
         let mut mock = MockUserFills::new(vec![vec![f1.clone(), f2.clone()], vec![]]);

@@ -174,6 +174,9 @@ pub(crate) fn parse_ws_trade(
             token,
             qty: Qty(qty_micro),
             px,
+            // LIVE: the trade's side is the taker's perspective — the consumer
+            // resolves our resting side from its own quote tracking.
+            side: None,
             trade_id: trade_id.to_string(),
         });
     }

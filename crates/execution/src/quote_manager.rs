@@ -187,6 +187,43 @@ impl QuoteManager {
         );
     }
 
+    /// Sync tracking with a [`MakerFill`](crate::fills::MakerFill) the strategy
+    /// just booked: decrement the matching resting order's remaining size by
+    /// `filled`, and DROP the `(token, side)` entry entirely once fully filled.
+    ///
+    /// The manager is otherwise UNAWARE of fills — they arrive out-of-band via
+    /// [`UserFillSource::poll`](crate::fills::UserFillSource), and the venue
+    /// removes a fully-filled resting order. Without this, the manager would keep
+    /// "tracking" a now-gone id, so [`reconcile`](Self::reconcile) would NO-OP an
+    /// identical next desired forever (it believes the quote is still resting) —
+    /// the tracked set drifts from the venue's real resting set and the strategy
+    /// STOPS re-quoting a filled market. Calling `note_fill` per booked fill
+    /// keeps the two in sync: a fully-filled side is dropped so the next
+    /// `reconcile` re-places it; a partial fill leaves the side tracked with a
+    /// reduced size so the next `reconcile` tops it back up (a replace).
+    ///
+    /// Matches `id` against the tracked orders (one per `(token, side)`); a pure
+    /// no-op if `id` isn't tracked (already replaced / cancelled / consumed), so
+    /// a duplicate or late fill is harmless.
+    pub fn note_fill(&mut self, id: &OrderId, filled: Qty) {
+        let Some(key) = self
+            .resting
+            .iter()
+            .find(|(_, r)| &r.id == id)
+            .map(|(key, _)| *key)
+        else {
+            return; // not tracked → nothing to sync (idempotent on dup/late fills)
+        };
+        if let Some(r) = self.resting.get_mut(&key) {
+            let remaining = r.order.size.0.saturating_sub(filled.0);
+            if remaining == 0 {
+                self.resting.remove(&key);
+            } else {
+                r.order.size = Qty(remaining);
+            }
+        }
+    }
+
     /// The current `(token, side) → OrderId` view, for tests and Task 3.5
     /// startup reconciliation against the venue's `open_orders()`.
     pub fn tracked(&self) -> HashMap<(TokenId, Side), OrderId> {
@@ -325,6 +362,56 @@ mod tests {
         qm.forget_all();
         assert!(qm.tracked().is_empty());
         assert!(v.cancelled.is_empty(), "forget_all must not call the venue");
+    }
+
+    #[tokio::test]
+    async fn note_fill_decrements_partial_then_drops_full_so_reconcile_requotes() {
+        let mut qm = QuoteManager::new();
+        let mut v = MockMakerVenue::new();
+
+        // Rest a 100-share bid.
+        let desired = vec![bid(7, 44, 100_000_000)];
+        qm.reconcile(&mut v, &desired).await.unwrap();
+        let id1 = tracked_id(&qm, 7, Side::Bid).unwrap();
+
+        // A PARTIAL fill (40 sh) leaves the side tracked under the SAME id with a
+        // reduced size — so re-reconciling the FULL desired tops it back up (a
+        // replace, not a no-op).
+        qm.note_fill(&id1, Qty(40_000_000));
+        assert_eq!(
+            tracked_id(&qm, 7, Side::Bid),
+            Some(id1.clone()),
+            "a partial fill keeps the side tracked"
+        );
+        qm.reconcile(&mut v, &desired).await.unwrap();
+        assert_eq!(v.replaced.len(), 1, "a partial fill tops the quote back to full size");
+        let id2 = tracked_id(&qm, 7, Side::Bid).unwrap();
+        assert_ne!(id2, id1, "the top-up replace re-keyed to a new id");
+
+        // A FULL fill DROPS the side from tracking entirely...
+        qm.note_fill(&id2, Qty(100_000_000));
+        assert!(
+            tracked_id(&qm, 7, Side::Bid).is_none(),
+            "a full fill drops the side from tracking"
+        );
+
+        // ...so the next reconcile RE-PLACES it (the drift fix: a filled market is
+        // re-quoted, never no-oped forever against a now-gone resting order).
+        let placed_before = v.placed.len();
+        qm.reconcile(&mut v, &desired).await.unwrap();
+        assert_eq!(
+            v.placed.len(),
+            placed_before + 1,
+            "the fully-filled side must be re-placed, not no-oped"
+        );
+        assert!(tracked_id(&qm, 7, Side::Bid).is_some(), "re-quoted and tracked again");
+
+        // note_fill for an UNKNOWN id (already replaced / cancelled / a dup or
+        // late fill) is a pure no-op — never panics, never touches other keys.
+        let before = qm.tracked();
+        qm.note_fill(&OrderId("nope".into()), Qty(1));
+        qm.note_fill(&id1, Qty(1)); // the old (replaced-away) id
+        assert_eq!(qm.tracked(), before, "an untracked id is a no-op");
     }
 
     #[tokio::test]
