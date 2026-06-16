@@ -25,6 +25,7 @@ pub mod basket;
 pub mod fills;
 pub mod live;
 pub mod maker;
+pub mod paper_maker;
 pub mod quote_manager;
 pub mod reconcile;
 pub mod secrets;
