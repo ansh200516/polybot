@@ -281,6 +281,27 @@ impl InventoryRisk {
         e.net = new_net;
     }
 
+    /// Seed a token's STARTING inventory at process start — its signed `net`
+    /// (µshares) and signed cost `basis_cash` (µUSDC) — so a restart resumes the
+    /// inventory caps, mark-to-market and stop-loss from the REAL standing
+    /// position rather than from zero (the inventory half of Task 3.5).
+    ///
+    /// Unlike [`on_fill`](Self::on_fill) this is an absolute SET, not an
+    /// accumulating delta, and books NO realized P&L: it reconstructs only the
+    /// open position. The sign convention matches [`TokenInventory::basis`]:
+    /// `net`/`basis_cash` are `> 0` for a long (cash paid in), `< 0` for a short
+    /// (cash taken in); seeding `net == 0` records a flat entry. Equivalently
+    /// `basis_cash = net · avg_price / 1e6`.
+    ///
+    /// The Phase-4 startup wiring sources `(net, basis_cash)` from
+    /// `store.position(token)`. Intended to be called ONCE per token before any
+    /// quoting; a later call overwrites net + basis (realized is left intact).
+    pub fn seed(&mut self, token: TokenId, net: i128, basis_cash: Usdc) {
+        let e = self.by_token.entry(token).or_default();
+        e.net = net;
+        e.basis = basis_cash;
+    }
+
     /// Pre-fill inventory cap check for a single quote (spec §5, Task 2.2).
     /// Read-only and INERT until a strategy calls it (Phase 4). Mirrors the
     /// plain-data, inclusive-boundary style of `RiskEngine::pre_check`.
@@ -1331,5 +1352,65 @@ mod tests {
             inv.vol_hint(t3, 550_001, t0 + Duration::from_millis(100)),
             "one µUSDC past the threshold fires"
         );
+    }
+
+    // ── Task 3.5: seed startup inventory ──────────────────────────────────────
+
+    #[test]
+    fn seed_counts_toward_per_market_cap_in_check_quote() {
+        // cfg(): max_inventory_usd = $500. A restart seeds the real position so
+        // the cap check resumes from it instead of from flat.
+        let t = TokenId(1);
+        let mut inv = InventoryRisk::new(cfg());
+        // Seed a restart position: long 450 sh with a $450 cost basis (avg $1.00).
+        inv.seed(t, 450 * SHARE, Usdc(450_000_000));
+        assert_eq!(inv.net(t), 450 * SHARE, "seeded signed net");
+        assert_eq!(inv.basis(t), Usdc(450_000_000), "seeded cost basis");
+        assert_eq!(inv.realized(t), Usdc(0), "seed books no realized P&L");
+
+        // Buying 100 more @ $1.00 → proj_net 550 sh, $550 notional > $500 cap →
+        // reject. The SEEDED 450 is what binds it.
+        let breach = QuoteIntent {
+            token: t,
+            signed_qty: 100 * SHARE,
+            price_micro: PRICE_1USD,
+        };
+        assert_eq!(
+            inv.check_quote(&breach),
+            QuoteVerdict::Reject(InvReason::PerMarketInventory),
+            "seeded inventory counts toward the per-market cap"
+        );
+
+        // The SAME quote from flat ($100 ≤ $500) is approved — proving the
+        // rejection above came from the seeded inventory, not the quote alone.
+        let from_flat = InventoryRisk::new(cfg());
+        assert_eq!(
+            from_flat.check_quote(&breach),
+            QuoteVerdict::Approve,
+            "without the seed the identical quote is fine"
+        );
+    }
+
+    #[test]
+    fn seed_basis_drives_mark_to_market_unrealized() {
+        // A price below a seeded long's basis must show the expected unrealized
+        // loss measured against the SEEDED basis.
+        let t = TokenId(1);
+        let mut inv = InventoryRisk::new(cfg());
+        // Seed long 100 sh with a $50 cost basis (avg $0.50).
+        inv.seed(t, 100 * SHARE, Usdc(50_000_000));
+
+        // Mark $0.40 (below the $0.50 seeded basis price): value = 100·0.40 =
+        // $40, unrealized = 40 − 50 = −$10 against the seeded basis.
+        let st = inv.mark(&Marks::from([(t, 400_000)]));
+        assert_eq!(
+            st.unrealized,
+            Usdc(-10_000_000),
+            "mark below seeded basis → −$10 unrealized"
+        );
+        assert_eq!(st.realized, Usdc(0), "seed booked no realized");
+        assert_eq!(st.mtm_pnl, Usdc(-10_000_000));
+        assert_eq!(st.net_by_token, vec![(t, 100 * SHARE)], "seeded net is marked");
+        assert_eq!(st.halted, None, "−$10 is well inside the $100 stop");
     }
 }

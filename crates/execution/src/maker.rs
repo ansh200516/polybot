@@ -148,6 +148,24 @@ impl MockMakerVenue {
         Self::default()
     }
 
+    /// Seed a resting order as if left by a PRIOR session — the orphaned quotes
+    /// that Task 3.5's startup/reconnect reconciliation discovers via
+    /// [`open_orders`](MakerVenue::open_orders) and then cancels or adopts. Mints
+    /// and returns a fresh venue id and rests the order, but records NOTHING in
+    /// `placed` (this process did not place it), so a reconcile test can still
+    /// assert "no venue calls" against the recorders.
+    pub fn seed_open(&mut self, token: TokenId, side: Side, price: Px, size: Qty) -> OrderId {
+        let id = self.mint_id();
+        self.open.push(OpenOrder {
+            id: id.clone(),
+            token,
+            side,
+            price,
+            size,
+        });
+        id
+    }
+
     fn mint_id(&mut self) -> OrderId {
         self.next_id += 1;
         OrderId(format!("mock-{}", self.next_id))

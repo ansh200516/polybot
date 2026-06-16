@@ -31,8 +31,9 @@ use std::collections::{HashMap, HashSet};
 
 use pm_core::book::Side;
 use pm_core::instrument::TokenId;
+use pm_core::num::{Px, Qty};
 
-use crate::maker::{MakerOrder, MakerVenue, OrderId};
+use crate::maker::{MakerOrder, MakerVenue, OrderId, OrderType};
 use crate::venue::VenueError;
 
 /// What we believe is resting for one `(TokenId, Side)` key: the venue-assigned
@@ -152,6 +153,38 @@ impl QuoteManager {
     /// `open_orders()` read, or to drop tracking after an out-of-band flatten.
     pub fn forget_all(&mut self) {
         self.resting.clear();
+    }
+
+    /// Adopt an order discovered resting on the venue into local tracking
+    /// WITHOUT any venue call, so the manager believes that `(token, side)` quote
+    /// is already on the book and a subsequent [`reconcile`](Self::reconcile)
+    /// won't double-place it. Inserts (overwriting any existing entry for the
+    /// key) the venue-assigned `id` plus a reconstructed [`MakerOrder`].
+    ///
+    /// The venue's open-book view ([`OpenOrder`](crate::maker::OpenOrder)) reports
+    /// only token/side/price/size — never `order_type`/`post_only` — so the
+    /// adopted order is reconstructed with the market-maker's standard shape
+    /// ([`OrderType::Gtc`], `post_only = true`). If the live desired quote later
+    /// differs from this reconstruction (a different price/size, or a
+    /// non-standard shape), the next [`reconcile`](Self::reconcile) simply
+    /// [`replace`](MakerVenue::replace)s it — safe normalization at the cost of a
+    /// single replace. Used by the startup/reconnect reconciliation primitive
+    /// (`crate::reconcile`) and by a strategy resuming after a bare reconnect.
+    pub fn adopt(&mut self, token: TokenId, side: Side, id: OrderId, price: Px, size: Qty) {
+        self.resting.insert(
+            (token, side),
+            Resting {
+                id,
+                order: MakerOrder {
+                    token,
+                    side,
+                    price,
+                    size,
+                    order_type: OrderType::Gtc,
+                    post_only: true,
+                },
+            },
+        );
     }
 
     /// The current `(token, side) → OrderId` view, for tests and Task 3.5
@@ -384,5 +417,48 @@ mod tests {
         assert!(v.replaced.is_empty());
         assert_eq!(tracked_id(&qm, 7, Side::Bid), Some(bid_old));
         assert_eq!(qm.tracked().len(), 1);
+    }
+
+    // ── Task 3.5: adopt (startup / reconnect reconciliation) ──────────────────
+
+    /// Adopting a resting order then reconciling an IDENTICAL desired quote must
+    /// be a pure no-op: adoption made the manager believe the quote is already
+    /// resting, so it suppresses a redundant place.
+    #[tokio::test]
+    async fn adopt_then_identical_reconcile_issues_no_venue_calls() {
+        let mut qm = QuoteManager::new();
+        let mut v = MockMakerVenue::new();
+        // The order really rests on the venue (prior session); adopt its real id.
+        let id = v.seed_open(TokenId(7), Side::Bid, px(44), Qty(100_000_000));
+        qm.adopt(TokenId(7), Side::Bid, id.clone(), px(44), Qty(100_000_000));
+        assert_eq!(tracked_id(&qm, 7, Side::Bid), Some(id.clone()));
+
+        // Desired quote identical to the adopted (reconstructed) Gtc/post_only
+        // shape → reconcile recognizes it as already resting: NO venue calls.
+        qm.reconcile(&mut v, &[bid(7, 44, 100_000_000)]).await.unwrap();
+        assert!(v.placed.is_empty(), "adoption must suppress a redundant place");
+        assert!(v.replaced.is_empty());
+        assert!(v.cancelled.is_empty());
+        assert_eq!(tracked_id(&qm, 7, Side::Bid), Some(id), "adopted id retained");
+    }
+
+    /// Adopting a resting order then reconciling a DIFFERENT price must issue
+    /// exactly one replace against the adopted id (no place, no cancel) — the
+    /// adopted quote is normalized to the live desired one.
+    #[tokio::test]
+    async fn adopt_then_reconcile_different_price_replaces_once() {
+        let mut qm = QuoteManager::new();
+        let mut v = MockMakerVenue::new();
+        let id = v.seed_open(TokenId(7), Side::Bid, px(44), Qty(100_000_000));
+        qm.adopt(TokenId(7), Side::Bid, id.clone(), px(44), Qty(100_000_000));
+
+        qm.reconcile(&mut v, &[bid(7, 45, 100_000_000)]).await.unwrap();
+        assert_eq!(v.replaced.len(), 1, "exactly one replace");
+        assert_eq!(v.replaced[0].0, id, "the adopted id is handed to the venue");
+        assert_eq!(v.replaced[0].1.price, px(45));
+        assert!(v.placed.is_empty(), "a changed adopted quote replaces, not places");
+        assert!(v.cancelled.is_empty());
+        // Tracking moved to the venue's new id (the mock re-keys on replace).
+        assert_eq!(tracked_id(&qm, 7, Side::Bid), Some(OrderId("mock-2".into())));
     }
 }

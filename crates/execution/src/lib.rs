@@ -26,6 +26,7 @@ pub mod fills;
 pub mod live;
 pub mod maker;
 pub mod quote_manager;
+pub mod reconcile;
 pub mod secrets;
 pub mod sign;
 pub mod venue;
