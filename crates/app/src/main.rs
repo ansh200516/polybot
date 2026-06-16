@@ -1126,10 +1126,13 @@ async fn main() {
         // LiquidStable + Liquid — NEVER Illiquid), skipping fee-free markets when
         // `[segments].mm_exclude_fee_free` (default true; the rebate-driven MM
         // earns no rebate on a fee-free market). The eligible markets are RANKED
-        // by liquidity (then volume) so the `max_markets` cap keeps the DEEPEST
-        // markets. ARB IS UNAFFECTED — it runs on every market unconditionally as
-        // the universal safety net; this routing is MM-only and only takes effect
-        // because the MM is enabled in this block.
+        // by PER-MARKET volume (then liquidity) and DE-CONCENTRATED to at most
+        // `max_per_event` per event/component before the `max_markets` cap, so
+        // the MM spreads across DISTINCT markets instead of piling into one
+        // event's many outcomes (which all inherit the event's liquidity). ARB
+        // IS UNAFFECTED — it runs on every market unconditionally as the universal
+        // safety net; this routing is MM-only and only takes effect because the
+        // MM is enabled in this block.
         //
         // For each selected market we build the token set + `token → MarketId`
         // map and (when live) register each token on MM's venue in the SAME pass
@@ -1144,26 +1147,38 @@ async fn main() {
             &mm_allowed,
             config.segments.mm_exclude_fee_free,
             config.strategies.mm.max_markets,
+            config.strategies.mm.max_per_event,
         );
-        // Eligible-before-cap count, for the routing log only (how many markets
-        // qualified vs. how many we actually quote after `max_markets`). The
-        // selection is a cheap startup-time filter+rank over the registry, so
-        // recomputing it uncapped (`usize::MAX`) here is negligible.
-        let mm_eligible = mm_market_selection(
+        // Eligible-before-cap list, for the routing log only (how many markets
+        // qualified — across how many distinct events/components — vs. how many
+        // we actually quote after the caps). Recomputed UNCAPPED (`usize::MAX`
+        // markets, `0` = no per-event cap) so it reflects the full eligible set;
+        // the selection is a cheap startup-time filter+rank over the registry.
+        let mm_eligible_markets = mm_market_selection(
             &reg,
             &mm_thresholds,
             &mm_allowed,
             config.segments.mm_exclude_fee_free,
             usize::MAX,
-        )
-        .len();
+            0,
+        );
+        // Distinct events/components among the eligible markets (a NegRisk event's
+        // outcomes share one `component_of`), so the log surfaces how many events
+        // the per-event cap is spreading the MM across.
+        let mm_eligible_events = mm_eligible_markets
+            .iter()
+            .map(|&id| reg.component_of(id))
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         info!(
-            "MM segment routing: {} eligible markets (segments={:?}, exclude_fee_free={}), \
-             quoting top {} by liquidity",
-            mm_eligible,
+            "MM segment routing: {} eligible across {} events (segments={:?}, \
+             exclude_fee_free={}) → quoting top {} (≤{} per event)",
+            mm_eligible_markets.len(),
+            mm_eligible_events,
             mm_allowed,
             config.segments.mm_exclude_fee_free,
             mm_markets.len(),
+            config.strategies.mm.max_per_event,
         );
         // MarketId → Market lookup for the selected ids (registry is dense, but a
         // map keeps the call site independent of that invariant).

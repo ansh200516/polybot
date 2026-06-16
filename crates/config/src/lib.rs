@@ -464,11 +464,24 @@ pub struct Mm {
     /// Cap on how many markets the MM quotes (both YES+NO sides). Per-segment
     /// routing (Task 5.2, `pm_app::wiring::mm_market_selection`) first filters
     /// the universe to the MM's allowed liquidity segments (`[segments]
-    /// .mm_segments`, fee-free markets skipped per `mm_exclude_fee_free`) and
-    /// ranks them by liquidity; the MM then quotes the top `max_markets` of that
-    /// ranked, eligible set. `0` quotes nothing (inert); any `usize` is valid —
-    /// documented, not bounded.
+    /// .mm_segments`, fee-free markets skipped per `mm_exclude_fee_free`), ranks
+    /// them by PER-MARKET volume (then liquidity), and de-concentrates them to
+    /// at most `max_per_event` per event/component; the MM then quotes the top
+    /// `max_markets` of that capped, ranked set. `0` quotes nothing (inert); any
+    /// `usize` is valid — documented, not bounded.
     pub max_markets: usize,
+    /// Max markets the MM quotes from any ONE event/component — the
+    /// de-concentration cap (`pm_app::wiring::mm_market_selection`). A NegRisk
+    /// event's outcomes — and any relationship-linked markets — collapse into
+    /// ONE component (`pm_registry::Registry::component_of`, union-find). Without
+    /// this cap the MM piled into ~20 outcomes of a SINGLE event (e.g. World-Cup
+    /// -winner longshots) because every outcome inherits the event's liquidity
+    /// and so ranks together at the top. Walking the volume-ranked candidates,
+    /// once this many markets from a component have been chosen the rest of that
+    /// component is skipped, so the MM spreads across DISTINCT markets. `0` ⇒ NO
+    /// cap (unlimited markets per event); any `usize` is valid — documented, not
+    /// bounded. Default `2`.
+    pub max_per_event: usize,
     /// LIVE maker-fill source (Task 4.6): `"ws"` (default) | `"rest"`. INERT
     /// unless the MM is cleared for live (process `--live` AND
     /// `[strategies.mm].live`); paper always uses the `PaperMakerVenue` sim.
@@ -508,9 +521,13 @@ impl Default for Mm {
             // real (category-dependent) program rate.
             rebate_bps: 0,
             // A small slice of the bankroll (the rest stays with arb), and a
-            // conservative market cap for the first enablement (Phase 5 refines).
+            // broad market cap (Phase 5 refines) so the MM covers many DISTINCT
+            // markets rather than a single event's outcomes.
             capital_usd: 25.0,
-            max_markets: 20,
+            max_markets: 60,
+            // Quote at most 2 markets from any one event/component, so a big
+            // multi-outcome NegRisk event can't crowd out the rest.
+            max_per_event: 2,
             // Default to the low-latency user-WS fills feed (the scalping
             // upgrade); operators can pin "rest" to fall back to the
             // offline-verified Task-4.5 REST poll.
@@ -844,6 +861,10 @@ impl Config {
         }
         // `max_markets` (usize) needs no bound: it is always ≥ 0; `0` simply
         // quotes nothing (inert). Documented, not checked.
+        // `max_per_event` (usize) likewise needs no bound: it is always ≥ 0; `0`
+        // is the sentinel for "no per-event cap" (unlimited markets from one
+        // event/component) and any positive value caps how many of a component's
+        // markets the MM quotes. Documented, not checked.
         // `inventory_skew_bps` needs no bound: as a `u32` it is always ≥ 0 (0
         // disables skew), and the quote loop clamps the skewed fair to the
         // interior tick range — an over-large skew just skips that side rather
@@ -1357,7 +1378,8 @@ mod tests {
         assert_eq!(c.strategies.mm.inventory_skew_bps, 150);
         assert_eq!(c.strategies.mm.rebate_bps, 0, "no assumed rebate by default");
         assert!((c.strategies.mm.capital_usd - 25.0).abs() < 1e-9, "default MM slice $25");
-        assert_eq!(c.strategies.mm.max_markets, 20, "default first-N market cap");
+        assert_eq!(c.strategies.mm.max_markets, 60, "default broad market cap");
+        assert_eq!(c.strategies.mm.max_per_event, 2, "default per-event de-concentration cap");
         assert_eq!(c.strategies.mm.live_fills_source, "ws", "default fills source is the WS feed");
         c.validate().unwrap();
     }
@@ -1365,7 +1387,7 @@ mod tests {
     #[test]
     fn mm_strategy_section_parses() {
         let c = Config::from_toml_str(
-            "[strategies.mm]\nenabled = true\nlive = false\nspread_bps = 300\nquote_refresh_ms = 1000\nmax_quote_usd = 7.5\ninventory_skew_bps = 250\nrebate_bps = 20\ncapital_usd = 100.0\nmax_markets = 8\nlive_fills_source = \"rest\"\n",
+            "[strategies.mm]\nenabled = true\nlive = false\nspread_bps = 300\nquote_refresh_ms = 1000\nmax_quote_usd = 7.5\ninventory_skew_bps = 250\nrebate_bps = 20\ncapital_usd = 100.0\nmax_markets = 8\nmax_per_event = 3\nlive_fills_source = \"rest\"\n",
         )
         .unwrap();
         assert!(c.strategies.mm.enabled);
@@ -1377,6 +1399,7 @@ mod tests {
         assert_eq!(c.strategies.mm.rebate_bps, 20);
         assert!((c.strategies.mm.capital_usd - 100.0).abs() < 1e-9);
         assert_eq!(c.strategies.mm.max_markets, 8);
+        assert_eq!(c.strategies.mm.max_per_event, 3);
         assert_eq!(c.strategies.mm.live_fills_source, "rest");
         c.validate().unwrap();
     }
@@ -1410,7 +1433,31 @@ mod tests {
         assert_eq!(c.strategies.mm.inventory_skew_bps, 150, "untouched field stays default");
         assert_eq!(c.strategies.mm.rebate_bps, 0, "untouched field stays default");
         assert!((c.strategies.mm.capital_usd - 25.0).abs() < 1e-9, "untouched field stays default");
-        assert_eq!(c.strategies.mm.max_markets, 20, "untouched field stays default");
+        assert_eq!(c.strategies.mm.max_markets, 60, "untouched field stays default");
+        assert_eq!(c.strategies.mm.max_per_event, 2, "untouched field stays default");
+    }
+
+    #[test]
+    fn mm_max_per_event_parses_validates_and_defaults() {
+        // Default is the de-concentration cap of 2 markets per event/component.
+        assert_eq!(Config::default().strategies.mm.max_per_event, 2);
+        // A custom positive cap parses + validates alongside max_markets.
+        let c =
+            Config::from_toml_str("[strategies.mm]\nmax_markets = 60\nmax_per_event = 4\n").unwrap();
+        assert_eq!(c.strategies.mm.max_per_event, 4);
+        assert_eq!(c.strategies.mm.max_markets, 60);
+        c.validate().unwrap();
+        // `0` is the documented "unlimited per event" sentinel and is valid —
+        // any usize is accepted, there is no bound.
+        let c = Config::from_toml_str("[strategies.mm]\nmax_per_event = 0\n").unwrap();
+        assert_eq!(c.strategies.mm.max_per_event, 0);
+        c.validate().unwrap();
+        // Omitting it keeps the default.
+        let c = Config::from_toml_str("[strategies.mm]\nenabled = true\n").unwrap();
+        assert_eq!(
+            c.strategies.mm.max_per_event, 2,
+            "omitted field keeps the default"
+        );
     }
 
     #[test]

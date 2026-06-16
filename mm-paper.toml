@@ -18,7 +18,10 @@
 enabled          = true     # turn the market-maker ON (default is off)
 live             = false    # PAPER: fills come from the simulator, never the venue
 capital_usd      = 50.0     # MM's slice of the bankroll; arb's risk cap shrinks to match
-max_markets      = 20       # quote at most this many (the most-liquid eligible) markets
+max_markets      = 60       # quote at most this many DISTINCT (busiest eligible) markets
+max_per_event    = 2        # ...but at most 2 from any one event/component (NegRisk events
+                            # collapse to one component), so a big multi-outcome event can't
+                            # crowd out the rest. 0 = no per-event cap.
 spread_bps       = 200      # total quoted spread: 200 bps = 0.02 → bid 0.49 / ask 0.51 at a 0.50 mid
 quote_refresh_ms = 1500     # re-quote cadence
 max_quote_usd    = 5.0      # max notional per single quote (one side)

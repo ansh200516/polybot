@@ -248,11 +248,24 @@ fn parse_segment(s: &str) -> Option<MarketSegment> {
 ///    `fee_bps == 0` (the rebate-driven MM earns no rebate there; its spread
 ///    economics differ), while `!exclude_fee_free` keeps every fee level.
 ///
-/// Kept markets are RANKED most-attractive first: liquidity DESC, then volume
-/// DESC, then `MarketId` ASC as a deterministic tiebreak — so when the universe
-/// is capped the MM quotes the DEEPEST eligible markets. The top `max_markets`
-/// ids are returned in that rank order (`max_markets == 0` → empty; a missing
-/// metric counts as `0.0` for ranking, matching the Task-5.1 classifier).
+/// Kept markets are RANKED most-attractive first by **per-market `volume` DESC**,
+/// then `liquidity` DESC, then `MarketId` ASC as a deterministic tiebreak.
+/// Volume is the PRIMARY key (NOT liquidity) on purpose: a NegRisk event's
+/// outcomes all INHERIT the event's `liquidity`, so ranking by liquidity ties a
+/// whole event's outcomes together at the very top and the MM piles into a
+/// SINGLE event (e.g. ~20 World-Cup-winner longshots). Per-market `volume`
+/// differs per outcome, so genuinely active markets sort to the top instead.
+///
+/// `max_per_event` then DE-CONCENTRATES the ranked list across DISTINCT markets:
+/// walking it best-first, a market is SKIPPED once `max_per_event` markets
+/// sharing its [`Registry::component_of`] have already been selected. A NegRisk
+/// event's outcomes — and any relationship-linked markets — form ONE component
+/// (union-find), so this caps how many markets the MM quotes from any one event.
+/// `max_per_event == 0` DISABLES the cap (treated as unlimited per event).
+///
+/// Finally the first `max_markets` of the capped, ranked list are returned in
+/// rank order (`max_markets == 0` → empty; a missing metric counts as `0.0` for
+/// ranking, matching the Task-5.1 classifier).
 ///
 /// ARB IS NOT ROUTED HERE: arb runs on EVERY market unconditionally (the
 /// universal safety net). This governs ONLY the MM's quoting universe, and only
@@ -263,11 +276,14 @@ pub fn mm_market_selection(
     allowed: &[MarketSegment],
     exclude_fee_free: bool,
     max_markets: usize,
+    max_per_event: usize,
 ) -> Vec<MarketId> {
-    // Liquidity / volume for ranking; a market with no captured metric ranks as
-    // 0.0 (it would also classify Illiquid, so it is rarely even kept).
-    let liquidity = |id: MarketId| reg.metrics(id).and_then(|m| m.liquidity).unwrap_or(0.0);
+    // Per-market volume / liquidity for ranking; a market with no captured
+    // metric ranks as 0.0 (it would also classify Illiquid, so it is rarely even
+    // kept). `volume` is per-market and meaningful; `liquidity` is the value
+    // every outcome of an event inherits (hence why it must NOT be the primary).
     let volume = |id: MarketId| reg.metrics(id).and_then(|m| m.volume).unwrap_or(0.0);
+    let liquidity = |id: MarketId| reg.metrics(id).and_then(|m| m.liquidity).unwrap_or(0.0);
 
     let mut kept: Vec<MarketId> = reg
         .markets()
@@ -279,21 +295,40 @@ pub fn mm_market_selection(
         .map(|m| m.id)
         .collect();
 
-    // liquidity DESC, then volume DESC, then MarketId ASC (deterministic).
+    // PER-MARKET volume DESC, then liquidity DESC, then MarketId ASC. Volume is
+    // primary so distinct active markets outrank a single event's many outcomes
+    // (which all share one inherited liquidity); the rest is a deterministic
+    // tiebreak.
     kept.sort_by(|&a, &b| {
-        liquidity(b)
-            .partial_cmp(&liquidity(a))
+        volume(b)
+            .partial_cmp(&volume(a))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
-                volume(b)
-                    .partial_cmp(&volume(a))
+                liquidity(b)
+                    .partial_cmp(&liquidity(a))
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .then(a.cmp(&b))
     });
 
-    kept.truncate(max_markets);
-    kept
+    // Walk the ranked candidates best-first, enforcing the per-event/component
+    // cap, until `max_markets` are chosen. `max_per_event == 0` ⇒ no cap.
+    let mut selected: Vec<MarketId> = Vec::with_capacity(max_markets.min(kept.len()));
+    let mut per_event: HashMap<ComponentId, usize> = HashMap::new();
+    for id in kept {
+        if selected.len() >= max_markets {
+            break;
+        }
+        if max_per_event != 0 {
+            let count = per_event.entry(reg.component_of(id)).or_insert(0);
+            if *count >= max_per_event {
+                continue;
+            }
+            *count += 1;
+        }
+        selected.push(id);
+    }
+    selected
 }
 
 /// Everything a detector needs about one connected component.
@@ -695,6 +730,42 @@ mod tests {
         });
     }
 
+    /// Add a NegRisk EVENT-MEMBER market (with recorded metrics) under `event`.
+    /// Every member sharing `event` (neg_risk, non-placeholder question) unions
+    /// into ONE [`Registry::component_of`] — the "event" the per-event cap
+    /// de-concentrates. Mirrors the venue shape where each outcome inherits the
+    /// event's `liquidity` but carries its own per-market `volume`.
+    #[allow(clippy::too_many_arguments)]
+    fn add_event_metric_market(
+        b: &mut RegistryBuilder,
+        cond: &str,
+        yes: &str,
+        no: &str,
+        fee_bps: i32,
+        volume: f64,
+        liquidity: f64,
+        event: &str,
+    ) {
+        b.add_market(
+            cond,
+            yes,
+            no,
+            TickSize::Cent,
+            fee_bps,
+            true,                              // neg_risk → mutually-exclusive event
+            Some(format!("Will {cond} win?")), // non-placeholder question
+            true,
+            false,
+            Some(event),
+        );
+        b.record_market_metrics(pm_registry::segment::MarketMetrics {
+            volume: Some(volume),
+            volume_24hr: None,
+            liquidity: Some(liquidity),
+            category: None,
+        });
+    }
+
     /// Registry of markets spanning every segment + fee shape under the DEFAULT
     /// thresholds (LiquidStable: vol≥100k ∧ liq≥50k; Liquid: vol≥10k ∧ liq≥5k):
     ///  - `0xs1` LiquidStable, deepest (liq 300k), fee 200
@@ -755,6 +826,7 @@ mod tests {
             &[MarketSegment::LiquidStable, MarketSegment::Liquid],
             false,
             usize::MAX,
+            0,
         );
         assert!(
             !sel.contains(&il),
@@ -766,7 +838,7 @@ mod tests {
         }
         // Narrowing to LiquidStable-only drops the Liquid market.
         let only_stable =
-            mm_market_selection(&r, &t, &[MarketSegment::LiquidStable], false, usize::MAX);
+            mm_market_selection(&r, &t, &[MarketSegment::LiquidStable], false, usize::MAX, 0);
         let lq = r.market_by_condition("0xlq").unwrap().id;
         assert!(
             !only_stable.contains(&lq),
@@ -781,13 +853,13 @@ mod tests {
         let ff = r.market_by_condition("0xff").unwrap().id;
         let allowed = [MarketSegment::LiquidStable, MarketSegment::Liquid];
         // exclude_fee_free = true → the fee-free market is dropped.
-        let excl = mm_market_selection(&r, &t, &allowed, true, usize::MAX);
+        let excl = mm_market_selection(&r, &t, &allowed, true, usize::MAX, 0);
         assert!(
             !excl.contains(&ff),
             "fee-free market dropped when exclude_fee_free=true"
         );
         // exclude_fee_free = false → it is kept.
-        let incl = mm_market_selection(&r, &t, &allowed, false, usize::MAX);
+        let incl = mm_market_selection(&r, &t, &allowed, false, usize::MAX, 0);
         assert!(
             incl.contains(&ff),
             "fee-free market kept when exclude_fee_free=false"
@@ -795,48 +867,60 @@ mod tests {
     }
 
     #[test]
-    fn mm_selection_ranks_by_liquidity_then_caps() {
+    fn mm_selection_ranks_by_volume_then_caps() {
         let r = seg_reg();
         let t = SegmentThresholds::default();
         let allowed = [MarketSegment::LiquidStable, MarketSegment::Liquid];
-        let s1 = r.market_by_condition("0xs1").unwrap().id; // liq 300k
-        let s2 = r.market_by_condition("0xs2").unwrap().id; // liq 100k
-        let lq = r.market_by_condition("0xlq").unwrap().id; // liq 20k
+        let s1 = r.market_by_condition("0xs1").unwrap().id; // vol 500k, liq 300k
+        let s2 = r.market_by_condition("0xs2").unwrap().id; // vol 200k, liq 100k
+        let lq = r.market_by_condition("0xlq").unwrap().id; // vol  50k, liq  20k
         // Fee present (fee-free excluded) → eligible = s1, s2, lq, ranked by
-        // liquidity DESC — the most-liquid eligible market first.
-        let sel = mm_market_selection(&r, &t, &allowed, true, usize::MAX);
-        assert_eq!(sel, vec![s1, s2, lq], "ranked by liquidity DESC");
-        // The cap takes the top-N most-liquid.
+        // PER-MARKET volume DESC — the busiest eligible market first.
+        let sel = mm_market_selection(&r, &t, &allowed, true, usize::MAX, 0);
+        assert_eq!(sel, vec![s1, s2, lq], "ranked by per-market volume DESC");
+        // The cap takes the top-N busiest (these are all distinct components, so
+        // the per-event cap never bites here).
         assert_eq!(
-            mm_market_selection(&r, &t, &allowed, true, 2),
+            mm_market_selection(&r, &t, &allowed, true, 2, 0),
             vec![s1, s2],
-            "cap keeps the two deepest"
+            "cap keeps the two busiest"
         );
-        assert_eq!(mm_market_selection(&r, &t, &allowed, true, 1), vec![s1]);
+        assert_eq!(mm_market_selection(&r, &t, &allowed, true, 1, 0), vec![s1]);
     }
 
     #[test]
-    fn mm_selection_tiebreaks_volume_then_market_id() {
-        // Three markets with IDENTICAL liquidity to exercise the secondary keys.
+    fn mm_selection_ranks_volume_then_liquidity_then_id() {
+        // Exercise all three ranking keys: volume PRIMARY, liquidity SECONDARY,
+        // MarketId tertiary tiebreak.
         let mut b = RegistryBuilder::default();
-        add_metric_market(&mut b, "0xt1", "y1", "n1", 100, 60_000.0, 100_000.0);
-        add_metric_market(&mut b, "0xt2", "y2", "n2", 100, 90_000.0, 100_000.0);
-        add_metric_market(&mut b, "0xt3", "y3", "n3", 100, 90_000.0, 100_000.0);
+        // Highest LIQUIDITY but lowest VOLUME → must rank LAST. Volume is primary,
+        // so a deep-but-quiet book loses to busier ones — the crux of the
+        // de-concentration fix (liquidity no longer dominates the ranking).
+        add_metric_market(&mut b, "0xv1", "y1", "n1", 100, 60_000.0, 300_000.0);
+        // Top volume, highest liquidity within that top-volume group → first.
+        add_metric_market(&mut b, "0xv2", "y2", "n2", 100, 90_000.0, 200_000.0);
+        // Top volume, LOWER liquidity → ranks just below v2.
+        add_metric_market(&mut b, "0xv3", "y3", "n3", 100, 90_000.0, 100_000.0);
+        // Same volume AND liquidity as v3 → MarketId ASC breaks the tie (v3 < v4).
+        add_metric_market(&mut b, "0xv4", "y4", "n4", 100, 90_000.0, 100_000.0);
         let r = b.finish("").unwrap();
         let t = SegmentThresholds::default();
-        let t1 = r.market_by_condition("0xt1").unwrap().id;
-        let t2 = r.market_by_condition("0xt2").unwrap().id;
-        let t3 = r.market_by_condition("0xt3").unwrap().id;
+        let v1 = r.market_by_condition("0xv1").unwrap().id;
+        let v2 = r.market_by_condition("0xv2").unwrap().id;
+        let v3 = r.market_by_condition("0xv3").unwrap().id;
+        let v4 = r.market_by_condition("0xv4").unwrap().id;
         let sel = mm_market_selection(
             &r,
             &t,
             &[MarketSegment::LiquidStable, MarketSegment::Liquid],
             true,
             usize::MAX,
+            0,
         );
-        // Equal liquidity → higher volume first (t2, t3 before t1); equal volume
-        // → MarketId ASC (t2 before t3, in insertion order).
-        assert_eq!(sel, vec![t2, t3, t1]);
+        // volume DESC (v2,v3,v4 @90k before v1 @60k, despite v1's deepest book);
+        // within the 90k group liquidity DESC (v2 @200k before v3,v4 @100k); the
+        // v3/v4 full tie falls to MarketId ASC.
+        assert_eq!(sel, vec![v2, v3, v4, v1]);
     }
 
     #[test]
@@ -845,9 +929,9 @@ mod tests {
         let t = SegmentThresholds::default();
         let allowed = [MarketSegment::LiquidStable, MarketSegment::Liquid];
         // No allowed segments → nothing.
-        assert!(mm_market_selection(&r, &t, &[], true, usize::MAX).is_empty());
+        assert!(mm_market_selection(&r, &t, &[], true, usize::MAX, 0).is_empty());
         // A zero cap → nothing, even with eligible markets.
-        assert!(mm_market_selection(&r, &t, &allowed, true, 0).is_empty());
+        assert!(mm_market_selection(&r, &t, &allowed, true, 0, 0).is_empty());
         // Only Illiquid allowed, but the one thin market is the only Illiquid one
         // and it IS returned — so to get "nothing" via segment, exclude it: a
         // registry whose only allowed-segment markets are all fee-free + excluded.
@@ -855,9 +939,91 @@ mod tests {
         add_metric_market(&mut b, "0xz", "yz", "nz", 0, 400_000.0, 250_000.0); // fee-free LiquidStable
         let only_feefree = b.finish("").unwrap();
         assert!(
-            mm_market_selection(&only_feefree, &t, &allowed, true, usize::MAX).is_empty(),
+            mm_market_selection(&only_feefree, &t, &allowed, true, usize::MAX, 0).is_empty(),
             "all eligible-segment markets fee-free + excluded → empty"
         );
+    }
+
+    /// The market-SELECTION concentration fix: per-event cap + per-market-volume
+    /// ranking. One big NegRisk event whose many outcomes all INHERIT a huge
+    /// event liquidity but each carry only modest PER-MARKET volume, plus several
+    /// DISTINCT single-market events with higher per-market volume. The MM must
+    /// DIVERSIFY — at most `max_per_event` of the big event's outcomes, with the
+    /// busier distinct markets preferred — instead of piling into one event.
+    #[test]
+    fn mm_selection_caps_per_event_and_prefers_volume() {
+        let mut b = RegistryBuilder::default();
+        // Big event "wc": 5 outcomes, each Liquid (vol 15k ≥ 10k, liq 200k ≥ 5k).
+        // They SHARE the inherited 200k liquidity, so under the OLD liquidity-first
+        // ranking they'd tie at the very top and the MM would pile into all of
+        // them — exactly the bug this fixes.
+        for i in 0..5 {
+            add_event_metric_market(
+                &mut b,
+                &format!("0xwc{i}"),
+                &format!("ywc{i}"),
+                &format!("nwc{i}"),
+                100,
+                15_000.0,
+                200_000.0,
+                "wc",
+            );
+        }
+        // Four DISTINCT single-market events, each with HIGHER per-market volume
+        // (80k) but lower liquidity (60k) than the big event's outcomes.
+        for i in 0..4 {
+            add_metric_market(
+                &mut b,
+                &format!("0xd{i}"),
+                &format!("yd{i}"),
+                &format!("nd{i}"),
+                100,
+                80_000.0,
+                60_000.0,
+            );
+        }
+        let r = b.finish("").unwrap();
+        let t = SegmentThresholds::default();
+        let allowed = [MarketSegment::LiquidStable, MarketSegment::Liquid];
+
+        // The big event's 5 outcomes are ONE component (component_of == event).
+        let wc_comp = r.component_of(r.market_by_condition("0xwc0").unwrap().id);
+        assert_eq!(
+            (0..5)
+                .map(|i| r.component_of(r.market_by_condition(&format!("0xwc{i}")).unwrap().id))
+                .filter(|&c| c == wc_comp)
+                .count(),
+            5,
+            "all big-event outcomes must collapse into ONE component"
+        );
+        let distinct_ids: Vec<MarketId> = (0..4)
+            .map(|i| r.market_by_condition(&format!("0xd{i}")).unwrap().id)
+            .collect();
+        let from_wc = |sel: &[MarketId]| sel.iter().filter(|&&id| r.component_of(id) == wc_comp).count();
+
+        // max_per_event = 2, uncapped market count.
+        let sel = mm_market_selection(&r, &t, &allowed, true, usize::MAX, 2);
+        // De-concentration: AT MOST max_per_event of the big event are selected.
+        assert_eq!(from_wc(&sel), 2, "the big event contributes at most max_per_event=2");
+        // Per-market-volume ranking: every busier distinct market is preferred...
+        for d in &distinct_ids {
+            assert!(sel.contains(d), "a higher-volume distinct market must be quoted");
+        }
+        // ...and they rank ABOVE the big event's outcomes (the first four chosen).
+        assert_eq!(&sel[..4], &distinct_ids[..], "busier markets rank first");
+        assert_eq!(sel.len(), 6, "4 distinct + 2 from the capped big event");
+
+        // total ≤ max_markets: the cap still truncates the capped+ranked list.
+        let capped = mm_market_selection(&r, &t, &allowed, true, 5, 2);
+        assert!(capped.len() <= 5, "never exceeds max_markets");
+        assert_eq!(capped.len(), 5, "4 distinct + 1 of the big event fills 5 slots");
+        assert_eq!(&capped[..4], &distinct_ids[..], "busier markets still first");
+
+        // max_per_event = 0 ⇒ NO per-event cap: every eligible market is kept,
+        // including ALL 5 big-event outcomes.
+        let uncapped = mm_market_selection(&r, &t, &allowed, true, usize::MAX, 0);
+        assert_eq!(uncapped.len(), 9, "5 big-event + 4 distinct, no per-event cap");
+        assert_eq!(from_wc(&uncapped), 5, "max_per_event=0 keeps all 5 outcomes");
     }
 
     #[test]
