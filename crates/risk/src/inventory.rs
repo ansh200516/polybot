@@ -30,13 +30,18 @@ pub struct InventoryConfig {
 /// One token's signed-net + average-cost accounting (the per-token view).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenInventory {
-    /// Signed net inventory in µshares. `>0` long (net of buys), `<0` short
-    /// (net of sells), `0` flat. (`Qty` is unsigned, so fills arrive signed.)
+    /// Signed net inventory in µshares (1 share = 1e6 µshares). `>0` long (net
+    /// of buys), `<0` short (net of sells), `0` flat. (`Qty` is unsigned, so
+    /// fills arrive signed.)
     pub net: i128,
-    /// Signed cost basis of the OPEN position in µUSDC, under average cost:
-    /// `basis = net · avg_price`. `>0` for longs (cash paid in), `<0` for shorts
-    /// (cash taken in), `0` when flat. Task 2.3 reads it as
-    /// `unrealized = net·mark − basis` (uniform for longs and shorts).
+    /// Signed cost basis of the OPEN position, in µUSDC (the net cash invested:
+    /// `basis -= cash` per fill). Equivalently `basis = net · avg_price / 1e6`
+    /// (`net` µshares × `avg_price` µUSDC/share ÷ 1e6 µshares/share = µUSDC).
+    /// `>0` for longs (cash paid in), `<0` for shorts (cash taken in), `0` flat.
+    ///
+    /// Mark-to-market (Task 2.3) values `net` at a per-share µUSDC `mark` and
+    /// MUST apply the same ÷1e6 share scaling:
+    /// `unrealized = net·mark/1e6 − basis` (µUSDC, uniform for longs & shorts).
     pub basis: Usdc,
     /// Realized P&L booked on the closed/reduced size so far, µUSDC.
     pub realized: Usdc,
@@ -270,5 +275,118 @@ mod tests {
         assert_eq!(inv.net(t), 10 * SHARE);
         assert_eq!(inv.basis(t), Usdc(4_000_000));
         assert_eq!(inv.realized(t), Usdc(0));
+    }
+
+    #[test]
+    fn on_fill_flips_short_to_long() {
+        // Mirror image of the long→short flip in
+        // `on_fill_accumulates_signed_net_and_basis`: open short, reduce it, then
+        // buy through flat into a net LONG (basis goes from negative to positive).
+        let t = TokenId(5);
+        let mut inv = InventoryRisk::new(cfg());
+
+        // 1) Sell-to-open −100 sh @ $0.40 → received $40 (cash positive).
+        inv.on_fill(t, -100 * SHARE, Usdc(40_000_000));
+        assert_eq!(inv.net(t), -100 * SHARE, "net short after sell-to-open");
+        assert_eq!(inv.basis(t), Usdc(-40_000_000), "short basis = −proceeds");
+        assert_eq!(inv.realized(t), Usdc(0), "no realized on an open");
+
+        // 2) Buy +40 sh @ $0.30 → paid $12 (cash negative). Reduce short −100→−60;
+        //    avg-cost basis releases pro-rata: −40·(−60/−100) = −24.
+        inv.on_fill(t, 40 * SHARE, Usdc(-12_000_000));
+        assert_eq!(inv.net(t), -60 * SHARE, "short reduced");
+        assert_eq!(inv.basis(t), Usdc(-24_000_000), "basis released pro-rata");
+        // released = −40 − (−24) = −16; realized = cash(−12) − (−16) = +4.
+        assert_eq!(inv.realized(t), Usdc(4_000_000), "realized on the 40 covered");
+
+        // 3) Buy +100 sh @ $0.45 → paid $45. This FLIPS short 60 → long 40.
+        //    Close 60 (paid 60·0.45=$27 to cover basis −$24 → realize −3), then
+        //    open long 40 at $0.45 (paid 40·0.45=$18 → basis +18, now POSITIVE).
+        inv.on_fill(t, 100 * SHARE, Usdc(-45_000_000));
+        assert_eq!(inv.net(t), 40 * SHARE, "flipped to long");
+        assert_eq!(inv.basis(t), Usdc(18_000_000), "long basis = outlay, positive");
+        assert_eq!(inv.realized(t), Usdc(1_000_000), "4 + (−3) realized total");
+
+        // Cash-conservation invariant: realized − basis = Σ cash.
+        let sum_cash = 40_000_000 - 12_000_000 - 45_000_000;
+        assert_eq!(inv.realized(t).0 - inv.basis(t).0, sum_cash);
+
+        assert_eq!(
+            inv.token(t),
+            Some(TokenInventory {
+                net: 40 * SHARE,
+                basis: Usdc(18_000_000),
+                realized: Usdc(1_000_000),
+            })
+        );
+    }
+
+    /// Deterministic xorshift64 PRNG with a FIXED seed. `pm-risk` has no
+    /// `proptest` dev-dependency (checked `Cargo.toml`), so the rounding
+    /// invariant is exercised with this hand-rolled, reproducible loop instead.
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed)
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        /// Uniform-ish integer in `[lo, hi]` (inclusive).
+        fn range(&mut self, lo: i128, hi: i128) -> i128 {
+            let span = (hi - lo + 1) as u128;
+            lo + (u128::from(self.next_u64()) % span) as i128
+        }
+        fn coin(&mut self) -> bool {
+            self.next_u64() & 1 == 1
+        }
+    }
+
+    #[test]
+    fn rounding_never_breaks_cash_conservation() {
+        // Randomized invariant (fixed seed → reproducible). ODD, non-divisible
+        // quantities and prices force the pro-rata basis division
+        // (`basis·new_net/old_net`) and the flip cash split to truncate; the
+        // invariant `realized − basis = Σ cash` must STILL hold EXACTLY after
+        // every fill — rounding only shifts dust between the realized and
+        // unrealized buckets, never their sum (so total equity is never wrong).
+        let t = TokenId(99);
+        let mut inv = InventoryRisk::new(cfg());
+        let mut rng = Rng::new(0x5DEE_CE66_D123_4567);
+        let mut sum_cash: i128 = 0;
+        let mut reduce_or_flip = 0u32;
+
+        for _ in 0..500 {
+            let old_net = inv.net(t);
+            let qty = rng.range(1, 12_345_678) | 1; // `| 1` → always odd µshares
+            let price = rng.range(1, 999_983); // µUSDC/share, large-prime ceiling
+            let buy = rng.coin();
+            let signed_qty = if buy { qty } else { -qty };
+            // cash = ∓ price·qty/1e6, sign per the money path (− buy / + sell).
+            let mag = price * qty / SHARE;
+            let cash = Usdc(if buy { -mag } else { mag });
+
+            // Count the fills that hit the rounding-prone reduce/flip branches.
+            if old_net != 0 && (old_net > 0) != buy {
+                reduce_or_flip += 1;
+            }
+
+            inv.on_fill(t, signed_qty, cash);
+            sum_cash += cash.0;
+            assert_eq!(
+                inv.realized(t).0 - inv.basis(t).0,
+                sum_cash,
+                "cash conservation must hold exactly after every fill"
+            );
+        }
+        assert!(
+            reduce_or_flip > 0,
+            "sequence must exercise the reduce/flip rounding branches"
+        );
     }
 }
