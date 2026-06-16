@@ -1952,11 +1952,15 @@ mod tests {
     /// venue's resting set. Pre-fix, `consume_fills` cannot resolve those fills'
     /// side from `placed` and DROPS them (warn-flood; inventory freezes).
     ///
-    /// INVARIANT: every fill the venue produces is booked — the MM's booked fills
-    /// (count + qty) equal the venue's emitted fills, and the "unknown resting
-    /// order" warning never fires.
+    /// INVARIANT: every fill the venue produces is booked AND durably persisted —
+    /// the store ends with exactly as many fill rows as the venue emitted, with
+    /// ZERO write errors (no FK-orphaned fills), and the "unknown resting order"
+    /// warning never fires.
     #[tokio::test]
     async fn mm_books_every_venue_fill_under_churn() {
+        use pm_store::Store;
+        use pm_store::writer::run_writer;
+
         let warns = WarnCapture::default();
         let logs = Arc::clone(&warns.0);
         let subscriber = tracing_subscriber::registry().with(warns);
@@ -1975,11 +1979,15 @@ mod tests {
         let mut inv_cfg = generous_inv();
         inv_cfg.max_inventory_usd = Usdc(30_000_000);
         inv_cfg.max_gross_inventory_usd = Usdc(60_000_000);
-        let (mut mm, mut store_rx, produced) =
+        let (mut mm, store_rx, produced) =
             build_loop_tally(fetcher, inv_cfg, params, tokens, Usdc(1_000_000_000));
 
-        let mut booked_count = 0usize;
-        let mut booked_qty: u128 = 0;
+        // Wire the loop's store channel to a REAL writer over an in-memory store,
+        // so every booked fill (and its FK-parent order row) is actually persisted
+        // — surfacing any orphaned-fill FK error as a store `write_error`.
+        let store = Store::open_in_memory().unwrap();
+        let writer = tokio::spawn(run_writer(store, store_rx));
+
         for i in 0..120u32 {
             // Oscillate the mid to force re-quotes (replaces) alongside the fills.
             let (b, a) = if i % 4 < 2 { (49u16, 51u16) } else { (48, 50) };
@@ -1988,23 +1996,19 @@ mod tests {
                 .unwrap()
                 .insert(TokenId(1), (cent_book(&[(b, 100 * SH)], &[(a, 100 * SH)]), true));
             mm.tick().await;
-            while let Ok(msg) = store_rx.try_recv() {
-                if let StoreMsg::FillSigned(row, _) = msg {
-                    booked_count += 1;
-                    booked_qty += u128::from(row.qty_micro.unsigned_abs());
-                }
-            }
         }
 
-        let produced = produced.lock().unwrap().clone();
-        let produced_count = produced.len();
-        let produced_qty: u128 = produced.iter().map(|(_, q)| u128::from(*q)).sum();
+        let produced_count = produced.lock().unwrap().len();
         let dropped = logs
             .lock()
             .unwrap()
             .iter()
             .filter(|m| m.contains("unknown resting order"))
             .count();
+
+        // Drop the loop (and thus its store_tx) so the writer drains and returns.
+        drop(mm);
+        let store = writer.await.unwrap();
 
         assert!(
             produced_count > 0,
@@ -2015,12 +2019,13 @@ mod tests {
             "the MM dropped {dropped} venue fills (\"unknown resting order\")"
         );
         assert_eq!(
-            booked_count, produced_count,
-            "every venue fill must be booked: venue produced {produced_count}, MM booked {booked_count}"
+            store.write_errors, 0,
+            "every booked fill must persist (no FK-orphaned fill rows)"
         );
         assert_eq!(
-            booked_qty, produced_qty,
-            "booked fill quantity must equal the venue's produced quantity"
+            store.count_fills().unwrap(),
+            produced_count as i64,
+            "the store must hold exactly one row per venue-produced fill (none dropped)"
         );
     }
 
