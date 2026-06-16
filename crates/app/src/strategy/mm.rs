@@ -18,11 +18,15 @@
 //!   kill cancels and exits cleanly.
 //! - **Paper only**: runs over the [`PaperMakerVenue`]; the live arm is Task 4.5.
 //!
+//! # Scope (Task 4.3 — skew + volatility pull, this task)
+//! - **Inventory SKEW**: [`skew_fair`] shifts `fair` (= mid) against inventory
+//!   inside [`compute_quotes`] — a long lowers BOTH quotes, a short raises them,
+//!   scaled by `clamp(net / inventory_cap, ±1)` up to `inventory_skew_bps`.
+//! - **Volatility pull**: [`InventoryRisk::vol_hint`] fires on a large + fast
+//!   mid move in [`MmLoop::quote`], excluding that token from the desired set so
+//!   `reconcile` cancels its resting quotes without replacing (a pull).
+//!
 //! # Deferred (left as clean seams — do NOT implement here)
-//! - **Inventory SKEW** of the quotes against inventory (Task 4.3) — plugs in
-//!   where `compute_quotes` derives the symmetric prices.
-//! - **Volatility pull** via [`InventoryRisk::vol_hint`] (Task 4.3) — plugs in
-//!   beside the `mark` call in [`MmLoop::mark_and_check`].
 //! - **Rebate accrual** (Task 4.4) — plugs in at fill consumption.
 //! - **Live venue + host wiring** (Task 4.5): `run` builds a concrete
 //!   [`PaperMakerVenue`], but the loop is generic over any
@@ -40,7 +44,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pm_core::book::{Book, Side};
 use pm_core::instrument::{MarketId, TokenId};
@@ -66,12 +70,16 @@ use super::{Strategy, StrategyCommand, StrategyCtx, StrategyId, StrategyStatus};
 /// Resolved quote-loop parameters (USD → µUSDC done once, up front).
 #[derive(Debug, Clone, Copy)]
 pub struct MmParams {
-    /// Total quoted spread around mid, in bps of $1 (1 bp = 100 µUSDC/share).
+    /// Total quoted spread around fair, in bps of $1 (1 bp = 100 µUSDC/share).
     pub spread_bps: u32,
     /// Quote-loop cadence.
     pub quote_refresh: Duration,
     /// Max notional per single quote (one side), µUSDC.
     pub max_quote_micro: i128,
+    /// Inventory-skew limit (Task 4.3): MAX fair-value shift at full per-market
+    /// inventory, bps of $1 (1 bp = 100 µUSDC/share). `0` disables skew. See
+    /// [`skew_fair`].
+    pub inventory_skew_bps: u32,
 }
 
 impl MmParams {
@@ -82,6 +90,7 @@ impl MmParams {
             spread_bps: mm.spread_bps,
             quote_refresh: Duration::from_millis(mm.quote_refresh_ms),
             max_quote_micro: pm_config::usd_to_microusdc(mm.max_quote_usd)?,
+            inventory_skew_bps: mm.inventory_skew_bps,
         })
     }
 }
@@ -215,23 +224,64 @@ fn quote_order(
     })
 }
 
-/// Compute the symmetric `(bid, ask)` quotes from a book + params, BEFORE the
-/// inventory cap check (that gate is applied in the loop). Pure so the quoting
-/// math is unit-tested without async.
+/// Shift `fair` (µUSDC/share) AGAINST inventory (Task 4.3, spec §7): a long
+/// (`net > 0`) LOWERS fair so BOTH quotes drop (less eager to buy more, keener
+/// to sell down); a short RAISES it. The magnitude is `skew_bps · 100 · r`
+/// µUSDC, where `r = clamp(net / max_inventory_shares, −1, +1)` and
+/// `max_inventory_shares` is the per-market cap (`max_inventory_micro` µUSDC)
+/// valued at `fair` — the same notional→µshares scaling as [`quote_order`].
 ///
-/// `fair = mid`; the half-spread (µUSDC) is `spread_bps · 100 / 2` (1 bp = 100
-/// µUSDC/share since $1.00 = 10_000 bps = 1_000_000 µUSDC). The bid rounds DOWN
-/// to a tick and the ask rounds UP (maker-favorable / never narrower); they are
-/// bumped apart to stay strictly non-crossing, and both must be interior ticks
-/// `[1, levels−1]` — otherwise the token is skipped (`(None, None)`).
+/// All-integer (µUSDC), no f64 in the money path: `net` is clamped to
+/// `±max_shares` so the ratio never exceeds 1, then `shift = skew_micro ·
+/// net_clamped / max_shares` truncates toward 0 (a slight UNDER-shift, never an
+/// over-shift; symmetric for long/short, matching the codebase's truncating
+/// integer money math). At FULL inventory the shift is exactly `skew_bps · 100`
+/// µUSDC. A flat book (`net == 0`), a non-positive cap/price, or `skew_bps == 0`
+/// returns `fair` unchanged. The skew only moves `fair`; [`compute_quotes`]'s
+/// existing tick clamps then keep the quote non-crossing and inside the interior
+/// range (a skew that pushes a side out just skips that quote — never a cross).
+fn skew_fair(fair: i128, net_micro: i128, max_inventory_micro: i128, skew_bps: u32) -> i128 {
+    if skew_bps == 0 || net_micro == 0 || max_inventory_micro <= 0 || fair <= 0 {
+        return fair;
+    }
+    // Per-market cap (µUSDC) valued at `fair` → max inventory in µshares
+    // (µUSDC × µshares/share ÷ µUSDC/share), mirroring `quote_order`'s sizing.
+    let max_shares = max_inventory_micro.saturating_mul(1_000_000) / fair;
+    if max_shares <= 0 {
+        return fair;
+    }
+    // r = clamp(net / max_shares, −1, +1), realized by clamping net to ±max.
+    let net_clamped = net_micro.clamp(-max_shares, max_shares);
+    // Max shift at full inventory, µUSDC (1 bp = 100 µUSDC/share).
+    let skew_micro = i128::from(skew_bps).saturating_mul(100);
+    let shift = skew_micro.saturating_mul(net_clamped) / max_shares;
+    fair - shift
+}
+
+/// Compute the `(bid, ask)` quotes from a book + params, BEFORE the inventory
+/// cap check (that gate is applied in the loop). Pure so the quoting math is
+/// unit-tested without async.
 ///
-/// SKEW (Task 4.3) plugs in here: shift `fair` (or the half-spreads) against
-/// inventory before rounding.
+/// `fair = mid` shifted against inventory by [`skew_fair`] (Task 4.3: a long
+/// lowers BOTH quotes, a short raises them; `net == 0` or `inventory_skew_bps ==
+/// 0` leaves `fair = mid`, i.e. the Task-4.2 symmetric quote). The half-spread
+/// (µUSDC) is `spread_bps · 100 / 2` (1 bp = 100 µUSDC/share since $1.00 =
+/// 10_000 bps = 1_000_000 µUSDC). The bid rounds DOWN to a tick and the ask
+/// rounds UP (maker-favorable / never narrower); they are bumped apart to stay
+/// strictly non-crossing, and both must be interior ticks `[1, levels−1]` —
+/// otherwise the token is skipped (`(None, None)`). These clamps bound the skew:
+/// it can never cross the book or leave the valid range (it just skips a side).
+///
+/// `net_micro` is the strategy's current signed net for `token` (µshares) and
+/// `max_inventory_micro` the per-market inventory cap (µUSDC) the skew
+/// normalizes against — sourced from [`InventoryRisk`] in the loop.
 fn compute_quotes(
     book: &Book,
     token: TokenId,
     params: &MmParams,
     notional_micro: i128,
+    net_micro: i128,
+    max_inventory_micro: i128,
 ) -> (Option<MakerOrder>, Option<MakerOrder>) {
     let ts = book.ts();
     let (Some(best_bid), Some(best_ask)) = (book.bids.best(), book.asks.best()) else {
@@ -240,8 +290,9 @@ fn compute_quotes(
     let unit = i128::from(ts.unit_microusdc());
     let levels = i128::from(ts.levels());
 
-    // fair = mid (µUSDC/share); half-spread in µUSDC (1 bp = 100 µUSDC).
-    let fair = (i128::from(best_bid.microusdc(ts)) + i128::from(best_ask.microusdc(ts))) / 2;
+    // fair = mid skewed against inventory (Task 4.3); half-spread in µUSDC.
+    let mid = (i128::from(best_bid.microusdc(ts)) + i128::from(best_ask.microusdc(ts))) / 2;
+    let fair = skew_fair(mid, net_micro, max_inventory_micro, params.inventory_skew_bps);
     let half = i128::from(params.spread_bps) * 100 / 2;
 
     // bid rounds DOWN (floor), ask rounds UP (ceil) — never narrower than asked.
@@ -323,6 +374,9 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
     /// venue, then record any newly-placed orders (+ write their order rows).
     async fn quote(&mut self) {
         let tokens = self.tokens.clone();
+        // Per-market inventory cap (µUSDC) the skew normalizes against — read
+        // once; the skew is otherwise a pure function of the per-token net.
+        let max_inventory_micro = self.inv.config().max_inventory_usd.0;
         let mut desired: Vec<MakerOrder> = Vec::new();
         let mut desired_ts: HashMap<(TokenId, Side), TickSize> = HashMap::new();
         for token in tokens {
@@ -331,7 +385,28 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 continue;
             };
             let ts = book.ts();
-            let (bid, ask) = compute_quotes(&book, token, &self.params, self.notional_micro);
+            // VOLATILITY PULL (Task 4.3, spec §7): a large + FAST mid move makes
+            // `vol_hint` fire — PULL this token's quotes for this tick by leaving
+            // them OUT of `desired`, so `reconcile` cancels any resting quotes and
+            // places none (a pull, NOT a replace — we don't want to be run over
+            // during the move). Non-sticky + per-token: `vol_hint` only fires on a
+            // fresh large move, so a calmer later tick re-quotes with no cooldown
+            // bookkeeping. A pulled token produces no quotes regardless of skew.
+            if let Some(mid) = mid_micro(&book)
+                && self.inv.vol_hint(token, mid, Instant::now())
+            {
+                continue;
+            }
+            // Skew fair against the strategy's current signed net for this token.
+            let net_micro = self.inv.net(token);
+            let (bid, ask) = compute_quotes(
+                &book,
+                token,
+                &self.params,
+                self.notional_micro,
+                net_micro,
+                max_inventory_micro,
+            );
             for o in [bid, ask].into_iter().flatten() {
                 let signed_qty = match o.side {
                     Side::Bid => o.size.0 as i128,
@@ -462,8 +537,10 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 marks.insert(token, mid);
             }
         }
-        // VOLATILITY PULL (Task 4.3) plugs in beside this mark: feed mids to
-        // `inv.vol_hint(...)` and pull quotes on a `true` hint.
+        // VOLATILITY PULL (Task 4.3) lives in `quote()`, not here: the pull must
+        // exclude a token from THIS tick's desired set (so `reconcile` cancels
+        // without replacing), which is built there. `mark` only owns the latched
+        // safety stop below.
         let _ = self.inv.mark(&marks);
         if self.inv.halted().is_some() {
             self.halted = true;
@@ -675,10 +752,17 @@ mod tests {
     }
 
     fn mk_params(spread_bps: u32, max_quote_usd: f64) -> MmParams {
+        // Skew OFF by default so the Task-4.2 quoting/fill/lifecycle tests keep
+        // their exact symmetric expectations; the skew tests opt in below.
+        mk_params_skew(spread_bps, max_quote_usd, 0)
+    }
+
+    fn mk_params_skew(spread_bps: u32, max_quote_usd: f64, inventory_skew_bps: u32) -> MmParams {
         MmParams {
             spread_bps,
             quote_refresh: Duration::from_millis(10),
             max_quote_micro: pm_config::usd_to_microusdc(max_quote_usd).unwrap(),
+            inventory_skew_bps,
         }
     }
 
@@ -742,7 +826,8 @@ mod tests {
     fn compute_quotes_symmetric_around_mid() {
         let book = mid50_book(); // mid 0.50
         let params = mk_params(200, 5.0);
-        let (bid, ask) = compute_quotes(&book, TokenId(1), &params, params.max_quote_micro);
+        let (bid, ask) =
+            compute_quotes(&book, TokenId(1), &params, params.max_quote_micro, 0, 0);
         let bid = bid.expect("bid");
         let ask = ask.expect("ask");
 
@@ -767,7 +852,8 @@ mod tests {
     fn compute_quotes_skips_when_out_of_range() {
         let book = mid50_book();
         let params = mk_params(20_000, 5.0); // half = 100 ticks → out of [1, 99]
-        let (bid, ask) = compute_quotes(&book, TokenId(1), &params, params.max_quote_micro);
+        let (bid, ask) =
+            compute_quotes(&book, TokenId(1), &params, params.max_quote_micro, 0, 0);
         assert!(bid.is_none() && ask.is_none());
     }
 
@@ -776,7 +862,8 @@ mod tests {
     fn compute_quotes_skips_one_sided_book() {
         let book = cent_book(&[(48, 100 * SH)], &[]);
         let params = mk_params(200, 5.0);
-        let (bid, ask) = compute_quotes(&book, TokenId(1), &params, params.max_quote_micro);
+        let (bid, ask) =
+            compute_quotes(&book, TokenId(1), &params, params.max_quote_micro, 0, 0);
         assert!(bid.is_none() && ask.is_none());
     }
 
@@ -786,7 +873,8 @@ mod tests {
     fn compute_quotes_never_crosses_on_tiny_spread() {
         let book = mid50_book();
         let params = mk_params(1, 5.0); // 1 bp ≪ one tick
-        let (bid, ask) = compute_quotes(&book, TokenId(1), &params, params.max_quote_micro);
+        let (bid, ask) =
+            compute_quotes(&book, TokenId(1), &params, params.max_quote_micro, 0, 0);
         let bid = bid.expect("bid");
         let ask = ask.expect("ask");
         assert!(
@@ -795,6 +883,99 @@ mod tests {
             bid.price.get(),
             ask.price.get()
         );
+    }
+
+    // ── Inventory skew (Task 4.3) ──────────────────────────────────────────────
+
+    /// $5 per-market cap valued at the 0.50 mid → 10 shares = full inventory.
+    const SKEW_CAP_MICRO: i128 = 5_000_000; // $5
+    const FULL_CAP_SHARES: i128 = 10 * SH as i128; // 10 sh @ $0.50 = $5
+
+    /// Same book/spread as `compute_quotes_symmetric_around_mid`, but a LONG net
+    /// shifts BOTH quotes strictly DOWN (offload), a SHORT shifts BOTH strictly
+    /// UP, and flat (net 0) is byte-identical to the Task-4.2 symmetric quote.
+    #[test]
+    fn skew_long_inventory_shifts_both_quotes_down() {
+        let book = mid50_book(); // mid 0.50
+        let params = mk_params_skew(200, 5.0, 150); // half = 0.01; full skew = 1.5¢
+
+        // Flat → no skew → the Task-4.2 symmetric quote (0.49 / 0.51).
+        let (fb, fa) = compute_quotes(&book, TokenId(1), &params, params.max_quote_micro, 0, SKEW_CAP_MICRO);
+        let (fb, fa) = (fb.expect("flat bid"), fa.expect("flat ask"));
+        assert_eq!((fb.price, fa.price), (px(49), px(51)), "flat == Task 4.2");
+
+        // Full-cap LONG → fair −1.5¢ to 0.485 → bid 0.47 / ask 0.50, both strictly
+        // below the flat quote.
+        let (lb, la) =
+            compute_quotes(&book, TokenId(1), &params, params.max_quote_micro, FULL_CAP_SHARES, SKEW_CAP_MICRO);
+        let (lb, la) = (lb.expect("long bid"), la.expect("long ask"));
+        assert_eq!((lb.price, la.price), (px(47), px(50)), "long lowers both quotes");
+        assert!(lb.price.get() < fb.price.get() && la.price.get() < fa.price.get());
+
+        // Full-cap SHORT → fair +1.5¢ to 0.515 → bid 0.50 / ask 0.53, both strictly
+        // above the flat quote.
+        let (sb, sa) =
+            compute_quotes(&book, TokenId(1), &params, params.max_quote_micro, -FULL_CAP_SHARES, SKEW_CAP_MICRO);
+        let (sb, sa) = (sb.expect("short bid"), sa.expect("short ask"));
+        assert_eq!((sb.price, sa.price), (px(50), px(53)), "short raises both quotes");
+        assert!(sb.price.get() > fb.price.get() && sa.price.get() > fa.price.get());
+    }
+
+    /// The skew magnitude scales LINEARLY with inventory: full cap ≈ the full
+    /// `inventory_skew_bps` shift, half cap ≈ half, flat = none, and inventory
+    /// beyond the cap clamps to the full shift (`r` saturates at ±1).
+    #[test]
+    fn skew_magnitude_scales_with_inventory() {
+        const MID: i128 = 500_000;
+        let full_micro = i128::from(150u32) * 100; // 1.5¢ = 15_000 µUSDC at full cap
+
+        // Flat → no shift.
+        assert_eq!(skew_fair(MID, 0, SKEW_CAP_MICRO, 150), MID);
+
+        // Full-cap long → exactly the configured max shift, DOWN.
+        let full_long = skew_fair(MID, FULL_CAP_SHARES, SKEW_CAP_MICRO, 150);
+        assert_eq!(MID - full_long, full_micro, "full cap → full skew");
+
+        // Half-cap long → ~half the shift (exact here: 7_500).
+        let half_long = skew_fair(MID, FULL_CAP_SHARES / 2, SKEW_CAP_MICRO, 150);
+        assert_eq!(MID - half_long, full_micro / 2, "half cap → half skew");
+
+        // Short is symmetric: same magnitude, opposite sign (UP).
+        let full_short = skew_fair(MID, -FULL_CAP_SHARES, SKEW_CAP_MICRO, 150);
+        assert_eq!(full_short - MID, full_micro, "short skews up by the same amount");
+
+        // Beyond the cap clamps to the full shift (no runaway).
+        let over_cap = skew_fair(MID, 10 * FULL_CAP_SHARES, SKEW_CAP_MICRO, 150);
+        assert_eq!(over_cap, full_long, "inventory past the cap clamps to full skew");
+    }
+
+    /// Extreme inventory + a tiny spread near a book edge must never cross or
+    /// leave the interior tick range, and never panic: a side pushed out is just
+    /// skipped, and a still-valid quote stays strictly non-crossing.
+    #[test]
+    fn skew_never_crosses_or_leaves_range() {
+        let extreme = 1_000_000_000i128; // ≫ any cap → ratio saturates at ±1
+        let tiny_cap = 1_000_000i128; // $1
+        let params = mk_params_skew(1, 5.0, 150); // 1 bp spread, 1.5¢ full skew
+
+        // Low edge: bid 0.01 / ask 0.03 (mid 0.02). A full-cap LONG skews fair
+        // below tick 1 → the bid leaves [1, 99] → token skipped (no panic).
+        let low = cent_book(&[(1, 100 * SH)], &[(3, 100 * SH)]);
+        let (lb, la) = compute_quotes(&low, TokenId(1), &params, params.max_quote_micro, extreme, tiny_cap);
+        assert!(lb.is_none() && la.is_none(), "skew past the low edge skips the token");
+
+        // High edge: bid 0.97 / ask 0.99 (mid 0.98). A full-cap SHORT skews fair
+        // above tick 99 → the ask leaves the range → token skipped.
+        let high = cent_book(&[(97, 100 * SH)], &[(99, 100 * SH)]);
+        let (hb, ha) = compute_quotes(&high, TokenId(1), &params, params.max_quote_micro, -extreme, tiny_cap);
+        assert!(hb.is_none() && ha.is_none(), "skew past the high edge skips the token");
+
+        // Mid-book: an extreme long with a sub-tick spread still yields a VALID,
+        // strictly non-crossing quote (skew shifts it, the clamps keep ask > bid).
+        let mid = mid50_book();
+        let (mb, ma) = compute_quotes(&mid, TokenId(1), &params, params.max_quote_micro, extreme, SKEW_CAP_MICRO);
+        let (mb, ma) = (mb.expect("mid bid"), ma.expect("mid ask"));
+        assert!(ma.price.get() > mb.price.get(), "skewed quote stays non-crossing");
     }
 
     // ── Inventory cap gating ───────────────────────────────────────────────────
@@ -1005,6 +1186,57 @@ mod tests {
             mm.venue.open_orders().await.unwrap().len(),
             2,
             "resume re-quotes"
+        );
+    }
+
+    // ── Volatility quote-pull (Task 4.3) ───────────────────────────────────────
+
+    /// A large + FAST mid move makes `vol_hint` fire → the token's resting quotes
+    /// are CANCELLED and NOT replaced this tick (a pull, not a replace). A later
+    /// calm tick (the move settled) re-quotes — the pull is non-sticky.
+    #[tokio::test]
+    async fn vol_hint_pulls_quotes_without_replace() {
+        let tokens = vec![TokenId(1)];
+        let (fetcher, shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        // vol_pull_ticks = 5 (5¢ threshold). A long window so the test never
+        // races the wall clock between successive quote() calls.
+        let mut inv_cfg = generous_inv();
+        inv_cfg.vol_window = Duration::from_secs(3600);
+        let params = mk_params(200, 5.0); // skew OFF — isolate the pull
+        let (mut mm, _store_rx, _status_rx) =
+            build_loop(fetcher, inv_cfg, params, tokens, Usdc(1_000_000_000));
+
+        // Tick 1 (mid 0.50): vol_hint's FIRST observation can't fire → quotes rest.
+        mm.quote().await;
+        assert_eq!(
+            mm.venue.open_orders().await.unwrap().len(),
+            2,
+            "a calm first tick rests bid + ask"
+        );
+
+        // A large + FAST jump 0.50 → 0.70 (+20¢ ≫ 5¢) within the window.
+        shared.lock().unwrap().insert(
+            TokenId(1),
+            (cent_book(&[(68, 100 * SH)], &[(72, 100 * SH)]), true),
+        );
+
+        // Tick 2: vol_hint fires → PULL. The resting quotes are cancelled and
+        // NONE are placed (asserting the cancel happened and there was no replace).
+        mm.quote().await;
+        assert!(
+            mm.venue.open_orders().await.unwrap().is_empty(),
+            "vol pull cancels the resting quotes WITHOUT replacing"
+        );
+        assert!(mm.qm.tracked().is_empty(), "nothing tracked while pulled");
+
+        // Tick 3 (book unchanged at 0.70): the move has settled (0¢ since last) →
+        // vol_hint quiet → the token re-quotes (the pull is non-sticky).
+        mm.quote().await;
+        assert_eq!(
+            mm.venue.open_orders().await.unwrap().len(),
+            2,
+            "a calm later tick re-quotes"
         );
     }
 

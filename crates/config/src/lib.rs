@@ -418,6 +418,14 @@ pub struct Mm {
     /// Max notional per single quote (one side), USD. Per-side size =
     /// notional / price; the inventory caps then clamp it further.
     pub max_quote_usd: f64,
+    /// Inventory SKEW (Task 4.3, spec §7): the MAXIMUM fair-value shift applied
+    /// at FULL per-market inventory, in bps of $1 (100 bps = $0.01 = one Cent
+    /// tick). The MM shifts BOTH quotes against inventory — a long lowers them
+    /// (less eager to buy more, keener to sell down), a short raises them —
+    /// scaled linearly by `clamp(net / inventory_cap_shares, −1, +1)`. `0`
+    /// disables skew (the Task-4.2 symmetric quoting); any `u32` is valid (a
+    /// value large enough to push a side out of range just skips that quote).
+    pub inventory_skew_bps: u32,
 }
 
 impl Default for Mm {
@@ -428,6 +436,7 @@ impl Default for Mm {
             spread_bps: 200,
             quote_refresh_ms: 1500,
             max_quote_usd: 5.0,
+            inventory_skew_bps: 150,
         }
     }
 }
@@ -621,6 +630,10 @@ impl Config {
                 "strategies.mm.max_quote_usd must be > 0",
             ));
         }
+        // `inventory_skew_bps` needs no bound: as a `u32` it is always ≥ 0 (0
+        // disables skew), and the quote loop clamps the skewed fair to the
+        // interior tick range — an over-large skew just skips that side rather
+        // than producing an invalid or crossed quote. Documented, not checked.
         Ok(())
     }
 }
@@ -1006,13 +1019,14 @@ mod tests {
         assert_eq!(c.strategies.mm.spread_bps, 200);
         assert_eq!(c.strategies.mm.quote_refresh_ms, 1500);
         assert!((c.strategies.mm.max_quote_usd - 5.0).abs() < 1e-9);
+        assert_eq!(c.strategies.mm.inventory_skew_bps, 150);
         c.validate().unwrap();
     }
 
     #[test]
     fn mm_strategy_section_parses() {
         let c = Config::from_toml_str(
-            "[strategies.mm]\nenabled = true\nlive = false\nspread_bps = 300\nquote_refresh_ms = 1000\nmax_quote_usd = 7.5\n",
+            "[strategies.mm]\nenabled = true\nlive = false\nspread_bps = 300\nquote_refresh_ms = 1000\nmax_quote_usd = 7.5\ninventory_skew_bps = 250\n",
         )
         .unwrap();
         assert!(c.strategies.mm.enabled);
@@ -1020,6 +1034,7 @@ mod tests {
         assert_eq!(c.strategies.mm.spread_bps, 300);
         assert_eq!(c.strategies.mm.quote_refresh_ms, 1000);
         assert!((c.strategies.mm.max_quote_usd - 7.5).abs() < 1e-9);
+        assert_eq!(c.strategies.mm.inventory_skew_bps, 250);
     }
 
     #[test]
@@ -1029,6 +1044,15 @@ mod tests {
         assert!(c.strategies.mm.enabled);
         assert_eq!(c.strategies.mm.spread_bps, 200, "untouched field stays default");
         assert_eq!(c.strategies.mm.quote_refresh_ms, 1500);
+        assert_eq!(c.strategies.mm.inventory_skew_bps, 150, "untouched field stays default");
+    }
+
+    #[test]
+    fn mm_inventory_skew_zero_is_valid() {
+        // 0 disables skew (Task-4.2 symmetric quoting) and must parse/validate.
+        let c = Config::from_toml_str("[strategies.mm]\ninventory_skew_bps = 0\n").unwrap();
+        assert_eq!(c.strategies.mm.inventory_skew_bps, 0);
+        c.validate().unwrap();
     }
 
     #[test]
