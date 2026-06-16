@@ -20,6 +20,7 @@ pub struct Config {
     pub store: Store,
     pub tui: Tui,
     pub live: Live,
+    pub inventory: Inventory,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -341,6 +342,43 @@ impl Default for Live {
     }
 }
 
+/// Per-strategy inventory-risk caps for inventory-bearing strategies (spec §5,
+/// Phase 2). Maps to `pm_risk::inventory::InventoryConfig` via
+/// `pm_app::wiring::inventory_config`. INERT until a strategy opts in (Phase 4);
+/// defaults are deliberately conservative (small caps, tight stop).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Inventory {
+    /// Per-market net exposure cap, USD.
+    pub max_inventory_usd: f64,
+    /// Gross inventory cap summed across markets, USD.
+    pub max_gross_inventory_usd: f64,
+    /// MtM loss that latches the tighter inventory stop-loss halt + flatten, USD.
+    pub inventory_stop_loss_usd: f64,
+    /// Broader per-strategy session realized+unrealized floor, USD. Operationally
+    /// `>= inventory_stop_loss_usd` (validated): the stop is the inner trigger,
+    /// this is the wider backstop.
+    pub daily_loss_usd: f64,
+    /// Volatility "pull-quotes" hint threshold, in ticks (1 tick = 1 cent): a mid
+    /// move beyond this many ticks within `vol_window_ms` advises pulling quotes.
+    pub vol_pull_ticks: u32,
+    /// Look-back window for the volatility hint, milliseconds.
+    pub vol_window_ms: u64,
+}
+
+impl Default for Inventory {
+    fn default() -> Self {
+        Inventory {
+            max_inventory_usd: 50.0,
+            max_gross_inventory_usd: 100.0,
+            inventory_stop_loss_usd: 25.0,
+            daily_loss_usd: 50.0,
+            vol_pull_ticks: 5,
+            vol_window_ms: 2000,
+        }
+    }
+}
+
 impl Config {
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
         let cfg: Self = toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
@@ -476,6 +514,39 @@ impl Config {
         }
         if self.risk.mid_spread_cap_ticks == 0 {
             return Err(ConfigError::BadMoney("risk.mid_spread_cap_ticks must be ≥ 1"));
+        }
+        // Inventory-risk caps (Phase 2; inert until a strategy opts in). All money
+        // must be positive + finite; the broader daily floor must not sit tighter
+        // than the stop-loss (mark checks the stop first, then the daily floor).
+        if self.inventory.max_inventory_usd <= 0.0 || !self.inventory.max_inventory_usd.is_finite() {
+            return Err(ConfigError::BadMoney(
+                "inventory.max_inventory_usd must be > 0",
+            ));
+        }
+        if self.inventory.max_gross_inventory_usd <= 0.0
+            || !self.inventory.max_gross_inventory_usd.is_finite()
+        {
+            return Err(ConfigError::BadMoney(
+                "inventory.max_gross_inventory_usd must be > 0",
+            ));
+        }
+        if self.inventory.inventory_stop_loss_usd <= 0.0
+            || !self.inventory.inventory_stop_loss_usd.is_finite()
+        {
+            return Err(ConfigError::BadMoney(
+                "inventory.inventory_stop_loss_usd must be > 0",
+            ));
+        }
+        if self.inventory.daily_loss_usd <= 0.0 || !self.inventory.daily_loss_usd.is_finite() {
+            return Err(ConfigError::BadMoney("inventory.daily_loss_usd must be > 0"));
+        }
+        if self.inventory.daily_loss_usd < self.inventory.inventory_stop_loss_usd {
+            return Err(ConfigError::BadMoney(
+                "inventory.daily_loss_usd must be ≥ inventory_stop_loss_usd",
+            ));
+        }
+        if self.inventory.vol_window_ms < 1 {
+            return Err(ConfigError::BadMoney("inventory.vol_window_ms must be ≥ 1"));
         }
         Ok(())
     }
@@ -785,6 +856,66 @@ mod tests {
 
         let mut c = Config::default();
         c.live.min_leg_value_usd = f64::NAN;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn inventory_defaults_are_conservative() {
+        let c = Config::default();
+        assert!((c.inventory.max_inventory_usd - 50.0).abs() < 1e-9);
+        assert!((c.inventory.max_gross_inventory_usd - 100.0).abs() < 1e-9);
+        assert!((c.inventory.inventory_stop_loss_usd - 25.0).abs() < 1e-9);
+        assert!((c.inventory.daily_loss_usd - 50.0).abs() < 1e-9);
+        assert_eq!(c.inventory.vol_pull_ticks, 5);
+        assert_eq!(c.inventory.vol_window_ms, 2000);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn inventory_section_parses() {
+        let c = Config::from_toml_str(
+            "[inventory]\nmax_inventory_usd = 75.0\ndaily_loss_usd = 60.0\nvol_pull_ticks = 8\nvol_window_ms = 1500\n",
+        )
+        .unwrap();
+        assert!((c.inventory.max_inventory_usd - 75.0).abs() < 1e-9);
+        assert!((c.inventory.daily_loss_usd - 60.0).abs() < 1e-9);
+        assert_eq!(c.inventory.vol_pull_ticks, 8);
+        assert_eq!(c.inventory.vol_window_ms, 1500);
+        // Untouched fields keep their conservative defaults.
+        assert!((c.inventory.inventory_stop_loss_usd - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inventory_validation_rejects_bad_values() {
+        // stop-loss must be > 0
+        assert!(Config::from_toml_str("[inventory]\ninventory_stop_loss_usd = 0.0\n").is_err());
+        // daily floor must be ≥ stop-loss (20 < 25 default stop → reject)
+        assert!(Config::from_toml_str("[inventory]\ndaily_loss_usd = 20.0\n").is_err());
+        // vol_window_ms must be ≥ 1
+        assert!(Config::from_toml_str("[inventory]\nvol_window_ms = 0\n").is_err());
+        // caps must be positive + finite
+        assert!(Config::from_toml_str("[inventory]\nmax_inventory_usd = 0.0\n").is_err());
+        assert!(Config::from_toml_str("[inventory]\nmax_gross_inventory_usd = -1.0\n").is_err());
+        // a daily floor exactly equal to the stop is allowed (inclusive)
+        let c = Config::from_toml_str(
+            "[inventory]\ninventory_stop_loss_usd = 40.0\ndaily_loss_usd = 40.0\n",
+        )
+        .unwrap();
+        assert!((c.inventory.daily_loss_usd - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inventory_floats_must_be_finite() {
+        let mut c = Config::default();
+        c.inventory.inventory_stop_loss_usd = f64::INFINITY;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.inventory.daily_loss_usd = f64::NAN;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.inventory.max_inventory_usd = f64::NAN;
         assert!(c.validate().is_err());
     }
 }

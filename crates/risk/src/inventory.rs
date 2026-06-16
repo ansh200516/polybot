@@ -5,14 +5,29 @@
 //!
 //! Implemented so far: inventory STATE + `on_fill` accounting (Task 2.1), the
 //! pre-fill cap check `check_quote` (Task 2.2), and mark-to-market `mark` with
-//! the latched stop-loss (Task 2.3). The flatten directive, the volatility
-//! hint, the daily-loss check, and config-file parsing (Task 2.4) are
-//! intentionally absent here.
+//! the latched stop-loss (Task 2.3). Task 2.4 adds the [`InventoryRisk::flatten_directive`]
+//! execution intent, the daily-loss latch ([`InvHalt::DailyLoss`]), and the
+//! non-sticky volatility [`InventoryRisk::vol_hint`]. Config-file parsing of the
+//! `[inventory]` section lives in `pm-config`; `pm-app`'s `wiring::inventory_config`
+//! converts it to [`InventoryConfig`]. Everything stays inert until a strategy
+//! opts in (Phase 4).
+//!
+//! Like `RiskEngine` in `lib.rs`, this module is a PURE state machine — no I/O
+//! and no internal clock. The volatility hint takes the caller's `now: Instant`
+//! exactly as `RiskEngine::record_error` does.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use pm_core::instrument::TokenId;
-use pm_core::num::{div_ceil_i128, Usdc, ONE_SHARE_MICRO};
+use pm_core::num::{div_ceil_i128, TickSize, Usdc, ONE_SHARE_MICRO};
+
+/// Tick basis for the volatility hint: 1 tick = 1 cent = 10_000 µUSDC, the
+/// dominant Polymarket increment (`TickSize::Cent`). `pm-risk` is pure and holds
+/// no per-token tick size, so [`InventoryRisk::vol_hint`] assumes the cent grid
+/// the Phase-4 market-making strategy quotes on; a finer-grid strategy can
+/// pre-scale its `vol_pull_ticks` to match.
+const VOL_TICK_MICRO: u64 = TickSize::Cent.unit_microusdc();
 
 /// Per-strategy inventory caps (spec §5, all µUSDC). Defined now so the type is
 /// stable across Phase 2, but this task only STORES it — the cap CHECKS land in
@@ -25,10 +40,26 @@ pub struct InventoryConfig {
     /// Gross inventory cap, summed across markets. Enforced by `check_quote`
     /// (Task 2.2).
     pub max_gross_inventory_usd: Usdc,
-    /// Mark-to-market loss that latches an inventory halt + flatten. Task 2.4.
+    /// Mark-to-market loss that latches the TIGHTER `StopLoss` halt + flatten:
+    /// `mark` trips it when `mtm_pnl ≤ −inventory_stop_loss_usd` (Task 2.4,
+    /// checked FIRST). Operationally the inner of the two MtM floors
+    /// (`≤ daily_loss_usd`).
     pub inventory_stop_loss_usd: Usdc,
-    /// Per-strategy daily realized+unrealized floor. Task 2.4.
+    /// Per-strategy session realized+unrealized floor — the BROADER backstop that
+    /// latches `DailyLoss` when `mtm_pnl ≤ −daily_loss_usd` and the tighter stop
+    /// has not already tripped (Task 2.4). SAME `mtm_pnl = realized + unrealized`
+    /// measure as the stop-loss (Task 2.3); operationally `≥ inventory_stop_loss_usd`,
+    /// so in normal config the stop binds first and `DailyLoss` is the wider net.
     pub daily_loss_usd: Usdc,
+    /// Volatility "pull-quotes" hint threshold in TICKS: a mid move of more than
+    /// this many ticks within `vol_window` makes [`InventoryRisk::vol_hint`]
+    /// return `true`. One tick = `VOL_TICK_MICRO` (1 cent). Advisory/non-sticky.
+    pub vol_pull_ticks: u32,
+    /// Look-back window for the volatility hint: a move counts as volatility only
+    /// if it lands within this of the previous observation for that token (a
+    /// slower move is ordinary drift, not volatility). See
+    /// [`InventoryRisk::vol_hint`].
+    pub vol_window: Duration,
 }
 
 /// One token's signed-net + average-cost accounting (the per-token view).
@@ -102,13 +133,35 @@ pub type Marks = HashMap<TokenId, u64>;
 /// Why an inventory halt latched. Sticky once set (spec §5: "like
 /// `SessionLoss`") — mirrors `lib.rs`'s `HaltReason`: there is no clear path,
 /// the strategy restarts to clear it.
+///
+/// Both variants key off the SAME `mtm_pnl = realized + unrealized` measure
+/// `mark` computes (Task 2.3); they differ only in threshold and in which is
+/// checked first. `StopLoss` is the tighter, flatten-triggering floor and is
+/// checked FIRST; `DailyLoss` is the broader session backstop. With the
+/// operational invariant `daily_loss_usd ≥ inventory_stop_loss_usd`, the stop
+/// binds before the daily floor — so `DailyLoss` is the wider net for configs
+/// where the two floors are deliberately ordered the other way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvHalt {
-    /// Mark-to-market P&L (`realized + unrealized`) fell to
-    /// `−inventory_stop_loss_usd` or lower. (The `daily_loss_usd` check — which
-    /// needs a daily baseline this module does not yet track — is DEFERRED to
-    /// Task 2.4, so there is no `DailyLoss` variant yet.)
+    /// `mtm_pnl ≤ −inventory_stop_loss_usd`. The tighter MtM floor; checked
+    /// first in `mark` so it wins the reason when both floors are crossed.
     StopLoss,
+    /// `mtm_pnl ≤ −daily_loss_usd` while the tighter `StopLoss` was NOT crossed
+    /// this cycle. The broader per-strategy session floor (Task 2.4).
+    DailyLoss,
+}
+
+/// Risk → execution intent emitted by [`InventoryRisk::flatten_directive`] once
+/// any inventory halt has latched. Cancelling ALL resting quotes is implied;
+/// `unwind` additionally asks the strategy to market-close (unwind) the standing
+/// inventory. Phase 2 keeps `unwind = false`: a latched halt stops quoting and
+/// cancels resting orders, but does NOT auto-unwind held inventory (that policy
+/// is left to a later phase / operator).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Flatten {
+    /// `false` (Phase 2): cancel resting quotes only. `true`: also market-close
+    /// the standing inventory.
+    pub unwind: bool,
 }
 
 /// Snapshot returned by `mark`: the marked P&L split plus any latched halt.
@@ -129,9 +182,10 @@ pub struct InventoryStatus {
     /// Held (non-flat) tokens that had NO real entry in `marks` this cycle,
     /// sorted by `TokenId` (deterministic). Non-empty means the marks set was
     /// incomplete: the worst-case loss above is still reported, but the sticky
-    /// `StopLoss` latch was WITHHELD this cycle so a transient data gap can't
-    /// permanently kill the session. Task 2.4 turns this into a NON-sticky
-    /// "pull quotes / can't value" hint.
+    /// halt latch was WITHHELD this cycle so a transient data gap can't
+    /// permanently kill the session. A non-empty `unmarked` is itself a
+    /// "can't-value → pull quotes" signal that complements the non-sticky
+    /// [`InventoryRisk::vol_hint`] (Task 2.4).
     pub unmarked: Vec<TokenId>,
     /// The latched inventory halt, if any (sticky once set).
     pub halted: Option<InvHalt>,
@@ -159,6 +213,9 @@ pub struct InventoryRisk {
     by_token: HashMap<TokenId, TokenInventory>,
     /// Latched inventory halt (sticky): set by `mark`, never auto-cleared.
     halted: Option<InvHalt>,
+    /// Per-token last observed mid `(mid_micro, at)` for the volatility hint
+    /// (Task 2.4). Advisory only — never feeds the sticky halt.
+    last_mid: HashMap<TokenId, (u64, Instant)>,
 }
 
 impl InventoryRisk {
@@ -167,6 +224,7 @@ impl InventoryRisk {
             cfg,
             by_token: HashMap::new(),
             halted: None,
+            last_mid: HashMap::new(),
         }
     }
 
@@ -303,16 +361,20 @@ impl InventoryRisk {
     /// **Incomplete marks DON'T latch.** The sticky `StopLoss` latches only when
     /// EVERY held token was really marked (`unmarked` is empty). A transient
     /// data gap must never permanently kill the session, so a cycle with any
-    /// omitted held token reports the worst-case loss but WITHHOLDS the latch;
-    /// Task 2.4 turns `unmarked` into a NON-sticky "pull quotes" hint. An
-    /// explicit mark of 0 is a real entry (e.g. a resolved-worthless token) and
-    /// does NOT count as omitted.
+    /// omitted held token reports the worst-case loss but WITHHOLDS the latch; a
+    /// non-empty `unmarked` is a non-sticky "can't value → pull quotes" signal
+    /// (complementing `vol_hint`, Task 2.4). An explicit mark of 0 is a real
+    /// entry (e.g. a resolved-worthless token) and does NOT count as omitted.
     ///
-    /// **Latch:** when `unmarked` is empty, if not already halted and
-    /// `mtm_pnl ≤ −inventory_stop_loss_usd`, the `StopLoss` halt latches. First
-    /// halt wins and recovery never clears it (sticky), mirroring
-    /// `RiskEngine::update_session_pnl`; the boundary is inclusive (exactly
-    /// `−cap` trips), matching the session-loss cap.
+    /// **Latch:** when `unmarked` is empty and not already halted, `mark` checks
+    /// the two MtM floors against `mtm_pnl` in priority order — the tighter
+    /// `inventory_stop_loss_usd` FIRST (it is the flatten trigger), then the
+    /// broader `daily_loss_usd`. `mtm_pnl ≤ −inventory_stop_loss_usd` latches
+    /// `StopLoss`; otherwise `mtm_pnl ≤ −daily_loss_usd` latches `DailyLoss`, so
+    /// when both are crossed `StopLoss` wins the reason. First halt wins and
+    /// recovery never clears it (sticky), mirroring `RiskEngine::update_session_pnl`;
+    /// each boundary is inclusive (exactly `−cap` trips), matching the
+    /// session-loss cap. Both floors use the one `mtm_pnl` measure above.
     pub fn mark(&mut self, marks: &Marks) -> InventoryStatus {
         let mut realized: i128 = 0;
         let mut unrealized: i128 = 0;
@@ -350,16 +412,19 @@ impl InventoryRisk {
         unmarked.sort_unstable();
 
         let mtm = realized + unrealized;
-        // Sticky stop-loss latch — ONLY when every held token was really marked
+        // Sticky halt latch — ONLY when every held token was really marked
         // (`unmarked` empty): incomplete marks report the worst-case loss but
-        // must NOT permanently halt on a transient data gap. First halt wins,
-        // recovery never clears it (mirrors update_session_pnl).
-        // daily_loss_usd is DEFERRED to Task 2.4.
-        if self.halted.is_none()
-            && unmarked.is_empty()
-            && mtm <= -self.cfg.inventory_stop_loss_usd.0
-        {
-            self.halted = Some(InvHalt::StopLoss);
+        // must NOT permanently halt on a transient data gap. First halt wins and
+        // recovery never clears it (mirrors update_session_pnl). Both floors key
+        // off the same `mtm`; the TIGHTER stop-loss is checked FIRST (it is the
+        // flatten trigger), then the broader daily floor — so when both are
+        // crossed the latched reason is StopLoss.
+        if self.halted.is_none() && unmarked.is_empty() {
+            if mtm <= -self.cfg.inventory_stop_loss_usd.0 {
+                self.halted = Some(InvHalt::StopLoss);
+            } else if mtm <= -self.cfg.daily_loss_usd.0 {
+                self.halted = Some(InvHalt::DailyLoss);
+            }
         }
 
         InventoryStatus {
@@ -377,6 +442,57 @@ impl InventoryRisk {
     /// `RiskEngine::halted`).
     pub fn halted(&self) -> Option<InvHalt> {
         self.halted
+    }
+
+    /// Execution intent derived from the latch (Task 2.4): `Some` whenever ANY
+    /// inventory halt has latched (either `StopLoss` or `DailyLoss`) — the
+    /// strategy must stop quoting and cancel all resting quotes — and `None`
+    /// while unhalted. Phase 2 always asks to cancel quotes only
+    /// (`unwind = false`), never to auto-unwind standing inventory. Pure read of
+    /// the sticky `halted` flag, so it stays `Some` for the rest of the session
+    /// once tripped.
+    pub fn flatten_directive(&self) -> Option<Flatten> {
+        if self.halted.is_some() {
+            Some(Flatten { unwind: false })
+        } else {
+            None
+        }
+    }
+
+    /// Non-sticky volatility "pull-quotes" hint (Task 2.4, spec §5). Returns
+    /// `true` when this token's mid moved more than `vol_pull_ticks` ticks
+    /// (`vol_pull_ticks · VOL_TICK_MICRO` µUSDC/share) since the previous
+    /// observation AND that previous observation is within `vol_window` of `now`
+    /// — i.e. a large, FAST move. A move that is small, or large but spread over
+    /// longer than the window (ordinary drift), returns `false`. The first
+    /// observation for a token has nothing to compare against and returns
+    /// `false`. Every call records `(mid_micro, now)` as the new last.
+    ///
+    /// Purely advisory: it never latches and never touches the sticky halt — the
+    /// strategy pulls quotes that later cycle back in once the move settles. It
+    /// complements `mark`'s `unmarked` (can't-value → also pull). `mid_micro` is
+    /// µUSDC per share (`0..=1_000_000`).
+    ///
+    /// PURE: like `RiskEngine::record_error`, the clock is the caller's — `now`
+    /// is passed in; the module reads no clock. `now` is expected to be
+    /// monotonically non-decreasing per token.
+    pub fn vol_hint(&mut self, token: TokenId, mid_micro: u64, now: Instant) -> bool {
+        debug_assert!(
+            self.last_mid
+                .get(&token)
+                .is_none_or(|&(_, at)| now >= at),
+            "vol_hint: now must be monotonically non-decreasing per token"
+        );
+        let threshold = u64::from(self.cfg.vol_pull_ticks) * VOL_TICK_MICRO;
+        let fired = match self.last_mid.get(&token) {
+            Some(&(last_mid, at)) => {
+                now.duration_since(at) <= self.cfg.vol_window
+                    && mid_micro.abs_diff(last_mid) > threshold
+            }
+            None => false,
+        };
+        self.last_mid.insert(token, (mid_micro, now));
+        fired
     }
 
     /// Signed net inventory for `token` in µshares (`0` if untouched).
@@ -406,14 +522,19 @@ mod tests {
     use super::*;
     use pm_core::instrument::TokenId;
     use pm_core::num::Usdc;
+    use std::time::{Duration, Instant};
 
     /// Caps are inert this task; any values work for constructing the state.
+    /// `vol_pull_ticks = 5` (= 5¢ = 50_000 µUSDC) / `vol_window = 1000 ms` are
+    /// the volatility-hint params the Task 2.4 tests key off.
     fn cfg() -> InventoryConfig {
         InventoryConfig {
             max_inventory_usd: Usdc(500_000_000),       // $500
             max_gross_inventory_usd: Usdc(2_000_000_000), // $2k
             inventory_stop_loss_usd: Usdc(100_000_000), // $100
             daily_loss_usd: Usdc(200_000_000),          // $200
+            vol_pull_ticks: 5,                          // 5¢ = 50_000 µUSDC
+            vol_window: Duration::from_millis(1000),
         }
     }
 
@@ -993,6 +1114,113 @@ mod tests {
             at_cap.halted,
             Some(InvHalt::StopLoss),
             "exactly at −cap must latch (inclusive boundary)"
+        );
+    }
+
+    // ── Task 2.4: flatten directive, daily-loss latch, volatility hint ────────
+
+    #[test]
+    fn flatten_directive_some_only_when_halted() {
+        // cfg(): inventory_stop_loss_usd = $100.
+        let t = TokenId(1);
+        let mut inv = InventoryRisk::new(cfg());
+        // No halt yet → no directive.
+        assert_eq!(inv.flatten_directive(), None, "unhalted → no flatten");
+
+        // Drive a stop-loss latch via mark: long 1000 sh @ $0.50 → basis $500;
+        // mark $0.39 → value $390, mtm = −$110 ≤ −$100 → StopLoss latches.
+        inv.on_fill(t, 1000 * SHARE, Usdc(-500_000_000));
+        let st = inv.mark(&Marks::from([(t, 390_000)]));
+        assert_eq!(st.halted, Some(InvHalt::StopLoss));
+
+        // Latched → cancel resting quotes, but NOT auto-unwind in Phase 2.
+        assert_eq!(
+            inv.flatten_directive(),
+            Some(Flatten { unwind: false }),
+            "any latched halt → flatten (cancel quotes), unwind stays false in Phase 2"
+        );
+    }
+
+    #[test]
+    fn daily_loss_latches_when_below_floor_but_not_stop() {
+        let t = TokenId(1);
+
+        // (a) ONLY the daily floor is crossed. Invert the operational ordering so
+        //     the stop sits DEEPER than the daily floor: stop $100, daily $50.
+        //     Long 1000 sh @ $0.50 → basis $500; mark $0.44 → value $440,
+        //     mtm = −$60. −$60 ≤ −$50 (daily) but −$60 > −$100 (stop) → DailyLoss.
+        let mut c = cfg();
+        c.inventory_stop_loss_usd = Usdc(100_000_000); // $100 (deeper)
+        c.daily_loss_usd = Usdc(50_000_000); // $50
+        let mut inv = InventoryRisk::new(c);
+        inv.on_fill(t, 1000 * SHARE, Usdc(-500_000_000));
+        let st = inv.mark(&Marks::from([(t, 440_000)]));
+        assert_eq!(st.mtm_pnl, Usdc(-60_000_000), "mtm −$60");
+        assert_eq!(
+            st.halted,
+            Some(InvHalt::DailyLoss),
+            "only the broader daily floor was crossed"
+        );
+        // A daily-loss latch flattens too.
+        assert_eq!(inv.flatten_directive(), Some(Flatten { unwind: false }));
+
+        // (b) BOTH floors cross → the tighter stop-loss is checked FIRST and wins
+        //     the reason. stop $25, daily $50, mtm −$60 (≤ both) → StopLoss.
+        let mut c2 = cfg();
+        c2.inventory_stop_loss_usd = Usdc(25_000_000); // $25 (tighter)
+        c2.daily_loss_usd = Usdc(50_000_000); // $50
+        let mut inv2 = InventoryRisk::new(c2);
+        inv2.on_fill(t, 1000 * SHARE, Usdc(-500_000_000));
+        let st2 = inv2.mark(&Marks::from([(t, 440_000)])); // mtm −$60 ≤ −$25 and ≤ −$50
+        assert_eq!(st2.mtm_pnl, Usdc(-60_000_000), "mtm −$60");
+        assert_eq!(
+            st2.halted,
+            Some(InvHalt::StopLoss),
+            "stop-loss is the tighter/flatten trigger; checked first when both cross"
+        );
+    }
+
+    #[test]
+    fn vol_hint_fires_on_large_fast_move_not_on_slow_or_small() {
+        // cfg(): vol_pull_ticks = 5 (= 5¢ = 50_000 µUSDC), vol_window = 1000 ms.
+        let t = TokenId(1);
+        let mut inv = InventoryRisk::new(cfg());
+        let t0 = Instant::now();
+
+        // First observation has nothing to compare → never fires; seeds the last.
+        assert!(!inv.vol_hint(t, 500_000, t0), "first obs cannot fire");
+
+        // Large + FAST: +8¢ (80_000 > 50_000) after 200 ms (≤ 1000) → pull.
+        assert!(
+            inv.vol_hint(t, 580_000, t0 + Duration::from_millis(200)),
+            "big fast move pulls quotes"
+        );
+
+        // Small: −1¢ (10_000 ≤ 50_000) after 100 ms → no pull (still updates last).
+        assert!(
+            !inv.vol_hint(t, 570_000, t0 + Duration::from_millis(300)),
+            "a small move is not volatility"
+        );
+
+        // Large but SLOW: +8¢ but 2000 ms later (> 1000 window) → drift, no pull.
+        assert!(
+            !inv.vol_hint(t, 650_000, t0 + Duration::from_millis(2300)),
+            "a move outside the window is drift, not volatility"
+        );
+
+        // Boundary: exactly 5¢ (50_000) is NOT "more than" 5 ticks → no pull.
+        let t2 = TokenId(2);
+        assert!(!inv.vol_hint(t2, 500_000, t0));
+        assert!(
+            !inv.vol_hint(t2, 550_000, t0 + Duration::from_millis(100)),
+            "exactly at the threshold does not fire (strict >)"
+        );
+        // One µUSDC over the threshold DOES fire.
+        let t3 = TokenId(3);
+        assert!(!inv.vol_hint(t3, 500_000, t0));
+        assert!(
+            inv.vol_hint(t3, 550_001, t0 + Duration::from_millis(100)),
+            "one µUSDC past the threshold fires"
         );
     }
 }

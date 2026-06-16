@@ -55,6 +55,23 @@ pub fn risk_config(
     })
 }
 
+/// Per-strategy inventory-risk caps (spec §5, Phase 2). Mirrors `risk_config`:
+/// converts the `[inventory]` config money (USD) to µUSDC via `usd_to_microusdc`
+/// and the volatility window (ms) to a `Duration`. INERT — there is no caller
+/// yet; the Phase-4 market-making strategy wires it when it opts into inventory
+/// risk. Parse-time bounds (positive money, `daily ≥ stop`, `vol_window_ms ≥ 1`)
+/// are enforced by `Config::validate`.
+pub fn inventory_config(cfg: &Config) -> Result<pm_risk::inventory::InventoryConfig, ConfigError> {
+    Ok(pm_risk::inventory::InventoryConfig {
+        max_inventory_usd: Usdc(usd_to_microusdc(cfg.inventory.max_inventory_usd)?),
+        max_gross_inventory_usd: Usdc(usd_to_microusdc(cfg.inventory.max_gross_inventory_usd)?),
+        inventory_stop_loss_usd: Usdc(usd_to_microusdc(cfg.inventory.inventory_stop_loss_usd)?),
+        daily_loss_usd: Usdc(usd_to_microusdc(cfg.inventory.daily_loss_usd)?),
+        vol_pull_ticks: cfg.inventory.vol_pull_ticks,
+        vol_window: std::time::Duration::from_millis(cfg.inventory.vol_window_ms),
+    })
+}
+
 /// Everything a detector needs about one connected component.
 pub struct ComponentEntry {
     pub markets: Vec<Market>,
@@ -295,6 +312,18 @@ mod tests {
         assert_eq!(r.max_unhedged, Usdc(200_000_000));
         assert_eq!(r.daily_drawdown_bps, 200);
         assert_eq!(r.restart_storm_count, 5);
+    }
+
+    #[test]
+    fn inventory_config_reflects_conservative_defaults() {
+        let cfg = pm_config::Config::default();
+        let inv = inventory_config(&cfg).unwrap();
+        assert_eq!(inv.max_inventory_usd, Usdc(50_000_000)); // $50
+        assert_eq!(inv.max_gross_inventory_usd, Usdc(100_000_000)); // $100
+        assert_eq!(inv.inventory_stop_loss_usd, Usdc(25_000_000)); // $25
+        assert_eq!(inv.daily_loss_usd, Usdc(50_000_000)); // $50
+        assert_eq!(inv.vol_pull_ticks, 5);
+        assert_eq!(inv.vol_window, std::time::Duration::from_millis(2000));
     }
 
     #[test]
