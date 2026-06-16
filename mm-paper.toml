@@ -71,3 +71,6 @@ prioritize_by_liquidity = true
 candidate_pool          = 150    # rank up to this many candidates, keep the top max_markets.
                                  # Higher = better selection but slower startup (each candidate is
                                  # a rate-limited CLOB fetch at ~5/s). 150 ≈ ~40s sync.
+auto_restart_secs       = 600    # every 10 min, re-exec for a FRESH universe (new markets appear
+                                 # over time); positions/P&L persist via the store. 0 = off.
+                                 # Lower it to see refreshes sooner (must be ≥ 60).

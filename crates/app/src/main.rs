@@ -1475,6 +1475,8 @@ async fn main() {
     let start = Instant::now();
     let duration = Duration::from_secs(args.duration_secs);
     let run_forever = args.duration_secs == 0;
+    // Periodic auto-restart: re-exec for a fresh universe every N secs (0 = off).
+    let auto_restart_secs = config.universe.auto_restart_secs;
     let mut ticker = tokio::time::interval(Duration::from_secs(10));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut poll = tokio::time::interval(Duration::from_secs(1));
@@ -1489,6 +1491,12 @@ async fn main() {
                 }
                 if !run_forever && start.elapsed() >= duration {
                     trigger = "duration";
+                    break;
+                }
+                if auto_restart_secs > 0 && start.elapsed().as_secs() >= auto_restart_secs {
+                    // Periodic re-exec for a fresh universe (handled after the
+                    // graceful shutdown cascade below).
+                    trigger = "resync";
                     break;
                 }
             }
@@ -1614,6 +1622,28 @@ async fn main() {
     );
     println!("FINAL stats: {}", stats.line());
     println!("session ended: duration_s={}", start.elapsed().as_secs());
+
+    // Periodic auto-restart (universe.auto_restart_secs): when this session ended
+    // because the resync timer fired, re-exec the SAME argv to pick up a fresh
+    // (and possibly larger) universe. Everything is already torn down cleanly
+    // above — store flushed, host joined, terminal restored — so the new process
+    // starts clean and reconciles open positions from the SQLite store. `exec`
+    // replaces this process image and only RETURNS on failure. A kill / quit /
+    // duration end uses a different `trigger`, so it falls through to a normal
+    // exit (no restart).
+    if trigger == "resync" {
+        use std::os::unix::process::CommandExt;
+        println!("resync: re-launching for a fresh universe (positions persist via the store) ...");
+        match std::env::current_exe() {
+            Ok(exe) => {
+                let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+                // exec() returns only if it FAILED; otherwise the image is replaced.
+                let err = std::process::Command::new(exe).args(&argv).exec();
+                fatal(format!("resync re-exec failed: {err}"));
+            }
+            Err(e) => fatal(format!("resync: cannot resolve current exe: {e}")),
+        }
+    }
 
     // A dead strategy (host task panic/cancel, or arb's coordinator aborting) is
     // unhealthy — restores the pre-Task-1.8 "exit 2 on coordinator death" signal

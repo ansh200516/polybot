@@ -111,6 +111,18 @@ pub struct Universe {
     /// `pm_ingestion::sync::MAX_CANDIDATE_POOL` (5000) to cap CLOB API cost.
     /// Inert unless `prioritize_by_liquidity`.
     pub candidate_pool: usize,
+    /// Periodic AUTO-RESTART interval, seconds. **Default `0`** ⇒ off (one-shot
+    /// session, as before). When `> 0`, the process re-execs itself every
+    /// `auto_restart_secs` to pick up a FRESH (and possibly larger) market
+    /// universe — the pragmatic "new markets over time" mechanism, since the
+    /// registry + WS supervisors are built once per run. The restart is a
+    /// graceful shutdown (store flushed, terminal restored) then `exec` of the
+    /// same argv; positions / P&L persist via the SQLite store + the existing
+    /// startup reconciliation, so the only cost is a brief re-quote gap during
+    /// the ~30-60 s re-sync. Set it well above the sync time (e.g. ≥ 600) so the
+    /// bot spends most of its time trading. A `kill` / `quit` / `--duration-secs`
+    /// end exits normally — only this timer re-execs.
+    pub auto_restart_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -214,6 +226,8 @@ impl Default for Universe {
             // Task 5.3 defaults keep the historical keyset-order cap unchanged.
             prioritize_by_liquidity: false,
             candidate_pool: 0,
+            // Off by default → one-shot session (no periodic re-exec).
+            auto_restart_secs: 0,
         }
     }
 }
@@ -675,6 +689,14 @@ impl Config {
                 "universe.candidate_pool must be 0 (= max_markets) or ≥ max_markets",
             ));
         }
+        // Auto-restart: 0 = off, else must clear the sync time so the bot does
+        // not thrash (re-sync alone is tens of seconds). Reject a too-small
+        // non-zero interval as a near-certain footgun.
+        if self.universe.auto_restart_secs != 0 && self.universe.auto_restart_secs < 60 {
+            return Err(ConfigError::BadMoney(
+                "universe.auto_restart_secs must be 0 (off) or ≥ 60 (a smaller interval would re-sync more than it trades)",
+            ));
+        }
         // Endpoints validation
         if self.endpoints.gamma_base.is_empty() {
             return Err(ConfigError::BadMoney("gamma_base must be non-empty"));
@@ -1095,6 +1117,23 @@ mod tests {
         let c =
             Config::from_toml_str("[universe]\nmax_markets = 200\ncandidate_pool = 2000\n").unwrap();
         assert_eq!(c.universe.candidate_pool, 2000);
+    }
+
+    #[test]
+    fn universe_auto_restart_parses_and_validates() {
+        // Default off.
+        assert_eq!(Config::default().universe.auto_restart_secs, 0);
+        // A sane interval parses + validates.
+        let c = Config::from_toml_str("[universe]\nauto_restart_secs = 600\n").unwrap();
+        assert_eq!(c.universe.auto_restart_secs, 600);
+        c.validate().unwrap();
+        // 0 = off is allowed.
+        Config::from_toml_str("[universe]\nauto_restart_secs = 0\n")
+            .unwrap()
+            .validate()
+            .unwrap();
+        // A too-small non-zero interval is rejected (would re-sync more than trade).
+        assert!(Config::from_toml_str("[universe]\nauto_restart_secs = 30\n").is_err());
     }
 
     #[test]
