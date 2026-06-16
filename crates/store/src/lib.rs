@@ -214,7 +214,7 @@ CREATE TABLE IF NOT EXISTS lots (
   id INTEGER PRIMARY KEY AUTOINCREMENT, token INTEGER NOT NULL, ts_ms INTEGER NOT NULL,
   qty_micro INTEGER NOT NULL, remaining_micro INTEGER NOT NULL,
   cost_micro INTEGER NOT NULL, cost_remaining_micro INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS lots_token ON lots(token) WHERE remaining_micro > 0;
+CREATE INDEX IF NOT EXISTS lots_token ON lots(token) WHERE remaining_micro <> 0;
 CREATE TABLE IF NOT EXISTS pnl_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, cash_micro INTEGER NOT NULL,
   realized_micro INTEGER NOT NULL, unrealized_micro INTEGER NOT NULL, equity_micro INTEGER NOT NULL,
@@ -261,6 +261,33 @@ fn migrate_strategy_columns(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Widen the partial `lots_token` index to index SHORT lots too.
+///
+/// The pre-signed-lots index was `... WHERE remaining_micro > 0`, which omits
+/// short lots (`remaining_micro < 0`) and so can't serve the signed Buy's
+/// short-cover scan. `CREATE INDEX IF NOT EXISTS` in `SCHEMA` won't rebuild an
+/// index that already exists, so an open DB keeps the old predicate until this
+/// drops + recreates it as `remaining_micro <> 0`.
+///
+/// Idempotent and safe on both new and old databases: a freshly created DB
+/// already has the `<> 0` predicate from `SCHEMA` (the `LIKE` finds no `> 0`
+/// definition), so this is a no-op there; a legacy DB is migrated exactly once.
+fn migrate_lots_index(conn: &Connection) -> Result<(), StoreError> {
+    let old_predicate: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'lots_token' AND sql LIKE '%remaining_micro > 0%'",
+        [],
+        |r| r.get(0),
+    )?;
+    if old_predicate > 0 {
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS lots_token;
+             CREATE INDEX IF NOT EXISTS lots_token ON lots(token) WHERE remaining_micro <> 0;",
+        )?;
+    }
+    Ok(())
+}
+
 /// Synchronous store core. One instance = one connection; the async writer
 /// task (writer.rs) owns it exclusively in production.
 pub struct Store {
@@ -276,6 +303,7 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         migrate_strategy_columns(&conn)?;
+        migrate_lots_index(&conn)?;
         Ok(Store {
             conn,
             write_errors: 0,
@@ -286,6 +314,7 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrate_strategy_columns(&conn)?;
+        migrate_lots_index(&conn)?;
         Ok(Store {
             conn,
             write_errors: 0,
@@ -404,10 +433,37 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM opportunities", [], |r| r.get(0))?)
     }
 
-    /// Insert a fill. Buys create a lot (cost = −cash, which includes fee).
-    /// Sells consume FIFO lots; returns the realized P&L delta in µUSDC
-    /// (sell cash − consumed cost). Oversell rolls the whole fill back.
+    /// Insert a fill (LONG-ONLY / arb path). Buys create a lot (cost = −cash,
+    /// which includes fee). Sells consume FIFO lots; returns the realized P&L
+    /// delta in µUSDC (sell cash − consumed cost). Oversell rolls the whole fill
+    /// back. This is the strict, inventory-free entry point the arbitrage engine
+    /// uses; market-making sells-to-open via [`insert_fill_signed`].
     pub fn insert_fill(&mut self, r: &FillRow) -> Result<i64, StoreError> {
+        self.insert_fill_core(r, false)
+    }
+
+    /// Insert a fill on the SIGNED (market-making) path: a token's open lots may
+    /// be a LONG stack (qty > 0) or a SHORT stack (qty < 0), never mixed.
+    /// Returns realized µUSDC.
+    ///
+    /// - **Sell** closes FIFO longs first, then opens a SHORT for any uncovered
+    ///   remainder (the proceeds received become the short's negative basis) —
+    ///   NO `Oversell`.
+    /// - **Buy** covers FIFO shorts first, then opens a LONG for any remainder.
+    /// - A single fill may cross zero (e.g. close a long and open a short);
+    ///   rounding is against us so realized is a floor, matching the strict path.
+    ///
+    /// Used by inventory-bearing strategies whose [`FillRow`] is routed through
+    /// `StoreMsg::FillSigned`; the arb path keeps using [`insert_fill`].
+    pub fn insert_fill_signed(&mut self, r: &FillRow) -> Result<i64, StoreError> {
+        self.insert_fill_core(r, true)
+    }
+
+    /// Shared core for [`insert_fill`] (`signed == false`, strict long-only) and
+    /// [`insert_fill_signed`] (`signed == true`, signed long/short). Validates
+    /// the action fail-closed, applies the lot effect, writes the fill row with
+    /// its computed realized, and commits atomically (any error rolls back).
+    fn insert_fill_core(&mut self, r: &FillRow, signed: bool) -> Result<i64, StoreError> {
         // Fail-closed: reject unrecognised actions BEFORE opening a transaction
         // so no lot mutation can occur on a typo'd string.
         match r.action.as_str() {
@@ -420,16 +476,23 @@ impl Store {
             }
         }
         let tx = self.conn.transaction()?;
-        let realized: i64 = match r.action.as_str() {
-            "Buy" => {
+        let realized: i64 = match (r.action.as_str(), signed) {
+            // Strict (arb) path — byte-identical to the original insert_fill:
+            // Buy opens a long lot; Sell consumes FIFO longs (Oversell + rollback).
+            ("Buy", false) => {
                 lots::insert_lot(&tx, r.token, r.ts_ms, r.qty_micro, -r.cash_micro)?;
                 0
             }
-            _ => {
-                // "Sell" — validated above
+            ("Sell", false) => {
                 let consumed = lots::consume_lots(&tx, r.token, r.qty_micro)?;
                 r.cash_micro - consumed
             }
+            // Signed (market-making) path — Buy may cover a short, Sell may open one.
+            ("Buy", true) => {
+                lots::buy_signed(&tx, r.token, r.ts_ms, r.qty_micro, r.cash_micro)?
+            }
+            // Only ("Sell", true) remains (action validated to Buy|Sell above).
+            _ => lots::sell_signed(&tx, r.token, r.ts_ms, r.qty_micro, r.cash_micro)?,
         };
         tx.execute(
             "INSERT INTO fills (order_id, ts_ms, token, action, px_ticks, tick_levels,
@@ -518,7 +581,20 @@ impl Store {
         Ok(realized)
     }
 
-    /// Open position for a token from lots: (remaining µshares, remaining cost µUSDC).
+    /// Open SIGNED position for a token, summed over its lots:
+    /// `(net_micro, cost_micro)`.
+    ///
+    /// Sign convention (so `InventoryRisk::seed(token, net_micro, Usdc(cost_micro))`
+    /// is correct):
+    /// - **Long** stack → `net_micro > 0`, `cost_micro > 0` (cash paid in). These
+    ///   are the identical positive values long-only (arb) callers saw before
+    ///   signed lots existed.
+    /// - **Short** stack → `net_micro < 0`, `cost_micro < 0` — the signed short
+    ///   basis (cash taken in: `cost_micro = −proceeds_received`).
+    /// - **Flat** (all lots consumed) → `(0, 0)`.
+    ///
+    /// A token never mixes long and short open lots (crossing zero closes the
+    /// opposite side first), so the SUM is an unambiguous single-sided position.
     pub fn position(&self, token: i64) -> Result<(i64, i64), StoreError> {
         Ok(self.conn.query_row(
             "SELECT COALESCE(SUM(remaining_micro),0), COALESCE(SUM(cost_remaining_micro),0)
@@ -851,6 +927,268 @@ mod tests {
         assert!(matches!(err, Err(StoreError::Oversell { token: 7, .. })));
         // The fill row must NOT exist (tx rollback).
         assert_eq!(s.count_fills().unwrap(), 0);
+    }
+
+    // ── Task 4.2b: signed / short-inventory fills (market-making path) ─────────
+    // The strict `insert_fill` tests above are UNCHANGED and still pass; these
+    // exercise the new `insert_fill_signed` entry point, which never Oversells.
+
+    #[test]
+    fn signed_sell_opens_short_and_position_is_negative() {
+        let mut s = mem();
+        s.insert_order(&order_row("o1")).unwrap();
+        // No longs → a signed Sell 100 @ $0.40 opens a PURE short: realized 0,
+        // and `position` is the signed short (net < 0, basis = −proceeds).
+        let realized = s
+            .insert_fill_signed(&FillRow {
+                order_id: "o1".into(),
+                ts_ms: 1,
+                token: 7,
+                action: "Sell".into(),
+                px_ticks: 40,
+                tick_levels: 100,
+                qty_micro: 100_000_000,
+                cash_micro: 40_000_000, // proceeds received
+                fee_micro: 0,
+                strategy: "mm".into(),
+            })
+            .unwrap();
+        assert_eq!(realized, 0, "a pure short-open realizes nothing");
+        // Signed: net −100µsh, short basis −$40 → seed(-100µ, Usdc(-40µ)) is right.
+        assert_eq!(s.position(7).unwrap(), (-100_000_000, -40_000_000));
+        assert_eq!(s.count_fills().unwrap(), 1, "the short-open fill row persisted");
+    }
+
+    #[test]
+    fn signed_buy_covers_short_and_realizes() {
+        let mut s = mem();
+        s.insert_order(&order_row("o1")).unwrap();
+        s.insert_order(&order_row("o2")).unwrap();
+        // Open short 100 @ $0.40 (proceeds $40 → basis −$40).
+        s.insert_fill_signed(&FillRow {
+            order_id: "o1".into(),
+            ts_ms: 1,
+            token: 7,
+            action: "Sell".into(),
+            px_ticks: 40,
+            tick_levels: 100,
+            qty_micro: 100_000_000,
+            cash_micro: 40_000_000,
+            fee_micro: 0,
+            strategy: "mm".into(),
+        })
+        .unwrap();
+        // Buy 100 @ $0.30 fully covers → realized = 40 − 30 = +$10, flat.
+        let realized = s
+            .insert_fill_signed(&FillRow {
+                order_id: "o2".into(),
+                ts_ms: 2,
+                token: 7,
+                action: "Buy".into(),
+                px_ticks: 30,
+                tick_levels: 100,
+                qty_micro: 100_000_000,
+                cash_micro: -30_000_000, // cash paid
+                fee_micro: 0,
+                strategy: "mm".into(),
+            })
+            .unwrap();
+        assert_eq!(realized, 10_000_000, "bought back $0.10/sh cheaper on 100 sh");
+        assert_eq!(s.position(7).unwrap(), (0, 0), "short fully covered → flat");
+        assert_eq!(s.realized_total().unwrap(), 10_000_000);
+    }
+
+    #[test]
+    fn signed_fill_crosses_zero() {
+        let mut s = mem();
+        s.insert_order(&order_row("o1")).unwrap();
+        s.insert_order(&order_row("o2")).unwrap();
+        // Long 100 @ $0.45 (basis $45).
+        s.insert_fill_signed(&FillRow {
+            order_id: "o1".into(),
+            ts_ms: 1,
+            token: 7,
+            action: "Buy".into(),
+            px_ticks: 45,
+            tick_levels: 100,
+            qty_micro: 100_000_000,
+            cash_micro: -45_000_000,
+            fee_micro: 0,
+            strategy: "mm".into(),
+        })
+        .unwrap();
+        // Sell 150 @ $0.50 (proceeds $75): close the 100 long AND open a 50 short.
+        //   proceeds_close = floor(75·100/150) = 50; realized = 50 − 45 = +$5.
+        //   short opens with proceeds_open = 75 − 50 = 25 → basis −$25.
+        let realized = s
+            .insert_fill_signed(&FillRow {
+                order_id: "o2".into(),
+                ts_ms: 2,
+                token: 7,
+                action: "Sell".into(),
+                px_ticks: 50,
+                tick_levels: 100,
+                qty_micro: 150_000_000,
+                cash_micro: 75_000_000,
+                fee_micro: 0,
+                strategy: "mm".into(),
+            })
+            .unwrap();
+        assert_eq!(realized, 5_000_000, "closed the 100 long for +$5");
+        assert_eq!(
+            s.position(7).unwrap(),
+            (-50_000_000, -25_000_000),
+            "now short 50 @ $0.50 (signed net + signed basis)"
+        );
+        assert_eq!(s.realized_total().unwrap(), 5_000_000);
+    }
+
+    #[test]
+    fn signed_partial_short_cover_conserves() {
+        let mut s = mem();
+        s.insert_order(&order_row("o1")).unwrap();
+        s.insert_order(&order_row("o2")).unwrap();
+        // Open short 3 µshares for 10 µUSDC proceeds (basis −10) — odd, indivisible
+        // numbers force the pro-rata rounding (mirrors the strict partial tests).
+        s.insert_fill_signed(&FillRow {
+            order_id: "o1".into(),
+            ts_ms: 1,
+            token: 9,
+            action: "Sell".into(),
+            px_ticks: 1,
+            tick_levels: 100,
+            qty_micro: 3,
+            cash_micro: 10,
+            fee_micro: 0,
+            strategy: "mm".into(),
+        })
+        .unwrap();
+        assert_eq!(s.position(9).unwrap(), (-3, -10));
+        // Cover 1 µshare for 4 µUSDC cost. Partial: consumed basis magnitude =
+        // floor(10·1/3) = 3 → proceeds_consumed 3; realized = 3 − 4 = −1 (a FLOOR,
+        // against us). 2 µshares remain with basis −7 (magnitude ceiled).
+        let realized = s
+            .insert_fill_signed(&FillRow {
+                order_id: "o2".into(),
+                ts_ms: 2,
+                token: 9,
+                action: "Buy".into(),
+                px_ticks: 4,
+                tick_levels: 100,
+                qty_micro: 1,
+                cash_micro: -4,
+                fee_micro: 0,
+                strategy: "mm".into(),
+            })
+            .unwrap();
+        assert_eq!(realized, -1);
+        // 2 µshares of short remain; the residual basis −7 has its magnitude
+        // ceiled (against us), and consuming the rest later conserves it to −10.
+        assert_eq!(s.position(9).unwrap(), (-2, -7));
+        assert_eq!(s.realized_total().unwrap(), -1);
+    }
+
+    #[test]
+    fn insert_fill_strict_still_oversells() {
+        // The signed path now exists, but the strict (arb) `insert_fill` MUST
+        // still Oversell + roll back when a Sell exceeds long holdings — the
+        // deliberate long-only safety error is unchanged. The SAME fill on the
+        // signed path succeeds, opening a short instead.
+        let mut s = mem();
+        s.insert_order(&order_row("o1")).unwrap();
+        let strict = s.insert_fill(&FillRow {
+            order_id: "o1".into(),
+            ts_ms: 1,
+            token: 7,
+            action: "Sell".into(),
+            px_ticks: 50,
+            tick_levels: 100,
+            qty_micro: 1_000_000,
+            cash_micro: 500_000,
+            fee_micro: 0,
+            strategy: "arb".into(),
+        });
+        assert!(matches!(strict, Err(StoreError::Oversell { token: 7, .. })));
+        assert_eq!(s.count_fills().unwrap(), 0, "strict oversell rolls the fill back");
+
+        let realized = s
+            .insert_fill_signed(&FillRow {
+                order_id: "o1".into(),
+                ts_ms: 1,
+                token: 7,
+                action: "Sell".into(),
+                px_ticks: 50,
+                tick_levels: 100,
+                qty_micro: 1_000_000,
+                cash_micro: 500_000,
+                fee_micro: 0,
+                strategy: "mm".into(),
+            })
+            .unwrap();
+        assert_eq!(realized, 0, "signed sell-to-open realizes nothing");
+        assert_eq!(s.position(7).unwrap(), (-1_000_000, -500_000));
+        assert_eq!(s.count_fills().unwrap(), 1, "the signed short-open fill persisted");
+    }
+
+    #[test]
+    fn signed_buy_with_no_short_opens_long_like_strict() {
+        // With nothing to cover, a signed Buy must behave exactly like the strict
+        // Buy: open a long lot, realized 0, identical position.
+        let mut s = mem();
+        s.insert_order(&order_row("o1")).unwrap();
+        let realized = s
+            .insert_fill_signed(&FillRow {
+                order_id: "o1".into(),
+                ts_ms: 1,
+                token: 7,
+                action: "Buy".into(),
+                px_ticks: 44,
+                tick_levels: 100,
+                qty_micro: 100_000_000,
+                cash_micro: -44_000_000,
+                fee_micro: 0,
+                strategy: "mm".into(),
+            })
+            .unwrap();
+        assert_eq!(realized, 0);
+        assert_eq!(s.position(7).unwrap(), (100_000_000, 44_000_000));
+    }
+
+    #[test]
+    fn legacy_lots_index_is_migrated_to_include_shorts() {
+        // A pre-signed DB carries the partial lots_token index with the old
+        // `remaining_micro > 0` predicate (short lots invisible). Opening must
+        // recreate it as `remaining_micro <> 0` so short lots are indexed too.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_idx.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE lots (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, token INTEGER NOT NULL, ts_ms INTEGER NOT NULL,
+                   qty_micro INTEGER NOT NULL, remaining_micro INTEGER NOT NULL,
+                   cost_micro INTEGER NOT NULL, cost_remaining_micro INTEGER NOT NULL);
+                 CREATE INDEX lots_token ON lots(token) WHERE remaining_micro > 0;",
+            )
+            .unwrap();
+        }
+        Store::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='lots_token'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("remaining_micro <> 0"),
+            "index predicate must be migrated to `<> 0`, got: {sql}"
+        );
+        assert!(
+            !sql.contains("remaining_micro > 0"),
+            "the old `> 0` predicate must be gone, got: {sql}"
+        );
     }
 
     #[test]

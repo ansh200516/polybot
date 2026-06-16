@@ -392,7 +392,8 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
     }
 
     /// Poll the venue for fills and book each into inventory + positions + the
-    /// store (`"mm"`-tagged). Makers pay 0 fee on CLOB V2.
+    /// store (`"mm"`-tagged, via the SIGNED store route so sell-to-open SHORTS
+    /// persist). Makers pay 0 fee on CLOB V2.
     async fn consume_fills(&mut self) {
         let fills = match self.venue.poll().await {
             Ok(f) => f,
@@ -435,7 +436,9 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 fee_micro: 0,
                 strategy: "mm".into(),
             };
-            let _ = self.store_tx.send(StoreMsg::Fill(row, None)).await;
+            // SIGNED route: an ask-fill opens a SHORT (no long holdings), which
+            // the strict `Fill` path would Oversell-drop — `FillSigned` persists it.
+            let _ = self.store_tx.send(StoreMsg::FillSigned(row, None)).await;
         }
     }
 
@@ -859,7 +862,7 @@ mod tests {
         let mut order_rows = 0usize;
         while let Ok(msg) = store_rx.try_recv() {
             match msg {
-                StoreMsg::Fill(row, _) => fills.push(row),
+                StoreMsg::FillSigned(row, _) => fills.push(row),
                 StoreMsg::OrderInsert(row, _) => {
                     assert_eq!(row.strategy, "mm");
                     order_rows += 1;
@@ -908,7 +911,7 @@ mod tests {
 
         let mut fill = None;
         while let Ok(msg) = store_rx.try_recv() {
-            if let StoreMsg::Fill(row, _) = msg {
+            if let StoreMsg::FillSigned(row, _) = msg {
                 fill = Some(row);
             }
         }
@@ -917,6 +920,51 @@ mod tests {
         assert_eq!(f.strategy, "mm");
         assert!(f.cash_micro > 0, "a sell receives cash");
         assert_eq!(f.qty_micro, (-net) as i64, "fill qty == |net| (flat → short)");
+    }
+
+    /// End-to-end (Task 4.2b): an MM ask-fill opens a SHORT, and the SIGNED store
+    /// route must DURABLY persist the fill row. The strict `Fill` route would
+    /// Oversell-drop it (a `write_error`, no row). Wires the loop's store channel
+    /// to a real writer + store and asserts the short-open fill landed cleanly.
+    #[tokio::test]
+    async fn ask_fill_opens_short_and_persists_via_signed_route() {
+        use pm_store::Store;
+        use pm_store::writer::run_writer;
+
+        let tokens = vec![TokenId(1)];
+        let (fetcher, shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        let params = mk_params(200, 5.0);
+        let (mut mm, store_rx, _status_rx) =
+            build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+
+        // Wire the loop's store channel to a real writer over an in-memory store.
+        let store = Store::open_in_memory().unwrap();
+        let writer = tokio::spawn(run_writer(store, store_rx));
+
+        mm.quote().await; // places bid + ask and their FK-parent order rows
+        // Buyer crosses UP to our ask (best_bid ≥ 0.51) → we SELL to open a short.
+        shared
+            .lock()
+            .unwrap()
+            .insert(TokenId(1), (cent_book(&[(51, 100 * SH)], &[(52, 100 * SH)]), true));
+        mm.consume_fills().await;
+        assert!(mm.inv.net(TokenId(1)) < 0, "an ask fill makes us short");
+
+        // Drop the loop (and thus its store_tx) so the writer drains and returns.
+        drop(mm);
+        let store = writer.await.unwrap();
+        assert_eq!(
+            store.write_errors, 0,
+            "the signed short-open fill must persist, not Oversell-drop"
+        );
+        assert_eq!(store.count_fills().unwrap(), 1, "exactly one fill row persisted");
+        // Durable signed position reflects the open short (net < 0, basis < 0).
+        let (net, cost) = store.position(1).unwrap();
+        assert!(
+            net < 0 && cost < 0,
+            "signed position reflects the open short: ({net}, {cost})"
+        );
     }
 
     // ── Pause / resume ─────────────────────────────────────────────────────────

@@ -18,7 +18,13 @@ pub enum StoreMsg {
     Opportunity(OppRow),
     OrderInsert(OrderRow, Ack),
     OrderEvent(OrderEventRow, Ack),
+    /// LONG-ONLY (arb) fill: routed to `Store::insert_fill` (strict; a Sell
+    /// beyond long holdings is an `Oversell` write error + rollback).
     Fill(FillRow, Ack),
+    /// SIGNED (market-making) fill: routed to `Store::insert_fill_signed` so a
+    /// sell-to-open SHORT (or a buy that covers one) persists instead of being
+    /// `Oversell`-dropped. Set by inventory-bearing strategies (e.g. MM).
+    FillSigned(FillRow, Ack),
     Conversion(ConversionRow, Ack),
     PnlSnapshot(PnlRow),
     Halt(HaltRow),
@@ -43,6 +49,9 @@ pub async fn run_writer(mut store: Store, mut rx: mpsc::Receiver<StoreMsg>) -> S
             StoreMsg::OrderInsert(r, ack) => (store.insert_order(&r), ack, "order_insert"),
             StoreMsg::OrderEvent(r, ack) => (store.insert_order_event(&r), ack, "order_event"),
             StoreMsg::Fill(r, ack) => (store.insert_fill(&r).map(|_| ()), ack, "fill"),
+            StoreMsg::FillSigned(r, ack) => {
+                (store.insert_fill_signed(&r).map(|_| ()), ack, "fill_signed")
+            }
             StoreMsg::Conversion(r, ack) => {
                 (store.apply_conversion(&r).map(|_| ()), ack, "conversion")
             }
@@ -155,5 +164,44 @@ mod tests {
         let store = writer.await.unwrap();
         assert_eq!(store.write_errors, 1);
         assert_eq!(store.count_fills().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn fill_signed_opens_short_without_oversell() {
+        // The SIGNED route persists a sell-to-open SHORT (no long holdings)
+        // instead of Oversell-dropping it the way the strict `Fill` route does
+        // in the test above — the ack fires (commit) and no write error counts.
+        let store = Store::open_in_memory().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let writer = tokio::spawn(run_writer(store, rx));
+
+        tx.send(StoreMsg::OrderInsert(order_row("o1"), None))
+            .await
+            .unwrap();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(StoreMsg::FillSigned(
+            FillRow {
+                order_id: "o1".into(),
+                ts_ms: 1,
+                token: 7,
+                action: "Sell".into(),
+                px_ticks: 50,
+                tick_levels: 100,
+                qty_micro: 1_000_000,
+                cash_micro: 500_000,
+                fee_micro: 0,
+                strategy: "mm".into(),
+            },
+            Some(ack_tx),
+        ))
+        .await
+        .unwrap();
+        ack_rx.await.unwrap(); // signed commit → ack fires (NOT dropped)
+
+        drop(tx);
+        let store = writer.await.unwrap();
+        assert_eq!(store.write_errors, 0, "the signed short-open must not error");
+        assert_eq!(store.count_fills().unwrap(), 1, "the short fill persisted");
+        assert_eq!(store.position(7).unwrap(), (-1_000_000, -500_000));
     }
 }
