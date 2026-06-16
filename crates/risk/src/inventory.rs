@@ -3,9 +3,10 @@
 //! SEPARATE from the risk-free-basket `RiskEngine` in `lib.rs` — arb keeps using
 //! that one untouched. This module is inert until a strategy opts in (Phase 4).
 //!
-//! Implemented so far: inventory STATE + `on_fill` accounting (Task 2.1) and
-//! the pre-fill cap check `check_quote` (Task 2.2). Mark-to-market (`mark`),
-//! the stop-loss latch, and the flatten directive (Tasks 2.3–2.4) are
+//! Implemented so far: inventory STATE + `on_fill` accounting (Task 2.1), the
+//! pre-fill cap check `check_quote` (Task 2.2), and mark-to-market `mark` with
+//! the latched stop-loss (Task 2.3). The flatten directive, the volatility
+//! hint, the daily-loss check, and config-file parsing (Task 2.4) are
 //! intentionally absent here.
 
 use std::collections::HashMap;
@@ -85,6 +86,46 @@ pub enum QuoteVerdict {
     Reject(InvReason),
 }
 
+/// Per-token mark prices for `mark`: µUSDC per share, each `0..=1_000_000`
+/// (= $0.00..=$1.00). The **caller** chooses the conservative price for each
+/// side it holds — e.g. the best BID for longs (what it could sell into) and
+/// the best ASK for shorts (what it would have to buy back at) — `mark` just
+/// applies whatever price is supplied per token. (See the coordinator's
+/// `marks_pair` for how the app already produces conservative per-token marks,
+/// mapping a missing book → 0.)
+pub type Marks = HashMap<TokenId, u64>;
+
+/// Why an inventory halt latched. Sticky once set (spec §5: "like
+/// `SessionLoss`") — mirrors `lib.rs`'s `HaltReason`: there is no clear path,
+/// the strategy restarts to clear it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvHalt {
+    /// Mark-to-market P&L (`realized + unrealized`) fell to
+    /// `−inventory_stop_loss_usd` or lower. (The `daily_loss_usd` check — which
+    /// needs a daily baseline this module does not yet track — is DEFERRED to
+    /// Task 2.4, so there is no `DailyLoss` variant yet.)
+    StopLoss,
+}
+
+/// Snapshot returned by `mark`: the marked P&L split plus any latched halt.
+/// Plain data (no engine types), like `QuoteVerdict` and `lib.rs`'s verdicts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryStatus {
+    /// Signed net µshares for every token with recorded state, sorted by
+    /// `TokenId` (deterministic; includes tokens that have round-tripped back
+    /// to flat — `net` 0 — whose `realized` still counts in the sum below).
+    pub net_by_token: Vec<(TokenId, i128)>,
+    /// Σ realized P&L across all tokens, µUSDC.
+    pub realized: Usdc,
+    /// Σ unrealized (marked) P&L across all tokens, µUSDC. Each token's
+    /// `net·mark/1e6` value term is rounded against us (see `mark`).
+    pub unrealized: Usdc,
+    /// `realized + unrealized`, µUSDC — the measure the stop-loss keys off.
+    pub mtm_pnl: Usdc,
+    /// The latched inventory halt, if any (sticky once set).
+    pub halted: Option<InvHalt>,
+}
+
 /// Per-strategy inventory state for one inventory-bearing strategy.
 ///
 /// Accounting model — **average cost** (chosen for simplicity and a clean
@@ -105,6 +146,8 @@ pub enum QuoteVerdict {
 pub struct InventoryRisk {
     cfg: InventoryConfig,
     by_token: HashMap<TokenId, TokenInventory>,
+    /// Latched inventory halt (sticky): set by `mark`, never auto-cleared.
+    halted: Option<InvHalt>,
 }
 
 impl InventoryRisk {
@@ -112,6 +155,7 @@ impl InventoryRisk {
         InventoryRisk {
             cfg,
             by_token: HashMap::new(),
+            halted: None,
         }
     }
 
@@ -220,6 +264,82 @@ impl InventoryRisk {
         }
 
         QuoteVerdict::Approve
+    }
+
+    /// Mark-to-market the whole book at the supplied per-token `marks`, returning
+    /// the realized/unrealized split, the combined `mtm_pnl`, and any latched
+    /// halt. INERT until a strategy calls it (Phase 4); the Phase-4 MM strategy
+    /// feeds the marks (conservative per side — see [`Marks`]).
+    ///
+    /// **Unrealized** (µUSDC) sums each token's `floor(net·mark/1e6) − basis` —
+    /// the same ÷1e6 share scaling as the `basis = net·avg_price/1e6` identity
+    /// on [`TokenInventory`]. The `net·mark/1e6` value term is rounded **toward
+    /// −∞** with `i128::div_euclid` (a true floor here, since the 1e6 divisor is
+    /// positive — `div_ceil_i128` only handles non-negative numerators, so it
+    /// can't value shorts). Flooring is "against us" on BOTH sides: a long's
+    /// value floors DOWN, and a short's negative value floors to a LARGER
+    /// buy-back liability — so a marked loss is never understated and the
+    /// stop-loss binds on the safe side. `realized` sums every token's booked
+    /// P&L; `mtm_pnl = realized + unrealized`.
+    ///
+    /// **Missing marks** (token absent from `marks`) are valued at the side's
+    /// WORST case: a long at mark 0 (worth nothing), a short at mark 1_000_000
+    /// ($1.00 — the maximal buy-back cost). This is the conservative, fail-safe
+    /// choice and generalizes the app's existing "missing book → 0" mark
+    /// (`marks_pair`), which is worst-case for the longs arb holds. Because the
+    /// latch is STICKY, callers should supply a mark for EVERY held token (0
+    /// when a book is unavailable, exactly as `marks_pair` does) so a transient
+    /// data gap can't permanently halt; a token genuinely absent here is treated
+    /// as unmarkable and fails safe toward the halt.
+    ///
+    /// **Latch:** if not already halted and `mtm_pnl ≤ −inventory_stop_loss_usd`,
+    /// the `StopLoss` halt latches. First halt wins and recovery never clears it
+    /// (sticky), mirroring `RiskEngine::update_session_pnl`; the boundary is
+    /// inclusive (exactly `−cap` trips), matching the session-loss cap.
+    pub fn mark(&mut self, marks: &Marks) -> InventoryStatus {
+        let mut realized: i128 = 0;
+        let mut unrealized: i128 = 0;
+        let mut net_by_token: Vec<(TokenId, i128)> = Vec::with_capacity(self.by_token.len());
+
+        for (&token, ti) in &self.by_token {
+            realized += ti.realized.0;
+            net_by_token.push((token, ti.net));
+
+            // Conservative price for a missing token: worst case per side — a
+            // long at $0.00 (worthless), a short at $1.00 (maximal buy-back).
+            let mark_price = match marks.get(&token) {
+                Some(&m) => i128::from(m),
+                None if ti.net < 0 => i128::from(ONE_SHARE_MICRO),
+                None => 0,
+            };
+            // floor(net·mark/1e6): against us on BOTH sides (div_euclid floors
+            // toward −∞ because the 1e6 divisor is positive).
+            let value = (ti.net * mark_price).div_euclid(i128::from(ONE_SHARE_MICRO));
+            unrealized += value - ti.basis.0;
+        }
+        net_by_token.sort_by_key(|&(t, _)| t);
+
+        let mtm = realized + unrealized;
+        // Sticky stop-loss latch: first halt wins, recovery never clears it
+        // (mirrors update_session_pnl). daily_loss_usd is DEFERRED to Task 2.4.
+        if self.halted.is_none() && mtm <= -self.cfg.inventory_stop_loss_usd.0 {
+            self.halted = Some(InvHalt::StopLoss);
+        }
+
+        InventoryStatus {
+            net_by_token,
+            realized: Usdc(realized),
+            unrealized: Usdc(unrealized),
+            mtm_pnl: Usdc(mtm),
+            halted: self.halted,
+        }
+    }
+
+    /// The latched inventory halt, if any. Sticky: once `mark` sets it there is
+    /// no clear path — the strategy restarts to clear it (mirrors
+    /// `RiskEngine::halted`).
+    pub fn halted(&self) -> Option<InvHalt> {
+        self.halted
     }
 
     /// Signed net inventory for `token` in µshares (`0` if untouched).
@@ -676,5 +796,110 @@ mod tests {
             QuoteVerdict::Approve,
             "quoted token's own basis must be excluded from the gross sum"
         );
+    }
+
+    // ── Task 2.3: mark-to-market + latched stop-loss ──────────────────────────
+
+    #[test]
+    fn mark_computes_mtm_and_latches_stop_loss() {
+        // cfg() has inventory_stop_loss_usd = $100.
+        let t = TokenId(1);
+        let mut inv = InventoryRisk::new(cfg());
+        // Long 1000 sh @ $0.50 → net +1000 sh, basis $500, realized 0.
+        inv.on_fill(t, 1000 * SHARE, Usdc(-500_000_000));
+
+        // Mark $0.39: value = 1000·0.39 = $390; unrealized = 390 − 500 = −$110.
+        // mtm = 0 + (−110) = −$110 ≤ −$100 → StopLoss latches.
+        let st = inv.mark(&Marks::from([(t, 390_000)]));
+        assert_eq!(st.realized, Usdc(0));
+        assert_eq!(st.unrealized, Usdc(-110_000_000));
+        assert_eq!(st.mtm_pnl, Usdc(-110_000_000));
+        assert_eq!(st.halted, Some(InvHalt::StopLoss));
+        assert_eq!(inv.halted(), Some(InvHalt::StopLoss));
+
+        // Recovery: mark $0.60 → unrealized = 600 − 500 = +$100, mtm = +$100.
+        // The latch is STICKY — it must STAY StopLoss despite the recovery.
+        let st2 = inv.mark(&Marks::from([(t, 600_000)]));
+        assert_eq!(st2.mtm_pnl, Usdc(100_000_000), "mtm recovered to +$100");
+        assert_eq!(
+            st2.halted,
+            Some(InvHalt::StopLoss),
+            "stop-loss is sticky: recovery never clears it"
+        );
+        assert_eq!(inv.halted(), Some(InvHalt::StopLoss));
+    }
+
+    #[test]
+    fn mark_above_stop_is_not_halted() {
+        // A long AND a short, each marked away from basis; mtm well above −$100.
+        let (a, b) = (TokenId(1), TokenId(2));
+        let mut inv = InventoryRisk::new(cfg());
+
+        // A: buy 100 @ $0.40, then sell 40 @ $0.50 → net +60 sh, basis $24,
+        //    realized +$4 (proceeds $20 − released basis $16).
+        inv.on_fill(a, 100 * SHARE, Usdc(-40_000_000));
+        inv.on_fill(a, -40 * SHARE, Usdc(20_000_000));
+        // B: sell-to-open 50 @ $0.60 → net −50 sh, basis −$30, realized 0.
+        inv.on_fill(b, -50 * SHARE, Usdc(30_000_000));
+
+        // Marks: A $0.45, B $0.55 (the short's mark ≠ its $0.60 basis price).
+        //   value_A = 60·0.45 = $27;       unrealized_A = 27 − 24       = +$3.00.
+        //   value_B = −50·0.55 = −$27.50;  unrealized_B = −27.5 − (−30) = +$2.50.
+        let st = inv.mark(&Marks::from([(a, 450_000), (b, 550_000)]));
+
+        assert_eq!(st.realized, Usdc(4_000_000), "Σ realized = $4 (all from A)");
+        assert_eq!(
+            st.unrealized,
+            Usdc(5_500_000),
+            "Σ unrealized = $3 (long A) + $2.50 (short B)"
+        );
+        assert_eq!(
+            st.mtm_pnl,
+            Usdc(9_500_000),
+            "mtm = realized $4 + unrealized $5.50"
+        );
+        assert_eq!(st.halted, None, "mtm $9.50 ≫ −$100 stop → no halt");
+        // net_by_token is sorted by id: A (TokenId 1) then B (TokenId 2).
+        assert_eq!(st.net_by_token, vec![(a, 60 * SHARE), (b, -50 * SHARE)]);
+    }
+
+    #[test]
+    fn mark_value_rounds_against_us_on_both_sides() {
+        // Zero-cash opens leave basis 0, isolating the value term so the
+        // assertion is purely about how net·mark/1e6 rounds. 3 µshares @ $0.46
+        // has the exact (fractional) value 1.38 µUSDC.
+        let (long, short) = (TokenId(1), TokenId(2));
+        let mut inv = InventoryRisk::new(cfg());
+        inv.on_fill(long, 3, Usdc(0)); // net +3 µshares, basis 0
+        inv.on_fill(short, -3, Usdc(0)); // net −3 µshares, basis 0
+
+        let st = inv.mark(&Marks::from([(long, 460_000), (short, 460_000)]));
+        // Long:  floor(+1.38) = 1  (value rounds DOWN — against us).
+        // Short: floor(−1.38) = −2 (buy-back liability magnitude rounds UP — against us).
+        // unrealized = (1 − 0) + (−2 − 0) = −1.
+        assert_eq!(st.unrealized, Usdc(-1));
+        assert_eq!(st.realized, Usdc(0));
+        assert_eq!(st.mtm_pnl, Usdc(-1));
+    }
+
+    #[test]
+    fn mark_missing_token_is_valued_at_side_worst_case() {
+        // Documented policy: a token absent from `marks` is valued at its side's
+        // worst case — a long at mark 0 ($0.00), a short at mark 1_000_000
+        // ($1.00). An empty marks map → BOTH are valued worst-case.
+        let (long, short) = (TokenId(1), TokenId(2));
+        let mut inv = InventoryRisk::new(cfg());
+        inv.on_fill(long, 100 * SHARE, Usdc(-40_000_000)); // long: net +100, basis $40
+        inv.on_fill(short, -50 * SHARE, Usdc(30_000_000)); // short: net −50, basis −$30
+
+        let st = inv.mark(&Marks::new());
+        // Long missing  → value 0      → unrealized = 0 − 40       = −$40.
+        // Short missing → value −50·$1 = −$50 → unrealized = −50 − (−30) = −$20.
+        // (Skipping missing tokens would give 0; marking the short at 0 would
+        //  give +$30 — asserting −$60 pins the documented worst-case policy.)
+        assert_eq!(st.unrealized, Usdc(-60_000_000));
+        assert_eq!(st.realized, Usdc(0));
+        assert_eq!(st.mtm_pnl, Usdc(-60_000_000));
+        assert_eq!(st.halted, None, "−$60 is above the −$100 stop");
     }
 }
