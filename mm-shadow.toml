@@ -1,0 +1,54 @@
+# mm-shadow.toml — LIVE SHADOW canary (signs every order, submits NOTHING).
+#
+# Run with `--live --shadow`: real env secrets + real auth (API-key derive) +
+# real EIP-712 signing of BOTH arb taker orders AND the new MM postOnly maker
+# orders — but the final submit is logged ("SHADOW: … signed, not submitted")
+# and never sent. No confirmation prompt; no money can move.
+#
+#   export PM_PRIVATE_KEY=<exported key>
+#   export PM_DEPOSIT_WALLET=<your Polymarket deposit-wallet address>
+#   cargo run --release --bin arb -- --live --shadow --headless \
+#     --config mm-shadow.toml --duration-secs 180 --db /tmp/mm-shadow.sqlite \
+#     2>&1 | tee /tmp/mm-shadow.log
+#
+# Then check (see the chat for the full checklist):
+#   grep -c "live venue armed"                  /tmp/mm-shadow.log   # ≥1 (auth ok)
+#   grep -c "SHADOW: maker order signed"        /tmp/mm-shadow.log   # ≥1 (maker signing ok)
+#   grep "session result"                       /tmp/mm-shadow.log   # healthy=true
+#   sqlite3 /tmp/mm-shadow.sqlite "select count(*) from fills"       # 0 (shadow never fills)
+
+[strategies.mm]
+enabled          = true
+live             = true     # exercise the LIVE maker venue — in SHADOW it signs, never submits
+capital_usd      = 25.0
+max_markets      = 10
+spread_bps       = 200
+quote_refresh_ms = 1500
+max_quote_usd    = 5.0
+# paper_taker_fill_pct is irrelevant in shadow (the live venue is used, not the sim).
+# live_fills_source: shadow does NOT open the user-WS; fills are inert (none).
+
+[inventory]
+max_inventory_usd       = 50.0
+max_gross_inventory_usd = 150.0
+inventory_stop_loss_usd = 25.0
+daily_loss_usd          = 50.0
+vol_pull_ticks          = 5
+vol_window_ms           = 2000
+
+[segments]
+liquid_stable_min_volume    = 50000.0
+liquid_stable_min_liquidity = 10000.0
+liquid_min_volume           = 2000.0
+liquid_min_liquidity        = 1000.0
+mm_segments         = ["LiquidStable", "Liquid"]
+mm_exclude_fee_free = true
+
+[universe]
+max_markets             = 30     # small → fast sync (~10s) for a dry run
+prioritize_by_liquidity = true
+candidate_pool          = 30
+# auto_restart off for a one-shot shadow test.
+
+[edges]
+max_edge_bps = 400               # same false-arb ceiling as paper

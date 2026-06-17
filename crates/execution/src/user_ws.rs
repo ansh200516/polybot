@@ -102,10 +102,11 @@ pub fn user_subscribe_message(creds: &ApiCreds, condition_ids: &[String]) -> Str
 /// `matched_amount`→µshares / `price`→[`Px`] helpers.
 ///
 /// Only `event_type == "trade"` frames produce fills; any other frame (an
-/// `order` event, a subscribe ack, etc.) returns empty. The user channel
-/// returns only OUR trades, so — unlike the REST path — there is NO
-/// `trader_side` filter: every `maker_orders[]` entry is one of OUR resting
-/// orders that filled. For each entry: build the key, skip if `seen`, map
+/// `order` event, a subscribe ack, etc.) returns empty. The user channel sends
+/// a trade because WE are in it, but its `maker_orders[]` lists EVERY maker the
+/// taker swept — so we filter to entries whose `owner` is `our_owner` (our
+/// API-key UUID); a foreign maker's entry is skipped. For each kept entry:
+/// build the key, skip if `seen`, map
 /// `matched_amount`→µshares and `price`→[`Px`] for the trade's token, emit a
 /// [`MakerFill`], and record the key (only on emit, so a transiently malformed
 /// entry is retried on a later frame). Robust to missing/malformed fields — a
@@ -118,6 +119,7 @@ pub(crate) fn parse_ws_trade(
     value: &serde_json::Value,
     resolve: impl Fn(&str) -> Option<(TokenId, TickSize)>,
     seen: &mut HashSet<String>,
+    our_owner: &str,
 ) -> Vec<MakerFill> {
     // Only `trade` frames carry fills. `order` events / non-trade frames → none.
     if value.get("event_type").and_then(|v| v.as_str()) != Some("trade") {
@@ -147,6 +149,16 @@ pub(crate) fn parse_ws_trade(
             warn!(trade_id, "ws maker_orders entry missing order_id; skipping");
             continue;
         };
+        // The user channel lists EVERY maker in a swept trade, not just ours — so
+        // a single taker that hits N makers delivers N entries. Keep only OURS:
+        // the entry whose `owner` (the maker's API-key UUID) is our key. Entries
+        // WITHOUT an owner are kept (ambiguous → the MM's order-id check is the
+        // backstop); a present-but-different owner is some other maker → skip.
+        if let Some(owner) = entry.get("owner").and_then(|v| v.as_str())
+            && owner != our_owner
+        {
+            continue;
+        }
         let key = format!("{trade_id}:{order_id}");
         if seen.contains(&key) {
             continue;
@@ -347,6 +359,9 @@ async fn run_user_ws<T, F, Fut>(
 {
     // Serialize the subscribe message ONCE: identical on connect + every resub.
     let subscribe_msg = user_subscribe_message(&creds, &condition_ids);
+    // Our maker identity in trade frames: the API-key UUID. Used to keep only
+    // OUR maker_orders entries (the channel lists every maker in a swept trade).
+    let our_owner = creds.key.clone();
     let mut seen: HashSet<String> = HashSet::new();
     let mut attempt: u32 = 0;
     loop {
@@ -359,10 +374,15 @@ async fn run_user_ws<T, F, Fut>(
         }
         match factory().await {
             Ok(mut transport) => {
+                tracing::info!(
+                    conditions = condition_ids.len(),
+                    "user-WS connected (low-latency fills feed live)"
+                );
                 // Connected. Session ends on clean close, transport error, or
                 // receiver-gone.
-                let _ = run_one_session(&mut transport, &tx, &subscribe_msg, &resolve, &mut seen)
-                    .await;
+                let _ =
+                    run_one_session(&mut transport, &tx, &subscribe_msg, &resolve, &mut seen, &our_owner)
+                        .await;
                 // A base backoff before reconnecting avoids hot-looping if the
                 // server drops us right after subscribe. This ALSO resets the
                 // counter after a successful connect: repeated CONNECT failures
@@ -370,7 +390,8 @@ async fn run_user_ws<T, F, Fut>(
                 // that worked drops it back to the 1-step base here.
                 attempt = 1;
             }
-            Err(_e) => {
+            Err(e) => {
+                tracing::warn!(error = %e, attempt, "user-WS connect failed; will retry with backoff");
                 attempt = attempt.saturating_add(1);
             }
         }
@@ -387,6 +408,7 @@ async fn run_one_session<T: WsTransport>(
     subscribe_msg: &str,
     resolve: &HashMap<String, (TokenId, TickSize)>,
     seen: &mut HashSet<String>,
+    our_owner: &str,
 ) -> Result<(), VenueError> {
     // Subscribe FIRST (by condition_id). A send failure here breaks the session.
     transport.send(subscribe_msg).await?;
@@ -408,7 +430,8 @@ async fn run_one_session<T: WsTransport>(
                         let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
                             continue;
                         };
-                        let fills = parse_ws_trade(&value, |aid| resolve.get(aid).copied(), seen);
+                        let fills =
+                            parse_ws_trade(&value, |aid| resolve.get(aid).copied(), seen, our_owner);
                         for fill in fills {
                             // Receiver dropped → the LiveUserWsFills is gone; stop.
                             if tx.send(fill).await.is_err() {
@@ -518,7 +541,7 @@ mod tests {
                 {"order_id": "0xresting-B", "matched_amount": "5", "price": "0.34"},
             ]),
         );
-        let fills = parse_ws_trade(&matched, resolve, &mut seen);
+        let fills = parse_ws_trade(&matched, resolve, &mut seen, "us");
         assert_eq!(fills.len(), 2, "both maker_orders emit on first observation");
         assert_eq!(fills[0].order_id, OrderId("0xresting-A".into()));
         assert_eq!(fills[0].trade_id, "trade-aaa");
@@ -534,7 +557,7 @@ mod tests {
                 {"order_id": "0xresting-B", "matched_amount": "5", "price": "0.34"},
             ]),
         );
-        let again = parse_ws_trade(&confirmed, resolve, &mut seen);
+        let again = parse_ws_trade(&confirmed, resolve, &mut seen, "us");
         assert!(again.is_empty(), "MATCHED→CONFIRMED dedup: {again:?}");
     }
 
@@ -549,7 +572,7 @@ mod tests {
             "asset_id": "999999999",
             "maker_orders": [{"order_id": "0xx", "matched_amount": "3", "price": "0.20"}],
         });
-        assert!(parse_ws_trade(&unreg, resolve, &mut seen).is_empty());
+        assert!(parse_ws_trade(&unreg, resolve, &mut seen, "us").is_empty());
 
         // Registered asset, mixed entries: missing matched_amount, then a
         // tick-unaligned price (0.335 on a Cent market), then one good entry —
@@ -563,15 +586,15 @@ mod tests {
                 {"order_id": "0xgood", "matched_amount": "4", "price": "0.33"},
             ]),
         );
-        let fills = parse_ws_trade(&mixed, resolve, &mut seen);
+        let fills = parse_ws_trade(&mixed, resolve, &mut seen, "us");
         assert_eq!(fills.len(), 1, "only the one good entry survives");
         assert_eq!(fills[0].order_id, OrderId("0xgood".into()));
 
         // A non-trade frame (an `order` event) → empty, never a fill.
         let order_evt = json!({"event_type": "order", "id": "o-1", "asset_id": "123456789"});
-        assert!(parse_ws_trade(&order_evt, resolve, &mut seen).is_empty());
+        assert!(parse_ws_trade(&order_evt, resolve, &mut seen, "us").is_empty());
         // A frame missing event_type → empty.
-        assert!(parse_ws_trade(&json!({"id": "x"}), resolve, &mut seen).is_empty());
+        assert!(parse_ws_trade(&json!({"id": "x"}), resolve, &mut seen, "us").is_empty());
     }
 
     #[test]
@@ -584,11 +607,36 @@ mod tests {
             "MATCHED",
             json!([{"order_id": "0xexact", "matched_amount": "5", "price": "0.34"}]),
         );
-        let fills = parse_ws_trade(&frame, resolve, &mut seen);
+        let fills = parse_ws_trade(&frame, resolve, &mut seen, "us");
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].qty, Qty(5_000_000), "5 shares → 5e6 µshares");
         assert_eq!(fills[0].px.get(), 34, "0.34 → tick 34 on Cent");
         assert_eq!(fills[0].px.microusdc(TickSize::Cent), 340_000);
+    }
+
+    /// A single taker sweep that hits several makers delivers ALL of them in
+    /// `maker_orders[]`. We keep only the entry whose `owner` is ours; a foreign
+    /// maker (different owner) is dropped. An owner-less entry is kept (fallback).
+    #[test]
+    fn parse_ws_trade_keeps_only_our_maker_by_owner() {
+        let mut seen = HashSet::new();
+        let frame = trade_frame(
+            "t-sweep",
+            "MATCHED",
+            json!([
+                {"order_id": "0xforeign", "matched_amount": "9", "price": "0.40", "owner": "someone-else"},
+                {"order_id": "0xours", "matched_amount": "5", "price": "0.40", "owner": "us"},
+                {"order_id": "0xlegacy", "matched_amount": "3", "price": "0.40"},
+            ]),
+        );
+        let fills = parse_ws_trade(&frame, resolve, &mut seen, "us");
+        // "0xforeign" dropped (owner mismatch); "0xours" (owner match) + "0xlegacy"
+        // (no owner → fallback-kept) survive.
+        let ids: Vec<&str> = fills.iter().map(|f| f.order_id.0.as_str()).collect();
+        assert_eq!(fills.len(), 2, "foreign owner filtered, ours + owner-less kept: {ids:?}");
+        assert!(ids.contains(&"0xours"));
+        assert!(ids.contains(&"0xlegacy"));
+        assert!(!ids.contains(&"0xforeign"), "foreign maker must be dropped");
     }
 
     #[test]

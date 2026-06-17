@@ -1223,7 +1223,11 @@ async fn main() {
         if let Some(v) = mm_live_venue.as_mut() {
             match v.open_orders().await {
                 Ok(open) if !open.is_empty() => {
-                    warn!(count = open.len(), "MM venue reports open orders at startup")
+                    // A maker path should leave nothing resting between sessions;
+                    // any open order is a STRANDED orphan (e.g. a prior run that
+                    // exited before cancel_all). Surface it loudly; the in-session
+                    // cancel_all is the primary guard against leaving orphans.
+                    warn!(count = open.len(), "MM venue reports open orders at startup (possible orphan — check the account)")
                 }
                 Ok(_) => {}
                 Err(e) => warn!("MM venue open-orders check failed at startup: {e}"),
@@ -1234,7 +1238,38 @@ async fn main() {
             .unwrap_or_else(|e| fatal(format!("MmParams::from_config: {e}")));
         let mm_inv_cfg =
             inventory_config(&config).unwrap_or_else(|e| fatal(format!("inventory_config: {e}")));
-        let mut mm = MmStrategy::new(mm_tokens, mm_token_market, mm_params, mm_inv_cfg, mm_capital);
+        // INVENTORY RELOAD (Phase-4 seed wiring; auto-restart correctness): resume
+        // the MM's signed inventory from its persisted lots so a restart starts
+        // from the REAL position (and can offload it via the ask side) instead of
+        // flat. The writer `store` was moved into the writer task, so read via a
+        // second read-only WAL connection. Scoped to strategy "mm" and to tokens
+        // we will quote, so a held position is actually worked off.
+        let mm_seed: Vec<(pm_core::instrument::TokenId, i128, pm_core::num::Usdc)> =
+            pm_store::read::ReadStore::open(Path::new(&config.store.path))
+                .and_then(|rs| rs.open_positions())
+                .map(|rows| {
+                    rows.into_iter()
+                        .filter_map(|(t, strat, net, cost)| {
+                            let tok = pm_core::instrument::TokenId(t as u64);
+                            (strat == "mm" && net != 0 && mm_token_market.contains_key(&tok))
+                                .then_some((tok, i128::from(net), pm_core::num::Usdc(i128::from(cost))))
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|e| {
+                    warn!("MM inventory reload failed (starting flat): {e}");
+                    Vec::new()
+                });
+        for (tok, net, cost) in &mm_seed {
+            info!(
+                token = tok.0,
+                net_micro = *net as i64,
+                cost_micro = cost.0,
+                "MM inventory reloaded (resuming held position to manage/offload)"
+            );
+        }
+        let mut mm = MmStrategy::new(mm_tokens, mm_token_market, mm_params, mm_inv_cfg, mm_capital)
+            .with_seed(mm_seed);
 
         if let Some(venue) = mm_live_venue {
             // Task 4.6 — choose the live FILLS source and build the matching

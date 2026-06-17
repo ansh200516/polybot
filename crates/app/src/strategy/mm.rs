@@ -195,6 +195,13 @@ pub struct MmStrategy {
     /// is chosen from `[strategies.mm].live_fills_source`. The paper arm
     /// therefore never constructs or holds a live venue.
     live_venue: Option<MmLive>,
+    /// Startup inventory seed (Phase-4 reload): `(token, net µshares, basis cash)`
+    /// from `store.open_positions()` scoped to `"mm"`. `run` applies each via
+    /// [`InventoryRisk::seed`] BEFORE quoting, so a restart resumes from the REAL
+    /// held position (and can offload it via the ask side) instead of starting
+    /// flat — which also makes the auto-restart loop position-correct. Empty by
+    /// default (a fresh session with no persisted MM lots).
+    seed: Vec<(TokenId, i128, Usdc)>,
 }
 
 impl MmStrategy {
@@ -219,6 +226,7 @@ impl MmStrategy {
             inv_cfg,
             capital,
             live_venue: None,
+            seed: Vec::new(),
         }
     }
 
@@ -230,6 +238,15 @@ impl MmStrategy {
     /// opt-in on top of the startup confirmation.
     pub fn with_live_venue(mut self, live: MmLive) -> Self {
         self.live_venue = Some(live);
+        self
+    }
+
+    /// Seed startup inventory (Phase-4 reload) from persisted lots. main sources
+    /// it from `store.open_positions()` (scoped to `"mm"`, quoted tokens only);
+    /// `run` applies it via [`InventoryRisk::seed`] before the first quote so the
+    /// MM resumes from — and can offload — its real position across restarts.
+    pub fn with_seed(mut self, seed: Vec<(TokenId, i128, Usdc)>) -> Self {
+        self.seed = seed;
         self
     }
 }
@@ -255,10 +272,17 @@ impl Strategy for MmStrategy {
                 inv_cfg,
                 capital,
                 live_venue,
+                seed,
             } = *self;
             // Per-strategy state is identical for both venues; build it once.
             let qm = QuoteManager::new();
-            let inv = InventoryRisk::new(inv_cfg);
+            // Reload persisted inventory BEFORE quoting (Phase-4 seed): resume the
+            // real signed net + basis per token so a restart manages (and offloads)
+            // held positions instead of starting flat.
+            let mut inv = InventoryRisk::new(inv_cfg);
+            for (token, net, basis) in &seed {
+                inv.seed(*token, *net, *basis);
+            }
             let positions = PositionBook::default();
             // VENUE SELECTION (Task 4.5 / 4.6): the live venue is present ONLY when
             // main cleared MM for live (process `--live` AND `[strategies.mm].live`
@@ -276,13 +300,13 @@ impl Strategy for MmStrategy {
             match live_venue {
                 Some(MmLive::Rest(live)) => {
                     run_mm_loop(
-                        live, qm, inv, positions, ctx, params, tokens, token_market, capital,
+                        live, qm, inv, positions, ctx, params, tokens, token_market, capital, true,
                     )
                     .await;
                 }
                 Some(MmLive::Ws(split)) => {
                     run_mm_loop(
-                        split, qm, inv, positions, ctx, params, tokens, token_market, capital,
+                        split, qm, inv, positions, ctx, params, tokens, token_market, capital, true,
                     )
                     .await;
                 }
@@ -292,7 +316,7 @@ impl Strategy for MmStrategy {
                     let venue = PaperMakerVenue::new(ctx.fetcher.clone())
                         .with_taker_fill_pct(params.paper_taker_fill_pct);
                     run_mm_loop(
-                        venue, qm, inv, positions, ctx, params, tokens, token_market, capital,
+                        venue, qm, inv, positions, ctx, params, tokens, token_market, capital, false,
                     )
                     .await;
                 }
@@ -342,6 +366,20 @@ fn quote_order(
     }
     // size µshares = notional µUSDC × 1e6 µshare/share ÷ (µUSDC/share).
     let size_micro = notional_micro.saturating_mul(1_000_000) / price_micro;
+    // QUANTISE THE SIZE to the venue's order-amount rules (RECON, two live
+    // rejections): for a maker order the CLOB enforces (a) price =
+    // makerAmount/takerAmount on the tick grid, (b) shares ≤ 2 decimals
+    // (multiple of 0.01 share = 10_000 µ), and (c) USDC ≤ 4 decimals (multiple
+    // of 100 µ). Rounding size DOWN to `grain = max(10_000, 1e8 / unit)` µshares
+    // satisfies all three: 10_000 µ (= 0.01 share) for Cent, 100_000 µ (= 0.1
+    // share) for Milli — at any tick `price·size` is then a whole, ≤4-decimal
+    // µUSDC and the maker/taker ratio is exactly the tick price.
+    let grain = (100_000_000 / i128::from(ts.unit_microusdc())).max(10_000);
+    let size_micro = if grain > 0 {
+        size_micro - size_micro.rem_euclid(grain)
+    } else {
+        size_micro
+    };
     if size_micro <= 0 {
         return None;
     }
@@ -508,6 +546,10 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     paused: bool,
     /// Latched once an inventory halt fires — quoting never resumes this session.
     halted: bool,
+    /// Venue capability: `true` for the live CLOB (NO naked shorts) → an ASK
+    /// sells at most the current LONG inventory and is skipped when flat
+    /// (bid-only). `false` for the paper venue, which models signed/short fills.
+    no_naked_shorts: bool,
 }
 
 impl<V: MakerVenue + UserFillSource> MmLoop<V> {
@@ -534,7 +576,16 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         let mut desired: Vec<MakerOrder> = Vec::new();
         for token in tokens {
             // Need a VALID two-sided book; skip the token otherwise.
-            let Some((book, true)) = self.fetcher.fetch(token).await else {
+            let fetched = self.fetcher.fetch(token).await;
+            match &fetched {
+                None => tracing::debug!(token = token.0, "mm quote: skip — no route / dead supervisor"),
+                Some((_, false)) => tracing::debug!(
+                    token = token.0,
+                    "mm quote: skip — book INVALID (crossed/stale/off-tick)"
+                ),
+                Some((_, true)) => {}
+            }
+            let Some((book, true)) = fetched else {
                 continue;
             };
             let ts = book.ts();
@@ -563,7 +614,39 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 net_micro,
                 max_inventory_micro,
             );
+            if bid.is_none() && ask.is_none() {
+                let bb = book.bids.best().map(|p| p.get());
+                let ba = book.asks.best().map(|p| p.get());
+                tracing::debug!(
+                    token = token.0,
+                    ?bb,
+                    ?ba,
+                    "mm quote: compute_quotes produced NO sides (extreme price / no interior room)"
+                );
+            }
             for o in [bid, ask].into_iter().flatten() {
+                // NO NAKED SHORTS on the live CLOB (RECON: an ASK with 0 share
+                // balance is rejected "not enough balance"): an ask may sell at
+                // most the current LONG inventory. When flat/short, skip the ask
+                // and quote BID-ONLY — inventory accrues via fills, then the ask
+                // offloads it (the natural MM bootstrap). The bid is USDC-funded,
+                // so it is unconstrained here; `check_quote` still caps how much
+                // we buy. (True shorting on Polymarket = buying the complement —
+                // a future enhancement; this keeps the live MM long-only.)
+                let o = if self.no_naked_shorts && o.side == Side::Ask {
+                    let long = net_micro.max(0);
+                    let grain = (100_000_000 / i128::from(ts.unit_microusdc())).max(10_000);
+                    let sellable = (o.size.0 as i128).min(long);
+                    let sellable = sellable - sellable.rem_euclid(grain);
+                    // Below the venue's ~5-share floor → nothing worth offloading.
+                    if sellable < 5_000_000 {
+                        tracing::debug!(token = token.0, net = net_micro as i64, "mm quote: skip ask — long inventory below venue minimum");
+                        continue;
+                    }
+                    MakerOrder { size: Qty(sellable as u64), ..o }
+                } else {
+                    o
+                };
                 let signed_qty = match o.side {
                     Side::Bid => o.size.0 as i128,
                     Side::Ask => -(o.size.0 as i128),
@@ -575,7 +658,10 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 };
                 // Inventory cap gate (Task 2.2): only quote sides it approves.
                 if matches!(self.inv.check_quote(&intent), QuoteVerdict::Approve) {
+                    tracing::debug!(token = token.0, side = ?o.side, tick = o.price.get(), "mm quote: DESIRED");
                     desired.push(o);
+                } else {
+                    tracing::debug!(token = token.0, side = ?o.side, "mm quote: inventory REJECTED side");
                 }
             }
         }
@@ -587,7 +673,12 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         // FK-reference — complete. Otherwise a quote that filled before a later
         // side's place was rejected (e.g. a skewed quote that crossed) would book
         // a fill whose FK-parent order row was never written.
-        let _ = self.qm.reconcile(&mut self.venue, &desired).await;
+        if let Err(e) = self.qm.reconcile(&mut self.venue, &desired).await {
+            // A live venue rejecting an order (postOnly cross, min-size, auth, …)
+            // was previously discarded — surface it so a persistent reject (every
+            // tick) is visible rather than silently quoting nothing.
+            tracing::warn!(error = %e, desired = desired.len(), "mm quote: reconcile failed (venue rejected an order)");
+        }
         self.record_placed(&desired).await;
     }
 
@@ -798,6 +889,10 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
     /// Cancel every resting quote (best-effort — the next tick re-quotes when
     /// active, or stays flat when paused/halted).
     async fn cancel_all(&mut self) {
+        let n = self.qm.tracked().len();
+        if n > 0 {
+            tracing::info!(resting = n, "mm: canceling all resting quotes");
+        }
         let _ = self.qm.cancel_all(&mut self.venue).await;
     }
 }
@@ -817,6 +912,7 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
     tokens: Vec<TokenId>,
     token_market: HashMap<TokenId, MarketId>,
     capital: Usdc,
+    no_naked_shorts: bool,
 ) {
     let StrategyCtx {
         registry: _,
@@ -845,6 +941,7 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
         rebate_accrued_micro: 0,
         paused: false,
         halted: false,
+        no_naked_shorts,
     };
 
     let mut tick = tokio::time::interval(params.quote_refresh);
@@ -1044,6 +1141,7 @@ mod tests {
             rebate_accrued_micro: 0,
             paused: false,
             halted: false,
+            no_naked_shorts: false,
         };
         (mm, store_rx, status_rx)
     }
@@ -1197,9 +1295,91 @@ mod tests {
         assert!(bid.post_only && ask.post_only);
         assert_eq!(bid.order_type, OrderType::Gtc);
         assert_eq!(ask.order_type, OrderType::Gtc);
-        // Size clamped by max_quote_usd: notional / price (µshares).
-        assert_eq!(bid.size, Qty(5_000_000 * 1_000_000 / 490_000));
-        assert_eq!(ask.size, Qty(5_000_000 * 1_000_000 / 510_000));
+        // Size clamped by max_quote_usd: notional / price (µshares), then
+        // quantised DOWN to a 10_000-µshare grain (0.01 share, Cent) so the
+        // venue's amount-precision + tick-grid rules all hold.
+        assert_eq!(bid.size, Qty(5_000_000 * 1_000_000 / 490_000 / 10_000 * 10_000));
+        assert_eq!(ask.size, Qty(5_000_000 * 1_000_000 / 510_000 / 10_000 * 10_000));
+    }
+
+    /// REGRESSION (two live rejections): an arbitrary notional/price gives a
+    /// µshare size that (1) drifts off the 0.01 price grid
+    /// (5_000_000 / 10_416_666 = 0.48000003…) and (2) exceeds the venue's
+    /// amount-precision (shares ≤ 2 dec, USDC ≤ 4 dec). The 10_000-µshare grain
+    /// fixes all three: shares land on 0.01 and `price_micro · size` is a whole,
+    /// ≤4-decimal µUSDC, so makerAmount is a multiple of 100 µ and
+    /// makerAmount/takerAmount is exactly the tick price.
+    #[test]
+    fn quote_order_size_satisfies_venue_amount_rules() {
+        for tick in [1u16, 7, 33, 48, 49, 99] {
+            let o = quote_order(TokenId(1), Side::Bid, px(tick), TickSize::Cent, 5_000_000)
+                .expect("quote");
+            let price_micro = u128::from(tick) * 10_000;
+            let size = u128::from(o.size.0);
+            // takerAmount (shares) ≤ 2 decimals → multiple of 0.01 share = 10_000 µ.
+            assert_eq!(size % 10_000, 0, "tick {tick}: shares exceed 2 decimals");
+            // price·size % 1e8 == 0 ⟹ makerAmount = price·size/1e6 is a whole µUSDC
+            // AND a multiple of 100 µ (≤ 4 decimals) AND maker/taker = the tick px.
+            assert_eq!(
+                (price_micro * size) % 100_000_000,
+                0,
+                "tick {tick}: makerAmount off the 4-decimal / tick grid"
+            );
+        }
+    }
+
+    /// Live venues have NO naked shorts: a FLAT MM quotes BID-ONLY — the ask is
+    /// skipped until a bid fills and gives it inventory to offload. (Paper keeps
+    /// quoting both sides; this is gated on the `no_naked_shorts` venue flag.)
+    #[tokio::test]
+    async fn no_naked_shorts_quotes_bid_only_when_flat() {
+        let tokens = vec![TokenId(1)];
+        let (fetcher, _shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        let (mut mm, _store_rx, _status_rx) = build_loop(
+            fetcher,
+            generous_inv(),
+            mk_params(200, 5.0),
+            tokens,
+            Usdc(1_000_000_000),
+        );
+        mm.no_naked_shorts = true; // emulate the live CLOB capability
+
+        mm.quote().await;
+        assert!(
+            mm.qm.tracked().contains_key(&(TokenId(1), Side::Bid)),
+            "flat → bid rests"
+        );
+        assert!(
+            !mm.qm.tracked().contains_key(&(TokenId(1), Side::Ask)),
+            "flat + no naked shorts → ask skipped (nothing to sell)"
+        );
+    }
+
+    /// The restart/offload path: with a seeded LONG (resumed inventory), the
+    /// no-naked-shorts MM DOES quote an ask — to offload what it holds — so a
+    /// position carried across a restart gets worked off, not stranded.
+    #[tokio::test]
+    async fn no_naked_shorts_quotes_ask_when_seeded_long() {
+        let tokens = vec![TokenId(1)];
+        let (fetcher, _shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        let (mut mm, _store_rx, _status_rx) = build_loop(
+            fetcher,
+            generous_inv(),
+            mk_params(200, 5.0),
+            tokens,
+            Usdc(1_000_000_000),
+        );
+        mm.no_naked_shorts = true;
+        // Resume a 20-share long (cost $10) — the seed a restart applies.
+        mm.inv.seed(TokenId(1), 20_000_000, Usdc(10_000_000));
+
+        mm.quote().await;
+        assert!(
+            mm.qm.tracked().contains_key(&(TokenId(1), Side::Ask)),
+            "a seeded long → ask quotes to offload it"
+        );
     }
 
     /// A spread so wide it pushes a side outside the interior tick range yields
@@ -1715,6 +1895,7 @@ mod tests {
             tokens,
             token_market,
             Usdc(1_000_000_000),
+            false,
         ));
 
         // Let it run a few quote cycles (10 ms interval), then kill it.
@@ -1980,6 +2161,7 @@ mod tests {
             rebate_accrued_micro: 0,
             paused: false,
             halted: false,
+            no_naked_shorts: false,
         };
         (mm, store_rx, produced)
     }
@@ -2138,6 +2320,7 @@ mod tests {
             tokens,
             token_market,
             Usdc(1_000_000_000),
+            false,
         ));
         // Dropping the control sender closes ctl_rx → the loop shuts down cleanly.
         drop(ctl_tx);

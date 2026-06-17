@@ -868,6 +868,18 @@ impl MakerVenue for LiveVenue {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        // Positive confirmation a resting maker order was accepted (debug: an
+        // active MM re-places frequently, so keep it off the info stream).
+        tracing::debug!(
+            token = %venue_token,
+            side = side_str,
+            order_type = order_type_str,
+            post_only = o.post_only,
+            limit_ticks = o.price.get(),
+            qty_micro = o.size.0,
+            order_id = %order_id,
+            "LIVE: maker order accepted (resting)"
+        );
         Ok(OrderId(order_id))
     }
 

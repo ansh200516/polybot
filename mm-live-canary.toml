@@ -1,0 +1,62 @@
+# mm-live-canary.toml — REAL-MONEY maker canary (rung 2).
+#
+# Runs the MM live (NOT shadow): real postOnly GTC orders that REST on the book,
+# get replaced/canceled each refresh, and fill via the live user-WS. Arb is
+# neutered (edge floors set absurdly high) so the ONLY thing trading is the MM
+# maker path — this isolates the test.
+#
+# Blast radius (worst case, all caps are HARD):
+#   * postOnly never crosses → we only ever pay the spread, never lift the book.
+#   * max_quote_usd = $5/side, max_markets = 2 → ≤ 4 resting orders, ≤ $20 notional
+#     RESTING (not risk — risk is only what FILLS).
+#   * inventory caps bound FILLED exposure: ≤ $6 net/market, ≤ $12 gross.
+#   * inventory_stop_loss_usd = $5 and live.session_loss_usd = $6 latch a halt.
+#   → realistic worst-case loss a few dollars (a one-sided fill that gaps before
+#     we offload), expected ≈ $0 (MM captures spread).
+#
+#   export PM_PRIVATE_KEY=…  PM_PROXY_ADDRESS=…  PM_DEPOSIT_WALLET=…
+#   echo "I understand this trades real money" | cargo run --release --bin arb -- \
+#     --live --headless --config mm-live-canary.toml --duration-secs 120 \
+#     --db /tmp/mm-canary.sqlite
+
+[strategies.mm]
+enabled          = true
+live             = true
+capital_usd      = 10.0
+max_markets      = 2
+spread_bps       = 80      # rest AT the touch so a real fill is likely (exercises the WS fill path)
+quote_refresh_ms = 2500    # replace every 2.5s → exercises cancel/replace
+max_quote_usd    = 4.0     # 4 tokens × $4 = $16 < balance → all bids rest at once (more fill odds); still ≥5 shares at any price ≤ $0.80
+live_fills_source = "ws"   # exercise the low-latency user-WS fills feed
+
+[inventory]
+max_inventory_usd       = 6.0
+max_gross_inventory_usd = 12.0
+inventory_stop_loss_usd = 5.0
+daily_loss_usd          = 6.0
+vol_pull_ticks          = 6
+vol_window_ms           = 2500
+
+[live]
+session_loss_usd = 6.0
+basket_cap_usd   = 1.0     # moot (arb neutered) but must be > 0
+
+# Neuter arb for an isolated maker test: only an impossible ≥90% risk-free edge
+# would ever dispatch, so arb never trades real money during this canary.
+[edges]
+min_edge_class12_bps = 9000
+min_edge_class3_bps  = 9000
+max_edge_bps         = 9500
+
+[segments]
+liquid_stable_min_volume    = 50000.0
+liquid_stable_min_liquidity = 10000.0
+liquid_min_volume           = 2000.0
+liquid_min_liquidity        = 1000.0
+mm_segments         = ["LiquidStable", "Liquid"]
+mm_exclude_fee_free = true
+
+[universe]
+max_markets             = 40
+prioritize_by_liquidity = true
+candidate_pool          = 40
