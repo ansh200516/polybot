@@ -12,6 +12,18 @@
 # Stop with `q` (TUI), `touch kill.switch`, or `kill -USR1 <pid>`.
 
 # ---------------------------------------------------------------------------
+# Arbitrage plausibility ceiling. The default (5000 bps = 50%) only catches
+# absurd false arbs; but thin multi-outcome markets (e.g. "OpenAI market cap
+# $500–750B", "GPT-6 released by …") produce 5–11% FALSE arbs from stale/crossed
+# books that slip under 50% — arb then dispatched them and lost money in paper.
+# Genuine risk-free arbs sit just above the 30/100 bps floors (well under ~2%),
+# so a 400 bps (4%) ceiling suppresses the false ones with wide headroom for real
+# ones. (Consider tightening your LIVE arb config the same way.)
+# ---------------------------------------------------------------------------
+[edges]
+max_edge_bps = 400
+
+# ---------------------------------------------------------------------------
 # Market maker (paper)
 # ---------------------------------------------------------------------------
 [strategies.mm]
