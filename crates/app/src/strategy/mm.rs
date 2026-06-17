@@ -398,10 +398,13 @@ fn skew_fair(fair: i128, net_micro: i128, max_inventory_micro: i128, skew_bps: u
 /// 0` leaves `fair = mid`, i.e. the Task-4.2 symmetric quote). The half-spread
 /// (µUSDC) is `spread_bps · 100 / 2` (1 bp = 100 µUSDC/share since $1.00 =
 /// 10_000 bps = 1_000_000 µUSDC). The bid rounds DOWN to a tick and the ask
-/// rounds UP (maker-favorable / never narrower); they are bumped apart to stay
-/// strictly non-crossing, and both must be interior ticks `[1, levels−1]` —
-/// otherwise the token is skipped (`(None, None)`). These clamps bound the skew:
-/// it can never cross the book or leave the valid range (it just skips a side).
+/// rounds UP (maker-favorable / never narrower). Both are then CLAMPED to the
+/// live book so a post-only quote never crosses — the bid stays strictly below
+/// the best ask, the ask strictly above the best bid (when skew would push a
+/// side across, it clamps to the most-aggressive non-crossing price). Finally
+/// they are bumped apart to stay strictly non-crossing of each other, and both
+/// must be interior ticks `[1, levels−1]` — otherwise the token is skipped
+/// (`(None, None)`). So skew can never produce a crossing (venue-rejected) quote.
 ///
 /// `net_micro` is the strategy's current signed net for `token` (µshares) and
 /// `max_inventory_micro` the per-market inventory cap (µUSDC) the skew
@@ -427,11 +430,22 @@ fn compute_quotes(
     let half = i128::from(params.spread_bps) * 100 / 2;
 
     // bid rounds DOWN (floor), ask rounds UP (ceil) — never narrower than asked.
-    let bid_tick = (fair - half).div_euclid(unit);
+    let mut bid_tick = (fair - half).div_euclid(unit);
     let mut ask_tick = {
         let n = fair + half;
         (n + unit - 1).div_euclid(unit)
     };
+    // CLAMP TO THE LIVE BOOK (post-only safety): a maker quote must NOT cross, or
+    // the venue rejects it (`INVALID_POST_ONLY_ORDER`) — and a single crossing
+    // side aborts the whole reconcile pass. Skew can push a side across the book
+    // (a big long skews the ASK below the best bid), so keep the bid STRICTLY
+    // below the best ask and the ask STRICTLY above the best bid. When skew would
+    // cross, this clamps to the most-aggressive NON-crossing price (the correct
+    // offload quote), e.g. a heavy long rests its ask at best_bid+1.
+    let best_bid_tick = i128::from(best_bid.get());
+    let best_ask_tick = i128::from(best_ask.get());
+    bid_tick = bid_tick.min(best_ask_tick - 1);
+    ask_tick = ask_tick.max(best_bid_tick + 1);
     // Never cross / collapse onto one tick: keep the ask strictly above the bid.
     if ask_tick <= bid_tick {
         ask_tick = bid_tick + 1;
@@ -1318,6 +1332,34 @@ mod tests {
         let (mb, ma) = compute_quotes(&mid, TokenId(1), &params, params.max_quote_micro, extreme, SKEW_CAP_MICRO);
         let (mb, ma) = (mb.expect("mid bid"), ma.expect("mid ask"));
         assert!(ma.price.get() > mb.price.get(), "skewed quote stays non-crossing");
+    }
+
+    /// Regression (the dropped-fills root trigger): a heavy long + large skew
+    /// would push the ASK below the best bid — a marketable post-only the venue
+    /// REJECTS, which used to abort the whole reconcile pass and orphan the bid.
+    /// The book clamp pins the ask to the most-aggressive NON-crossing price
+    /// (best_bid + 1) instead of emitting a crossing quote.
+    #[test]
+    fn skew_clamps_a_crossing_ask_to_the_book() {
+        let book = mid50_book(); // best bid 0.49, best ask 0.51
+        let params = mk_params_skew(200, 5.0, 400); // 4¢ full skew → raw ask 0.47 (crosses)
+        let (bid, ask) = compute_quotes(
+            &book,
+            TokenId(1),
+            &params,
+            params.max_quote_micro,
+            FULL_CAP_SHARES,
+            SKEW_CAP_MICRO,
+        );
+        // mid50_book is best bid 0.48 / best ask 0.52, so the most-aggressive
+        // non-crossing ask is best_bid + 1 = 49 (the raw skewed ask 0.47 crosses).
+        let ask = ask.expect("ask present");
+        assert_eq!(ask.price.get(), 49, "crossing ask clamped to best_bid+1, not the raw 0.47");
+        assert!(ask.price.get() > 48, "ask must never cross (sit at/below) the best bid");
+        if let Some(b) = bid {
+            assert!(b.price.get() < 52, "bid must never cross (sit at/above) the best ask");
+            assert!(b.price.get() < ask.price.get(), "bid stays below ask");
+        }
     }
 
     // ── Inventory cap gating ───────────────────────────────────────────────────
