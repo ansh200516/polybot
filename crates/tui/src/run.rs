@@ -53,7 +53,7 @@ pub async fn run_tui<B: Backend>(
             maybe_key = key_rx.recv() => {
                 let Some(key) = maybe_key else { return Ok(()) };
                 let paused = state.paused;
-                if let Some(cmd) = crate::ui::handle_key(key, &mut ui, paused) {
+                if let Some(cmd) = crate::ui::handle_key(key, &mut ui, paused, &state.open_orders) {
                     let quit = cmd == TuiCommand::Quit;
                     let _ = cmd_tx.send(cmd).await;
                     if quit {

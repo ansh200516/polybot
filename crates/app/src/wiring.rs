@@ -1,7 +1,7 @@
 //! Config → engine/risk parameter conversion, component indexing, shard
 //! packing, and the BookFetcher adapter (spec §12 app wiring).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use pm_config::{Config, ConfigError, usd_to_microusdc};
@@ -329,6 +329,39 @@ pub fn mm_market_selection(
         selected.push(id);
     }
     selected
+}
+
+/// Confluence directional filter: from a market's two outcome tokens, return the
+/// side(s) the top traders FAVOR — those whose venue (CLOB) token id is in
+/// `favored_venue_ids` (built from the Data-API confluence signal).
+///
+/// * EMPTY `favored_venue_ids` ⇒ confluence is OFF → return BOTH sides (the MM's
+///   normal two-sided universe is unchanged).
+/// * Non-empty ⇒ return only the favored side. Token ids are globally unique, so
+///   at most one of a market's two tokens is ever in the set (the aggregator
+///   picks ONE favored outcome per `conditionId`). If NEITHER matches (a venue-id
+///   / data mismatch that should not happen for a confluence-sourced market) the
+///   market is SKIPPED — we never quote a side the smart money does not hold.
+///
+/// Quoting only the favored token makes the (no-naked-shorts) MM accumulate that
+/// side as it buys low / sells back — a directional lean toward the smart money —
+/// while still capturing the spread.
+pub fn directional_quote_tokens(
+    reg: &Registry,
+    market: &Market,
+    favored_venue_ids: &HashSet<String>,
+) -> Vec<TokenId> {
+    if favored_venue_ids.is_empty() {
+        return vec![market.yes, market.no];
+    }
+    [market.yes, market.no]
+        .into_iter()
+        .filter(|&t| {
+            reg.token_venue_id(t)
+                .map(|v| favored_venue_ids.contains(v))
+                .unwrap_or(false)
+        })
+        .collect()
 }
 
 /// Everything a detector needs about one connected component.
@@ -864,6 +897,36 @@ mod tests {
             incl.contains(&ff),
             "fee-free market kept when exclude_fee_free=false"
         );
+    }
+
+    #[test]
+    fn directional_quote_tokens_picks_favored_side_or_both() {
+        let r = reg();
+        // Market 0xa: yes venue id "ya", no venue id "na" (see `reg()`).
+        let m = r.market_by_condition("0xa").unwrap();
+
+        // Confluence OFF (empty set) → BOTH sides, in yes/no order.
+        assert_eq!(
+            directional_quote_tokens(&r, m, &HashSet::new()),
+            vec![m.yes, m.no],
+            "empty favored set ⇒ confluence off ⇒ quote both"
+        );
+
+        // Favored = the YES venue id → only the yes token.
+        let fav_yes: HashSet<String> = ["ya".to_string()].into_iter().collect();
+        assert_eq!(directional_quote_tokens(&r, m, &fav_yes), vec![m.yes]);
+
+        // Favored = the NO venue id → only the no token (directional short side).
+        let fav_no: HashSet<String> = ["na".to_string()].into_iter().collect();
+        assert_eq!(directional_quote_tokens(&r, m, &fav_no), vec![m.no]);
+
+        // Non-empty set matching NEITHER side → skip (never quote a side the smart
+        // money does not hold). Other markets' favored ids never bleed in because
+        // token ids are globally unique.
+        let fav_other: HashSet<String> = ["yb".to_string(), "nc".to_string()]
+            .into_iter()
+            .collect();
+        assert!(directional_quote_tokens(&r, m, &fav_other).is_empty());
     }
 
     #[test]

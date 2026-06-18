@@ -257,6 +257,8 @@ fn coord_status_to_strategy(cs: &CoordStatus) -> StrategyStatus {
         open_positions: cs.open_positions,
         // Arb harvests no maker rebate — the estimate is MM-specific (Task 4.4).
         rebate_micro: 0,
+        // Arb holds no resting maker quotes — the open-orders panel is MM-only.
+        resting_orders: Vec::new(),
     }
 }
 
@@ -280,6 +282,9 @@ async fn bridge_control(
                         break;
                     }
                 }
+                // Dashboard per-order veto is MM-only — arb holds no resting
+                // maker quotes, so it ignores this control.
+                Some(StrategyCommand::VetoQuote { .. }) => {}
                 None => ctl_open = false,
             },
             cmd = live_ctl_rx.recv(), if live_open => match cmd {

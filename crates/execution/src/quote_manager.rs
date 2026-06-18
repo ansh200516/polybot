@@ -17,15 +17,20 @@
 //! the Phase-4 market-making strategy wires it up — it is inert.
 //!
 //! # On-error consistency contract
-//! Any [`VenueError`] aborts the pass and propagates (`Err`), leaving the
-//! tracking map in a state a subsequent `reconcile`/`cancel_all` can resume
-//! from, because the map mutates ONLY after the venue call succeeds:
+//! [`reconcile`](QuoteManager::reconcile) does NOT abort on the first
+//! [`VenueError`]: a single rejected order must not block every OTHER market's
+//! quote. It CONTINUES past each per-order failure and returns the FIRST error
+//! at the end (`cancel_all` still aborts — flatten is all-or-nothing). The map
+//! mutates ONLY after the venue call succeeds, so each failed call leaves
+//! consistent, resumable state:
 //! - a **failed `place`** records nothing — the key stays untracked;
 //! - a **failed `replace`** keeps the OLD id tracked — the prior quote is still
 //!   (believed) resting, so the next pass re-attempts the replace;
 //! - a **failed `cancel`** keeps the id tracked — the next pass re-cancels it.
 //!
-//! Retry / reconnect orchestration lives in the MM strategy (Task 3.5).
+//! So a returned `Err` means "≥1 order failed (state still consistent), and the
+//! orders that COULD go up did". Retry / reconnect orchestration lives in the MM
+//! strategy (Task 3.5).
 
 use std::collections::{HashMap, HashSet};
 
@@ -77,8 +82,10 @@ impl QuoteManager {
     /// Every tracked key absent from `desired` is
     /// [`cancel`](MakerVenue::cancel)led and dropped.
     ///
-    /// On any [`VenueError`] the pass aborts and returns `Err`, leaving the map
-    /// per the module-level on-error contract.
+    /// A [`VenueError`] on any single order is logged-by-skipping: the pass
+    /// CONTINUES (other orders still place/cancel) and returns the FIRST error,
+    /// leaving each failed order's tracking consistent per the module-level
+    /// on-error contract. So `Err` means "≥1 order failed; the rest still went up".
     pub async fn reconcile<V: MakerVenue>(
         &mut self,
         venue: &mut V,
@@ -86,6 +93,14 @@ impl QuoteManager {
     ) -> Result<(), VenueError> {
         let desired_keys: HashSet<(TokenId, Side)> =
             desired.iter().map(|o| (o.token, o.side)).collect();
+
+        // A single order's rejection (balance/allowance, a transient venue error,
+        // a momentarily-crossing post-only) must NOT block every OTHER market's
+        // quote — so we CONTINUE past per-order failures and return the FIRST one
+        // at the end. Per-order state stays consistent exactly as before (a failed
+        // place records nothing; a failed replace/cancel keeps the id tracked), so
+        // the next pass retries precisely the failed orders while the rest stay up.
+        let mut first_err: Option<VenueError> = None;
 
         // 1. Cancel + drop everything tracked that is no longer desired. Snapshot
         //    (key, id) first so no borrow of `self.resting` crosses an await.
@@ -96,8 +111,15 @@ impl QuoteManager {
             .map(|(key, resting)| (*key, resting.id.clone()))
             .collect();
         for (key, id) in stale {
-            venue.cancel(&id).await?; // err → key stays tracked; next pass re-cancels
-            self.resting.remove(&key);
+            match venue.cancel(&id).await {
+                Ok(()) => {
+                    self.resting.remove(&key);
+                }
+                // err → key stays tracked; next pass re-cancels. Don't drop it.
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
         }
 
         // 2. Place / replace / no-op each desired quote.
@@ -111,20 +133,33 @@ impl QuoteManager {
                 // Nothing tracked → place fresh.
                 None => None,
             };
-            let new_id = match old_id {
-                Some(old) => venue.replace(&old, o).await?, // err → OLD id retained
-                None => venue.place(o).await?,              // err → nothing recorded
+            let result = match &old_id {
+                Some(old) => venue.replace(old, o).await, // err → OLD id retained
+                None => venue.place(o).await,             // err → nothing recorded
             };
-            self.resting.insert(
-                key,
-                Resting {
-                    id: new_id,
-                    order: o.clone(),
-                },
-            );
+            match result {
+                Ok(new_id) => {
+                    self.resting.insert(
+                        key,
+                        Resting {
+                            id: new_id,
+                            order: o.clone(),
+                        },
+                    );
+                }
+                // Per-contract on failure: a fresh place recorded nothing, and a
+                // replace leaves the OLD id tracked (we never touched `self.resting`
+                // for `key`). Skip this order and keep going.
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
         }
 
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Cancel every tracked order and clear the map — the flatten directive
@@ -231,6 +266,36 @@ impl QuoteManager {
             .iter()
             .map(|(key, resting)| (*key, resting.id.clone()))
             .collect()
+    }
+
+    /// A snapshot of every resting quote with its FULL detail (the
+    /// [`MakerOrder`] — token/side/price/size) plus its venue [`OrderId`].
+    /// Unlike [`tracked`](Self::tracked) (ids only) this carries the price/size
+    /// the dashboard's open-orders panel renders. Order is unspecified.
+    pub fn resting_orders(&self) -> Vec<(OrderId, MakerOrder)> {
+        self.resting
+            .values()
+            .map(|r| (r.id.clone(), r.order.clone()))
+            .collect()
+    }
+
+    /// Cancel the single resting quote at `(token, side)`, dropping it only after
+    /// the venue confirms. A no-op `Ok(())` when nothing is tracked there (so a
+    /// double-cancel or a cancel of an already-filled order is harmless). Used by
+    /// the dashboard's per-order cancel: it pulls exactly that one quote without
+    /// disturbing the others (vs [`cancel_all`](Self::cancel_all)).
+    pub async fn cancel_one<V: MakerVenue>(
+        &mut self,
+        venue: &mut V,
+        token: TokenId,
+        side: Side,
+    ) -> Result<(), VenueError> {
+        if let Some(r) = self.resting.get(&(token, side)) {
+            let id = r.id.clone();
+            venue.cancel(&id).await?;
+            self.resting.remove(&(token, side));
+        }
+        Ok(())
     }
 }
 
@@ -345,6 +410,37 @@ mod tests {
         qm.cancel_all(&mut v).await.unwrap();
         assert_eq!(v.cancelled.len(), 2, "second cancel_all must be a no-op");
         assert!(qm.tracked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_one_pulls_only_that_side_and_resting_orders_snapshots_detail() {
+        let mut qm = QuoteManager::new();
+        let mut v = MockMakerVenue::new();
+        qm.reconcile(&mut v, &[bid(7, 44, 100_000_000), ask(7, 46, 100_000_000)])
+            .await
+            .unwrap();
+
+        // resting_orders() carries the FULL detail (price/size), not just ids.
+        let snap = qm.resting_orders();
+        assert_eq!(snap.len(), 2);
+        let bid_row = snap.iter().find(|(_, o)| o.side == Side::Bid).unwrap();
+        assert_eq!(bid_row.1.price, px(44));
+        assert_eq!(bid_row.1.size, Qty(100_000_000));
+
+        // cancel_one pulls ONLY the bid; the ask stays resting.
+        let bid_id = tracked_id(&qm, 7, Side::Bid).unwrap();
+        qm.cancel_one(&mut v, TokenId(7), Side::Bid).await.unwrap();
+        assert_eq!(v.cancelled, vec![bid_id], "exactly the bid was cancelled");
+        assert_eq!(tracked_id(&qm, 7, Side::Bid), None);
+        assert_eq!(
+            tracked_id(&qm, 7, Side::Ask),
+            Some(OrderId("mock-2".into())),
+            "the ask is untouched"
+        );
+
+        // Cancelling a side that isn't tracked is a no-op Ok (idempotent).
+        qm.cancel_one(&mut v, TokenId(7), Side::Bid).await.unwrap();
+        assert_eq!(v.cancelled.len(), 1, "no extra cancel for an absent side");
     }
 
     #[tokio::test]
@@ -504,6 +600,31 @@ mod tests {
         assert!(v.replaced.is_empty());
         assert_eq!(tracked_id(&qm, 7, Side::Bid), Some(bid_old));
         assert_eq!(qm.tracked().len(), 1);
+    }
+
+    /// RESILIENCE: a single rejected order must NOT block the others. The first
+    /// place fails, but the SECOND market's quote still goes up; reconcile returns
+    /// the (first) error so the caller still knows, and per-order state is
+    /// consistent (the failed order is untracked, the placed one is tracked).
+    #[tokio::test]
+    async fn reconcile_continues_past_a_failed_order() {
+        let mut qm = QuoteManager::new();
+        let mut v = MockMakerVenue::new();
+        v.fail_place
+            .push_back(VenueError::Live("token-7 place rejected".into()));
+
+        // Two markets desired; the first place (token 7) fails — the second
+        // (token 8) must STILL be placed (the old code aborted the whole pass).
+        let r = qm
+            .reconcile(&mut v, &[bid(7, 44, 100_000_000), bid(8, 30, 100_000_000)])
+            .await;
+        assert!(matches!(r, Err(VenueError::Live(_))), "the first error is surfaced");
+        assert_eq!(tracked_id(&qm, 7, Side::Bid), None, "the failed order is not tracked");
+        assert!(
+            tracked_id(&qm, 8, Side::Bid).is_some(),
+            "a later order still goes up despite the earlier failure"
+        );
+        assert_eq!(v.placed.len(), 1, "only the order that succeeded was placed");
     }
 
     // ── Task 3.5: adopt (startup / reconnect reconciliation) ──────────────────

@@ -33,15 +33,17 @@ use pm_app::strategy::mm::{MmFillsSource, MmLive, MmParams, MmStrategy};
 use pm_app::strategy::stub::HeartbeatStrategy;
 use pm_app::strategy::StrategyId;
 use pm_app::wiring::{
-    BookFetcher, PlatformEnvelopes, build_component_index, engine_params, fee_map,
-    inventory_config, mm_allowed_segments, mm_market_selection, mm_use_live, pack_components,
-    risk_config, segment_thresholds, strategy_envelopes, token_maps, user_ws_url,
+    BookFetcher, PlatformEnvelopes, build_component_index, directional_quote_tokens, engine_params,
+    fee_map, inventory_config, mm_allowed_segments, mm_market_selection, mm_use_live,
+    pack_components, risk_config, segment_thresholds, strategy_envelopes, token_maps, user_ws_url,
 };
 use pm_config::Config;
 use pm_core::instrument::Relationship;
 use pm_engine::RedeemStrategy;
 use pm_execution::basket::ExecParams;
 use pm_execution::venue::PaperVenue;
+use pm_ingestion::confluence::{ConfluenceParams, top_trader_markets};
+use pm_ingestion::data_api::{DataApiClient, OrderBy, TimePeriod};
 use pm_ingestion::rest::ClobRest;
 use pm_ingestion::stats::StatsCell;
 use pm_ingestion::supervisor::{FactoryDecision, Supervisor, SupervisorCommand, SupervisorConfig};
@@ -187,6 +189,37 @@ fn fatal(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+/// Run the `[confluence]` "follow the smart money" selection: pull the Data-API
+/// leaderboard's top traders and aggregate their OPEN positions into per-market
+/// favored sides (best-confluence-first). The config strings were validated to
+/// the accepted spellings upstream, so the matches fall back to the documented
+/// default on anything else. Best-effort: any transport/parse failure is returned
+/// to the caller, which falls back to the normal liquidity universe rather than
+/// aborting startup.
+async fn build_confluence(
+    cfg: &Config,
+) -> Result<Vec<pm_ingestion::confluence::ConfluenceMarket>, pm_ingestion::IngestError> {
+    let order_by = match cfg.confluence.order_by.to_ascii_lowercase().as_str() {
+        "vol" => OrderBy::Vol,
+        _ => OrderBy::Pnl,
+    };
+    let period = match cfg.confluence.time_period.to_ascii_lowercase().as_str() {
+        "day" => TimePeriod::Day,
+        "week" => TimePeriod::Week,
+        "all" => TimePeriod::All,
+        _ => TimePeriod::Month,
+    };
+    let params = ConfluenceParams {
+        order_by,
+        period,
+        top_traders: cfg.confluence.top_traders,
+        scan_limit: cfg.confluence.scan_limit,
+        size_threshold: cfg.confluence.size_threshold,
+    };
+    let client = DataApiClient::new(None)?;
+    top_trader_markets(&client, &params).await
+}
+
 /// Advisory soft ceiling (USD) for a LIVE market-maker capital slice (Task 4.5).
 /// Live MM is a tiny canary, so a slice above this almost certainly is NOT
 /// intended for a first live run and earns a loud WARN. It is NOT a hard cap —
@@ -264,6 +297,14 @@ async fn main() {
     // so the dashboard is skipped automatically without --headless.
     use std::io::IsTerminal;
     let tui_active = !args.headless && std::io::stdout().is_terminal();
+    // A periodic auto-restart re-exec (universe.auto_restart_secs) carries
+    // `PM_RESUME_LIVE=1` when the session it restarted was ALREADY RELEASED — so
+    // the fresh process resumes live trading instead of re-holding. The operator
+    // already confirmed live in the prior process; the restart is an INTERNAL
+    // universe refresh, not a new launch, so it skips the confirm/hold rather than
+    // pausing every cycle. Only the bot's own re-exec sets this (never a fresh
+    // launch — a held session re-execs WITHOUT it and stays held).
+    let resume_live = std::env::var("PM_RESUME_LIVE").as_deref() == Ok("1");
 
     // Tracing init — the EnvFilter MUST be the FIRST layer so debug/trace events
     // are discarded before they ever reach the ring buffer's lock. In TUI mode
@@ -355,8 +396,11 @@ async fn main() {
         // Cross-check identities at startup. Addresses are public — no secrets.
         info!(eoa = %signer.address(), deposit_wallet = %deposit_wallet, "live identities");
         // Headless live trades real money on startup: demand the typed phrase.
-        // The TUI path confirms via the `l` modal instead (release latch).
-        if !args.shadow && !args.auth_check && !tui_active {
+        // The TUI path confirms via the `l` modal instead (release latch). A
+        // RESUME (auto-restart of an already-confirmed, already-released session)
+        // skips the prompt — re-confirming on every internal re-sync is both
+        // impossible (stdin pipe consumed) and pointless.
+        if !args.shadow && !args.auth_check && !tui_active && !resume_live {
             eprintln!(
                 "LIVE MODE — type the confirmation phrase to continue:\n  {}",
                 config.live.confirm_phrase
@@ -503,6 +547,75 @@ async fn main() {
     )
     .unwrap_or_else(|e| fatal(format!("ClobRest init: {e}")));
 
+    // [confluence] — "follow the smart money": build the universe from the top
+    // leaderboard traders' OPEN positions (their favored side per market) instead
+    // of the liquidity-ranked Gamma keyset. Runs at startup, so auto_restart
+    // re-runs it each relaunch for a fresh snapshot. Best-effort: on any Data-API
+    // failure (or an empty result) we log and FALL BACK to the normal universe.
+    let confluence_markets = if config.confluence.enabled {
+        if tui_active {
+            println!("confluence: querying top-trader leaderboard + open positions ...");
+        }
+        info!(
+            top_traders = config.confluence.top_traders,
+            scan_limit = config.confluence.scan_limit,
+            order_by = %config.confluence.order_by,
+            period = %config.confluence.time_period,
+            "confluence: building smart-money universe"
+        );
+        match build_confluence(&config).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("confluence: disabled this run ({e}); falling back to liquidity universe");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    // Bound the fetched-by-condition universe exactly like the keyset one: keep the
+    // strongest-confluence ids up to the candidate pool (or `max_markets` when not
+    // prioritizing) so a trader holding hundreds of longshots can't explode the
+    // Gamma fetch. The aggregator already sorted them best-confluence-first.
+    let confluence_conditions: Option<Vec<String>> = (!confluence_markets.is_empty()).then(|| {
+        let cap = if config.universe.prioritize_by_liquidity {
+            config
+                .universe
+                .candidate_pool
+                .max(config.universe.max_markets)
+        } else {
+            config.universe.max_markets
+        }
+        .max(1);
+        confluence_markets
+            .iter()
+            .take(cap)
+            .map(|m| m.condition_id.clone())
+            .collect()
+    });
+    // The favored-outcome venue (CLOB) token ids — in confluence mode the MM quotes
+    // ONLY these (a directional lean toward the smart money). Empty when confluence
+    // is off/empty, which `directional_quote_tokens` reads as "quote both sides".
+    let favored_venue_ids: std::collections::HashSet<String> = confluence_markets
+        .iter()
+        .map(|m| m.favored_token.clone())
+        .collect();
+    if config.confluence.enabled {
+        info!(
+            markets = confluence_markets.len(),
+            quoting_conditions = confluence_conditions.as_ref().map_or(0, Vec::len),
+            "confluence: smart-money universe ready (empty ⇒ fell back to liquidity universe)"
+        );
+        // Progress marker (TUI hides the logs above in its ring buffer; print to
+        // stdout BEFORE the alternate screen so startup isn't a silent freeze).
+        if tui_active {
+            println!(
+                "arb: confluence ready — {} smart-money markets.",
+                confluence_markets.len()
+            );
+        }
+    }
+
     let filter = UniverseFilter {
         max_markets: config.universe.max_markets,
         require_active: config.universe.require_active,
@@ -519,7 +632,8 @@ async fn main() {
         filter,
         tx,
     )
-    .unwrap_or_else(|e| fatal(format!("SyncTask init: {e}")));
+    .unwrap_or_else(|e| fatal(format!("SyncTask init: {e}")))
+    .with_confluence_conditions(confluence_conditions);
 
     // In TUI mode tracing already goes to the ring buffer, so without this
     // line the user stares at a silent blank terminal for the whole sync
@@ -554,6 +668,15 @@ async fn main() {
         unresolved = reg.unresolved_relationships().len(),
         "universe assembled"
     );
+    // Progress marker: the rate-limited CLOB sync is the longest silent phase in
+    // TUI mode — surface its completion so the screen doesn't look frozen.
+    if tui_active {
+        println!(
+            "arb: universe ready — {} markets, {} tokens.",
+            reg.markets().len(),
+            reg.all_tokens().len()
+        );
+    }
 
     // ---- store the universe (directly, BEFORE spawning the writer) ---------
     for m in reg.markets() {
@@ -777,6 +900,9 @@ async fn main() {
         // No secret fields on this line — keep it that way (creds/signer must
         // never be interpolated into logs).
         info!(shadow = args.shadow, "live venue armed (api key ready)");
+        if tui_active {
+            println!("arb: live venue armed (api key ready); finishing startup ...");
+        }
         // Task 4.5: if the market maker is cleared for live, stash a CLONE of
         // these EXACT live inputs BEFORE they move into arb's venue below, so MM
         // builds a byte-identical LiveVenue (same creds/signer/deposit_wallet/
@@ -991,9 +1117,21 @@ async fn main() {
     // headless live (the typed phrase was demanded at startup); it is HELD only
     // for TUI live, where the `l` modal releases the latch. Passed verbatim into
     // arb's coordinator, so the live gating is byte-identical.
+    // Bound here so the MM reuses the SAME live gate: it trades real money too,
+    // so it must NOT quote while live is HELD (TUI live before the `l` release).
+    // `resume_live` forces RELEASED — an already-confirmed session continuing
+    // across an auto-restart re-sync resumes trading instead of re-holding.
+    let released_at_start = !args.live || args.shadow || !tui_active || resume_live;
+    // Tracks whether live dispatch is currently RELEASED, for the auto-restart
+    // re-exec to carry forward: starts at `released_at_start`, flips true on the
+    // `l` modal. A held session that never released re-execs WITHOUT resume.
+    let mut live_released = released_at_start;
+    if resume_live {
+        info!("resume: auto-restart of an already-released live session — resuming live (no re-hold/confirm)");
+    }
     let live_params = LiveParams {
         live: args.live,
-        released_at_start: !args.live || args.shadow || !tui_active,
+        released_at_start,
         basket_cap: pm_core::num::Usdc(
             pm_config::usd_to_microusdc(config.live.basket_cap_usd)
                 .unwrap_or_else(|e| fatal(format!("live.basket_cap_usd: {e}"))),
@@ -1196,15 +1334,20 @@ async fn main() {
             String,
             (pm_core::instrument::TokenId, pm_core::num::TickSize),
         > = HashMap::new();
+        // CONFLUENCE directional: when the confluence universe is active we quote
+        // ONLY the favored outcome per market (the side the top traders hold — a
+        // directional lean). With no confluence the set is empty and
+        // `directional_quote_tokens` returns BOTH sides (the normal MM universe).
+        // Either way we still REGISTER + WS-resolve BOTH tokens on the venue so a
+        // stray fill on the unquoted side always resolves to a known token.
         for &mid in &mm_markets {
             let m = mm_market_by_id[&mid];
             // Subscribe by condition_id (market), NOT token id (Task 4.6).
             if mm_live && let Some(cid) = reg.market_condition(m.id) {
                 mm_condition_ids.push(cid.to_string());
             }
+            let quote_toks = directional_quote_tokens(&reg, &m, &favored_venue_ids);
             for tok in [m.yes, m.no] {
-                mm_tokens.push(tok);
-                mm_token_market.insert(tok, m.id);
                 if let Some(vid) = reg.token_venue_id(tok) {
                     if mm_live {
                         mm_ws_resolve.insert(vid.to_owned(), (tok, m.tick));
@@ -1213,9 +1356,19 @@ async fn main() {
                         v.register_token(tok, vid.to_owned(), m.neg_risk, m.tick);
                     }
                 }
+                if quote_toks.contains(&tok) {
+                    mm_tokens.push(tok);
+                    mm_token_market.insert(tok, m.id);
+                }
             }
         }
-        let mm_market_count = mm_token_market.len() / 2;
+        // Distinct quoted markets (confluence mode quotes ~one token per market, so
+        // a `/2` token count would be wrong) — count unique MarketIds we will quote.
+        let mm_market_count = mm_token_market
+            .values()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
 
         // Startup venue reconciliation (live only), mirroring arb's check: a
         // resting/maker path should leave little open, so any open order is worth
@@ -1269,7 +1422,11 @@ async fn main() {
             );
         }
         let mut mm = MmStrategy::new(mm_tokens, mm_token_market, mm_params, mm_inv_cfg, mm_capital)
-            .with_seed(mm_seed);
+            .with_seed(mm_seed)
+            // Same live gate as arb: when live is HELD (TUI before `l`), the MM
+            // starts PAUSED and only quotes once released — never trades real
+            // money on its own before the operator confirms.
+            .with_start_paused(mm_live && !released_at_start);
 
         if let Some(venue) = mm_live_venue {
             // Task 4.6 — choose the live FILLS source and build the matching
@@ -1464,6 +1621,7 @@ async fn main() {
         let (state_rx, _pub_handle) =
             pm_app::publisher::spawn_publisher(ctx, Duration::from_millis(config.tui.refresh_ms));
 
+        println!("arb: startup complete — launching dashboard ...");
         crossterm::terminal::enable_raw_mode().unwrap_or_else(|e| fatal(format!("raw mode: {e}")));
         let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
         let default_hook = std::panic::take_hook();
@@ -1544,19 +1702,51 @@ async fn main() {
             }
             cmd = recv_tui(&mut tui_cmd_rx) => match cmd {
                 pm_tui::state::TuiCommand::SetPaused(p) => {
-                    // Pause dispatch → arb, via the host. Matches today's
-                    // semantics: arb is the only dispatching strategy, and the
-                    // header `paused` badge ("any strategy paused") still lights.
+                    // Pause dispatch applies to EVERY trading strategy: arb's
+                    // coordinator AND the MM's quote loop (pausing it cancels its
+                    // resting quotes). The header `paused` badge ("any strategy
+                    // paused") still lights. `pause` on an absent strategy is a
+                    // harmless no-op.
                     let _ = running.pause(StrategyId("arb"), p).await;
+                    let _ = running.pause(StrategyId("mm"), p).await;
                 }
                 pm_tui::state::TuiCommand::Kill => kill.store(true, Ordering::Release),
                 pm_tui::state::TuiCommand::GoLive => {
                     if args.live {
-                        // Release the coordinator's live latch via arb's
-                        // live_release_sender (bridged into the coordinator).
+                        // Release BOTH live paths: arb's coordinator latch AND the
+                        // MM's held quote loop (it starts PAUSED under a held live
+                        // latch — see `with_start_paused`). Until this fires, the MM
+                        // never places a real order.
                         let _ = live_release_sender.send(CtlCommand::ReleaseLive).await;
+                        let _ = running.pause(StrategyId("mm"), false).await;
+                        // Remember the release so a periodic auto-restart resumes
+                        // live (carries PM_RESUME_LIVE) instead of re-holding.
+                        live_released = true;
                     } else {
                         warn!("live not armed — restart with --live to trade real money");
+                    }
+                }
+                pm_tui::state::TuiCommand::SetVeto { key, veto } => {
+                    // Decode the publisher's opaque "<token_u64>:<b|a>" handle and
+                    // route the veto/un-veto to the MM's control channel — only the
+                    // MM holds a resting maker book, so the cancel targets it.
+                    if let Some((tok_s, side_s)) = key.split_once(':')
+                        && let Ok(tok) = tok_s.parse::<u64>()
+                    {
+                        let side = if side_s == "a" {
+                            pm_core::book::Side::Ask
+                        } else {
+                            pm_core::book::Side::Bid
+                        };
+                        if let Some(tx) = running.control_sender(StrategyId("mm")) {
+                            let _ = tx
+                                .send(pm_app::strategy::StrategyCommand::VetoQuote {
+                                    token: pm_core::instrument::TokenId(tok),
+                                    side,
+                                    veto,
+                                })
+                                .await;
+                        }
                     }
                 }
                 pm_tui::state::TuiCommand::Quit => {
@@ -1672,8 +1862,17 @@ async fn main() {
         match std::env::current_exe() {
             Ok(exe) => {
                 let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+                let mut cmd = std::process::Command::new(exe);
+                cmd.args(&argv);
+                // Carry the live-release state across the re-exec: a session that
+                // was RELEASED resumes live (the fresh process reads PM_RESUME_LIVE
+                // and skips the hold/confirm); a session still HELD re-execs WITHOUT
+                // it and re-holds. Only ever set for an actually-released live run.
+                if args.live && live_released {
+                    cmd.env("PM_RESUME_LIVE", "1");
+                }
                 // exec() returns only if it FAILED; otherwise the image is replaced.
-                let err = std::process::Command::new(exe).args(&argv).exec();
+                let err = cmd.exec();
                 fatal(format!("resync re-exec failed: {err}"));
             }
             Err(e) => fatal(format!("resync: cannot resolve current exe: {e}")),

@@ -10,6 +10,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use pm_core::book::Side;
+use pm_core::instrument::TokenId;
 use pm_core::num::Usdc;
 use pm_ingestion::supervisor::OnApplyFn;
 use pm_registry::Registry;
@@ -87,6 +89,29 @@ pub struct StrategyStatus {
     /// kept SEPARATE from `cash`/`equity`/`realized` (an unverified, out-of-band
     /// estimate). `0` for strategies that earn no rebate (arb, the heartbeat).
     pub rebate_micro: i64,
+    /// Live resting maker quotes + any VETOED (manually cancelled, re-quote
+    /// suppressed) `(token, side)` slots — the dashboard's open-orders panel.
+    /// Empty for strategies with no resting book (arb, the heartbeat).
+    pub resting_orders: Vec<RestingOrderSnapshot>,
+}
+
+/// One row of the dashboard's open-orders panel: a resting maker quote, OR a
+/// VETOED slot the operator cancelled and suppressed (no live order, `vetoed =
+/// true`, price/size 0). `token`/`side` are the stable identity the publisher
+/// renders (market name + side) and the cancel/un-veto command targets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestingOrderSnapshot {
+    pub token: TokenId,
+    pub side: Side,
+    /// Limit price in ticks; `0` for a vetoed slot (no live order).
+    pub px_ticks: u16,
+    /// Tick levels (100 = Cent, 1000 = Milli) so the publisher renders the price.
+    pub tick_levels: u16,
+    /// Remaining size, µshares; `0` for a vetoed slot.
+    pub qty_micro: u64,
+    /// `true` ⇒ this `(token, side)` is manually VETOED: cancelled and not
+    /// re-quoted until the operator un-vetoes it.
+    pub vetoed: bool,
 }
 
 /// Neutral per-strategy control command from the host (TUI-translated),
@@ -97,6 +122,15 @@ pub struct StrategyStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrategyCommand {
     SetPaused(bool),
+    /// Manually VETO (cancel + suppress re-quoting) or UN-VETO one `(token,
+    /// side)` resting quote, from the dashboard's open-orders panel. `veto =
+    /// true` cancels the resting order now and stops the strategy re-placing it;
+    /// `veto = false` lifts the suppression so the next quote cycle re-places it.
+    VetoQuote {
+        token: TokenId,
+        side: Side,
+        veto: bool,
+    },
 }
 
 /// The runtime handles a strategy's `run` loop owns: shared read-only ingestion

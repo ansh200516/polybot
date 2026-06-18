@@ -12,11 +12,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use pm_core::book::Side;
 use pm_core::instrument::TokenId;
 use pm_core::num::{Qty, sell_proceeds};
 use pm_registry::Registry;
 use pm_store::read::ReadStore;
-use pm_tui::state::{AppState, FillLine, Health, OppLine, OrderLine, PositionLine, StrategyLine};
+use pm_tui::state::{
+    AppState, FillLine, Health, OpenOrderLine, OppLine, OrderLine, PositionLine, StrategyLine,
+};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -24,7 +27,7 @@ use crate::coordinator::{CoordStatus, now_ms};
 use crate::logbuf::LogBuffer;
 use crate::stats::AppStats;
 use crate::strategy::host::StrategyStatusView;
-use crate::strategy::{StrategyId, StrategyStatus};
+use crate::strategy::{RestingOrderSnapshot, StrategyId, StrategyStatus};
 use crate::wiring::BookFetcher;
 
 /// Display-only µUSDC → USD (`micro / 1e6`). Never fed back into accounting.
@@ -108,6 +111,33 @@ pub fn market_display(reg: &Registry, token_i64: i64) -> String {
             }
         }
         None => format!("token {token_i64}"),
+    }
+}
+
+/// Turn one strategy's [`RestingOrderSnapshot`] into a display [`OpenOrderLine`].
+/// The `key` is the opaque `"<token>:<b|a>"` handle the cancel/un-veto command
+/// carries back (decoded in `main.rs`); a vetoed slot shows no live price/size.
+fn open_order_line(strategy: &str, r: &RestingOrderSnapshot, reg: &Registry) -> OpenOrderLine {
+    let (side_label, side_char) = match r.side {
+        Side::Bid => ("Bid", 'b'),
+        Side::Ask => ("Ask", 'a'),
+    };
+    let px = if r.vetoed {
+        "—".to_string()
+    } else {
+        format!(
+            "{:.2}",
+            f64::from(r.px_ticks) / f64::from(r.tick_levels.max(1))
+        )
+    };
+    OpenOrderLine {
+        strategy: strategy.to_string(),
+        market: market_display(reg, r.token.0 as i64),
+        side: side_label.to_string(),
+        px,
+        qty_shares: r.qty_micro as f64 / 1e6,
+        vetoed: r.vetoed,
+        key: format!("{}:{}", r.token.0, side_char),
     }
 }
 
@@ -415,6 +445,28 @@ pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
             }
         };
 
+    // Open-orders panel: flatten every strategy's resting + vetoed quotes into
+    // display rows (MM is the only strategy with a resting book today). SORTED by
+    // the opaque key so the selectable list is STABLE across ticks (the MM's
+    // snapshot order is otherwise HashMap-arbitrary, which would make the cursor
+    // jump between unrelated orders).
+    let open_orders: Vec<OpenOrderLine> = match &ctx.strategy_status_rx {
+        Some(rx) => {
+            let view = rx.borrow();
+            let mut rows: Vec<OpenOrderLine> = view
+                .iter()
+                .flat_map(|(id, s)| {
+                    s.resting_orders
+                        .iter()
+                        .map(|r| open_order_line(id.0, r, &ctx.registry))
+                })
+                .collect();
+            rows.sort_by(|a, b| a.key.cmp(&b.key));
+            rows
+        }
+        None => Vec::new(),
+    };
+
     AppState {
         uptime_s: ctx.start.elapsed().as_secs(),
         mode_paper: ctx.mode_paper,
@@ -433,6 +485,7 @@ pub async fn assemble(ctx: &mut PublisherCtx) -> AppState {
         positions,
         fills,
         orders,
+        open_orders,
         health,
         log: ctx.logbuf.tail(ctx.log_lines),
         per_strategy,

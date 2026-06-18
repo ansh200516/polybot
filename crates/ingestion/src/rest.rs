@@ -5,6 +5,7 @@
 //! (b) `ClobRest` — thin reqwest wrapper; all response parsing is pure and
 //!     fixture-tested via `parse_book_response`.
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::IngestError;
@@ -130,10 +131,18 @@ pub fn parse_book_response(body: &str) -> Result<ParsedBook, IngestError> {
 ///
 /// All methods call `acquire()` before issuing the HTTP request so throughput
 /// is bounded by the token bucket.
+///
+/// The bucket lives behind a `Mutex` so the methods take `&self`: the bounded
+/// universe sync ([`crate::sync::fetch_clob_bounded`]) fires many single-market
+/// lookups CONCURRENTLY through one shared client, and the shared bucket keeps
+/// the aggregate issue-rate at the configured limit while slow responses overlap
+/// instead of serialising (a slow `/markets` tail used to stretch startup into
+/// minutes). The lock is held only for the O(1) token arithmetic — never across
+/// the await — so contention is negligible.
 pub struct ClobRest {
     http: reqwest::Client,
     base: String,
-    bucket: TokenBucket,
+    bucket: Mutex<TokenBucket>,
 }
 
 impl ClobRest {
@@ -152,22 +161,30 @@ impl ClobRest {
         Ok(ClobRest {
             http,
             base: base.to_owned(),
-            bucket: TokenBucket::new(capacity, rate_per_sec),
+            bucket: Mutex::new(TokenBucket::new(capacity, rate_per_sec)),
         })
     }
 
-    /// Sleep until the bucket has a token.
-    async fn acquire(&mut self) {
+    /// Sleep until the bucket has a token. Takes `&self` (interior-mutable bucket)
+    /// so concurrent callers share one rate limit. The guard is dropped BEFORE the
+    /// sleep so the lock is never held across an await; a poisoned lock is
+    /// recovered (the bucket is plain arithmetic — a panic mid-update cannot leave
+    /// it in a dangerous state).
+    async fn acquire(&self) {
         loop {
-            match self.bucket.try_acquire(Instant::now()) {
-                Ready::Now => return,
-                Ready::After(d) => tokio::time::sleep(d).await,
-            }
+            let wait = {
+                let mut bucket = self.bucket.lock().unwrap_or_else(|e| e.into_inner());
+                match bucket.try_acquire(Instant::now()) {
+                    Ready::Now => return,
+                    Ready::After(d) => d,
+                }
+            };
+            tokio::time::sleep(wait).await;
         }
     }
 
     /// Fetch a full order-book snapshot for one token.
-    pub async fn book(&mut self, venue_token_id: &str) -> Result<ParsedBook, IngestError> {
+    pub async fn book(&self, venue_token_id: &str) -> Result<ParsedBook, IngestError> {
         self.acquire().await;
         let url = format!("{}/book?token_id={}", self.base, venue_token_id);
         let body = self
@@ -189,7 +206,7 @@ impl ClobRest {
     /// Pagination per RECON.md: cursor starts as empty string; terminal value
     /// is `"LTE="` (base64 of "-1"). Guard: abort after 200 pages.
     pub async fn all_markets(
-        &mut self,
+        &self,
     ) -> Result<Vec<pm_registry::gamma::ClobMarket>, IngestError> {
         const TERMINAL: &str = "LTE=";
         const MAX_PAGES: usize = 200;
@@ -232,7 +249,7 @@ impl ClobRest {
     /// returns a [`ClobMarket`]-shaped object directly (not a page envelope).
     /// Live-verified 200, per RECON.md fetch strategy.
     pub async fn market(
-        &mut self,
+        &self,
         condition_id: &str,
     ) -> Result<pm_registry::gamma::ClobMarket, IngestError> {
         self.acquire().await;
@@ -252,7 +269,7 @@ impl ClobRest {
     }
 
     /// Fetch the server's current Unix timestamp in seconds.
-    pub async fn server_time(&mut self) -> Result<u64, IngestError> {
+    pub async fn server_time(&self) -> Result<u64, IngestError> {
         self.acquire().await;
         let url = format!("{}/time", self.base);
         let body = self

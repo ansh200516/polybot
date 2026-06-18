@@ -23,6 +23,7 @@ pub struct Config {
     pub inventory: Inventory,
     pub strategies: Strategies,
     pub segments: Segments,
+    pub confluence: Confluence,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -123,6 +124,41 @@ pub struct Universe {
     /// bot spends most of its time trading. A `kill` / `quit` / `--duration-secs`
     /// end exits normally — only this timer re-execs.
     pub auto_restart_secs: u64,
+}
+
+/// `[confluence]` — "follow the smart money" market selection (opt-in). When
+/// `enabled`, the universe is built from the OPEN positions of the top
+/// leaderboard traders (public Data API) instead of liquidity-ranked Gamma
+/// markets, and the MM leans toward the side those traders hold. OFF by default
+/// (the normal liquidity universe).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Confluence {
+    /// Master switch. `false` ⇒ the normal liquidity-ranked universe.
+    pub enabled: bool,
+    /// Number of top traders WITH open positions to follow.
+    pub top_traders: usize,
+    /// How deep to scan the leaderboard (1..=50) to find `top_traders` of them.
+    pub scan_limit: usize,
+    /// Leaderboard ranking metric: `"pnl"` (top performers) or `"vol"` (active).
+    pub order_by: String,
+    /// Leaderboard window: `"day"` | `"week"` | `"month"` | `"all"`.
+    pub time_period: String,
+    /// Drop a trader's positions below this many shares (API `sizeThreshold`).
+    pub size_threshold: f64,
+}
+
+impl Default for Confluence {
+    fn default() -> Self {
+        Confluence {
+            enabled: false,
+            top_traders: 10,
+            scan_limit: 50,
+            order_by: "pnl".into(),
+            time_period: "month".into(),
+            size_threshold: 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -697,6 +733,33 @@ impl Config {
                 "universe.auto_restart_secs must be 0 (off) or ≥ 60 (a smaller interval would re-sync more than it trades)",
             ));
         }
+        // Confluence (only meaningful when enabled).
+        if self.confluence.enabled {
+            if self.confluence.top_traders == 0 {
+                return Err(ConfigError::BadMoney("confluence.top_traders must be > 0"));
+            }
+            if self.confluence.scan_limit < self.confluence.top_traders
+                || self.confluence.scan_limit > 50
+            {
+                return Err(ConfigError::BadMoney(
+                    "confluence.scan_limit must be ≥ top_traders and ≤ 50 (leaderboard cap)",
+                ));
+            }
+            if !matches!(self.confluence.order_by.to_ascii_lowercase().as_str(), "pnl" | "vol") {
+                return Err(ConfigError::BadMoney("confluence.order_by must be \"pnl\" or \"vol\""));
+            }
+            if !matches!(
+                self.confluence.time_period.to_ascii_lowercase().as_str(),
+                "day" | "week" | "month" | "all"
+            ) {
+                return Err(ConfigError::BadMoney(
+                    "confluence.time_period must be day|week|month|all",
+                ));
+            }
+            if self.confluence.size_threshold < 0.0 || !self.confluence.size_threshold.is_finite() {
+                return Err(ConfigError::BadMoney("confluence.size_threshold must be ≥ 0"));
+            }
+        }
         // Endpoints validation
         if self.endpoints.gamma_base.is_empty() {
             return Err(ConfigError::BadMoney("gamma_base must be non-empty"));
@@ -1134,6 +1197,29 @@ mod tests {
             .unwrap();
         // A too-small non-zero interval is rejected (would re-sync more than trade).
         assert!(Config::from_toml_str("[universe]\nauto_restart_secs = 30\n").is_err());
+    }
+
+    #[test]
+    fn confluence_parses_and_validates() {
+        // Default off.
+        assert!(!Config::default().confluence.enabled);
+        // A sane enabled block parses + validates.
+        let c = Config::from_toml_str(
+            "[confluence]\nenabled = true\ntop_traders = 10\nscan_limit = 50\norder_by = \"pnl\"\ntime_period = \"month\"\n",
+        )
+        .unwrap();
+        assert!(c.confluence.enabled);
+        assert_eq!(c.confluence.top_traders, 10);
+        // scan_limit < top_traders → rejected.
+        assert!(
+            Config::from_toml_str("[confluence]\nenabled = true\ntop_traders = 20\nscan_limit = 10\n")
+                .is_err()
+        );
+        // unknown order_by / time_period → rejected.
+        assert!(Config::from_toml_str("[confluence]\nenabled = true\norder_by = \"sharpe\"\n").is_err());
+        assert!(Config::from_toml_str("[confluence]\nenabled = true\ntime_period = \"forever\"\n").is_err());
+        // Disabled → confluence values are NOT validated (inert).
+        Config::from_toml_str("[confluence]\nenabled = false\norder_by = \"nonsense\"\n").unwrap();
     }
 
     #[test]

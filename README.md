@@ -371,3 +371,80 @@ sizing are all proven live; only the network submit is stubbed in shadow.
 
 _Pending operator run (≤$10 basket, ~$50 funded; see the M5 plan Task 14
 for the reconciliation checklist)._
+
+## Multi-strategy platform: market making + confluence
+
+Beyond the single arbitrage strategy, `arb` runs a **multi-strategy host**: the
+risk-free arbitrage detector and a **risk-taking market maker (MM)** run in
+parallel under isolated capital, risk, and accounting. The MM posts two-sided
+`postOnly` GTC quotes that rest on the CLOB book — capturing the spread and
+maker rebates — bounded by per-market inventory caps, a stop-loss latch, and a
+session-loss latch. Markets are segmented (LiquidStable / Liquid / Illiquid) and
+the MM is routed only to liquid-enough markets.
+
+Design spec: `docs/superpowers/specs/2026-06-15-multi-strategy-platform-design.md`.
+
+### Confluence: follow the smart money (`[confluence]`)
+
+Opt-in market selection that builds the universe from the OPEN positions of the
+top Polymarket leaderboard traders (public Data API, keyless), and leans the MM
+toward the side they collectively hold (directional — one favored token per
+market). The segment liquidity filter still applies on top, so only
+liquid-enough smart-money markets are quoted. OFF by default. Re-runs on each
+periodic auto-restart so the snapshot stays fresh.
+
+| Key | Meaning | Default |
+|---|---|---|
+| `enabled` | turn confluence on (else the normal liquidity universe) | `false` |
+| `top_traders` | how many top traders WITH open positions to follow | `10` |
+| `scan_limit` | how deep to scan the leaderboard to find them (≤ 50) | `50` |
+| `order_by` | `"pnl"` (top profit) or `"vol"` (most active) | `"pnl"` |
+| `time_period` | `day` / `week` / `month` / `all` | `"month"` |
+| `size_threshold` | ignore a trader's positions below this many shares | `1.0` |
+
+### Running (paper / shadow / live)
+
+`mm-live-canary.toml` runs the MM as a tiny live canary (arb neutered) with
+confluence enabled. Run from the worktree:
+
+```bash
+# paper — no money, simulated fills:
+cargo run --release --bin arb -- --config mm-live-canary.toml --db /tmp/mm.sqlite
+
+# shadow — real auth + real EIP-712 signing, NOTHING submitted (safe rehearsal):
+cargo run --release --bin arb -- --live --shadow --headless \
+  --config mm-live-canary.toml --duration-secs 120 --db /tmp/mm-shadow.sqlite
+
+# live — REAL money. In the TUI do NOT pipe a confirmation: just run it and press
+# `l` to release (the session starts LIVE-HELD). Headless live needs the phrase:
+cargo run --release --bin arb -- --live --config mm-live-canary.toml --db /tmp/mm.sqlite
+```
+
+Startup is rate-limited (CLOB + leaderboard fetches). Progress prints to stdout
+before the dashboard takes over so the screen is never a silent freeze:
+`confluence ready …` → `universe ready …` → `live venue armed …` →
+`launching dashboard …`. The CLOB metadata sync issues its lookups in bounded
+concurrent waves (shared rate limiter), so a slow venue tail no longer stretches
+startup into minutes.
+
+### Dashboard controls (current)
+
+| Key | Action |
+|---|---|
+| `p` | Pause / resume BOTH strategies (the MM cancels its resting quotes on pause) |
+| `l` | Go live — type `live` + Enter to release (`LIVE·HELD` → `LIVE`) |
+| `k` | Kill switch — `y` to confirm a clean stop |
+| `q` / `Ctrl-C` | Quit and end the session |
+| `↑` / `↓` | Scroll the log panel |
+| `Tab` / `Shift-Tab` | Move the selection cursor in the **Open Orders** panel |
+| `x` | Cancel the selected resting order (and suppress re-quoting that market), or un-veto a `VETOED` one |
+
+### Open Orders panel + per-order cancel
+
+The lower-left panel's bottom sub-table shows the MM's LIVE resting quotes plus
+any VETOED slots (`strat · market · side · px · qty · status`). Because the MM
+re-quotes every ~2.5 s, a one-off cancel would just reappear — so `x` **cancels
+the order AND suppresses re-quoting that `(market, side)`** until you press `x`
+again on the (now `VETOED`) row to un-veto it. Selecting and cancelling targets
+exactly one order without disturbing the rest; `p` (pause) still cancels them
+all at once.

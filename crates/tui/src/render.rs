@@ -144,8 +144,10 @@ fn draw_header(f: &mut Frame, s: &AppState, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect) {
-    let para = Paragraph::new(" [p]ause dispatch  [l]ive  [k]ill  [q]uit  [↑/↓] log scroll ")
-        .style(Style::default().fg(Color::DarkGray));
+    let para = Paragraph::new(
+        " [p]ause  [l]ive  [k]ill  [q]uit  [↑/↓] log  [Tab] order  [x] cancel/un-veto ",
+    )
+    .style(Style::default().fg(Color::DarkGray));
     f.render_widget(para, area);
 }
 
@@ -228,10 +230,10 @@ fn draw_positions(f: &mut Frame, s: &AppState, area: Rect) {
     f.render_widget(table, area);
 }
 
-fn draw_fills_orders(f: &mut Frame, s: &AppState, area: Rect) {
+fn draw_fills_orders(f: &mut Frame, s: &AppState, area: Rect, selected: usize) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Fills & Orders ");
+        .title(" Fills (top) · Open Orders (bottom: Tab select, x cancel) ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -274,27 +276,46 @@ fn draw_fills_orders(f: &mut Frame, s: &AppState, area: Rect) {
         f.render_widget(table, splits[0]);
     }
 
-    // Orders table
+    // Open-orders table: LIVE resting quotes + VETOED slots. The highlighted row
+    // (`>` marker + reversed style) is the one j/k selects and `x` cancels /
+    // un-vetoes. Vetoed rows are dimmed and show no live price/qty.
     {
         let header_style = Style::default().add_modifier(Modifier::BOLD);
-        let header = Row::new(["age", "order", "state", "detail"]).style(header_style);
+        let header =
+            Row::new(["", "strat", "market", "side", "px", "qty", "status"]).style(header_style);
+        let sel = selected.min(s.open_orders.len().saturating_sub(1));
         let rows: Vec<Row> = s
-            .orders
+            .open_orders
             .iter()
-            .map(|o| {
-                Row::new([
-                    Cell::from(format!("{}s", o.ago_s)),
-                    Cell::from(o.order_id_short.clone()),
-                    Cell::from(o.state.clone()),
-                    Cell::from(o.detail.clone()),
-                ])
+            .enumerate()
+            .map(|(i, o)| {
+                let selected_row = i == sel;
+                let row = Row::new([
+                    Cell::from(if selected_row { ">" } else { " " }),
+                    Cell::from(o.strategy.clone()),
+                    Cell::from(o.market.clone()),
+                    Cell::from(o.side.clone()),
+                    Cell::from(o.px.clone()),
+                    Cell::from(format!("{:.0}", o.qty_shares)),
+                    Cell::from(if o.vetoed { "VETOED" } else { "Resting" }),
+                ]);
+                if selected_row {
+                    row.style(Style::default().add_modifier(Modifier::REVERSED))
+                } else if o.vetoed {
+                    row.style(Style::default().add_modifier(Modifier::DIM))
+                } else {
+                    row
+                }
             })
             .collect();
         let widths = [
+            Constraint::Length(1),
             Constraint::Length(5),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Min(10),
+            Constraint::Min(12),
+            Constraint::Length(4),
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(8),
         ];
         let table = Table::new(rows, widths).header(header);
         f.render_widget(table, splits[1]);
@@ -467,7 +488,7 @@ pub fn draw(f: &mut Frame, s: &AppState, ui: &UiState) {
     draw_header(f, s, header_area);
     draw_opps(f, s, upper[0]);
     draw_positions(f, s, upper[1]);
-    draw_fills_orders(f, s, lower[0]);
+    draw_fills_orders(f, s, lower[0], ui.open_orders_selected);
     draw_health(f, s, lower[1]);
     draw_log(f, s, ui, log_area);
     draw_footer(f, footer_area);
@@ -586,7 +607,7 @@ mod tests {
             ..Default::default()
         };
         let text = render_to_text(&s, &UiState::default(), 120, 30);
-        for key in ["[p]ause dispatch", "[l]ive", "[k]ill", "[q]uit"] {
+        for key in ["[p]ause", "[l]ive", "[k]ill", "[q]uit", "[Tab] order", "[x] cancel"] {
             assert!(text.contains(key), "footer key {key} missing:\n{text}");
         }
     }
@@ -601,7 +622,7 @@ mod tests {
         for title in [
             "Opportunities",
             "Positions",
-            "Fills & Orders",
+            "Open Orders",
             "Health",
             "Log",
         ] {
@@ -784,15 +805,39 @@ mod tests {
 
     #[test]
     fn fills_and_orders_render() {
-        let text = render_to_text(&sample_state(), &UiState::default(), 160, 45);
-        for needle in ["strat", "0.44", "-44.00", "0192abcd", "Filled"] {
-            assert!(text.contains(needle), "fills/orders missing {needle}");
+        let mut s = sample_state();
+        // A LIVE resting quote + a VETOED slot for the open-orders sub-panel.
+        s.open_orders = vec![
+            crate::state::OpenOrderLine {
+                strategy: "mm".into(),
+                market: "Will Q win? YES".into(),
+                side: "Bid".into(),
+                px: "0.40".into(),
+                qty_shares: 25.0,
+                vetoed: false,
+                key: "111:b".into(),
+            },
+            crate::state::OpenOrderLine {
+                strategy: "mm".into(),
+                market: "Will R win? NO".into(),
+                side: "Ask".into(),
+                px: "—".into(),
+                qty_shares: 0.0,
+                vetoed: true,
+                key: "222:a".into(),
+            },
+        ];
+        let text = render_to_text(&s, &UiState::default(), 160, 45);
+        // Fills (top sub-panel).
+        for needle in ["strat", "0.44", "-44.00"] {
+            assert!(text.contains(needle), "fills missing {needle}:\n{text}");
+        }
+        // Open orders (bottom sub-panel): a live resting quote + a VETOED slot.
+        for needle in ["Bid", "Resting", "VETOED"] {
+            assert!(text.contains(needle), "open-orders missing {needle}:\n{text}");
         }
         // The strat column tags each fill with the strategy that traded it.
-        let fill_row = text
-            .lines()
-            .find(|l| l.contains("-44.00"))
-            .unwrap();
+        let fill_row = text.lines().find(|l| l.contains("-44.00")).unwrap();
         assert!(fill_row.contains("arb"), "fill row must show its strategy:\n{fill_row}");
     }
 

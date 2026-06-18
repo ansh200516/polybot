@@ -16,10 +16,12 @@
 //! label outcomes by candidate name — the venue's index order is the yes/no
 //! convention per RECON §3), index 0 is yes and index 1 is no.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
+
+use futures_util::stream::StreamExt;
 
 use pm_core::num::TickSize;
 use pm_registry::gamma::{ClobMarket, GammaEvent, GammaMarket};
@@ -541,6 +543,15 @@ pub struct SyncTask {
     relationship_toml: String,
     filter: UniverseFilter,
     tx: tokio::sync::watch::Sender<Arc<pm_registry::Registry>>,
+    /// Opt-in CONFLUENCE mode (Data-API "follow the smart money"): when `Some`,
+    /// [`sync_once`] builds the universe from these specific market condition ids
+    /// (the top traders' favored markets) via
+    /// [`fetch_gamma_markets_by_condition`] instead of walking the Gamma keyset.
+    /// `None` ⇒ the normal keyset universe.
+    ///
+    /// [`sync_once`]: SyncTask::sync_once
+    /// [`fetch_gamma_markets_by_condition`]: SyncTask::fetch_gamma_markets_by_condition
+    confluence_conditions: Option<Vec<String>>,
 }
 
 impl SyncTask {
@@ -565,7 +576,17 @@ impl SyncTask {
             relationship_toml: String::new(),
             filter,
             tx,
+            confluence_conditions: None,
         })
+    }
+
+    /// Enable CONFLUENCE mode: build the universe from these market `condition_ids`
+    /// (the top traders' favored markets) instead of the Gamma keyset. Both `None`
+    /// and `Some(empty)` fall back to the keyset universe. Builder-style so the
+    /// existing `new` call sites and tests are unaffected.
+    pub fn with_confluence_conditions(mut self, conditions: Option<Vec<String>>) -> Self {
+        self.confluence_conditions = conditions.filter(|c| !c.is_empty());
+        self
     }
 
     /// Walk the gamma `/events/keyset` endpoint collecting events until
@@ -631,6 +652,55 @@ impl SyncTask {
         Ok(all_events)
     }
 
+    /// Fetch Gamma metadata for a SPECIFIC set of market `condition_ids`
+    /// (CONFLUENCE mode), batching repeated `&condition_ids=` query params. Unlike
+    /// [`fetch_gamma_events`] (which walks active events in keyset order) this
+    /// targets the exact markets the top traders hold. Markets that are missing,
+    /// inactive, or closed are simply ABSENT from the result (best-effort): the
+    /// `active=true&closed=false` filter is applied server-side so a resolved
+    /// smart-money pick never enters the universe.
+    ///
+    /// Each returned [`GammaMarket`] is wrapped in a synthetic single-market
+    /// [`GammaEvent`] by [`confluence_events`] so the rest of the pipeline
+    /// (`fetch_clob_for` + [`assemble_registry`], including the Phase-5 segment
+    /// filter) is identical to the keyset path.
+    ///
+    /// [`fetch_gamma_events`]: SyncTask::fetch_gamma_events
+    pub async fn fetch_gamma_markets_by_condition(
+        &self,
+        condition_ids: &[String],
+    ) -> Result<Vec<GammaMarket>, IngestError> {
+        let mut out: Vec<GammaMarket> = Vec::new();
+        // Gamma caps the query-string length; 20 ids/request stays well under it
+        // and keeps each response small. A batch failure is propagated (the caller
+        // falls back to the keyset universe rather than running on a partial set).
+        for chunk in condition_ids.chunks(20) {
+            let params: String = chunk
+                .iter()
+                .map(|c| format!("&condition_ids={c}"))
+                .collect();
+            let url = format!(
+                "{}/markets?active=true&closed=false&limit=100{}",
+                self.gamma_base, params
+            );
+            let body = self
+                .http
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| IngestError::Http(e.to_string()))?
+                .error_for_status()
+                .map_err(|e| IngestError::Http(e.to_string()))?
+                .text()
+                .await
+                .map_err(|e| IngestError::Http(e.to_string()))?;
+            let markets: Vec<GammaMarket> =
+                serde_json::from_str(&body).map_err(|e| IngestError::Parse(e.to_string()))?;
+            out.extend(markets);
+        }
+        Ok(out)
+    }
+
     /// Issue single-market CLOB lookups for the markets in `events`, bounded
     /// by `filter.max_markets` would-be-accepted markets (see
     /// [`fetch_clob_bounded`]), returning a map of condition id →
@@ -639,7 +709,7 @@ impl SyncTask {
         &mut self,
         events: &[GammaEvent],
     ) -> (HashMap<String, ClobMarket>, Vec<(String, SkippedReason)>) {
-        fetch_clob_bounded(&mut self.clob, events, &self.filter).await
+        fetch_clob_bounded(&self.clob, events, &self.filter).await
     }
 
     /// Check whether the relationships file's mtime has changed and, if so,
@@ -692,7 +762,21 @@ impl SyncTask {
     /// `assemble_registry` is the sole recorder.  The failures vec returned by
     /// `fetch_clob_for` is intentionally discarded here to avoid double-counting.
     pub async fn sync_once(&mut self) -> Result<AssembledUniverse, IngestError> {
-        let events = self.fetch_gamma_events(50).await?;
+        // CONFLUENCE mode (opt-in): build the universe from the top traders'
+        // favored markets (fetched by condition id) instead of the Gamma keyset.
+        // Everything downstream (CLOB fetch + assembly + segment filter) is shared.
+        let events = match self.confluence_conditions.clone() {
+            Some(conditions) => {
+                let markets = self.fetch_gamma_markets_by_condition(&conditions).await?;
+                tracing::info!(
+                    requested = conditions.len(),
+                    resolved = markets.len(),
+                    "sync: confluence universe (top-trader favored markets)"
+                );
+                confluence_events(markets)
+            }
+            None => self.fetch_gamma_events(50).await?,
+        };
         // CLOB failures are dropped: assemble_registry will emit ClobLookupFailed
         // for each condition absent from the map, covering the same set exactly.
         let (clob_by_condition, _clob_failures) = self.fetch_clob_for(&events).await;
@@ -713,29 +797,75 @@ impl SyncTask {
     }
 }
 
+/// Wrap each CONFLUENCE [`GammaMarket`] in a synthetic single-market
+/// [`GammaEvent`] so the confluence universe flows through the SAME
+/// `fetch_clob_for` + [`assemble_registry`] path as the keyset universe. The
+/// market's own `volume`/`liquidity` are lifted to the event level (the Phase-5
+/// segmentation fallback reads event-level metrics when a market omits its own),
+/// so the segment filter classifies confluence markets exactly as keyset ones.
+///
+/// Order is PRESERVED: callers pass markets best-confluence-first so the
+/// non-prioritized assembly keeps the strongest signals under `max_markets`.
+///
+/// NOTE: a synthetic event holds ONE market, so a NegRisk member market loses
+/// its event grouping here — acceptable for the MM (it quotes a single token per
+/// market); the universal arb's NegRisk LP simply has no multi-leg partition to
+/// solve over for a confluence-sourced market.
+pub fn confluence_events(markets: Vec<GammaMarket>) -> Vec<GammaEvent> {
+    markets
+        .into_iter()
+        .map(|m| GammaEvent {
+            id: m.condition_id.clone(),
+            neg_risk: m.neg_risk,
+            title: m.question.clone(),
+            volume: m.volume,
+            volume_24hr: m.volume_24hr,
+            liquidity: m.liquidity,
+            liquidity_clob: None,
+            markets: vec![m],
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Bounded CLOB fetch
 // ---------------------------------------------------------------------------
 
 /// Fetch seam over the single-market CLOB lookup so the bounded fetch loop is
 /// testable without a network client.
+///
+/// `&self` (not `&mut self`): [`fetch_clob_bounded`] issues many lookups
+/// CONCURRENTLY through one shared `&F`, so the method must be callable from
+/// several in-flight futures at once. [`ClobRest`] satisfies this via its
+/// interior-mutable (Mutex-guarded) rate limiter.
 pub trait ClobFetch {
     /// Fetch a single CLOB market by condition id.
     fn market(
-        &mut self,
+        &self,
         condition_id: &str,
     ) -> impl std::future::Future<Output = Result<ClobMarket, IngestError>>;
 }
 
 impl ClobFetch for ClobRest {
-    async fn market(&mut self, condition_id: &str) -> Result<ClobMarket, IngestError> {
+    async fn market(&self, condition_id: &str) -> Result<ClobMarket, IngestError> {
         ClobRest::market(self, condition_id).await
     }
 }
 
-/// Fetch CLOB metadata for the markets in `events`, visiting them in exactly
-/// the order [`assemble_registry`] does and stopping once the visit cap of
-/// would-be-accepted markets is reached.
+/// Max CLOB single-market lookups [`fetch_clob_bounded`] keeps IN FLIGHT at once.
+///
+/// The shared token-bucket rate limiter (5 req/s default) still caps the issue
+/// RATE; this only lets that many requests be outstanding so a slow tail of
+/// `/markets` responses OVERLAPS instead of serialising. Sized so the rate limit
+/// stays the binding constraint even when responses sit near the 10s client
+/// timeout (≈ rate × timeout) — turning a pathological multi-minute sync into
+/// tens of seconds WITHOUT raising the request rate.
+const CLOB_FETCH_CONCURRENCY: usize = 32;
+
+/// Fetch CLOB metadata for the markets in `events`, in assemble_registry's visit
+/// order, stopping once the visit cap of would-be-accepted markets is reached —
+/// but issuing the lookups in CONCURRENT waves (bounded by [`CLOB_FETCH_CONCURRENCY`]
+/// and the shared rate limiter) so a slow `/markets` tail no longer serialises.
 ///
 /// The cap depends on the prioritization mode (Task 5.3):
 /// - **Default (`!prioritize_by_liquidity`):** `filter.max_markets` — assembly
@@ -749,16 +879,17 @@ impl ClobFetch for ClobRest {
 ///   CLOB-backed [`gate_market`] to be rankable at all.
 ///
 /// Acceptance mirrors `assemble_registry`'s per-market gating (shared via
-/// [`gate_market`] + `effective_candidate_pool`), so the fetch and assembly
-/// visit the identical prefix: every CLOB record assembly needs was fetched,
-/// and no record outside the pool is fetched.
+/// [`gate_market`] + `effective_candidate_pool`). The fetched SET is identical to
+/// a purely sequential walk: each wave scans at most `cap - accepted` further
+/// VISITS (beyond that even an all-accept run would have hit the cap, so a
+/// sequential fetch would not have looked further), so we never fetch past the
+/// prefix assembly needs. Within a wave the lookups run concurrently; results are
+/// applied in scan order so `by_condition`/`failures` stay deterministic.
 ///
-/// This bound matters for startup latency: a single gamma keyset page can
-/// carry 1000+ member markets, and the CLOB client is rate-limited — an
-/// unbounded per-market fetch takes minutes when only `max_markets` (default
-/// 200, smoke runs 20) are kept.
+/// This bound matters for startup latency: a single gamma keyset page can carry
+/// 1000+ member markets, and the CLOB client is rate-limited.
 pub async fn fetch_clob_bounded<F: ClobFetch>(
-    fetch: &mut F,
+    fetch: &F,
     events: &[GammaEvent],
     filter: &UniverseFilter,
 ) -> (HashMap<String, ClobMarket>, Vec<(String, SkippedReason)>) {
@@ -770,41 +901,96 @@ pub async fn fetch_clob_bounded<F: ClobFetch>(
         filter.max_markets
     };
 
+    // Ordered visits in assemble_registry's exact order, empties skipped.
+    // Duplicates are RETAINED — assembly counts a repeated condition id toward
+    // the cap without a refetch, so we must too.
+    let visits: Vec<&str> = events
+        .iter()
+        .flat_map(|e| e.markets.iter())
+        .map(|gm| gm.condition_id.as_str())
+        .filter(|c| !c.is_empty())
+        .collect();
+
     let mut by_condition: HashMap<String, ClobMarket> = HashMap::new();
+    let mut failed: HashSet<String> = HashSet::new();
     let mut failures: Vec<(String, SkippedReason)> = Vec::new();
     let mut accepted = 0usize;
+    let mut gate_idx = 0usize;
 
-    'outer: for event in events {
-        for gm in &event.markets {
-            // Mirror assemble_registry's cap check: it breaks at the TOP of
-            // the loop for the market AFTER the last accepted one, so nothing
-            // past this point is ever visited by assembly either.
-            if accepted >= cap {
-                break 'outer;
-            }
-            if gm.condition_id.is_empty() {
-                continue; // assembly will record EmptyConditionId
-            }
-            if !by_condition.contains_key(&gm.condition_id) {
-                match fetch.market(&gm.condition_id).await {
-                    Ok(cm) => {
-                        by_condition.insert(gm.condition_id.clone(), cm);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            condition_id = %gm.condition_id,
-                            error = %e,
-                            "CLOB single-market lookup failed; skipping"
-                        );
-                        failures.push((gm.condition_id.clone(), SkippedReason::ClobLookupFailed));
-                        continue;
-                    }
+    while gate_idx < visits.len() && accepted < cap {
+        // Gate every already-resolved visit in order, counting acceptances, until
+        // the cap is hit or we reach an unresolved (not-yet-fetched) condition.
+        while gate_idx < visits.len() && accepted < cap {
+            let cond = visits[gate_idx];
+            if let Some(cm) = by_condition.get(cond) {
+                if gate_market(cm, filter).is_ok() {
+                    accepted += 1;
                 }
+                gate_idx += 1;
+            } else if failed.contains(cond) {
+                gate_idx += 1; // a failed lookup never counts toward the cap
+            } else {
+                break; // unresolved → fetch the next wave below
             }
-            // Count every visit assembly would accept — including a repeated
-            // condition id (assembly does not dedup), which costs no refetch.
-            if gate_market(&by_condition[&gm.condition_id], filter).is_ok() {
-                accepted += 1;
+        }
+        if accepted >= cap || gate_idx >= visits.len() {
+            break;
+        }
+
+        // Build the next wave: distinct, not-yet-resolved condition ids scanning
+        // forward from gate_idx. Bounded by (a) `cap - accepted` VISITS scanned and
+        // (b) CLOB_FETCH_CONCURRENCY distinct lookups in flight. The first
+        // unresolved visit (at gate_idx) is always picked up, so each wave makes
+        // progress and the loop terminates.
+        let visit_budget = cap - accepted;
+        let mut wave: Vec<String> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut scanned = 0usize;
+        let mut j = gate_idx;
+        while j < visits.len() && scanned < visit_budget && wave.len() < CLOB_FETCH_CONCURRENCY {
+            let cond = visits[j];
+            j += 1;
+            scanned += 1;
+            if !by_condition.contains_key(cond) && !failed.contains(cond) && seen.insert(cond) {
+                wave.push(cond.to_owned());
+            }
+        }
+
+        // Fetch the wave concurrently; the shared rate limiter throttles the
+        // issue rate, so this just overlaps slow responses.
+        let mut results: HashMap<String, Result<ClobMarket, IngestError>> =
+            futures_util::stream::iter(wave.iter().map(|cond| {
+                let cond = cond.clone();
+                async move {
+                    let r = fetch.market(&cond).await;
+                    (cond, r)
+                }
+            }))
+            .buffer_unordered(CLOB_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+
+        // Apply in scan order so by_condition / failures are completion-order
+        // independent (matches the old sequential output exactly).
+        for cond in &wave {
+            match results.remove(cond) {
+                Some(Ok(cm)) => {
+                    by_condition.insert(cond.clone(), cm);
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(
+                        condition_id = %cond,
+                        error = %e,
+                        "CLOB single-market lookup failed; skipping"
+                    );
+                    failed.insert(cond.clone());
+                    failures.push((cond.clone(), SkippedReason::ClobLookupFailed));
+                }
+                None => {
+                    // Defensive: every wave entry yields a result, but never loop.
+                    failed.insert(cond.clone());
+                    failures.push((cond.clone(), SkippedReason::ClobLookupFailed));
+                }
             }
         }
     }
@@ -1518,7 +1704,9 @@ mod tests {
     /// from `responses` fail like an HTTP error.
     struct StubClob {
         responses: HashMap<String, ClobMarket>,
-        calls: Vec<String>,
+        // Interior-mutable: the bounded fetch now calls `market(&self)` from a
+        // concurrent wave, so the recorder cannot take `&mut self`.
+        calls: std::sync::Mutex<Vec<String>>,
     }
 
     impl StubClob {
@@ -1528,14 +1716,23 @@ mod tests {
                     .into_iter()
                     .map(|m| (m.condition_id.clone(), m))
                     .collect(),
-                calls: Vec::new(),
+                calls: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        /// Recorded lookups, SORTED. The bounded fetch issues each wave of lookups
+        /// concurrently, so the asserted contract is the SET fetched (the cost
+        /// bound), not the (now nondeterministic) completion order.
+        fn calls_sorted(&self) -> Vec<String> {
+            let mut c = self.calls.lock().unwrap().clone();
+            c.sort();
+            c
         }
     }
 
     impl ClobFetch for StubClob {
-        async fn market(&mut self, condition_id: &str) -> Result<ClobMarket, IngestError> {
-            self.calls.push(condition_id.to_string());
+        async fn market(&self, condition_id: &str) -> Result<ClobMarket, IngestError> {
+            self.calls.lock().unwrap().push(condition_id.to_string());
             self.responses
                 .get(condition_id)
                 .cloned()
@@ -1563,7 +1760,7 @@ mod tests {
             make_event_multi("e1", false, &[("c1", "y1", "n1"), ("c2", "y2", "n2")]),
             make_event_multi("e2", false, &[("c3", "y3", "n3"), ("c4", "y4", "n4")]),
         ];
-        let mut stub = StubClob::new(vec![
+        let stub = StubClob::new(vec![
             ok_clob("c1", "y1", "n1"),
             ok_clob("c2", "y2", "n2"),
             ok_clob("c3", "y3", "n3"),
@@ -1575,10 +1772,10 @@ mod tests {
             ..UniverseFilter::default()
         };
 
-        let (map, failures) = fetch_clob_bounded(&mut stub, &events, &filter).await;
+        let (map, failures) = fetch_clob_bounded(&stub, &events, &filter).await;
 
         assert_eq!(
-            stub.calls,
+            stub.calls_sorted(),
             vec!["c1", "c2"],
             "must stop fetching once max_markets acceptable markets are in hand"
         );
@@ -1610,7 +1807,7 @@ mod tests {
                 ("c4", "y4", "n4"),
             ],
         )];
-        let mut stub = StubClob::new(vec![
+        let stub = StubClob::new(vec![
             inactive,
             ok_clob("c2", "y2", "n2"),
             ok_clob("c3", "y3", "n3"),
@@ -1622,10 +1819,10 @@ mod tests {
             ..UniverseFilter::default()
         };
 
-        let (map, _failures) = fetch_clob_bounded(&mut stub, &events, &filter).await;
+        let (map, _failures) = fetch_clob_bounded(&stub, &events, &filter).await;
 
         assert_eq!(
-            stub.calls,
+            stub.calls_sorted(),
             vec!["c1", "c2", "c3"],
             "inactive c1 must not count; c4 must never be fetched"
         );
@@ -1640,7 +1837,7 @@ mod tests {
             false,
             &[("c1", "y1", "n1"), ("c2", "y2", "n2"), ("c3", "y3", "n3")],
         )];
-        let mut stub = StubClob::new(vec![
+        let stub = StubClob::new(vec![
             ok_clob("c2", "y2", "n2"),
             ok_clob("c3", "y3", "n3"),
         ]);
@@ -1650,9 +1847,9 @@ mod tests {
             ..UniverseFilter::default()
         };
 
-        let (map, failures) = fetch_clob_bounded(&mut stub, &events, &filter).await;
+        let (map, failures) = fetch_clob_bounded(&stub, &events, &filter).await;
 
-        assert_eq!(stub.calls, vec!["c1", "c2"]);
+        assert_eq!(stub.calls_sorted(), vec!["c1", "c2"]);
         assert_eq!(map.len(), 1);
         assert!(map.contains_key("c2"));
         assert_eq!(
@@ -1670,7 +1867,7 @@ mod tests {
             make_event("e1", "c1", "y1", "n1", false, true),
             make_event_multi("e2", false, &[("c1", "y1", "n1"), ("c2", "y2", "n2")]),
         ];
-        let mut stub = StubClob::new(vec![
+        let stub = StubClob::new(vec![
             ok_clob("c1", "y1", "n1"),
             ok_clob("c2", "y2", "n2"),
         ]);
@@ -1680,9 +1877,13 @@ mod tests {
             ..UniverseFilter::default()
         };
 
-        let (map, _failures) = fetch_clob_bounded(&mut stub, &events, &filter).await;
+        let (map, _failures) = fetch_clob_bounded(&stub, &events, &filter).await;
 
-        assert_eq!(stub.calls, vec!["c1"], "duplicate visit must not refetch");
+        assert_eq!(
+            stub.calls_sorted(),
+            vec!["c1"],
+            "duplicate visit must not refetch"
+        );
         assert_eq!(map.len(), 1);
     }
 
@@ -1726,8 +1927,8 @@ mod tests {
             .iter()
             .map(|m| (m.condition_id.clone(), m.clone()))
             .collect();
-        let mut stub = StubClob::new(full);
-        let (bounded_map, _) = fetch_clob_bounded(&mut stub, &events, &filter).await;
+        let stub = StubClob::new(full);
+        let (bounded_map, _) = fetch_clob_bounded(&stub, &events, &filter).await;
 
         let from_full = assemble_registry(&events, &full_map, "", &filter).unwrap();
         let from_bounded = assemble_registry(&events, &bounded_map, "", &filter).unwrap();
@@ -1954,7 +2155,7 @@ mod tests {
                 ("c4", "y4", "n4"),
             ],
         )];
-        let mut stub = StubClob::new(vec![
+        let stub = StubClob::new(vec![
             ok_clob("c1", "y1", "n1"),
             ok_clob("c2", "y2", "n2"),
             ok_clob("c3", "y3", "n3"),
@@ -1967,9 +2168,9 @@ mod tests {
             candidate_pool: 4,
             ..UniverseFilter::default()
         };
-        let (map, failures) = fetch_clob_bounded(&mut stub, &events, &filter).await;
+        let (map, failures) = fetch_clob_bounded(&stub, &events, &filter).await;
         assert_eq!(
-            stub.calls,
+            stub.calls_sorted(),
             vec!["c1", "c2", "c3", "c4"],
             "fetch covers the whole candidate pool when prioritizing"
         );
@@ -1977,7 +2178,7 @@ mod tests {
         assert!(failures.is_empty());
 
         // Contrast: the DEFAULT path still stops at max_markets.
-        let mut stub_default = StubClob::new(vec![
+        let stub_default = StubClob::new(vec![
             ok_clob("c1", "y1", "n1"),
             ok_clob("c2", "y2", "n2"),
             ok_clob("c3", "y3", "n3"),
@@ -1988,11 +2189,106 @@ mod tests {
             require_active: true,
             ..UniverseFilter::default()
         };
-        let (_m, _f) = fetch_clob_bounded(&mut stub_default, &events, &default_filter).await;
+        let (_m, _f) = fetch_clob_bounded(&stub_default, &events, &default_filter).await;
         assert_eq!(
-            stub_default.calls,
+            stub_default.calls_sorted(),
             vec!["c1", "c2"],
             "default fetch still stops at max_markets"
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_fetch_runs_lookups_concurrently_bounded_by_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A fetch seam that records the PEAK number of simultaneously in-flight
+        // lookups. The counter is bumped at entry (before the await), so the peak
+        // is observed deterministically regardless of the timer.
+        struct Probe {
+            responses: HashMap<String, ClobMarket>,
+            in_flight: AtomicUsize,
+            max_in_flight: AtomicUsize,
+        }
+        impl ClobFetch for Probe {
+            async fn market(&self, cid: &str) -> Result<ClobMarket, IngestError> {
+                let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(cur, Ordering::SeqCst);
+                // Hold the "request" open so concurrent lookups actually overlap.
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                self.responses
+                    .get(cid)
+                    .cloned()
+                    .ok_or_else(|| IngestError::Http("probe miss".into()))
+            }
+        }
+
+        // 40 distinct acceptable markets > the concurrency limit, so the first
+        // wave must saturate (but not exceed) it.
+        let specs: Vec<(String, String, String)> = (0..40)
+            .map(|i| (format!("c{i}"), format!("y{i}"), format!("n{i}")))
+            .collect();
+        let pairs: Vec<(&str, &str, &str)> = specs
+            .iter()
+            .map(|(c, y, n)| (c.as_str(), y.as_str(), n.as_str()))
+            .collect();
+        let events = vec![make_event_multi("e1", false, &pairs)];
+        let responses: HashMap<String, ClobMarket> = specs
+            .iter()
+            .map(|(c, y, n)| (c.clone(), ok_clob(c, y, n)))
+            .collect();
+        let probe = Probe {
+            responses,
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        };
+        // Prioritized so the cap covers the whole pool → all 40 are fetched.
+        let filter = UniverseFilter {
+            max_markets: 40,
+            require_active: true,
+            prioritize_by_liquidity: true,
+            candidate_pool: 100,
+            ..UniverseFilter::default()
+        };
+
+        let (map, failures) = fetch_clob_bounded(&probe, &events, &filter).await;
+
+        assert_eq!(map.len(), 40, "all acceptable markets fetched");
+        assert!(failures.is_empty());
+        assert_eq!(
+            probe.max_in_flight.load(Ordering::SeqCst),
+            CLOB_FETCH_CONCURRENCY,
+            "the first wave runs lookups concurrently, saturating but not exceeding the limit"
+        );
+    }
+
+    #[test]
+    fn confluence_events_wraps_each_market_and_lifts_metrics() {
+        // Two markets exactly as Gamma `/markets?condition_ids=` returns them:
+        // string `volume`/`liquidity`, the second omitting `liquidity`.
+        let body = r#"[
+          {"conditionId":"0xAAA","clobTokenIds":"[\"111\",\"222\"]","active":true,
+           "closed":false,"negRisk":false,"question":"Q1?","volume":"50000.5",
+           "volume24hr":1234.0,"liquidity":"9000.25"},
+          {"conditionId":"0xBBB","clobTokenIds":"[\"333\",\"444\"]","active":true,
+           "closed":false,"negRisk":true,"question":"Q2?","volume":2000.0}
+        ]"#;
+        let markets: Vec<GammaMarket> = serde_json::from_str(body).unwrap();
+        let events = confluence_events(markets);
+
+        assert_eq!(events.len(), 2, "one synthetic single-market event per market");
+        // Order preserved; each event holds exactly its one market.
+        assert_eq!(events[0].id, "0xAAA");
+        assert_eq!(events[0].markets.len(), 1);
+        assert_eq!(events[0].markets[0].condition_id, "0xAAA");
+        // Market metrics lifted to the EVENT level for the Phase-5 segment fallback.
+        assert_eq!(events[0].volume, Some(50000.5));
+        assert_eq!(events[0].liquidity, Some(9000.25));
+        assert!(!events[0].neg_risk);
+        // Second market: neg_risk preserved, absent liquidity stays None.
+        assert_eq!(events[1].id, "0xBBB");
+        assert!(events[1].neg_risk);
+        assert_eq!(events[1].volume, Some(2000.0));
+        assert_eq!(events[1].liquidity, None);
     }
 }

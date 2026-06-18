@@ -100,6 +100,7 @@ impl Strategy for HeartbeatStrategy {
                     }
                     cmd = ctl_rx.recv() => match cmd {
                         Some(StrategyCommand::SetPaused(p)) => paused = p,
+                        Some(StrategyCommand::VetoQuote { .. }) => {}
                         None => break, // host dropped the control sender
                     },
                 }

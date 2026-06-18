@@ -449,6 +449,7 @@ mod tests {
                             Some(StrategyCommand::SetPaused(p)) => {
                                 status_tx.send_modify(|s| s.paused = p);
                             }
+                            Some(StrategyCommand::VetoQuote { .. }) => {}
                             None => break, // host dropped the control sender
                         },
                         _ = tokio::time::sleep(Duration::from_millis(5)) => {}

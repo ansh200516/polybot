@@ -46,6 +46,27 @@ pub struct OrderLine {
     pub detail: String,
 }
 
+/// One row of the OPEN-ORDERS panel: either a LIVE resting maker quote, or a
+/// VETOED (manually cancelled + re-quote-suppressed) slot. Selectable; the
+/// cancel/un-veto command carries `key` back to the app.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenOrderLine {
+    /// Owning strategy (e.g. "mm").
+    pub strategy: String,
+    pub market: String,
+    /// "Bid" (buy) or "Ask" (sell).
+    pub side: String,
+    /// Pre-formatted limit price (e.g. "0.44"); "—" for a vetoed slot.
+    pub px: String,
+    /// Remaining size in shares; `0.0` for a vetoed slot.
+    pub qty_shares: f64,
+    /// `true` ⇒ this slot is VETOED (no live order) — selecting it un-vetoes.
+    pub vetoed: bool,
+    /// Opaque "<token_u64>:<b|a>" handle; the app decodes it to (token, side)
+    /// to target the cancel/un-veto. Display code never interprets it.
+    pub key: String,
+}
+
 /// One strategy's display-only money + control flags for the per-strategy
 /// dashboard breakdown (multi-strategy platform). Same "display only" rule as
 /// the header: the publisher converts µUSDC→USD (`usd()`) and these `f64`
@@ -126,6 +147,9 @@ pub struct AppState {
     pub positions: Vec<PositionLine>,
     pub fills: Vec<FillLine>,
     pub orders: Vec<OrderLine>,
+    /// LIVE resting maker quotes + VETOED slots — the open-orders panel. The
+    /// operator selects a row and cancels/un-vetoes it (MM only today).
+    pub open_orders: Vec<OpenOrderLine>,
     pub health: Health,
     /// (level, formatted line) — level: 1=ERROR 2=WARN 3=INFO 4=DEBUG 5=TRACE.
     pub log: Vec<(u8, String)>,
@@ -137,12 +161,16 @@ pub struct AppState {
 }
 
 /// Commands the TUI emits toward the app (translated in main.rs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiCommand {
     SetPaused(bool),
     /// Confirmed via modal; sets the app kill flag.
     Kill,
     /// Typed-confirmed live toggle — M4 stub: app logs "unavailable until M5".
     GoLive,
+    /// Per-order cancel/un-veto from the open-orders panel. `key` is the opaque
+    /// "<token>:<b|a>" handle from the selected [`OpenOrderLine`]; `veto = true`
+    /// cancels + suppresses the order, `veto = false` lifts the suppression.
+    SetVeto { key: String, veto: bool },
     Quit,
 }

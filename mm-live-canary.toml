@@ -23,10 +23,10 @@
 enabled          = true
 live             = true
 capital_usd      = 10.0
-max_markets      = 2
+max_markets      = 100
 spread_bps       = 80      # rest AT the touch so a real fill is likely (exercises the WS fill path)
 quote_refresh_ms = 2500    # replace every 2.5s → exercises cancel/replace
-max_quote_usd    = 4.0     # 4 tokens × $4 = $16 < balance → all bids rest at once (more fill odds); still ≥5 shares at any price ≤ $0.80
+max_quote_usd    = 5.0     # $5 buys ≥ 5 shares at ANY price ≤ $1 (5×$1=$5) → clears the venue's 5-share minimum on every market. $1 gave ~1-share orders that the venue rejected ("Size (1) lower than the minimum: 5"). NOTE: with ~$18 this funds only ~3-4 resting orders; add funding for more breadth.
 live_fills_source = "ws"   # exercise the low-latency user-WS fills feed
 
 [inventory]
@@ -57,6 +57,32 @@ mm_segments         = ["LiquidStable", "Liquid"]
 mm_exclude_fee_free = true
 
 [universe]
-max_markets             = 40
+max_markets             = 100   # synced/subscribed markets → ~200 books (×2 tokens). THIS is what `books` counts.
 prioritize_by_liquidity = true
-candidate_pool          = 40
+candidate_pool          = 150    # rank a bigger pool by liquidity, keep the top `max_markets`
+# Periodic universe REFRESH ("keep diversifying"): re-exec every 30 min to pick
+# up new markets. A RELEASED live session resumes automatically across the
+# re-sync (it carries the release via PM_RESUME_LIVE — no re-hold/re-confirm); a
+# still-held session re-holds. 0 = off; must be 0 or >= 60.
+auto_restart_secs       = 1800
+
+# [confluence] — "follow the smart money" (LEVEL-1 CONFLUENCE).
+#
+# When enabled, the universe is NOT the liquidity-ranked Gamma keyset above —
+# instead it is built from the OPEN positions of the top leaderboard traders
+# (public Data API). For each such market the MM quotes ONLY the FAVORED outcome
+# (the side most of those traders hold), so we lean DIRECTIONALLY toward the
+# smart money instead of quoting both sides. The [segments] liquidity filter and
+# [universe] caps STILL apply on top, so we only follow them into markets liquid
+# enough to make a market in; illiquid longshots are dropped. Re-runs each
+# auto_restart so the smart-money snapshot stays fresh.
+#
+# Caps/guards are UNCHANGED — inventory caps + session loss still bound the
+# blast radius exactly as documented at the top of this file.
+[confluence]
+enabled       = true     # set false to fall back to the liquidity universe above
+top_traders   = 10       # follow the top 10 traders WHO HOLD open positions
+scan_limit    = 50       # scan this deep down the board to find 10 with open positions (top PnL winners often hold nothing)
+order_by      = "pnl"    # "pnl" = top profit, "vol" = most active
+time_period   = "month"  # day | week | month | all  → "top profit THIS MONTH"
+size_threshold = 1.0     # ignore a trader's positions smaller than this many shares
