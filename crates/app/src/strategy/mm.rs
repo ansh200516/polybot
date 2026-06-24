@@ -89,6 +89,7 @@ use crate::coordinator::now_ms;
 use crate::positions::PositionBook;
 use crate::wiring::BookFetcher;
 
+use super::quote_policy::{Policy, adjusted_mid, reward_quote_prices};
 use super::{
     RestingOrderSnapshot, Strategy, StrategyCommand, StrategyCtx, StrategyId, StrategyStatus,
 };
@@ -115,6 +116,13 @@ pub struct MmParams {
     /// `PaperMakerVenue` demo aid. `0` = conservative adverse-only sim. Ignored
     /// on the live path (live fills come from the real user feed).
     pub paper_taker_fill_pct: u32,
+    /// Quote policy (Task 5): [`Policy::SpreadCapture`] (default, legacy spread
+    /// quoting — unchanged) or [`Policy::RewardFarm`] (tight two-sided
+    /// liquidity-reward quoting, spec §8). Resolved from `[strategies.mm].policy`
+    /// in [`MmParams::from_config`]; selects the quote-computation branch in
+    /// [`MmLoop::quote`]. The two paths share the SAME veto / no-naked-short /
+    /// inventory gating, so they differ ONLY in which prices/sizes they propose.
+    pub policy: Policy,
 }
 
 impl MmParams {
@@ -128,6 +136,7 @@ impl MmParams {
             inventory_skew_bps: mm.inventory_skew_bps,
             rebate_bps: mm.rebate_bps,
             paper_taker_fill_pct: mm.paper_taker_fill_pct,
+            policy: Policy::from_cfg(&mm.policy),
         })
     }
 }
@@ -537,6 +546,63 @@ fn compute_quotes(
     )
 }
 
+/// RewardFarm per-token quote computation (Task 5, spec §8.2): tight,
+/// non-crossing, two-sided prices from the live book via [`reward_quote_prices`],
+/// converted to venue [`MakerOrder`]s. Returns `(bid, ask)` mirroring
+/// [`compute_quotes`] so the loop's veto / no-naked-short / inventory gating is
+/// IDENTICAL for both policies — the policies differ ONLY in the prices/sizes.
+///
+/// Balanced BASE size = `notional_micro` per side for now; real size SKEW and the
+/// reward `min_size` floor are Task 6. `max_spread_cents` is the per-market reward
+/// scoring band; `0.0` (no metrics / not reward-eligible) skips BOTH sides.
+///
+/// The pure pricing seam works in DOLLARS (0..1); each returned price is already
+/// floored/ceiled to the tick grid, so [`reward_price_to_px`] maps it back to an
+/// interior [`Px`]. The size-cutoff-adjusted mid (dropping sub-`min_size` levels,
+/// spec §8.1) needs per-level sizes the [`Book`] does not expose here, so Task 5
+/// uses the RAW mid; the size cutoff is deferred to a later task.
+fn reward_compute_quotes(
+    book: &Book,
+    token: TokenId,
+    notional_micro: i128,
+    max_spread_cents: f64,
+) -> (Option<MakerOrder>, Option<MakerOrder>) {
+    let ts = book.ts();
+    let (Some(best_bid), Some(best_ask)) = (book.bids.best(), book.asks.best()) else {
+        return (None, None);
+    };
+    let tick = ts.unit_microusdc() as f64 / 1_000_000.0;
+    let bb = best_bid.microusdc(ts) as f64 / 1_000_000.0;
+    let ba = best_ask.microusdc(ts) as f64 / 1_000_000.0;
+    // TODO(reward-farm sizing, later task): drop sub-`min_size` levels first.
+    let adj_mid = adjusted_mid(bb, ba);
+    let (bid_px, ask_px) = reward_quote_prices(adj_mid, bb, ba, tick, max_spread_cents);
+    let order = |side: Side, price: f64| -> Option<MakerOrder> {
+        reward_price_to_px(price, ts)
+            .and_then(|px| quote_order(token, side, px, ts, notional_micro))
+    };
+    (
+        bid_px.and_then(|p| order(Side::Bid, p)),
+        ask_px.and_then(|p| order(Side::Ask, p)),
+    )
+}
+
+/// Map a reward-farm dollar price (already a tick multiple from
+/// [`reward_quote_prices`]) to an interior [`Px`], or `None` if it is not a valid
+/// interior tick `[1, levels-1]`. The price sits on the tick grid, so the
+/// division lands on an integer tick (rounded to absorb f64 error).
+fn reward_price_to_px(price: f64, ts: TickSize) -> Option<Px> {
+    let tick = ts.unit_microusdc() as f64 / 1_000_000.0;
+    if tick <= 0.0 || !price.is_finite() {
+        return None;
+    }
+    let idx = (price / tick).round();
+    if !(1.0..f64::from(ts.levels())).contains(&idx) {
+        return None;
+    }
+    Px::new(idx as u16, ts).ok()
+}
+
 // ---------------------------------------------------------------------------
 // The quote loop
 // ---------------------------------------------------------------------------
@@ -567,6 +633,17 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     params: MmParams,
     tokens: Vec<TokenId>,
     token_market: HashMap<TokenId, MarketId>,
+    /// Quote policy (Task 5): which quote-computation path [`quote`](Self::quote)
+    /// takes — [`Policy::SpreadCapture`] (the UNCHANGED spread path) or
+    /// [`Policy::RewardFarm`] (tight two-sided reward quoting). Set from
+    /// [`MmParams::policy`] in [`run_mm_loop`].
+    policy: Policy,
+    /// Per-token reward-program params `(min_size_shares, max_spread_cents)`,
+    /// resolved ONCE at construction from the registry [`MarketMetrics`] for each
+    /// token's market (spec §6). RewardFarm reads `max_spread_cents` (`.1`) as the
+    /// scoring band; `min_size` (`.0`) is threaded for Task-6 sizing. A token with
+    /// no metrics / not reward-eligible maps to zeros, gating its quotes out.
+    reward_by_token: HashMap<TokenId, (f64, f64)>,
     /// Per-side notional cap: `min(max_quote_usd, capital)`, µUSDC.
     notional_micro: i128,
     /// `order_id → resting-order metadata`, for fill→side resolution and the
@@ -647,16 +724,31 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             {
                 continue;
             }
-            // Skew fair against the strategy's current signed net for this token.
+            // Current signed net for this token: drives SpreadCapture's skew and
+            // the no-naked-short ask cap below (the latter for BOTH policies).
             let net_micro = self.inv.net(token);
-            let (bid, ask) = compute_quotes(
-                &book,
-                token,
-                &self.params,
-                self.notional_micro,
-                net_micro,
-                max_inventory_micro,
-            );
+            // POLICY BRANCH (Task 5): SpreadCapture keeps the EXACT spread-capture
+            // quote math (byte-for-byte unchanged); RewardFarm computes tight,
+            // non-crossing, two-sided reward-band prices. Both feed the SAME veto /
+            // no-naked-short / inventory-gate path below — isolation by quote
+            // computation only (spec §5).
+            let (bid, ask) = match self.policy {
+                Policy::SpreadCapture => compute_quotes(
+                    &book,
+                    token,
+                    &self.params,
+                    self.notional_micro,
+                    net_micro,
+                    max_inventory_micro,
+                ),
+                Policy::RewardFarm => {
+                    // Per-token reward band (`.1` = max_spread_cents); `.0`
+                    // (min_size) is threaded for Task-6 sizing. No metrics / not
+                    // reward-eligible → band 0.0 → both sides gate out (skip).
+                    let max_spread_cents = self.reward_by_token.get(&token).map_or(0.0, |r| r.1);
+                    reward_compute_quotes(&book, token, self.notional_micro, max_spread_cents)
+                }
+            };
             if bid.is_none() && ask.is_none() {
                 let bb = book.bids.best().map(|p| p.get());
                 let ba = book.asks.best().map(|p| p.get());
@@ -1033,7 +1125,7 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
     start_paused: bool,
 ) {
     let StrategyCtx {
-        registry: _,
+        registry,
         fetcher,
         store_tx,
         kill,
@@ -1042,6 +1134,18 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
     } = ctx;
     // Per-side notional is capped by max_quote_usd AND the whole capital envelope.
     let notional_micro = params.max_quote_micro.min(capital.0).max(0);
+    // Per-token reward-program params `(min_size, max_spread_cents)` resolved ONCE
+    // from the registry MarketMetrics for each token's market (spec §6). Read by
+    // the RewardFarm policy; harmlessly built (and ignored) under SpreadCapture. A
+    // token with no metrics maps to zeros → not reward-eligible → gated out. The
+    // registry `Arc` is dropped after this — only the resolved map is retained.
+    let reward_by_token: HashMap<TokenId, (f64, f64)> = tokens
+        .iter()
+        .filter_map(|t| {
+            let m = registry.metrics(*token_market.get(t)?)?;
+            Some((*t, (m.reward_min_size, m.reward_max_spread_cents)))
+        })
+        .collect();
     let mut mm = MmLoop {
         venue,
         qm,
@@ -1053,6 +1157,8 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
         params,
         tokens,
         token_market,
+        policy: params.policy,
+        reward_by_token,
         notional_micro,
         placed: HashMap::new(),
         token_ts: HashMap::new(),
@@ -1190,6 +1296,9 @@ mod tests {
             // Paper taker-flow OFF by default (conservative adverse-only sim);
             // the demo / fill tests opt in.
             paper_taker_fill_pct: 0,
+            // SpreadCapture by default so the Task-4.2/4.3 tests run the unchanged
+            // spread path; reward-farm pricing is unit-tested in `quote_policy`.
+            policy: Policy::SpreadCapture,
         }
     }
 
@@ -1266,6 +1375,8 @@ mod tests {
             params,
             tokens,
             token_market,
+            policy: params.policy,
+            reward_by_token: HashMap::new(),
             notional_micro,
             placed: HashMap::new(),
             token_ts: HashMap::new(),
@@ -2343,6 +2454,8 @@ mod tests {
             params,
             tokens,
             token_market,
+            policy: params.policy,
+            reward_by_token: HashMap::new(),
             notional_micro,
             placed: HashMap::new(),
             token_ts: HashMap::new(),
@@ -2413,6 +2526,8 @@ mod tests {
             params: mk_params(200, 5.0),
             tokens: vec![yes, no],
             token_market: HashMap::from([(yes, MarketId(0)), (no, MarketId(0))]),
+            policy: Policy::SpreadCapture,
+            reward_by_token: HashMap::new(),
             notional_micro: 5_000_000,
             placed: HashMap::new(),
             token_ts: HashMap::new(),

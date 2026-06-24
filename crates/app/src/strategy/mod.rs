@@ -24,6 +24,7 @@ use crate::wiring::BookFetcher;
 pub mod arb;
 pub mod host;
 pub mod mm;
+pub mod quote_policy;
 pub mod reward_score;
 pub mod stub;
 
