@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags};
 
 use crate::{DAY_MS, PnlRow, StoreError};
 
@@ -235,33 +235,47 @@ impl ReadStore {
         Ok(rows)
     }
 
-    /// Today's P&L in µUSDC for `strategy`: the LATEST snapshot whose `ts_ms`
-    /// falls in the UTC day `[utc_day·DAY_MS, +DAY_MS)`, valued as
-    /// `realized_micro + unrealized_micro` (i128); `0` if the strategy logged no
-    /// snapshot that day. `utc_day` is a whole-day index (see
-    /// [`crate::utc_day_from_ms`]).
+    /// The WORST (most negative) intraday `realized_micro + unrealized_micro`
+    /// over ALL of `strategy`'s snapshots in the UTC day `[utc_day·DAY_MS,
+    /// +DAY_MS)`, in µUSDC (i128); `0` if the strategy logged no snapshot that
+    /// day. `utc_day` is a whole-day index (see [`crate::utc_day_from_ms`]).
     ///
     /// Backs the market-maker's PERSISTENT UTC-day loss cap: on startup the MM
-    /// reads this and refuses to quote when the day is already at/under its
-    /// daily-loss cap, so the cap binds across the periodic auto-restart instead
-    /// of resetting every session. Reads the single newest row (`ORDER BY id DESC
-    /// LIMIT 1`) via `.optional()` — no row → `Ok(0)`, exactly like a fresh day.
+    /// reads this and refuses to quote when the day's worst point is already
+    /// at/under its daily-loss cap, so the cap binds across the periodic
+    /// auto-restart instead of resetting every session.
+    ///
+    /// Uses the day's MINIMUM, NOT the latest snapshot, deliberately. A latest-
+    /// snapshot read re-armed the bot after a cap breach: once a losing session
+    /// halts and goes flat it writes fresh ~0 P&L snapshots, so the newest row
+    /// recovers to ~0 and a restart would quote again. The worst-point snapshot
+    /// stays in the day's history, so `MIN` keeps the gate latched across every
+    /// restart that day — and it is also the correct "max intraday drawdown"
+    /// semantic for a daily loss cap (down the cap at ANY point → stop for the day).
+    ///
+    /// RESIDUAL LIMITATION (documented; needs a follow-up): `realized_micro` is
+    /// cumulative PER SESSION and resets on each restart, so MANY sub-cap sessions
+    /// — none individually reaching the cap, but whose realized losses SUM over it
+    /// across the day — are NOT caught here (each session's worst point is itself
+    /// sub-cap). MIN catches the dominant cases: any SINGLE-session cap breach,
+    /// and held/unrealized drawdowns (the seeded position keeps marking negative).
+    /// Fully closing the sum-of-sessions gap needs a cumulative day-realized
+    /// ledger (the separate accounting fix), not derivable from these snapshots.
+    ///
+    /// `MIN` over the day returns SQL `NULL` when no row matches → `Ok(0)`,
+    /// exactly like a fresh day.
     pub fn day_pnl_micro(&self, strategy: &str, utc_day: i64) -> Result<i128, StoreError> {
         let lo = utc_day * DAY_MS;
         let hi = lo + DAY_MS;
-        let row: Option<(i64, i64)> = self
-            .conn
-            .query_row(
-                "SELECT realized_micro, unrealized_micro FROM pnl_snapshots
-                 WHERE strategy = ?1 AND ts_ms >= ?2 AND ts_ms < ?3
-                 ORDER BY id DESC LIMIT 1",
-                rusqlite::params![strategy, lo, hi],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        Ok(row.map_or(0, |(realized, unrealized)| {
-            i128::from(realized) + i128::from(unrealized)
-        }))
+        // Aggregate (no GROUP BY) → always exactly one row; the value is NULL when
+        // no snapshot matches, read as `Option<i64>` (None → fresh day → 0).
+        let worst: Option<i64> = self.conn.query_row(
+            "SELECT MIN(realized_micro + unrealized_micro) FROM pnl_snapshots
+             WHERE strategy = ?1 AND ts_ms >= ?2 AND ts_ms < ?3",
+            rusqlite::params![strategy, lo, hi],
+            |r| r.get(0),
+        )?;
+        Ok(worst.map_or(0, i128::from))
     }
 
     /// Most-recent `n` halts, newest first.
@@ -544,14 +558,54 @@ mod tests {
     }
 
     #[test]
-    fn day_pnl_sums_todays_realized_plus_last_unrealized() {
+    fn day_pnl_is_worst_point_in_day() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("d.sqlite");
         let mut s = Store::open(&path).unwrap();
-        s.record_pnl_at(1_000, 0, -3_000_000, -1_000_000, 0, "mm").unwrap();
-        s.record_pnl_at(2_000, 0, -5_000_000, -500_000, 0, "mm").unwrap();
+        // Worst point FIRST (realized −5M + unrealized −1M = −6M), then a LATER,
+        // BETTER snapshot (−2M). day_pnl_micro must return the WORST point's
+        // realized+unrealized (−6M) — proving (a) it sums realized+unrealized and
+        // (b) it uses the day's MIN, not the latest snapshot (which would have
+        // wrongly returned −2M).
+        s.record_pnl_at(1_000, 0, -5_000_000, -1_000_000, 0, "mm").unwrap();
+        s.record_pnl_at(2_000, 0, -2_000_000, 0, 0, "mm").unwrap();
         let rs = ReadStore::open(&path).unwrap();
         let day = utc_day_from_ms(2_000);
-        assert_eq!(rs.day_pnl_micro("mm", day).unwrap(), -5_500_000);
+        assert_eq!(rs.day_pnl_micro("mm", day).unwrap(), -6_000_000);
+    }
+
+    #[test]
+    fn day_pnl_stays_latched_after_flat_session() {
+        // The cross-restart hazard MIN fixes: an early session breaches the cap
+        // (worst −6M), then later HALTED+FLAT sessions write ~0 P&L snapshots
+        // (realized resets each restart). MIN over the day keeps returning the
+        // worst point, so the loss-cap gate stays latched across every restart —
+        // a "latest snapshot" read would wrongly recover to ~0 and re-arm.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flat.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        s.record_pnl_at(1_000, 0, -6_000_000, 0, -6_000_000, "mm").unwrap();
+        s.record_pnl_at(5_000, 0, 0, 0, 0, "mm").unwrap();
+        s.record_pnl_at(9_000, 0, 0, 0, 0, "mm").unwrap();
+        s.record_pnl_at(13_000, 0, 0, 0, 0, "mm").unwrap();
+        let rs = ReadStore::open(&path).unwrap();
+        let day = utc_day_from_ms(1_000);
+        assert_eq!(rs.day_pnl_micro("mm", day).unwrap(), -6_000_000);
+    }
+
+    #[test]
+    fn day_pnl_excludes_other_utc_days_and_is_zero_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("xday.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        // Day 0 worst −6M; day 1 carries an even-worse −9M that must NOT bleed
+        // into day 0's window (and vice-versa). 86_400_000 ms = one UTC day.
+        s.record_pnl_at(1_000, 0, -6_000_000, 0, -6_000_000, "mm").unwrap();
+        s.record_pnl_at(86_400_000 + 1_000, 0, -9_000_000, 0, -9_000_000, "mm").unwrap();
+        let rs = ReadStore::open(&path).unwrap();
+        assert_eq!(rs.day_pnl_micro("mm", 0).unwrap(), -6_000_000, "day 0 sees only day-0 snapshots");
+        assert_eq!(rs.day_pnl_micro("mm", 1).unwrap(), -9_000_000, "day 1 sees only day-1 snapshots");
+        // A day with no snapshots → NULL MIN → 0 (a fresh day never latches).
+        assert_eq!(rs.day_pnl_micro("mm", 2).unwrap(), 0, "no snapshots that day → 0");
     }
 }

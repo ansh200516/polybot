@@ -1240,7 +1240,19 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         }
         let pnl = self.positions.pnl(&bid_marks); // bid-marked (reporting)
         let pnl_mid = self.positions.pnl(&mid_marks); // mid-marked (risk feed)
-        let halted = self.inv.halted().map(|h| format!("{h:?}"));
+        // Surface BOTH halt sources to the dashboard (DISPLAY ONLY — InvHalt
+        // semantics are unchanged). The in-session InvHalt reason
+        // (StopLoss/DailyLoss) takes precedence as the more specific cause;
+        // otherwise, when only the PERSISTENT UTC-day loss cap (Task 9) is
+        // latched, show `DayLossCap` so operators see WHY the MM refuses to quote
+        // instead of it appearing un-halted. Equivalent to
+        // `self.halted || self.day_loss_halted` for the is-halted flag, since
+        // `self.halted` mirrors `self.inv.halted().is_some()`.
+        let halted = self
+            .inv
+            .halted()
+            .map(|h| format!("{h:?}"))
+            .or_else(|| self.day_loss_halted.then(|| "DayLossCap".to_string()));
 
         let row = PnlRow {
             ts_ms: now_ms(),
@@ -2610,7 +2622,7 @@ mod tests {
         let mut inv_cfg = generous_inv();
         inv_cfg.daily_loss_usd = Usdc(50_000_000);
         let params = mk_params(200, 5.0);
-        let (mut mm, _store_rx, _status_rx) =
+        let (mut mm, _store_rx, status_rx) =
             build_loop(fetcher, inv_cfg, params, tokens, Usdc(1_000_000_000));
 
         // A real file-backed store with a losing "mm" snapshot on UTC day 0.
@@ -2636,6 +2648,16 @@ mod tests {
         assert!(
             mm.venue.open_orders().await.unwrap().is_empty(),
             "quote() places nothing while the day-loss latch is set"
+        );
+
+        // Hardening 2: the latch is SURFACED in the published status so operators
+        // see the MM is halted — even though InvHalt is None here (only the
+        // persistent day-loss gate fired).
+        mm.publish_status().await;
+        assert_eq!(
+            status_rx.borrow().halted.as_deref(),
+            Some("DayLossCap"),
+            "the persistent day-loss latch is surfaced in StrategyStatus.halted"
         );
     }
 
