@@ -92,7 +92,7 @@ use crate::wiring::BookFetcher;
 
 use super::quote_policy::{
     Policy, adjusted_mid, combined_signal, imbalance, ladder_depth, microprice, needs_requote,
-    reward_quote_prices, should_pull, skewed_sizes,
+    needs_requote_size, reward_quote_prices, should_pull, skewed_sizes,
 };
 use super::reward_score::{ScoredOrder, est_daily_reward_usd, order_score, quote_set_q_min};
 use super::signals::SignalState;
@@ -1264,18 +1264,26 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 };
                 // Inventory cap gate (Task 2.2): only quote sides it approves.
                 if matches!(self.inv.check_quote(&intent), QuoteVerdict::Approve) {
-                    // Task 8 — STICKY RE-QUOTING (RewardFarm only; the SpreadCapture
-                    // path is byte-for-byte unchanged). When a quote for this
-                    // `(token, side)` is ALREADY resting AND its target price has NOT
-                    // drifted past `requote_band_ticks`, keep the RESTING order
-                    // VERBATIM: `reconcile` then value-compares it equal (MakerOrder:
-                    // Eq) and leaves it untouched — no cancel+place, which would reset
-                    // Polymarket's TIME-WEIGHTED reward score. Gated on PRICE drift
-                    // ONLY; the per-cycle size lean is deliberately ignored here (a
-                    // documented Task-8 scope choice) — re-leaning sizes every tick
-                    // would re-introduce exactly the churn this anti-flicker rule
-                    // exists to prevent. Prices compare in DOLLARS, matching
-                    // `reward_compute_quotes`.
+                    // STICKY RE-QUOTING (RewardFarm only; the SpreadCapture path is
+                    // byte-for-byte unchanged). When a quote for this `(token, side)`
+                    // is ALREADY resting, keep the RESTING order VERBATIM so
+                    // `reconcile` value-compares it equal (MakerOrder: Eq) and issues
+                    // no cancel+place — a replace resets Polymarket's TIME-WEIGHTED
+                    // reward score, so we churn only when something material moved.
+                    //
+                    // KEEP only when BOTH are in tolerance (Spec-2 §8.4b):
+                    //   (a) PRICE has NOT drifted past `requote_band_ticks` (Spec-1
+                    //       anti-flicker; compared in DOLLARS, matching
+                    //       `reward_compute_quotes`), AND
+                    //   (b) the resting SIZE has NOT drifted past `size_rebalance_pct`
+                    //       from the freshly-computed target size — so an inventory
+                    //       shift that re-leans `skewed_sizes` enough is RESTORED
+                    //       rather than left stale, without re-leaning every tick.
+                    // Either out of tolerance ⇒ replace with the fresh order `o`
+                    // (which carries the current price + inventory-skewed size lean).
+                    // Sizes compare in SHARES (`Qty` is µshares ÷ 1e6); `o` is the
+                    // order we would actually place (post no-naked-short cap), so the
+                    // comparison is against the real replacement candidate.
                     let o = if self.policy == Policy::RewardFarm
                         && let Some(r) = resting.get(&(token, o.side))
                         && !needs_requote(
@@ -1283,8 +1291,13 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                             o.price.microusdc(ts) as f64 / 1_000_000.0,
                             ts.unit_microusdc() as f64 / 1_000_000.0,
                             self.params.requote_band_ticks,
+                        )
+                        && !needs_requote_size(
+                            r.size.0 as f64 / 1_000_000.0,
+                            o.size.0 as f64 / 1_000_000.0,
+                            self.params.size_rebalance_pct,
                         ) {
-                        tracing::debug!(token = token.0, side = ?o.side, resting_tick = r.price.get(), target_tick = o.price.get(), "mm quote: STICKY keep (within band)");
+                        tracing::debug!(token = token.0, side = ?o.side, resting_tick = r.price.get(), target_tick = o.price.get(), resting_size = r.size.0, target_size = o.size.0, "mm quote: STICKY keep (price + size in band)");
                         r.clone()
                     } else {
                         o
@@ -2774,6 +2787,91 @@ mod tests {
         mm.quote().await;
         let bid_id1 = mm.qm.tracked().get(&(TokenId(1), Side::Bid)).cloned().expect("bid still resting");
         assert_ne!(bid_id1, bid_id0, "SpreadCapture must re-quote on a tick move (id re-keys)");
+    }
+
+    // ── RewardFarm size-rebalance sticky trigger (Spec-2 §8.4b) ─────────────────
+
+    /// Spec-2 §8.4(b): the sticky keep must ALSO re-place a resting reward side
+    /// when the inventory-implied SIZE lean has drifted past `size_rebalance_pct`
+    /// — restoring the delta-neutral skew — even while the PRICE stays in band
+    /// (so the Spec-1 price-drift gate alone would have kept it). We hold the book
+    /// STATIC (price target never moves) and shift inventory between cycles: a
+    /// large shift re-leans `skewed_sizes` enough to replace; a small shift stays
+    /// sticky. The paper venue re-keys a replaced order, so a CHANGED id proves a
+    /// cancel+place happened and an UNCHANGED id proves it did not — the same
+    /// message-independent technique as
+    /// `rewardfarm_sticky_requote_keeps_in_band_resting_order`.
+    #[tokio::test]
+    async fn rewardfarm_size_rebalance_replaces_in_band_on_size_drift() {
+        // One scenario: cycle 1 FLAT (balanced 10-share quote), then SEED a long
+        // and re-quote on the SAME book. Returns whether each side's venue id
+        // re-keyed across the two cycles (`true` ⇒ a replace happened).
+        async fn ids_change_after_seed(seed_net_shares: i128) -> (bool, bool) {
+            let tokens = vec![TokenId(1)];
+            // Static in-band book (bid 0.48 / ask 0.52 → mid 0.50) served unchanged
+            // both cycles, so the PRICE target never drifts (the Spec-1 gate stays
+            // put) and ONLY the size trigger can drive a replace.
+            let (fetcher, _shared) =
+                controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+            let mut params = mk_params(200, 5.0);
+            params.policy = Policy::RewardFarm;
+            // A 4:1 lean cap pushes the per-side size drift COMFORTABLY across (big
+            // seed) / under (small seed) the 0.25 `size_rebalance_pct` on BOTH
+            // sides, so the id assertions aren't margin-fragile. The rebalance pct
+            // stays at its 0.25 default.
+            params.size_skew_max_ratio = 4.0;
+            // generous_inv(): $1000 per-market cap ⇒ 2000-share cap at the 0.50 mid;
+            // $5 per-side quote ⇒ a 10-share balanced base when flat.
+            let (mut mm, _store_rx, _status_rx) =
+                build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+            mm.reward_by_token.insert(TokenId(1), (1.0, 3.0, 100.0));
+
+            // Cycle 1 (flat → balanced): bid 0.50 / ask 0.51, 10 shares each.
+            mm.quote().await;
+            let bid0 =
+                mm.qm.tracked().get(&(TokenId(1), Side::Bid)).cloned().expect("cycle-1 bid");
+            let ask0 =
+                mm.qm.tracked().get(&(TokenId(1), Side::Ask)).cloned().expect("cycle-1 ask");
+
+            // SHIFT inventory: a long re-leans the fresh quote (bigger ask to sell
+            // down, smaller bid) so the target sizes now differ from the resting
+            // balanced 10/10. The tiny bid buy stays well inside the $1000 cap.
+            mm.inv.seed(TokenId(1), seed_net_shares * SH as i128, Usdc(0));
+
+            // Cycle 2 (SAME book ⇒ price in band): only the size trigger is in play.
+            mm.quote().await;
+            let bid1 =
+                mm.qm.tracked().get(&(TokenId(1), Side::Bid)).cloned().expect("cycle-2 bid");
+            let ask1 =
+                mm.qm.tracked().get(&(TokenId(1), Side::Ask)).cloned().expect("cycle-2 ask");
+            (bid1 != bid0, ask1 != ask0)
+        }
+
+        // (1) LARGE long: 1900 sh = r 0.95 of the 2000-sh cap ⇒ ~1.93× lean, so
+        // the bid shrinks ~48% and the ask grows ~93% — both past the 25% band ⇒
+        // the in-band sides ARE re-placed (ids re-key) to restore the lean.
+        let (bid_replaced, ask_replaced) = ids_change_after_seed(1900).await;
+        assert!(
+            bid_replaced,
+            "size drift > pct must re-place the bid even though the price is in band"
+        );
+        assert!(
+            ask_replaced,
+            "size drift > pct must re-place the ask even though the price is in band"
+        );
+
+        // (2) SMALL long: 400 sh = r 0.2 ⇒ ~1.15× lean, so bid ~13% / ask ~15%
+        // drift — both UNDER the 25% band ⇒ the sticky keep holds, ids stable
+        // (no cancel+place churn from a sub-threshold lean wobble).
+        let (bid_replaced, ask_replaced) = ids_change_after_seed(400).await;
+        assert!(
+            !bid_replaced,
+            "sub-threshold size drift must KEEP the bid sticky (id stable)"
+        );
+        assert!(
+            !ask_replaced,
+            "sub-threshold size drift must KEEP the ask sticky (id stable)"
+        );
     }
 
     // ── RewardFarm paper integration (Task 11, spec §9/§15) ─────────────────────

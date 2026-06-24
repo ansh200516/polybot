@@ -187,6 +187,13 @@ pub fn needs_requote(resting_price: f64, target_price: f64, tick: f64, band_tick
     (resting_price - target_price).abs() > (f64::from(band_ticks) * tick) + 1e-9
 }
 
+/// True when a resting side's size has drifted more than `pct` (relative) from
+/// the new target size, so it should be re-placed to restore the inventory lean.
+pub fn needs_requote_size(resting_size: f64, target_size: f64, pct: f64) -> bool {
+    if resting_size <= 0.0 { return target_size > 0.0; }
+    ((resting_size - target_size).abs() / resting_size) > pct
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
     SpreadCapture,
@@ -316,6 +323,14 @@ mod tests {
         // resting at 0.49; band 1 tick (0.01). target 0.495 -> keep; target 0.51 -> replace.
         assert!(!needs_requote(0.49, 0.495, 0.01, 1));
         assert!(needs_requote(0.49, 0.51, 0.01, 1));
+    }
+
+    #[test]
+    fn requote_on_size_drift_even_when_price_in_band() {
+        assert!(needs_requote_size(100.0, 130.0, 0.25));  // +30% > 25% -> requote
+        assert!(!needs_requote_size(100.0, 115.0, 0.25)); // +15% < 25% -> keep
+        assert!(needs_requote_size(0.0, 5.0, 0.25));      // was empty, now want size -> requote
+        assert!(!needs_requote_size(0.0, 0.0, 0.25));     // both zero -> keep
     }
 
     #[test]
