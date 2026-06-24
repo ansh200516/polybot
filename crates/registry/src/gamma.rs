@@ -6,6 +6,7 @@
 //!   is present in fixture but not consumed by M2 — excluded to keep model minimal.
 //! - ClobMarket: added `maker_base_fee` / `taker_base_fee` (int, RECON §4/8); ClobToken got
 //!   `price` (f64) and `winner` (bool) as seen in clob_markets.json.
+//! - ClobMarket: added `rewards` (`ClobRewards`: `rates` / `min_size` / `max_spread`) per RECON §4.
 //! - ClobMarketsPage: added `limit` and `count` (both default) to absorb envelope fields without
 //!   deny_unknown_fields; only `data` and `next_cursor` are consumed downstream.
 //! - ClobBook: fully specified from clob_book.json — `market`, `timestamp` (String, milliseconds),
@@ -273,10 +274,10 @@ pub struct ClobRewardRate {
 pub struct ClobRewards {
     #[serde(default)]
     pub rates: Option<Vec<ClobRewardRate>>,
-    /// `min_incentive_size` — minimum order size (shares) to qualify.
+    /// Minimum order size (shares) to qualify for rewards. Wire key: rewards.min_size (RECON §4).
     #[serde(default)]
     pub min_size: f64,
-    /// `max_incentive_spread` — max distance from mid (cents) that scores.
+    /// Max distance from the adjusted mid (cents) that still scores. Wire key: rewards.max_spread (RECON §4).
     #[serde(default)]
     pub max_spread: f64,
 }
@@ -289,6 +290,7 @@ impl ClobRewards {
             .map(|r| r.iter().map(|x| x.rewards_daily_rate).sum())
             .unwrap_or(0.0)
     }
+
     /// Reward-eligible iff there is a positive scoring band AND a positive rate.
     pub fn is_eligible(&self) -> bool {
         self.max_spread > 0.0 && self.daily_rate_usd() > 0.0
@@ -485,6 +487,11 @@ mod tests {
         for m in &page.data {
             assert!(m.minimum_tick_size > 0.0);
         }
+        // The committed capture has `rewards: {rates:null, min_size:0, max_spread:0}` on every
+        // market, so the first one must deserialize to an all-zero, reward-ineligible band.
+        let first = &page.data[0];
+        assert_eq!(first.rewards.daily_rate_usd(), 0.0);
+        assert!(!first.rewards.is_eligible());
     }
 
     #[test]
@@ -513,6 +520,24 @@ mod tests {
         let m2: ClobMarket = serde_json::from_str(
             r#"{"condition_id":"0x1","minimum_tick_size":0.01,"tokens":[],"active":true}"#).unwrap();
         assert!(!m2.rewards.is_eligible());
+    }
+
+    #[test]
+    fn clob_rewards_daily_rate_sums_multiple_and_handles_empty() {
+        // Multiple reward assets: the daily rate is their SUM, not just rates[0].
+        let r: ClobRewards = serde_json::from_str(
+            r#"{"rates":[{"rewards_daily_rate":30.0},{"rewards_daily_rate":20.0}],
+                "min_size":100.0,"max_spread":3.0}"#,
+        )
+        .unwrap();
+        assert_eq!(r.daily_rate_usd(), 50.0);
+        assert!(r.is_eligible());
+
+        // Empty rates array → zero rate, hence ineligible despite a positive scoring band.
+        let empty: ClobRewards =
+            serde_json::from_str(r#"{"rates":[],"min_size":100.0,"max_spread":3.0}"#).unwrap();
+        assert_eq!(empty.daily_rate_usd(), 0.0);
+        assert!(!empty.is_eligible());
     }
 
     #[test]
