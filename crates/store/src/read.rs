@@ -253,14 +253,17 @@ impl ReadStore {
     /// restart that day — and it is also the correct "max intraday drawdown"
     /// semantic for a daily loss cap (down the cap at ANY point → stop for the day).
     ///
-    /// RESIDUAL LIMITATION (documented; needs a follow-up): `realized_micro` is
+    /// SCOPE (what this query alone does / does NOT catch): `realized_micro` is
     /// cumulative PER SESSION and resets on each restart, so MANY sub-cap sessions
     /// — none individually reaching the cap, but whose realized losses SUM over it
-    /// across the day — are NOT caught here (each session's worst point is itself
-    /// sub-cap). MIN catches the dominant cases: any SINGLE-session cap breach,
-    /// and held/unrealized drawdowns (the seeded position keeps marking negative).
-    /// Fully closing the sum-of-sessions gap needs a cumulative day-realized
-    /// ledger (the separate accounting fix), not derivable from these snapshots.
+    /// across the day — are NOT visible to THIS query (each session's worst point
+    /// is itself sub-cap). MIN catches the dominant cases: any SINGLE-session cap
+    /// breach, and held/unrealized drawdowns (the seeded position keeps marking
+    /// negative). The summed-sub-cap-*realized* gap is now CLOSED by the separate
+    /// cumulative day-realized ledger ([`day_realized_micro`](Self::day_realized_micro),
+    /// I3): the MM latches the day-loss cap when EITHER this snapshot MIN OR that
+    /// persisted running realized total reaches the cap, so the two are
+    /// complementary arms of one gate rather than this query needing to catch all.
     ///
     /// `MIN` over the day returns SQL `NULL` when no row matches → `Ok(0)`,
     /// exactly like a fresh day.
@@ -276,6 +279,34 @@ impl ReadStore {
             |r| r.get(0),
         )?;
         Ok(worst.map_or(0, i128::from))
+    }
+
+    /// The CUMULATIVE day-realized ledger total for `strategy` on `utc_day`, in
+    /// µUSDC (i128); `0` if no ledger row exists (a fresh day/strategy). Written
+    /// by [`crate::Store::add_day_realized`] as a running sum of per-fill realized
+    /// deltas.
+    ///
+    /// Backs the SECOND arm of the market-maker's persistent UTC-day loss cap
+    /// (I3): unlike [`day_pnl_micro`](Self::day_pnl_micro) — whose snapshot MIN
+    /// only catches a SINGLE session's cap breach or a held/unrealized drawdown —
+    /// this persists and accrues across the periodic auto-restart, so MANY sub-cap
+    /// *realized* sessions whose losses SUM over the cap across a day ARE caught.
+    /// The MM latches when EITHER query reaches the cap; both scope to the UTC
+    /// day, so a day rollover resets both to 0 and releases the gate.
+    pub fn day_realized_micro(&self, strategy: &str, utc_day: i64) -> Result<i128, StoreError> {
+        let total: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT realized_micro FROM day_realized WHERE strategy = ?1 AND utc_day = ?2",
+                rusqlite::params![strategy, utc_day],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        Ok(total.map_or(0, i128::from))
     }
 
     /// Most-recent `n` halts, newest first.
@@ -607,5 +638,45 @@ mod tests {
         assert_eq!(rs.day_pnl_micro("mm", 1).unwrap(), -9_000_000, "day 1 sees only day-1 snapshots");
         // A day with no snapshots → NULL MIN → 0 (a fresh day never latches).
         assert_eq!(rs.day_pnl_micro("mm", 2).unwrap(), 0, "no snapshots that day → 0");
+    }
+
+    // ── I3: cumulative day-realized ledger (closes the summed-sub-cap gap) ──────
+
+    #[test]
+    fn day_realized_micro_accumulates_and_is_day_scoped() {
+        // The cumulative day-realized LEDGER (I3): per (utc_day, strategy) each
+        // `add_day_realized` ADDS its delta. Two −$4 adds on the SAME day sum to
+        // −$8 — exactly the summed-sub-cap-realized case the snapshot-MIN gate
+        // (`day_pnl_micro`) misses (no single row is past a −$6 cap, but the day
+        // is). A different day is independent; an unseen day/strategy reads 0.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        s.add_day_realized(0, "mm", -4_000_000).unwrap();
+        s.add_day_realized(0, "mm", -4_000_000).unwrap();
+        s.add_day_realized(1, "mm", -4_000_000).unwrap();
+        drop(s);
+
+        let rs = ReadStore::open(&path).unwrap();
+        assert_eq!(
+            rs.day_realized_micro("mm", 0).unwrap(),
+            -8_000_000,
+            "two same-day adds SUM (−4M + −4M)"
+        );
+        assert_eq!(
+            rs.day_realized_micro("mm", 1).unwrap(),
+            -4_000_000,
+            "a different UTC day is an independent ledger row"
+        );
+        assert_eq!(
+            rs.day_realized_micro("mm", 2).unwrap(),
+            0,
+            "an unseen day reads 0 (no row → fresh)"
+        );
+        assert_eq!(
+            rs.day_realized_micro("arb", 0).unwrap(),
+            0,
+            "a different strategy is independent"
+        );
     }
 }

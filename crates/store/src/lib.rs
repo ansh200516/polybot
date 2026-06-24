@@ -270,6 +270,9 @@ CREATE TABLE IF NOT EXISTS rf_outcomes (
   decision_id INTEGER NOT NULL, ts_ms INTEGER NOT NULL,
   reward_score_delta_micro INTEGER NOT NULL, rebate_micro INTEGER NOT NULL,
   adverse_pnl_micro INTEGER NOT NULL, inv_penalty_micro INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS day_realized (
+  utc_day INTEGER NOT NULL, strategy TEXT NOT NULL,
+  realized_micro INTEGER NOT NULL, PRIMARY KEY (utc_day, strategy));
 ";
 
 const TERMINAL_STATES: [&str; 4] = ["Filled", "Cancelled", "Rejected", "Expired"];
@@ -721,6 +724,33 @@ impl Store {
             equity_micro,
             strategy: strategy.to_string(),
         })
+    }
+
+    /// ADD `delta_micro` to the cumulative day-realized LEDGER for
+    /// `(utc_day, strategy)` (I3). Upsert that ACCUMULATES — a per-fill realized
+    /// delta is added to the running total for the UTC day, so MANY sub-cap
+    /// realizing sessions across a day SUM into one figure. Unlike the
+    /// per-session `pnl_snapshots` (whose `realized_micro` resets each restart),
+    /// this ledger persists and accrues, which is what closes the
+    /// summed-sub-cap-realized loss-cap gap that [`ReadStore::day_pnl_micro`]'s
+    /// snapshot-MIN gate cannot catch.
+    ///
+    /// `delta_micro` is i128 but stored as sqlite i64; an out-of-range delta is
+    /// SATURATED (clamped) rather than erroring — real per-fill deltas are tiny,
+    /// so this is purely a defensive guard on the wider engine type.
+    pub fn add_day_realized(
+        &mut self,
+        utc_day: i64,
+        strategy: &str,
+        delta_micro: i128,
+    ) -> Result<(), StoreError> {
+        let delta_i64 = delta_micro.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        self.conn.execute(
+            "INSERT INTO day_realized (utc_day, strategy, realized_micro) VALUES (?1, ?2, ?3)
+             ON CONFLICT(utc_day, strategy) DO UPDATE SET realized_micro = realized_micro + excluded.realized_micro",
+            rusqlite::params![utc_day, strategy, delta_i64],
+        )?;
+        Ok(())
     }
 
     pub fn insert_halt(&mut self, r: &HaltRow) -> Result<(), StoreError> {
@@ -1972,5 +2002,73 @@ mod tests {
 
         // A market with no decision yet → the outcome is dropped (Ok(false)).
         assert!(!s.record_rf_outcome_for_latest("ZZZ", 5, 0, 0, 0, 0).unwrap());
+    }
+
+    // ── I3: cumulative day-realized ledger (closes the summed-sub-cap loss gap) ──
+
+    #[test]
+    fn legacy_db_gains_day_realized_table_additively() {
+        // A pre-I3 database lacks the `day_realized` ledger table. Opening must
+        // ADD it via the additive `CREATE TABLE IF NOT EXISTS` path WITHOUT
+        // disturbing existing data — purely additive, mirroring the rf_* tables.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_ledger.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pnl_snapshots (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL,
+                   cash_micro INTEGER NOT NULL, realized_micro INTEGER NOT NULL,
+                   unrealized_micro INTEGER NOT NULL, equity_micro INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pnl_snapshots
+                   (ts_ms, cash_micro, realized_micro, unrealized_micro, equity_micro)
+                 VALUES (7, 1, 2, 3, 4)",
+                [],
+            )
+            .unwrap();
+            let ledger: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='day_realized'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ledger, 0, "legacy DB starts WITHOUT the day_realized table");
+        }
+
+        // Opening creates the table additively; it now accepts adds that ACCUMULATE.
+        let mut s = Store::open(&path).unwrap();
+        s.add_day_realized(0, "mm", -4_000_000).unwrap();
+        s.add_day_realized(0, "mm", -4_000_000).unwrap();
+        drop(s);
+
+        let r = crate::read::ReadStore::open(&path).unwrap();
+        assert_eq!(r.day_realized_micro("mm", 0).unwrap(), -8_000_000);
+        // The pre-existing legacy pnl row is intact (back-filled to 'arb').
+        let arb = r.recent_pnl_by_strategy("arb", 10).unwrap();
+        assert_eq!(arb.len(), 1);
+        assert_eq!(arb[0].equity_micro, 4);
+    }
+
+    #[test]
+    fn add_day_realized_saturates_out_of_i64_range() {
+        // `delta_micro` is i128 but stored as i64; an out-of-range delta SATURATES
+        // (clamps) rather than panicking or silently wrapping. Real per-fill
+        // deltas are tiny, but the type is i128, so the conversion is guarded.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sat.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        s.add_day_realized(0, "mm", i128::from(i64::MIN) - 1000).unwrap();
+        drop(s);
+        let r = crate::read::ReadStore::open(&path).unwrap();
+        assert_eq!(
+            r.day_realized_micro("mm", 0).unwrap(),
+            i128::from(i64::MIN),
+            "an out-of-range negative delta clamps to i64::MIN"
+        );
     }
 }

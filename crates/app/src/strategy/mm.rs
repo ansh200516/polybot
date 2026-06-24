@@ -803,6 +803,14 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     /// deliberately left untouched by the rollover so an inventory halt stays
     /// latched for the whole session.
     day_loss_halted: bool,
+    /// Read-only store handle for the PERSISTENT day-loss gate (Task 9 + I3),
+    /// opened ONCE at startup from `store_path`. `arm_day_loss_gate` uses it (via
+    /// the borrowed arg) to latch at startup, and [`tick`](Self::tick) re-reads it
+    /// each cycle so the gate ALSO binds when the cumulative day-realized ledger
+    /// (or the worst-point snapshot) crosses the cap MID-session — not only at the
+    /// next auto-restart. `None` on paper/test paths with no store, leaving the
+    /// per-cycle re-check inert (a fresh run is never halted by default).
+    day_loss_read: Option<ReadStore>,
     /// Venue capability: `true` for the live CLOB (NO naked shorts) → an ASK
     /// sells at most the current LONG inventory and is skipped when flat
     /// (bid-only). `false` for the paper venue, which models signed/short fills.
@@ -828,6 +836,31 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     reward_cumulative_est: f64,
 }
 
+/// Read BOTH arms of the persistent UTC-day loss gate for `"mm"` on `utc_day`,
+/// in µUSDC: the cumulative day-realized LEDGER ([`ReadStore::day_realized_micro`],
+/// I3) and the worst-point snapshot P&L ([`ReadStore::day_pnl_micro`], Task 9).
+/// A read error on either arm is treated as `0` (logged), so a transient DB
+/// error can never trip the gate. The caller latches the day-loss halt when
+/// EITHER value is at/under the daily-loss cap:
+/// - the LEDGER catches MANY sub-cap *realized* sessions whose losses SUM over
+///   the cap across the day — per-session realized resets each restart, so no
+///   single snapshot row shows it;
+/// - the snapshot MIN catches any single-session cap breach and held/unrealized
+///   drawdowns.
+///
+/// Both scope to the same UTC day, so a day rollover resets both to 0 → released.
+fn read_day_loss(read: &ReadStore, utc_day: i64) -> (i128, i128) {
+    let realized = read.day_realized_micro("mm", utc_day).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "mm: day-realized ledger read failed — treating as 0");
+        0
+    });
+    let snapshot = read.day_pnl_micro("mm", utc_day).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "mm: day-loss snapshot read failed — treating as 0");
+        0
+    });
+    (realized, snapshot)
+}
+
 impl<V: MakerVenue + UserFillSource> MmLoop<V> {
     /// One quote cycle: re-quote (when active), consume fills, mark + safety
     /// stop, publish status.
@@ -846,6 +879,36 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                     "mm: UTC day rolled over — releasing persistent day-loss cap latch"
                 );
                 self.day_loss_halted = false;
+            }
+        }
+        // I3 — per-cycle day-loss RE-LATCH: a fresh process arms the gate at
+        // startup, but a long-running session can cross the cap MID-session as the
+        // cumulative day-realized ledger accrues (or held inventory marks down).
+        // Re-read both arms each cycle (cheap indexed reads on the WAL read conn)
+        // so the gate binds WITHIN a session too, not only across auto-restarts.
+        // Inert when there is no store handle (paper/tests → `day_loss_read` None).
+        // The breach is computed under an immutable borrow that ENDS before the
+        // latch is set, satisfying the borrow checker.
+        if !self.day_loss_halted {
+            let cap_micro = self.inv.config().daily_loss_usd.0;
+            let breach = self.day_loss_read.as_ref().map(|read| {
+                let (realized, snapshot) = read_day_loss(read, self.day);
+                (
+                    realized,
+                    snapshot,
+                    realized <= -cap_micro || snapshot <= -cap_micro,
+                )
+            });
+            if let Some((realized, snapshot, true)) = breach {
+                self.day_loss_halted = true;
+                tracing::warn!(
+                    utc_day = self.day,
+                    day_realized_micro = realized as i64,
+                    day_pnl_micro = snapshot as i64,
+                    daily_loss_cap_micro = cap_micro as i64,
+                    "mm: daily loss cap crossed MID-session (cumulative ledger / worst-point \
+                     snapshot) — halting until the UTC day rolls over"
+                );
             }
         }
         if !self.paused && !self.halted && !self.day_loss_halted {
@@ -1229,6 +1292,12 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             self.inv.on_fill(token, signed_qty, cash);
             let basis_after = self.inv.basis(token).0;
             let realized_after = self.inv.realized(token).0;
+            // The realized-P&L delta this fill BOOKED (signed µUSDC; negative ⇒
+            // adverse selection ran us over). This is the authoritative per-fill
+            // realized figure `InventoryRisk` already computes — NOT re-derived
+            // from cost basis — and feeds BOTH the cumulative day-realized ledger
+            // (I3, below) and the RewardFarm outcome telemetry's `adverse_pnl`.
+            let realized_delta = realized_after - realized_before;
             // Mirror into the reporting PositionBook in lock-step: the cost-basis
             // delta tracks inventory exactly, and `qty` (the filled volume) keeps
             // the token present in `pnl` even for shorts (value comes from the
@@ -1263,6 +1332,23 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             // SIGNED route: an ask-fill opens a SHORT (no long holdings), which
             // the strict `Fill` path would Oversell-drop — `FillSigned` persists it.
             let _ = self.store_tx.send(StoreMsg::FillSigned(row, None)).await;
+            // I3 — CUMULATIVE DAY-REALIZED LEDGER: persist this fill's realized
+            // delta into the running UTC-day total so the PERSISTENT loss cap also
+            // catches MANY sub-cap *realized* sessions whose losses SUM over the
+            // cap across a day — the gap the per-session snapshot-MIN gate
+            // (`day_pnl_micro`) cannot see (each session's realized resets to 0).
+            // Applies to the MM REGARDLESS of policy (the cap protects the MM, not
+            // just RewardFarm); arb is a SEPARATE strategy tag and is untouched.
+            // Only a NON-ZERO delta matters (a short-open / pure accrual realizes
+            // nothing). Fire-and-forget: `try_send` DROPS on a full/closed channel
+            // so this safety telemetry never blocks the quote loop.
+            if realized_delta != 0 {
+                let _ = self.store_tx.try_send(StoreMsg::DayRealized {
+                    utc_day: utc_day_from_ms(now_ms()),
+                    strategy: "mm".into(),
+                    delta_micro: realized_delta,
+                });
+            }
             // Task 10 — RewardFarm OUTCOME instrumentation (spec §12): the realized
             // components of the reward signal for this fill. RewardFarm-only and
             // fire-and-forget (`try_send` drops on a full/closed channel, never
@@ -1278,8 +1364,7 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                     ts_ms: now_ms(),
                     reward_score_delta_micro: 0,
                     rebate_micro: i64::try_from(fill_rebate_micro).unwrap_or(0),
-                    adverse_pnl_micro: i64::try_from(realized_after - realized_before)
-                        .unwrap_or(0),
+                    adverse_pnl_micro: i64::try_from(realized_delta).unwrap_or(0),
                     inv_penalty_micro: 0,
                 };
                 let _ = self.store_tx.try_send(StoreMsg::RfOutcome(outcome));
@@ -1287,44 +1372,42 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         }
     }
 
-    /// Arm the PERSISTENT UTC-day loss-cap latch at startup (Task 9). Records the
-    /// current UTC day and reads the LATEST `"mm"` P&L snapshot for that day from
-    /// the read store; if today's `realized + unrealized` is already at/under the
-    /// daily-loss cap (`InventoryConfig::daily_loss_usd`, µUSDC — the SAME floor
-    /// the in-session `InvHalt::DailyLoss` keys off, inclusive boundary), latch
+    /// Arm the PERSISTENT UTC-day loss-cap latch at startup (Task 9 + I3). Records
+    /// the current UTC day and reads BOTH gate arms for that day from the read
+    /// store (see [`read_day_loss`]); if EITHER the cumulative day-realized LEDGER
+    /// (I3 — summed realized) OR the worst-point snapshot `realized + unrealized`
+    /// (held/unrealized) is already at/under the daily-loss cap
+    /// (`InventoryConfig::daily_loss_usd`, µUSDC — the SAME floor the in-session
+    /// `InvHalt::DailyLoss` keys off, inclusive boundary), latch
     /// [`day_loss_halted`](Self::day_loss_halted) so the bot refuses to quote
     /// until the day rolls over. This is what makes the daily loss cap BIND across
-    /// the periodic auto-restart instead of resetting every session.
+    /// the periodic auto-restart instead of resetting every session — the LEDGER
+    /// arm specifically closes the summed-sub-cap-realized gap the snapshot MIN
+    /// alone cannot see (many sub-cap sessions whose realized losses SUM over it).
     ///
     /// No read handle (the DB does not exist yet / failed to open), a read error,
-    /// or no snapshot today → today's P&L is treated as `0`, so a fresh run is
-    /// NEVER halted by default. Called ONCE, before the loop starts ticking, so no
-    /// quote is resting yet (nothing to cancel). SEPARATE from `halted`: the
-    /// rollover can release this latch without disturbing an inventory halt.
+    /// or no data today → both arms read `0`, so a fresh run is NEVER halted by
+    /// default. Called ONCE, before the loop starts ticking, so no quote is
+    /// resting yet (nothing to cancel); [`tick`](Self::tick) then re-checks the
+    /// same two arms each cycle so a MID-session crossing also latches. SEPARATE
+    /// from `halted`: the rollover can release this latch without disturbing an
+    /// inventory halt.
     fn arm_day_loss_gate(&mut self, read: Option<&ReadStore>, now_ms: i64) {
         let today = utc_day_from_ms(now_ms);
         self.day = today;
-        let day_pnl = read
-            .and_then(|r| match r.day_pnl_micro("mm", today) {
-                Ok(pnl) => Some(pnl),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "mm: day-loss gate read failed — treating today's P&L as 0"
-                    );
-                    None
-                }
-            })
-            .unwrap_or(0);
         let cap_micro = self.inv.config().daily_loss_usd.0;
-        if day_pnl <= -cap_micro {
+        let Some(read) = read else { return };
+        let (realized, snapshot) = read_day_loss(read, today);
+        if realized <= -cap_micro || snapshot <= -cap_micro {
             self.day_loss_halted = true;
             tracing::warn!(
                 utc_day = today,
-                day_pnl_micro = day_pnl as i64,
+                day_realized_micro = realized as i64,
+                day_pnl_micro = snapshot as i64,
                 daily_loss_cap_micro = cap_micro as i64,
-                "mm: daily loss cap ALREADY hit for the UTC day (persisted across restart) — \
-                 refusing to quote until the day rolls over"
+                "mm: daily loss cap ALREADY hit for the UTC day (persisted across restart; \
+                 summed-realized ledger or worst-point snapshot) — refusing to quote until \
+                 the day rolls over"
             );
         }
     }
@@ -1685,6 +1768,7 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
         halted: false,
         day: utc_day_from_ms(now_ms()),
         day_loss_halted: false,
+        day_loss_read: None,
         no_naked_shorts,
         vetoed: HashSet::new(),
         last_reward_sample: None,
@@ -1694,15 +1778,16 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
     if start_paused {
         tracing::info!("mm: live held — quoting PAUSED until release (press `l`)");
     }
-    // Task 9 — PERSISTENT UTC-day loss cap: before the first tick, read today's
-    // persisted `"mm"` P&L from the store and latch `day_loss_halted` if the day
-    // is already at/under the daily-loss cap, so the cap binds across the periodic
-    // auto-restart. The read-only connection is dropped immediately (the gate only
-    // re-reads on a fresh process); a missing/failed DB → not halted (fresh run).
-    {
-        let day_loss_read = store_path.as_deref().and_then(|p| ReadStore::open(p).ok());
-        mm.arm_day_loss_gate(day_loss_read.as_ref(), now_ms());
-    }
+    // Task 9 + I3 — PERSISTENT UTC-day loss cap: before the first tick, read
+    // today's persisted `"mm"` data from the store and latch `day_loss_halted` if
+    // the day is already at/under the daily-loss cap, so the cap binds across the
+    // periodic auto-restart. The read-only handle is RETAINED in the loop so
+    // `tick` can re-check both gate arms (summed-realized ledger + worst-point
+    // snapshot) MID-session (I3), not only at the next restart; a missing/failed
+    // DB → no handle → not halted (fresh run) and the per-cycle re-check is inert.
+    let day_loss_read = store_path.as_deref().and_then(|p| ReadStore::open(p).ok());
+    mm.arm_day_loss_gate(day_loss_read.as_ref(), now_ms());
+    mm.day_loss_read = day_loss_read;
 
     let mut tick = tokio::time::interval(params.quote_refresh);
     // A steady cadence, not a catch-up burst after a stall (mirrors the stub).
@@ -1925,6 +2010,7 @@ mod tests {
             halted: false,
             day: utc_day_from_ms(now_ms()),
             day_loss_halted: false,
+            day_loss_read: None,
             no_naked_shorts: false,
             vetoed: HashSet::new(),
             last_reward_sample: None,
@@ -3239,6 +3325,85 @@ mod tests {
         );
     }
 
+    // ── I3: cumulative day-realized ledger closes the summed-sub-cap gap ────────
+
+    /// I3 SAFETY NET: the persistent day-loss cap must also catch MANY sub-cap
+    /// *realized* sessions whose losses SUM over the cap across a day — the gap
+    /// the per-session snapshot-MIN gate (`day_pnl_micro`) cannot see. Seed the
+    /// store's `day_realized` ledger for "mm" today with several deltas EACH under
+    /// the cap that SUM past it, plus a couple of SUB-cap `pnl_snapshots` rows (so
+    /// the snapshot gate ALONE would NOT latch). The loop must arm HALTED at
+    /// startup from the LEDGER arm and `quote()` must place nothing.
+    #[tokio::test]
+    async fn day_loss_latches_on_summed_sub_cap_realized() {
+        use pm_store::Store;
+        use pm_store::read::ReadStore;
+
+        let tokens = vec![TokenId(1)];
+        let (fetcher, _shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        // $6 daily-loss cap (the SAME floor the in-session InvHalt::DailyLoss uses).
+        let mut inv_cfg = generous_inv();
+        inv_cfg.daily_loss_usd = Usdc(6_000_000);
+        let params = mk_params(200, 5.0);
+        let (mut mm, _store_rx, status_rx) =
+            build_loop(fetcher, inv_cfg, params, tokens, Usdc(1_000_000_000));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("summed.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        let ts = 1_000i64; // within UTC day 0
+        let day = utc_day_from_ms(ts);
+        // FIVE sub-cap realizing sessions (−$2 each, each < the $6 cap) that SUM
+        // to −$10 — past the cap. This is exactly the summed-sub-cap-realized case.
+        for _ in 0..5 {
+            s.add_day_realized(day, "mm", -2_000_000).unwrap();
+        }
+        // A couple of SUB-cap snapshots: worst point −$2 (> −$6), so the
+        // snapshot-MIN gate ALONE would NOT latch — proving the LEDGER is what
+        // catches this day.
+        s.record_pnl_at(ts, 0, -2_000_000, 0, -2_000_000, "mm").unwrap();
+        s.record_pnl_at(ts + 1, 0, -1_000_000, 0, -1_000_000, "mm").unwrap();
+        drop(s);
+        let read = ReadStore::open(&path).unwrap();
+
+        // PROOF the snapshot gate is blind here: its worst point is −$2, well
+        // inside the −$6 cap — so without the ledger the bot would re-arm and bleed.
+        assert_eq!(
+            read.day_pnl_micro("mm", day).unwrap(),
+            -2_000_000,
+            "no single snapshot row breaches the cap — the MIN gate alone would NOT halt"
+        );
+        // The cumulative realized ledger, however, is past the cap.
+        assert_eq!(read.day_realized_micro("mm", day).unwrap(), -10_000_000);
+
+        // Arm exactly as run_mm_loop does at startup: the LEDGER arm latches.
+        mm.arm_day_loss_gate(Some(&read), ts);
+        assert!(
+            mm.day_loss_halted,
+            "summed sub-cap realized past the cap → latched at startup via the ledger"
+        );
+
+        // The latch stops quoting: a full quote pass places NOTHING.
+        mm.quote().await;
+        assert!(
+            mm.qm.tracked().is_empty(),
+            "no quotes tracked under the summed-realized day-loss latch"
+        );
+        assert!(
+            mm.venue.open_orders().await.unwrap().is_empty(),
+            "quote() places nothing while the ledger-armed day-loss latch is set"
+        );
+
+        // Surfaced in status as DayLossCap (same as the snapshot-armed path).
+        mm.publish_status().await;
+        assert_eq!(
+            status_rx.borrow().halted.as_deref(),
+            Some("DayLossCap"),
+            "the ledger-armed day-loss latch is surfaced in StrategyStatus.halted"
+        );
+    }
+
     // ── Kill → cancel + clean exit (drives the real run_mm_loop) ───────────────
 
     #[tokio::test]
@@ -3542,6 +3707,7 @@ mod tests {
             halted: false,
             day: utc_day_from_ms(now_ms()),
             day_loss_halted: false,
+            day_loss_read: None,
             no_naked_shorts: false,
             vetoed: HashSet::new(),
             last_reward_sample: None,
@@ -3619,6 +3785,7 @@ mod tests {
             halted: false,
             day: utc_day_from_ms(now_ms()),
             day_loss_halted: false,
+            day_loss_read: None,
             no_naked_shorts: true,
             vetoed: HashSet::new(),
             last_reward_sample: None,

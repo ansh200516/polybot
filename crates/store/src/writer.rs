@@ -37,6 +37,18 @@ pub enum StoreMsg {
     /// decision is dropped (NOT an error), so the un-acked, best-effort contract
     /// holds even right after a restart.
     RfOutcome(RfOutcomeRow),
+    /// Cumulative day-realized LEDGER add (I3): best-effort, un-acked. The MM
+    /// sends each NON-ZERO per-fill realized delta; the writer ADDS it to the
+    /// `(utc_day, strategy)` running total via [`Store::add_day_realized`]. A
+    /// failed add is a CLEAN DROP — logged, but NOT counted as a `write_error`
+    /// (the ledger is a SECONDARY loss-cap signal layered on the snapshot gate;
+    /// a dropped add merely under-counts it and degrades to prior behavior, so it
+    /// must never look like a trading-path failure or block the loop).
+    DayRealized {
+        utc_day: i64,
+        strategy: String,
+        delta_micro: i128,
+    },
 }
 
 /// Run until the channel closes; returns the store for final inspection
@@ -87,6 +99,20 @@ pub async fn run_writer(mut store: Store, mut rx: mpsc::Receiver<StoreMsg>) -> S
                 None,
                 "rf_outcome",
             ),
+            StoreMsg::DayRealized {
+                utc_day,
+                strategy,
+                delta_micro,
+            } => {
+                // CLEAN DROP on failure: a dropped ledger add only slightly
+                // under-counts a secondary loss-cap signal, so it is logged but
+                // NOT surfaced as a `write_error` (returns `Ok(())` to the unified
+                // handler below). Un-acked; never blocks the trading loop.
+                if let Err(e) = store.add_day_realized(utc_day, &strategy, delta_micro) {
+                    error!(op = "day_realized", "store day-realized add dropped: {e}");
+                }
+                (Ok(()), None, "day_realized")
+            }
         };
         match result {
             Ok(()) => {
@@ -284,6 +310,46 @@ mod tests {
             store.count_rf_outcomes_for(1).unwrap(),
             1,
             "exactly the correlated outcome attached to decision id 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn day_realized_adds_accumulate_via_writer() {
+        // I3: the DayRealized LEDGER variant flows through the writer like the
+        // other un-acked telemetry. Two adds for the same (day, strategy)
+        // ACCUMULATE into one row; a successful add never bumps `write_errors`.
+        // File-backed so a ReadStore can verify the persisted total after drain.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger_writer.sqlite");
+        let store = Store::open(&path).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let writer = tokio::spawn(run_writer(store, rx));
+
+        tx.send(StoreMsg::DayRealized {
+            utc_day: 0,
+            strategy: "mm".into(),
+            delta_micro: -4_000_000,
+        })
+        .await
+        .unwrap();
+        tx.send(StoreMsg::DayRealized {
+            utc_day: 0,
+            strategy: "mm".into(),
+            delta_micro: -4_000_000,
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+        let store = writer.await.unwrap();
+        assert_eq!(store.write_errors, 0, "ledger adds are never write errors");
+        drop(store);
+
+        let r = crate::read::ReadStore::open(&path).unwrap();
+        assert_eq!(
+            r.day_realized_micro("mm", 0).unwrap(),
+            -8_000_000,
+            "two DayRealized adds accumulated into one ledger row"
         );
     }
 }
