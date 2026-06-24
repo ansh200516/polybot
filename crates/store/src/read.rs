@@ -11,9 +11,9 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
-use crate::{PnlRow, StoreError};
+use crate::{DAY_MS, PnlRow, StoreError};
 
 // ---------------------------------------------------------------------------
 // View types — subset of columns surfaced to the dashboard
@@ -235,6 +235,35 @@ impl ReadStore {
         Ok(rows)
     }
 
+    /// Today's P&L in µUSDC for `strategy`: the LATEST snapshot whose `ts_ms`
+    /// falls in the UTC day `[utc_day·DAY_MS, +DAY_MS)`, valued as
+    /// `realized_micro + unrealized_micro` (i128); `0` if the strategy logged no
+    /// snapshot that day. `utc_day` is a whole-day index (see
+    /// [`crate::utc_day_from_ms`]).
+    ///
+    /// Backs the market-maker's PERSISTENT UTC-day loss cap: on startup the MM
+    /// reads this and refuses to quote when the day is already at/under its
+    /// daily-loss cap, so the cap binds across the periodic auto-restart instead
+    /// of resetting every session. Reads the single newest row (`ORDER BY id DESC
+    /// LIMIT 1`) via `.optional()` — no row → `Ok(0)`, exactly like a fresh day.
+    pub fn day_pnl_micro(&self, strategy: &str, utc_day: i64) -> Result<i128, StoreError> {
+        let lo = utc_day * DAY_MS;
+        let hi = lo + DAY_MS;
+        let row: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT realized_micro, unrealized_micro FROM pnl_snapshots
+                 WHERE strategy = ?1 AND ts_ms >= ?2 AND ts_ms < ?3
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![strategy, lo, hi],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map_or(0, |(realized, unrealized)| {
+            i128::from(realized) + i128::from(unrealized)
+        }))
+    }
+
     /// Most-recent `n` halts, newest first.
     pub fn recent_halts(&self, n: usize) -> Result<Vec<HaltView>, StoreError> {
         let mut stmt = self
@@ -266,7 +295,7 @@ impl ReadStore {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::{FillRow, HaltRow, OppRow, OrderEventRow, OrderRow, PnlRow, Store};
+    use crate::{FillRow, HaltRow, OppRow, OrderEventRow, OrderRow, PnlRow, Store, utc_day_from_ms};
 
     /// Seed a real file-backed store (read-only conns can't see another conn's
     /// in-memory db), return (dir, path).
@@ -512,5 +541,17 @@ mod tests {
         assert_eq!(orders[0].state, "Draft"); // present immediately, before any events
         assert_eq!(orders[1].order_id, "o1");
         assert_eq!(orders[1].state, "Signed"); // current state, not the event history
+    }
+
+    #[test]
+    fn day_pnl_sums_todays_realized_plus_last_unrealized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        s.record_pnl_at(1_000, 0, -3_000_000, -1_000_000, 0, "mm").unwrap();
+        s.record_pnl_at(2_000, 0, -5_000_000, -500_000, 0, "mm").unwrap();
+        let rs = ReadStore::open(&path).unwrap();
+        let day = utc_day_from_ms(2_000);
+        assert_eq!(rs.day_pnl_micro("mm", day).unwrap(), -5_500_000);
     }
 }

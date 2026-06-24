@@ -66,6 +66,18 @@ pub fn usdc_to_i64(u: pm_core::num::Usdc) -> Result<i64, StoreError> {
     i64::try_from(u.0).map_err(|_| StoreError::Overflow("usdc out of i64 range"))
 }
 
+/// Milliseconds in a UTC day (24h), the divisor for [`utc_day_from_ms`].
+const DAY_MS: i64 = 86_400_000;
+
+/// UTC-day index for a millisecond timestamp: `ts_ms / 86_400_000` (whole days
+/// since the Unix epoch). A pure, allocation-free helper shared by the store's
+/// per-day P&L query ([`read::ReadStore::day_pnl_micro`]) and the market-maker's
+/// persistent UTC-day loss cap, so both agree on exactly which snapshots fall in
+/// "today". Floors toward −∞ for the realistic (non-negative) timestamp range.
+pub fn utc_day_from_ms(ts_ms: i64) -> i64 {
+    ts_ms.div_euclid(DAY_MS)
+}
+
 // ---------------------------------------------------------------------------
 // Row types (plain data; the coordinator converts engine types into these)
 // ---------------------------------------------------------------------------
@@ -648,6 +660,31 @@ impl Store {
             rusqlite::params![r.ts_ms, r.cash_micro, r.realized_micro, r.unrealized_micro, r.equity_micro, r.strategy],
         )?;
         Ok(())
+    }
+
+    /// Insert a P&L snapshot at an EXPLICIT `ts_ms` (positional convenience over
+    /// [`insert_pnl_snapshot`], which takes a full [`PnlRow`]). Production stamps
+    /// `now` at the call site and uses `insert_pnl_snapshot`; this lets a caller —
+    /// notably the store tests and the UTC-day loss-cap tests — record a snapshot
+    /// at a deterministic timestamp. Delegates to `insert_pnl_snapshot` so there
+    /// is a single INSERT path.
+    pub fn record_pnl_at(
+        &mut self,
+        ts_ms: i64,
+        cash_micro: i64,
+        realized_micro: i64,
+        unrealized_micro: i64,
+        equity_micro: i64,
+        strategy: &str,
+    ) -> Result<(), StoreError> {
+        self.insert_pnl_snapshot(&PnlRow {
+            ts_ms,
+            cash_micro,
+            realized_micro,
+            unrealized_micro,
+            equity_micro,
+            strategy: strategy.to_string(),
+        })
     }
 
     pub fn insert_halt(&mut self, r: &HaltRow) -> Result<(), StoreError> {

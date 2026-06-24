@@ -1635,6 +1635,12 @@ async fn main() {
         }
         let mut mm = MmStrategy::new(mm_tokens, mm_token_market, mm_params, mm_inv_cfg, mm_capital)
             .with_seed(mm_seed)
+            // Task 9 — PERSISTENT UTC-day loss cap: thread the store path so the
+            // loop reads today's persisted "mm" P&L at startup and refuses to quote
+            // when the day is already at/under the daily-loss cap, making the cap
+            // bind across the periodic auto-restart (same file the seed reload
+            // above reads). Inert when the DB is fresh / today's P&L is within cap.
+            .with_store_path(std::path::PathBuf::from(&config.store.path))
             // Same live gate as arb: when live is HELD (TUI before `l`), the MM
             // starts PAUSED and only quotes once released — never trades real
             // money on its own before the operator confirms.

@@ -79,8 +79,9 @@ use pm_execution::split_venue::SplitVenue;
 use pm_execution::user_ws::LiveUserWsFills;
 use pm_ingestion::supervisor::OnApplyFn;
 use pm_risk::inventory::{InventoryConfig, InventoryRisk, Marks, QuoteIntent, QuoteVerdict};
+use pm_store::read::ReadStore;
 use pm_store::writer::StoreMsg;
-use pm_store::{FillRow, OrderRow, PnlRow, usdc_to_i64};
+use pm_store::{FillRow, OrderRow, PnlRow, usdc_to_i64, utc_day_from_ms};
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::warn;
@@ -254,6 +255,13 @@ pub struct MmStrategy {
     /// later sends `SetPaused(false)` on release. Default `false` (paper / shadow
     /// / headless-confirmed all run immediately).
     start_paused: bool,
+    /// Path to the durable SQLite store, threaded so the loop can open a
+    /// READ-ONLY connection at startup to arm the PERSISTENT UTC-day loss cap
+    /// (Task 9) from the persisted `"mm"` P&L. `None` (the default) → the loop
+    /// reads no prior P&L and the day-loss gate stays inert (a fresh run). main
+    /// sets it from `config.store.path`; the seed reload already reads the same
+    /// file, so this only opens a second short-lived read connection at startup.
+    store_path: Option<std::path::PathBuf>,
 }
 
 impl MmStrategy {
@@ -280,6 +288,7 @@ impl MmStrategy {
             live_venue: None,
             seed: Vec::new(),
             start_paused: false,
+            store_path: None,
         }
     }
 
@@ -310,6 +319,16 @@ impl MmStrategy {
         self.start_paused = start_paused;
         self
     }
+
+    /// Thread the durable-store path so the loop can arm the PERSISTENT UTC-day
+    /// loss cap (Task 9) at startup from the persisted `"mm"` P&L. main sources it
+    /// from `config.store.path`. Without it the day-loss gate is inert (a fresh
+    /// run reads no prior P&L), so paper/test paths that don't set it behave
+    /// exactly as before.
+    pub fn with_store_path(mut self, store_path: std::path::PathBuf) -> Self {
+        self.store_path = Some(store_path);
+        self
+    }
 }
 
 impl Strategy for MmStrategy {
@@ -335,6 +354,7 @@ impl Strategy for MmStrategy {
                 live_venue,
                 seed,
                 start_paused,
+                store_path,
             } = *self;
             // Per-strategy state is identical for both venues; build it once.
             let qm = QuoteManager::new();
@@ -363,14 +383,14 @@ impl Strategy for MmStrategy {
                 Some(MmLive::Rest(live)) => {
                     run_mm_loop(
                         live, qm, inv, positions, ctx, params, tokens, token_market, capital, true,
-                        start_paused,
+                        start_paused, store_path,
                     )
                     .await;
                 }
                 Some(MmLive::Ws(split)) => {
                     run_mm_loop(
                         split, qm, inv, positions, ctx, params, tokens, token_market, capital, true,
-                        start_paused,
+                        start_paused, store_path,
                     )
                     .await;
                 }
@@ -381,7 +401,7 @@ impl Strategy for MmStrategy {
                         .with_taker_fill_pct(params.paper_taker_fill_pct);
                     run_mm_loop(
                         venue, qm, inv, positions, ctx, params, tokens, token_market, capital, false,
-                        start_paused,
+                        start_paused, store_path,
                     )
                     .await;
                 }
@@ -741,6 +761,20 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     paused: bool,
     /// Latched once an inventory halt fires — quoting never resumes this session.
     halted: bool,
+    /// UTC-day index ([`utc_day_from_ms`]) this loop is currently accounting
+    /// against. Set at startup and advanced when [`tick`](Self::tick) detects a
+    /// day rollover, which releases [`day_loss_halted`](Self::day_loss_halted).
+    day: i64,
+    /// PERSISTENT UTC-day loss-cap latch (Task 9), SEPARATE from
+    /// [`halted`](Self::halted). Set at startup by
+    /// [`arm_day_loss_gate`](Self::arm_day_loss_gate) when the store shows today's
+    /// `"mm"` P&L is already at/under the daily-loss cap, so the bot does NOT
+    /// re-arm and keep bleeding across the periodic auto-restart. Stops quoting
+    /// exactly like `halted`, but is RELEASED on a UTC-day rollover (a fresh day
+    /// gets a fresh cap) — whereas `halted` (the in-session `InvHalt` latch) is
+    /// deliberately left untouched by the rollover so an inventory halt stays
+    /// latched for the whole session.
+    day_loss_halted: bool,
     /// Venue capability: `true` for the live CLOB (NO naked shorts) → an ASK
     /// sells at most the current LONG inventory and is skipped when flat
     /// (bid-only). `false` for the paper venue, which models signed/short fills.
@@ -756,7 +790,23 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
     /// One quote cycle: re-quote (when active), consume fills, mark + safety
     /// stop, publish status.
     async fn tick(&mut self) {
-        if !self.paused && !self.halted {
+        // Task 9 — persistent UTC-day loss cap ROLLOVER: when the UTC day advances
+        // past the tracked day, release the cross-restart day-loss latch so the
+        // fresh day may quote again. The in-session `InvHalt` latch (`halted`) is
+        // deliberately NOT cleared here (an inventory halt stays latched for the
+        // whole session, per the existing behavior).
+        let today = utc_day_from_ms(now_ms());
+        if today > self.day {
+            self.day = today;
+            if self.day_loss_halted {
+                tracing::warn!(
+                    utc_day = today,
+                    "mm: UTC day rolled over — releasing persistent day-loss cap latch"
+                );
+                self.day_loss_halted = false;
+            }
+        }
+        if !self.paused && !self.halted && !self.day_loss_halted {
             self.quote().await;
         }
         // Fills are consumed even when paused/halted — resting orders may still
@@ -769,6 +819,13 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
     /// Build the desired quote set (inventory-gated) and reconcile it onto the
     /// venue, then record any newly-placed orders (+ write their order rows).
     async fn quote(&mut self) {
+        // Task 9 safety net: a latched PERSISTENT day-loss cap stops quoting even
+        // for a direct caller (the per-cycle gate in `tick` already skips `quote`).
+        // The latch is only ever SET at startup before any quote rests, so there
+        // is nothing to cancel here.
+        if self.day_loss_halted {
+            return;
+        }
         let tokens = self.tokens.clone();
         // Per-market inventory cap (µUSDC) the skew normalizes against — read
         // once; the skew is otherwise a pure function of the per-token net.
@@ -1078,6 +1135,48 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         }
     }
 
+    /// Arm the PERSISTENT UTC-day loss-cap latch at startup (Task 9). Records the
+    /// current UTC day and reads the LATEST `"mm"` P&L snapshot for that day from
+    /// the read store; if today's `realized + unrealized` is already at/under the
+    /// daily-loss cap (`InventoryConfig::daily_loss_usd`, µUSDC — the SAME floor
+    /// the in-session `InvHalt::DailyLoss` keys off, inclusive boundary), latch
+    /// [`day_loss_halted`](Self::day_loss_halted) so the bot refuses to quote
+    /// until the day rolls over. This is what makes the daily loss cap BIND across
+    /// the periodic auto-restart instead of resetting every session.
+    ///
+    /// No read handle (the DB does not exist yet / failed to open), a read error,
+    /// or no snapshot today → today's P&L is treated as `0`, so a fresh run is
+    /// NEVER halted by default. Called ONCE, before the loop starts ticking, so no
+    /// quote is resting yet (nothing to cancel). SEPARATE from `halted`: the
+    /// rollover can release this latch without disturbing an inventory halt.
+    fn arm_day_loss_gate(&mut self, read: Option<&ReadStore>, now_ms: i64) {
+        let today = utc_day_from_ms(now_ms);
+        self.day = today;
+        let day_pnl = read
+            .and_then(|r| match r.day_pnl_micro("mm", today) {
+                Ok(pnl) => Some(pnl),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "mm: day-loss gate read failed — treating today's P&L as 0"
+                    );
+                    None
+                }
+            })
+            .unwrap_or(0);
+        let cap_micro = self.inv.config().daily_loss_usd.0;
+        if day_pnl <= -cap_micro {
+            self.day_loss_halted = true;
+            tracing::warn!(
+                utc_day = today,
+                day_pnl_micro = day_pnl as i64,
+                daily_loss_cap_micro = cap_micro as i64,
+                "mm: daily loss cap ALREADY hit for the UTC day (persisted across restart) — \
+                 refusing to quote until the day rolls over"
+            );
+        }
+    }
+
     /// Mark held inventory at the mid feed and latch the safety stop: an
     /// inventory halt cancels all quotes and stops quoting (latched).
     async fn mark_and_check(&mut self) {
@@ -1256,6 +1355,7 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
     capital: Usdc,
     no_naked_shorts: bool,
     start_paused: bool,
+    store_path: Option<std::path::PathBuf>,
 ) {
     let StrategyCtx {
         registry,
@@ -1300,11 +1400,22 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
         // money until released; the host sends `SetPaused(false)` on release.
         paused: start_paused,
         halted: false,
+        day: utc_day_from_ms(now_ms()),
+        day_loss_halted: false,
         no_naked_shorts,
         vetoed: HashSet::new(),
     };
     if start_paused {
         tracing::info!("mm: live held — quoting PAUSED until release (press `l`)");
+    }
+    // Task 9 — PERSISTENT UTC-day loss cap: before the first tick, read today's
+    // persisted `"mm"` P&L from the store and latch `day_loss_halted` if the day
+    // is already at/under the daily-loss cap, so the cap binds across the periodic
+    // auto-restart. The read-only connection is dropped immediately (the gate only
+    // re-reads on a fresh process); a missing/failed DB → not halted (fresh run).
+    {
+        let day_loss_read = store_path.as_deref().and_then(|p| ReadStore::open(p).ok());
+        mm.arm_day_loss_gate(day_loss_read.as_ref(), now_ms());
     }
 
     let mut tick = tokio::time::interval(params.quote_refresh);
@@ -1522,6 +1633,8 @@ mod tests {
             rebate_accrued_micro: 0,
             paused: false,
             halted: false,
+            day: utc_day_from_ms(now_ms()),
+            day_loss_halted: false,
             no_naked_shorts: false,
             vetoed: HashSet::new(),
         };
@@ -2478,6 +2591,93 @@ mod tests {
         );
     }
 
+    // ── Task 9: persistent UTC-day loss cap (binds across auto-restarts) ───────
+
+    /// SAFETY NET: when the persisted store shows today's `"mm"` P&L is already
+    /// at/under the daily-loss cap, the loop must START latched — so the periodic
+    /// auto-restart can NOT re-arm the bot and let it keep bleeding. Mirrors what
+    /// `run_mm_loop` does at startup (arm the gate from a `ReadStore`), then proves
+    /// a quote pass places NOTHING.
+    #[tokio::test]
+    async fn starts_halted_when_day_already_at_loss_cap() {
+        use pm_store::Store;
+        use pm_store::read::ReadStore;
+
+        let tokens = vec![TokenId(1)];
+        let (fetcher, _shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        // $50 daily-loss cap (same floor as the in-session InvHalt::DailyLoss).
+        let mut inv_cfg = generous_inv();
+        inv_cfg.daily_loss_usd = Usdc(50_000_000);
+        let params = mk_params(200, 5.0);
+        let (mut mm, _store_rx, _status_rx) =
+            build_loop(fetcher, inv_cfg, params, tokens, Usdc(1_000_000_000));
+
+        // A real file-backed store with a losing "mm" snapshot on UTC day 0.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daycap.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        let ts = 1_000i64; // within UTC day 0
+        // realized −$60 + unrealized $0 = −$60 ≤ −$50 cap → past it.
+        s.record_pnl_at(ts, 0, -60_000_000, 0, -60_000_000, "mm").unwrap();
+        drop(s);
+        let read = ReadStore::open(&path).unwrap();
+
+        // Arm exactly as `run_mm_loop` does at startup, for that snapshot's day.
+        mm.arm_day_loss_gate(Some(&read), ts);
+        assert!(
+            mm.day_loss_halted,
+            "today already at/under the daily-loss cap → latched at startup"
+        );
+
+        // The persisted latch stops quoting: a full quote pass places NOTHING.
+        mm.quote().await;
+        assert!(mm.qm.tracked().is_empty(), "no quotes tracked under the day-loss latch");
+        assert!(
+            mm.venue.open_orders().await.unwrap().is_empty(),
+            "quote() places nothing while the day-loss latch is set"
+        );
+    }
+
+    /// The DEFAULT must not halt a normal run: a persisted day P&L comfortably
+    /// inside the cap leaves the latch clear and the MM quotes both sides as
+    /// usual. Guards against the gate accidentally binding when it should not
+    /// (the converse of the safety net above). The "no snapshot → P&L 0 → not
+    /// halted" path is covered by the store-level `day_pnl_micro` test.
+    #[tokio::test]
+    async fn does_not_start_halted_when_day_pnl_within_cap() {
+        use pm_store::Store;
+        use pm_store::read::ReadStore;
+
+        let tokens = vec![TokenId(1)];
+        let (fetcher, _shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        let mut inv_cfg = generous_inv();
+        inv_cfg.daily_loss_usd = Usdc(50_000_000); // $50 cap
+        let params = mk_params(200, 5.0);
+        let (mut mm, _store_rx, _status_rx) =
+            build_loop(fetcher, inv_cfg, params, tokens, Usdc(1_000_000_000));
+
+        // A small loss WELL inside the cap (−$10 > −$50).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        s.record_pnl_at(1_000, 0, -10_000_000, 0, -10_000_000, "mm").unwrap();
+        drop(s);
+        let read = ReadStore::open(&path).unwrap();
+
+        mm.arm_day_loss_gate(Some(&read), 1_000);
+        assert!(!mm.day_loss_halted, "within the cap → NOT latched");
+
+        // And it quotes normally — the gate did not interfere.
+        mm.quote().await;
+        assert_eq!(
+            mm.venue.open_orders().await.unwrap().len(),
+            2,
+            "within the cap → the MM quotes both sides normally"
+        );
+    }
+
     // ── Kill → cancel + clean exit (drives the real run_mm_loop) ───────────────
 
     #[tokio::test]
@@ -2511,6 +2711,7 @@ mod tests {
             Usdc(1_000_000_000),
             false,
             false,
+            None,
         ));
 
         // Let it run a few quote cycles (10 ms interval), then kill it.
@@ -2778,6 +2979,8 @@ mod tests {
             rebate_accrued_micro: 0,
             paused: false,
             halted: false,
+            day: utc_day_from_ms(now_ms()),
+            day_loss_halted: false,
             no_naked_shorts: false,
             vetoed: HashSet::new(),
         };
@@ -2850,6 +3053,8 @@ mod tests {
             rebate_accrued_micro: 0,
             paused: false,
             halted: false,
+            day: utc_day_from_ms(now_ms()),
+            day_loss_halted: false,
             no_naked_shorts: true,
             vetoed: HashSet::new(),
         };
@@ -3033,6 +3238,7 @@ mod tests {
             Usdc(1_000_000_000),
             false,
             false,
+            None,
         ));
         // Dropping the control sender closes ctl_rx → the loop shuts down cleanly.
         drop(ctl_tx);
