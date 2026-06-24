@@ -64,6 +64,61 @@ pub fn microprice(bid: f64, ask: f64, bid_qty: f64, ask_qty: f64) -> f64 {
     (bid * ask_qty + ask * bid_qty) / denom
 }
 
+/// Order-book imbalance over summed depths: (bid - ask)/(bid + ask) in [-1,1].
+/// Positive = buy pressure. 0 when both are 0.
+pub fn imbalance(bid_depth: f64, ask_depth: f64) -> f64 {
+    let denom = bid_depth + ask_depth;
+    if denom <= 0.0 {
+        0.0
+    } else {
+        (bid_depth - ask_depth) / denom
+    }
+}
+
+/// Sum resting size (SHARES) over up to `levels` non-empty price levels inward
+/// from `best` on a ladder (µshares -> shares). 0 when the ladder is empty.
+///
+/// Walks from `best` toward worse prices, matching the ladder's orientation:
+/// a BID ladder's best is the highest tick, so depth lies at LOWER ticks
+/// (step -1); an ASK ladder's best is the lowest tick, so depth lies at HIGHER
+/// ticks (step +1) — the same direction as [`Ladder::iter_from_best`]. Empty
+/// ticks are skipped (they don't consume a level), and the walk is bounded by
+/// `Px::new`'s interior-tick invariant (`1..levels`), so it never runs off
+/// either end of the ladder.
+pub fn ladder_depth(ladder: &pm_core::book::Ladder, levels: u16) -> f64 {
+    use pm_core::book::Side;
+    use pm_core::num::Px;
+
+    let Some(best) = ladder.best() else {
+        return 0.0;
+    };
+    let ts = ladder.ts();
+    // Best is the touch; depth is BEHIND it: bids deepen at lower ticks, asks at
+    // higher ticks (best toward worse), mirroring `Ladder::iter_from_best`.
+    let step: i32 = match ladder.side() {
+        Side::Bid => -1,
+        Side::Ask => 1,
+    };
+
+    let mut tick = i32::from(best.get());
+    let mut found = 0u16;
+    let mut depth = 0.0;
+    while found < levels {
+        // `Px::new` rejects ticks outside `1..levels`, which bounds the walk at
+        // BOTH ends (tick 0 below bids, `levels` above asks) — no manual edge math.
+        let Ok(px) = Px::new(tick as u16, ts) else {
+            break;
+        };
+        let q = ladder.qty_at(px).0;
+        if q > 0 {
+            depth += q as f64 / 1_000_000.0;
+            found += 1;
+        }
+        tick += step;
+    }
+    depth
+}
+
 /// Balanced base sizes leaned against signed inventory `net` (shares).
 /// Long (net>0) -> bigger ask; short -> bigger bid. Ratio clamped to
 /// `max_ratio`; both sides floored at `min_size` to preserve the 2-sided bonus.
@@ -138,6 +193,12 @@ mod tests {
     // assertions below; allowed (not rewritten) to keep the spec tests verbatim.
     #![allow(clippy::unwrap_used, clippy::manual_range_contains)]
     use super::*;
+    use pm_core::book::{Book, Side};
+    use pm_core::num::{Px, Qty, TickSize};
+
+    fn cent_px(t: u16) -> Px {
+        Px::new(t, TickSize::Cent).unwrap()
+    }
 
     #[test]
     fn quotes_tight_and_non_crossing() {
@@ -248,5 +309,51 @@ mod tests {
         let mp = microprice(0.50, 0.52, 300.0, 100.0); // bid-heavy -> up toward ask
         assert!(mp > 0.51 && mp < 0.52, "got {mp}");
         assert!((microprice(0.50, 0.52, 0.0, 0.0) - 0.51).abs() < 1e-9); // zero -> mid
+    }
+
+    #[test]
+    fn imbalance_sign_and_bounds() {
+        assert!((imbalance(100.0, 100.0)).abs() < 1e-9);
+        assert!(imbalance(300.0, 100.0) > 0.0);
+        assert!(imbalance(100.0, 300.0) < 0.0);
+        assert!(imbalance(100.0, 0.0) <= 1.0 && imbalance(0.0, 100.0) >= -1.0);
+        assert_eq!(imbalance(0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn ladder_depth_sums_top_levels_skipping_gaps_per_side() {
+        // µshares: 1 share = 1_000_000. Levels are NON-adjacent so the test proves
+        // we sum the top-N *non-empty* price levels (skipping the empty ticks
+        // between them) and that the walk steps the correct way for each side.
+        let mut book = Book::new(TickSize::Cent);
+        // Bids: best is the HIGHEST tick; depth lies at LOWER ticks (60 -> 58 -> 55).
+        book.apply(Side::Bid, cent_px(60), Qty(2_000_000)); // 2.0 shares (best)
+        book.apply(Side::Bid, cent_px(58), Qty(3_000_000)); // 3.0 shares (gap at 59)
+        book.apply(Side::Bid, cent_px(55), Qty(5_000_000)); // 5.0 shares
+        // Asks: best is the LOWEST tick; depth lies at HIGHER ticks (40 -> 42 -> 45).
+        book.apply(Side::Ask, cent_px(40), Qty(1_000_000)); // 1.0 share (best)
+        book.apply(Side::Ask, cent_px(42), Qty(4_000_000)); // 4.0 shares (gap at 41)
+        book.apply(Side::Ask, cent_px(45), Qty(2_000_000)); // 2.0 shares
+
+        // Top 1 = just the touch.
+        assert!((ladder_depth(&book.bids, 1) - 2.0).abs() < 1e-9);
+        assert!((ladder_depth(&book.asks, 1) - 1.0).abs() < 1e-9);
+        // Top 2 = touch + next non-empty level (skips the empty tick), STOPS there.
+        assert!((ladder_depth(&book.bids, 2) - 5.0).abs() < 1e-9); // 2 + 3
+        assert!((ladder_depth(&book.asks, 2) - 5.0).abs() < 1e-9); // 1 + 4
+        // Top 3 = every level on each side.
+        assert!((ladder_depth(&book.bids, 3) - 10.0).abs() < 1e-9); // 2 + 3 + 5
+        assert!((ladder_depth(&book.asks, 3) - 7.0).abs() < 1e-9); // 1 + 4 + 2
+        // Asking for MORE levels than exist returns all available without
+        // over-iterating past the ladder bounds (no panic, no extra depth).
+        assert!((ladder_depth(&book.bids, 50) - 10.0).abs() < 1e-9);
+        assert!((ladder_depth(&book.asks, 50) - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ladder_depth_empty_ladder_is_zero() {
+        let book = Book::new(TickSize::Cent);
+        assert!((ladder_depth(&book.bids, 5)).abs() < 1e-9);
+        assert!((ladder_depth(&book.asks, 5)).abs() < 1e-9);
     }
 }
