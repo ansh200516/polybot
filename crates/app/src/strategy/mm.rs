@@ -91,9 +91,11 @@ use crate::positions::PositionBook;
 use crate::wiring::BookFetcher;
 
 use super::quote_policy::{
-    Policy, adjusted_mid, microprice, needs_requote, reward_quote_prices, skewed_sizes,
+    Policy, adjusted_mid, combined_signal, imbalance, ladder_depth, microprice, needs_requote,
+    reward_quote_prices, should_pull, skewed_sizes,
 };
 use super::reward_score::{ScoredOrder, est_daily_reward_usd, order_score, quote_set_q_min};
+use super::signals::SignalState;
 use super::{
     RestingOrderSnapshot, RewardFarmStatus, Strategy, StrategyCommand, StrategyCtx, StrategyId,
     StrategyStatus,
@@ -893,6 +895,18 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     /// proxy, NOT a realized payout); surfaced as
     /// [`RewardFarmStatus::cumulative_est`].
     reward_cumulative_est: f64,
+    /// RewardFarm Phase-A (spec §4) per-token rolling signal state: the windowed
+    /// (ts, microprice) history feeding the MOMENTUM half of the adverse-selection
+    /// quote-pull signal. Populated/consulted ONLY in the RewardFarm branch of
+    /// [`quote`](Self::quote); never touched under SpreadCapture (so that path
+    /// stays byte-for-byte unchanged).
+    signals: HashMap<TokenId, SignalState>,
+    /// RewardFarm Phase-A (spec §4) quote-pull COOLDOWN: `(token, side)` →
+    /// wall-clock ms ([`now_ms`]) deadline until which a pulled side stays
+    /// omitted, so an easing-then-re-firing signal can't flicker the quote in/out.
+    /// Re-armed each time the live signal endangers the side, read each cycle;
+    /// RewardFarm-only (SpreadCapture never inserts or reads it).
+    pulled_until: HashMap<(TokenId, Side), i64>,
 }
 
 /// Read BOTH arms of the persistent UTC-day loss gate for `"mm"` on `utc_day`,
@@ -1097,6 +1111,67 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                     )
                 }
             };
+            // Phase-A ADVERSE-SELECTION QUOTE-PULL (spec §4; RewardFarm ONLY).
+            // Step aside from a fill about to be run over: blend book IMBALANCE
+            // (summed top-`microprice_levels` depth, +ve = buy pressure) with
+            // short-term microprice MOMENTUM into one signed pressure, and PULL
+            // the endangered side — strong UP pressure lifts the ASK just before
+            // the price rises; strong DOWN hits the BID. A pulled side is also
+            // held out for `pull_cooldown_ms` so an easing-then-re-firing signal
+            // can't flicker the quote in/out. The whole block is gated on
+            // `Policy::RewardFarm`, so SpreadCapture/arb stay byte-for-byte
+            // unchanged (and `pull_bid`/`pull_ask` remain `false` for them, the
+            // per-side drop below being independently RewardFarm-gated too).
+            let mut pull_bid = false;
+            let mut pull_ask = false;
+            let (mut sig_imb, mut sig_mom, mut sig_blend) = (0.0_f64, 0.0_f64, 0.0_f64);
+            if self.policy == Policy::RewardFarm {
+                let now = now_ms();
+                // `.0` = min_incentive_size (shares); the cutoff fair value uses it.
+                let min_size_shares =
+                    self.reward_by_token.get(&token).map_or(0.0, |r| r.0);
+                // MOMENTUM: feed this cycle's size-weighted fair value (the SAME
+                // microprice the quote priced off, spec §8.1) into the token's
+                // rolling window, then read its windowed relative change. A
+                // one-sided book has no mid (`None`) — but then the quote is
+                // already `(None, None)`, so there is nothing to pull.
+                if let Some(fair) = reward_fair_value(&book, ts, min_size_shares) {
+                    let window = Duration::from_millis(self.params.signal_window_ms);
+                    let st = self
+                        .signals
+                        .entry(token)
+                        .or_insert_with(|| SignalState::new(window));
+                    st.observe(now, fair);
+                    sig_mom = st.momentum(now);
+                }
+                // IMBALANCE over the summed top-`microprice_levels` depth each side.
+                sig_imb = imbalance(
+                    ladder_depth(&book.bids, self.params.microprice_levels),
+                    ladder_depth(&book.asks, self.params.microprice_levels),
+                );
+                sig_blend = combined_signal(sig_imb, sig_mom);
+                // Per side: pull when the live signal endangers it OR a prior
+                // pull's cooldown is still running. An active pull (re)arms the
+                // cooldown deadline; once it lapses AND the signal has eased the
+                // side is allowed again.
+                let thresh = self.params.pull_threshold;
+                let cooldown_ms = self.params.pull_cooldown_ms as i64;
+                for side in [Side::Bid, Side::Ask] {
+                    let active = should_pull(side, sig_blend, thresh);
+                    if active {
+                        self.pulled_until.insert((token, side), now + cooldown_ms);
+                    }
+                    let cooling = self
+                        .pulled_until
+                        .get(&(token, side))
+                        .is_some_and(|&until| now < until);
+                    let pulled = active || cooling;
+                    match side {
+                        Side::Bid => pull_bid = pulled,
+                        Side::Ask => pull_ask = pulled,
+                    }
+                }
+            }
             if bid.is_none() && ask.is_none() {
                 let bb = book.bids.best().map(|p| p.get());
                 let ba = book.asks.best().map(|p| p.get());
@@ -1115,13 +1190,45 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             // inventory gating so it records the POLICY's chosen quote; `bid`/`ask`
             // are borrowed (`as_ref`) so the gating loop below still consumes them.
             if self.policy == Policy::RewardFarm {
-                self.log_rf_decision(token, &book, net_micro, bid.as_ref(), ask.as_ref());
+                self.log_rf_decision(
+                    token,
+                    &book,
+                    net_micro,
+                    bid.as_ref(),
+                    ask.as_ref(),
+                    sig_imb,
+                    sig_mom,
+                    sig_blend,
+                    pull_bid,
+                    pull_ask,
+                );
             }
             for o in [bid, ask].into_iter().flatten() {
                 // Operator VETO (dashboard per-order cancel): this (token, side)
                 // was manually cancelled — leave it OUT of `desired` so reconcile
                 // never re-places it, until the operator un-vetoes.
                 if self.vetoed.contains(&(token, o.side)) {
+                    continue;
+                }
+                // Phase-A ADVERSE-SELECTION QUOTE-PULL (spec §4; RewardFarm ONLY,
+                // independently gated): the signal/cooldown block above marked this
+                // side endangered — omit it this cycle exactly like the veto path,
+                // so `reconcile` cancels any resting quote on that side and places
+                // none (a pull, not a replace). `pull_bid`/`pull_ask` are `false`
+                // under SpreadCapture, but the policy gate keeps the path provably
+                // inert there too.
+                if self.policy == Policy::RewardFarm
+                    && match o.side {
+                        Side::Bid => pull_bid,
+                        Side::Ask => pull_ask,
+                    }
+                {
+                    tracing::debug!(
+                        token = token.0,
+                        side = ?o.side,
+                        signal = sig_blend,
+                        "mm quote: PULL side (strong adverse signal / cooldown)"
+                    );
                     continue;
                 }
                 // NO NAKED SHORTS on the live CLOB (RECON: an ASK with 0 share
@@ -1253,6 +1360,7 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
     /// `market` key gives the tightest decision↔outcome correlation (no YES/NO
     /// cross-attribution). The JSON is opaque to the store; only the future Spec-3
     /// tuner reads it.
+    #[allow(clippy::too_many_arguments)]
     fn log_rf_decision(
         &self,
         token: TokenId,
@@ -1260,6 +1368,11 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         net_micro: i128,
         bid: Option<&MakerOrder>,
         ask: Option<&MakerOrder>,
+        imb: f64,
+        mom: f64,
+        signal: f64,
+        pull_bid: bool,
+        pull_ask: bool,
     ) {
         let ts = book.ts();
         let bb = book.bids.best().map(|p| p.microusdc(ts) as f64 / 1_000_000.0);
@@ -1285,11 +1398,22 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             "best_ask": ba,
             "inv_net_micro": net_micro as i64,
             "max_spread_cents": max_spread_cents,
+            // Phase-A adverse-selection signal (spec §4): the blended pull
+            // pressure and its two components, so the Spec-3 tuner can learn the
+            // pull threshold from the same features the loop decided on.
+            "imbalance": imb,
+            "momentum": mom,
+            "signal": signal,
         });
         let action = serde_json::json!({
             "bid": side(bid),
             "ask": side(ask),
             "skip": bid.is_none() && ask.is_none(),
+            // Phase-A: whether each side was PULLED this cycle (adverse signal or
+            // an active cooldown) — recorded even though the pulled side is still
+            // shown above as the policy's chosen quote (pre-gating).
+            "pull_bid": pull_bid,
+            "pull_ask": pull_ask,
         });
         let row = RfDecisionRow {
             ts_ms: now_ms(),
@@ -1836,6 +1960,8 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
         last_reward_sample: None,
         reward_status: None,
         reward_cumulative_est: 0.0,
+        signals: HashMap::new(),
+        pulled_until: HashMap::new(),
     };
     if start_paused {
         tracing::info!("mm: live held — quoting PAUSED until release (press `l`)");
@@ -2085,6 +2211,8 @@ mod tests {
             last_reward_sample: None,
             reward_status: None,
             reward_cumulative_est: 0.0,
+            signals: HashMap::new(),
+            pulled_until: HashMap::new(),
         };
         (mm, store_rx, status_rx)
     }
@@ -2890,6 +3018,140 @@ mod tests {
             }
         }
         assert_eq!(rf_msgs, 0, "SpreadCapture must emit no rf_decision/rf_outcome telemetry");
+    }
+
+    // ── RewardFarm Phase-A adverse-selection quote-pull (Task A5, spec §4) ──────
+
+    /// A strongly bid-imbalanced book makes the ASK the endangered side (it gets
+    /// lifted just before the price rises), so under RewardFarm the ask is PULLED
+    /// — omitted from the placed orders while the BID still rests. Once the signal
+    /// eases (a balanced book) AND the cooldown has lapsed, the ask returns.
+    ///
+    /// SIGNAL SETUP (Step-5 note): `combined_signal` AVERAGES imbalance + momentum
+    /// (`(imb + mom)/2`), so a single observation (momentum 0) gives `signal =
+    /// imbalance/2`. Imbalance alone can therefore never reach the default 0.6
+    /// threshold (`imbalance ≤ 1 ⇒ signal ≤ 0.5`), so this test LOWERS
+    /// `pull_threshold` to 0.3 and uses a book with a balanced TOP (equal best
+    /// sizes ⇒ a clean 0.50 microprice, hence momentum 0 on both cycles) but heavy
+    /// bid DEPTH BEHIND the touch ⇒ a ~0.9 summed imbalance ⇒ signal ~0.45 ≥ 0.3.
+    /// `pull_cooldown_ms = 0` so the recovery cycle is gated only on the signal
+    /// easing (the cooldown's own effect is covered by the test below).
+    #[tokio::test]
+    async fn rewardfarm_pulls_ask_on_strong_bid_imbalance() {
+        let tokens = vec![TokenId(1)];
+        // Balanced TOP (100 sh each ⇒ microprice 0.50) but heavy bid depth behind
+        // the touch (47¢/46¢) ⇒ strong POSITIVE imbalance over the top-3 levels.
+        let imbalanced = cent_book(
+            &[(48, 100 * SH), (47, 1000 * SH), (46, 1000 * SH)],
+            &[(52, 100 * SH)],
+        );
+        let (fetcher, shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (imbalanced, true))]));
+        let mut params = mk_params(200, 5.0);
+        params.policy = Policy::RewardFarm;
+        // imbalance/2 (~0.45) clears 0.3; the default 0.6 is unreachable on
+        // imbalance alone (the blend halves it).
+        params.pull_threshold = 0.3;
+        // Recovery gated only on the signal easing (not a lingering cooldown).
+        params.pull_cooldown_ms = 0;
+        let (mut mm, _store_rx, _status_rx) =
+            build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+        mm.reward_by_token.insert(TokenId(1), (1.0, 3.0, 100.0));
+
+        // Cycle 1: strong UP pressure ⇒ the ASK is pulled; the BID is still placed.
+        mm.quote().await;
+        assert!(
+            mm.qm.tracked().contains_key(&(TokenId(1), Side::Bid)),
+            "the safe BID side is still placed"
+        );
+        assert!(
+            !mm.qm.tracked().contains_key(&(TokenId(1), Side::Ask)),
+            "the endangered ASK is PULLED (omitted) on a strong adverse up-signal"
+        );
+
+        // Cycle 2: a balanced book eases the signal (imbalance 0; microprice stays
+        // 0.50 ⇒ momentum 0) and the 0-ms cooldown has lapsed ⇒ the ask returns
+        // (the bid stays put, sticky).
+        shared.lock().unwrap().insert(TokenId(1), (mid50_book(), true));
+        mm.quote().await;
+        assert!(
+            mm.qm.tracked().contains_key(&(TokenId(1), Side::Ask)),
+            "the ASK returns once the signal eases and the cooldown lapses"
+        );
+        assert!(
+            mm.qm.tracked().contains_key(&(TokenId(1), Side::Bid)),
+            "the BID remains placed throughout"
+        );
+    }
+
+    /// The pull COOLDOWN holds a side out even AFTER the live signal eases, so a
+    /// flickering signal can't churn the quote (a cancel+replace would reset
+    /// Polymarket's time-weighted reward score). Same strong-imbalance cycle pulls
+    /// the ask; with a long cooldown the following BALANCED cycle keeps it pulled.
+    #[tokio::test]
+    async fn rewardfarm_pulls_respect_cooldown_after_signal_eases() {
+        let tokens = vec![TokenId(1)];
+        let imbalanced = cent_book(
+            &[(48, 100 * SH), (47, 1000 * SH), (46, 1000 * SH)],
+            &[(52, 100 * SH)],
+        );
+        let (fetcher, shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (imbalanced, true))]));
+        let mut params = mk_params(200, 5.0);
+        params.policy = Policy::RewardFarm;
+        params.pull_threshold = 0.3;
+        // Long cooldown ⇒ the next cycle is still within it.
+        params.pull_cooldown_ms = 60_000;
+        let (mut mm, _store_rx, _status_rx) =
+            build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+        mm.reward_by_token.insert(TokenId(1), (1.0, 3.0, 100.0));
+
+        // Cycle 1: ask pulled on the adverse signal (cooldown armed to now + 60s).
+        mm.quote().await;
+        assert!(
+            !mm.qm.tracked().contains_key(&(TokenId(1), Side::Ask)),
+            "ask pulled on the adverse signal"
+        );
+
+        // Cycle 2: a balanced book eases the live signal, but the cooldown has NOT
+        // lapsed ⇒ the ask STAYS pulled (no flicker back in).
+        shared.lock().unwrap().insert(TokenId(1), (mid50_book(), true));
+        mm.quote().await;
+        assert!(
+            !mm.qm.tracked().contains_key(&(TokenId(1), Side::Ask)),
+            "ask stays pulled while the cooldown runs, even though the signal eased"
+        );
+    }
+
+    /// Isolation LOCK: SpreadCapture must be byte-for-byte unaffected by the
+    /// Phase-A signal/pull block. On the SAME strongly bid-imbalanced book that
+    /// pulls the ask under RewardFarm, SpreadCapture still quotes BOTH sides (the
+    /// signal block is gated out entirely, as is the per-side drop).
+    #[tokio::test]
+    async fn spreadcapture_ignores_adverse_signal_quotes_both_sides() {
+        let tokens = vec![TokenId(1)];
+        let imbalanced = cent_book(
+            &[(48, 100 * SH), (47, 1000 * SH), (46, 1000 * SH)],
+            &[(52, 100 * SH)],
+        );
+        let (fetcher, _shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (imbalanced, true))]));
+        // SpreadCapture (mk_params default); a low pull_threshold that WOULD pull
+        // under RewardFarm — proving the gate, not the threshold, is what isolates.
+        let mut params = mk_params(200, 5.0);
+        params.pull_threshold = 0.3;
+        let (mut mm, _store_rx, _status_rx) =
+            build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+
+        mm.quote().await;
+        assert!(
+            mm.qm.tracked().contains_key(&(TokenId(1), Side::Bid)),
+            "SpreadCapture still quotes the bid"
+        );
+        assert!(
+            mm.qm.tracked().contains_key(&(TokenId(1), Side::Ask)),
+            "SpreadCapture is unaffected by the adverse signal — ask still quoted"
+        );
     }
 
     // ── Inventory skew (Task 4.3) ──────────────────────────────────────────────
@@ -3864,6 +4126,8 @@ mod tests {
             last_reward_sample: None,
             reward_status: None,
             reward_cumulative_est: 0.0,
+            signals: HashMap::new(),
+            pulled_until: HashMap::new(),
         };
         (mm, store_rx, produced)
     }
@@ -3942,6 +4206,8 @@ mod tests {
             last_reward_sample: None,
             reward_status: None,
             reward_cumulative_est: 0.0,
+            signals: HashMap::new(),
+            pulled_until: HashMap::new(),
         };
         // We placed this order on YES (an Ask). The fill must follow THIS token.
         mm.placed.insert(

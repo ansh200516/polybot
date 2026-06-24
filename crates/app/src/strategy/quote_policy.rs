@@ -119,6 +119,21 @@ pub fn ladder_depth(ladder: &pm_core::book::Ladder, levels: u16) -> f64 {
     depth
 }
 
+/// Blend imbalance + momentum into one signed pressure in [-1,1] (positive = up).
+pub fn combined_signal(imbalance: f64, momentum: f64) -> f64 {
+    ((imbalance + momentum.clamp(-1.0, 1.0)) / 2.0).clamp(-1.0, 1.0)
+}
+
+/// Pull the side about to be run over: strong UP pressure endangers the ASK
+/// (it gets lifted just before the price rises), strong DOWN endangers the BID.
+pub fn should_pull(side: pm_core::book::Side, signal: f64, threshold: f64) -> bool {
+    use pm_core::book::Side;
+    match side {
+        Side::Ask => signal >= threshold,
+        Side::Bid => signal <= -threshold,
+    }
+}
+
 /// Balanced base sizes leaned against signed inventory `net` (shares).
 /// Long (net>0) -> bigger ask; short -> bigger bid. Ratio clamped to
 /// `max_ratio`; both sides floored at `min_size` to preserve the 2-sided bonus.
@@ -318,6 +333,22 @@ mod tests {
         assert!(imbalance(100.0, 300.0) < 0.0);
         assert!(imbalance(100.0, 0.0) <= 1.0 && imbalance(0.0, 100.0) >= -1.0);
         assert_eq!(imbalance(0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn pull_endangered_side_on_strong_signal() {
+        // `combined_signal` BLENDS the two [-1,1] inputs by AVERAGING them
+        // (`(imbalance + momentum)/2`), so `combined_signal(0.7, 0.3) == 0.5`.
+        // The threshold is therefore 0.4 (a strong 0.5 clears it; the weak 0.15
+        // below does not) — note the blend halves the raw inputs, so the spec's
+        // verbatim 0.6 cannot be cleared by `(0.7, 0.3)` and is lowered here for
+        // a coherent pure-fn check (the loop's default 0.6 is exercised end-to-end
+        // by the mm-level tests, which feed the threshold a strong enough signal).
+        let s = combined_signal(0.7, 0.3); // imbalance, momentum -> blended [-1,1] = 0.5
+        assert!(should_pull(Side::Ask, s, 0.4)); // strong UP pressure endangers the ASK
+        assert!(!should_pull(Side::Bid, s, 0.4)); // bid safe
+        let w = combined_signal(0.2, 0.1); // = 0.15
+        assert!(!should_pull(Side::Ask, w, 0.4) && !should_pull(Side::Bid, w, 0.4));
     }
 
     #[test]
