@@ -89,7 +89,7 @@ use crate::coordinator::now_ms;
 use crate::positions::PositionBook;
 use crate::wiring::BookFetcher;
 
-use super::quote_policy::{Policy, adjusted_mid, reward_quote_prices};
+use super::quote_policy::{Policy, adjusted_mid, reward_quote_prices, skewed_sizes};
 use super::{
     RestingOrderSnapshot, Strategy, StrategyCommand, StrategyCtx, StrategyId, StrategyStatus,
 };
@@ -123,6 +123,20 @@ pub struct MmParams {
     /// [`MmLoop::quote`]. The two paths share the SAME veto / no-naked-short /
     /// inventory gating, so they differ ONLY in which prices/sizes they propose.
     pub policy: Policy,
+    /// RewardFarm size-skew cap (Task 6, spec §8.3): the MAX bigger:smaller size
+    /// ratio between the two sides when leaning against inventory. The reward
+    /// score is quadratic in TIGHTNESS, so the lean is expressed by skewing
+    /// SIZES (bigger on the reducing side), never prices — prices stay pinned at
+    /// the tight reward band. `1.0` disables the lean (balanced). Read by
+    /// [`reward_compute_quotes`] via [`skewed_sizes`]; inert under SpreadCapture.
+    ///
+    /// SOURCE: the operator knob is `[reward_farm].size_skew_max_ratio`
+    /// (validated finite & ≥ 1.0 in `pm_config`). That section is a SIBLING of
+    /// `[strategies.mm]`, so [`MmParams::from_config`] — which only receives
+    /// `&pm_config::Mm` — cannot reach it without a new `from_config` argument
+    /// (a `main.rs` call-site change). Until that is threaded, this defaults to
+    /// the validated `RewardFarm` default; see [`MmParams::from_config`].
+    pub size_skew_max_ratio: f64,
 }
 
 impl MmParams {
@@ -137,6 +151,13 @@ impl MmParams {
             rebate_bps: mm.rebate_bps,
             paper_taker_fill_pct: mm.paper_taker_fill_pct,
             policy: Policy::from_cfg(&mm.policy),
+            // The operator knob lives on `[reward_farm]` (a sibling section), not
+            // on `mm`, so it is NOT reachable here without an extra `from_config`
+            // argument — which would change main's call site. Default to the
+            // validated `RewardFarm` default (2.0); threading the real
+            // `[reward_farm].size_skew_max_ratio` is a one-line main.rs change
+            // (pass `&config.reward_farm` in and read it here).
+            size_skew_max_ratio: pm_config::RewardFarm::default().size_skew_max_ratio,
         })
     }
 }
@@ -552,20 +573,36 @@ fn compute_quotes(
 /// [`compute_quotes`] so the loop's veto / no-naked-short / inventory gating is
 /// IDENTICAL for both policies — the policies differ ONLY in the prices/sizes.
 ///
-/// Balanced BASE size = `notional_micro` per side for now; real size SKEW and the
-/// reward `min_size` floor are Task 6. `max_spread_cents` is the per-market reward
-/// scoring band; `0.0` (no metrics / not reward-eligible) skips BOTH sides.
+/// BASE size (per side, valued at the adjusted mid) is leaned against signed
+/// inventory into a balanced bid/ask via [`skewed_sizes`] (Task 6, spec §8.3):
+/// bigger on the REDUCING side, capped at `max_ratio`, both floored at the
+/// reward `min_size` (`min_size_shares`) so each side keeps the two-sided bonus.
+/// PRICES stay tight (the lean is in SIZES only). `max_spread_cents` is the
+/// per-market reward scoring band; `0.0` (no metrics / not reward-eligible)
+/// skips BOTH sides.
+///
+/// Inventory inputs mirror [`compute_quotes`]/[`skew_fair`]: `net_micro` is the
+/// strategy's signed net for `token` (µshares) and `max_inventory_micro` the
+/// per-market cap (µUSDC) the lean normalizes against (valued at the mid →
+/// shares). When a side price is `None` (out of band) OR the inventory cap is
+/// hit, the loop's EXISTING no-naked-short / `check_quote` gating quotes only
+/// the reducing side — NOT duplicated here; this just emits the two candidates.
 ///
 /// The pure pricing seam works in DOLLARS (0..1); each returned price is already
 /// floored/ceiled to the tick grid, so [`reward_price_to_px`] maps it back to an
 /// interior [`Px`]. The size-cutoff-adjusted mid (dropping sub-`min_size` levels,
-/// spec §8.1) needs per-level sizes the [`Book`] does not expose here, so Task 5
-/// uses the RAW mid; the size cutoff is deferred to a later task.
+/// spec §8.1) needs per-level sizes the [`Book`] does not expose here, so this
+/// still uses the RAW mid; the size cutoff is deferred to a later task.
+#[allow(clippy::too_many_arguments)]
 fn reward_compute_quotes(
     book: &Book,
     token: TokenId,
     notional_micro: i128,
     max_spread_cents: f64,
+    net_micro: i128,
+    max_inventory_micro: i128,
+    max_ratio: f64,
+    min_size_shares: f64,
 ) -> (Option<MakerOrder>, Option<MakerOrder>) {
     let ts = book.ts();
     let (Some(best_bid), Some(best_ask)) = (book.bids.best(), book.asks.best()) else {
@@ -577,13 +614,42 @@ fn reward_compute_quotes(
     // TODO(reward-farm sizing, later task): drop sub-`min_size` levels first.
     let adj_mid = adjusted_mid(bb, ba);
     let (bid_px, ask_px) = reward_quote_prices(adj_mid, bb, ba, tick, max_spread_cents);
-    let order = |side: Side, price: f64| -> Option<MakerOrder> {
-        reward_price_to_px(price, ts)
-            .and_then(|px| quote_order(token, side, px, ts, notional_micro))
+
+    // BALANCED, INVENTORY-SKEWED SIZES (spec §8.3), all in SHARES so the reward
+    // `min_size` floor applies directly:
+    //   base       = per-side notional valued at the adj mid (= notional_usd /
+    //                mid; quote_order's notional→shares, kept in SHARES).
+    //   cap_shares = per-market inventory cap valued at the mid (mirrors
+    //                skew_fair's `max_shares`, in SHARES not µshares).
+    //   net        = signed µshare inventory / 1e6.
+    // Each side's resulting SHARE size is converted back to a per-side notional
+    // AT ITS OWN PRICE and handed to quote_order, which re-derives µshares,
+    // quantizes to the venue grain, and enforces the 5-share floor — so no
+    // amount rounding is hand-rolled here (quote_order owns it for BOTH policies).
+    let adj_mid_micro = adj_mid * 1_000_000.0;
+    let (base_shares, cap_shares) = if adj_mid_micro > 0.0 {
+        (
+            notional_micro as f64 / adj_mid_micro,
+            max_inventory_micro as f64 / adj_mid_micro,
+        )
+    } else {
+        (0.0, 0.0)
+    };
+    let net_shares = net_micro as f64 / 1_000_000.0;
+    let (bid_shares, ask_shares) =
+        skewed_sizes(base_shares, net_shares, cap_shares, max_ratio, min_size_shares);
+
+    // shares → per-side notional (µUSDC) at the side's own price (notional =
+    // shares × price_micro), so quote_order's `notional·1e6 / price_micro`
+    // recovers the share size before quantizing it to the venue grain.
+    let order = |side: Side, price: f64, shares: f64| -> Option<MakerOrder> {
+        let px = reward_price_to_px(price, ts)?;
+        let notional = (shares * px.microusdc(ts) as f64) as i128;
+        quote_order(token, side, px, ts, notional)
     };
     (
-        bid_px.and_then(|p| order(Side::Bid, p)),
-        ask_px.and_then(|p| order(Side::Ask, p)),
+        bid_px.and_then(|p| order(Side::Bid, p, bid_shares)),
+        ask_px.and_then(|p| order(Side::Ask, p, ask_shares)),
     )
 }
 
@@ -742,11 +808,24 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                     max_inventory_micro,
                 ),
                 Policy::RewardFarm => {
-                    // Per-token reward band (`.1` = max_spread_cents); `.0`
-                    // (min_size) is threaded for Task-6 sizing. No metrics / not
-                    // reward-eligible → band 0.0 → both sides gate out (skip).
-                    let max_spread_cents = self.reward_by_token.get(&token).map_or(0.0, |r| r.1);
-                    reward_compute_quotes(&book, token, self.notional_micro, max_spread_cents)
+                    // Per-token reward params: `.0` = min_incentive_size (shares,
+                    // the two-sided size floor), `.1` = max_spread_cents (scoring
+                    // band). No metrics / not reward-eligible → `(0.0, 0.0)` → band
+                    // 0.0 gates BOTH sides out (skip). `net_micro` /
+                    // `max_inventory_micro` (read above) drive the SIZE lean,
+                    // capped by `size_skew_max_ratio` (spec §8.3) — prices stay tight.
+                    let (min_size_shares, max_spread_cents) =
+                        self.reward_by_token.get(&token).copied().unwrap_or((0.0, 0.0));
+                    reward_compute_quotes(
+                        &book,
+                        token,
+                        self.notional_micro,
+                        max_spread_cents,
+                        net_micro,
+                        max_inventory_micro,
+                        self.params.size_skew_max_ratio,
+                        min_size_shares,
+                    )
                 }
             };
             if bid.is_none() && ask.is_none() {
@@ -1299,6 +1378,9 @@ mod tests {
             // SpreadCapture by default so the Task-4.2/4.3 tests run the unchanged
             // spread path; reward-farm pricing is unit-tested in `quote_policy`.
             policy: Policy::SpreadCapture,
+            // 2.0 = the spec/§8.3 + `RewardFarm` default ≤2:1 lean cap; the
+            // reward-farm sizing tests below set inventory/cap explicitly.
+            size_skew_max_ratio: 2.0,
         }
     }
 
@@ -1717,6 +1799,65 @@ mod tests {
             bid.price.get(),
             ask.price.get()
         );
+    }
+
+    // ── RewardFarm balanced size-skew (Task 6, spec §8.3) ──────────────────────
+
+    /// A LONG net leans the SIZES — bigger ask (to sell down), smaller bid —
+    /// within the ≤2:1 ratio and the reward `min_size` floor, while the PRICES
+    /// stay pinned tight to the reward band (bid at the mid, ask one tick up).
+    /// Exercises the full path through `quote_order`'s grain quantization.
+    #[test]
+    fn reward_compute_quotes_long_skews_ask_size_bigger_prices_tight() {
+        // Wide Cent book (best 0.40 / 0.60, mid 0.50) → tight two-sided reward
+        // quotes; $50 per-side notional, $1000 per-market inventory cap.
+        let book = cent_book(&[(40, 100 * SH)], &[(60, 100 * SH)]);
+        let notional = 50_000_000; // $50 → base 100 sh @ the 0.50 mid
+        let max_inv = 1_000_000_000; // $1000 → cap 2000 sh @ 0.50
+        let net = 1_000 * SH as i128; // +1000 sh long → r = 1000/2000 = 0.5
+        let (bid, ask) =
+            reward_compute_quotes(&book, TokenId(1), notional, 3.0, net, max_inv, 2.0, 5.0);
+        let bid = bid.expect("bid");
+        let ask = ask.expect("ask");
+        // SIZES lean against the long: bigger ask, within the ≤2:1 cap, both ≥ min.
+        assert!(ask.size.0 > bid.size.0, "long → bigger ask size");
+        assert!(
+            (ask.size.0 as f64) / (bid.size.0 as f64) <= 2.0 + 1e-9,
+            "two-sided ratio within max_ratio: {} / {}",
+            ask.size.0,
+            bid.size.0
+        );
+        assert!(bid.size.0 >= MM_MIN_ORDER_SHARES_MICRO as u64, "bid ≥ venue min");
+        assert!(ask.size.0 >= MM_MIN_ORDER_SHARES_MICRO as u64, "ask ≥ venue min");
+        // PRICES stay tight (NOT skewed): bid at the mid tick, ask one tick up.
+        assert_eq!(bid.price, px(50), "bid pinned at the tight reward band");
+        assert_eq!(ask.price, px(51), "ask one tick up (post-only non-cross)");
+    }
+
+    /// Flat inventory → EQUAL share sizes on both sides (delta-neutral base),
+    /// even though the bid and ask sit at different prices (the size, not the
+    /// notional, is balanced — what the quadratic reward score rewards).
+    #[test]
+    fn reward_compute_quotes_flat_is_balanced_in_shares() {
+        let book = cent_book(&[(40, 100 * SH)], &[(60, 100 * SH)]);
+        let (bid, ask) =
+            reward_compute_quotes(&book, TokenId(1), 50_000_000, 3.0, 0, 1_000_000_000, 2.0, 5.0);
+        let bid = bid.expect("bid");
+        let ask = ask.expect("ask");
+        assert_eq!(bid.size.0, ask.size.0, "flat → balanced share sizes");
+    }
+
+    /// A NET SHORT leans the other way — bigger BID (to buy back) — confirming
+    /// the lean direction flips with the sign of inventory.
+    #[test]
+    fn reward_compute_quotes_short_skews_bid_size_bigger() {
+        let book = cent_book(&[(40, 100 * SH)], &[(60, 100 * SH)]);
+        let net = -(1_000 * SH as i128); // short → bigger bid
+        let (bid, ask) =
+            reward_compute_quotes(&book, TokenId(1), 50_000_000, 3.0, net, 1_000_000_000, 2.0, 5.0);
+        let bid = bid.expect("bid");
+        let ask = ask.expect("ask");
+        assert!(bid.size.0 > ask.size.0, "short → bigger bid size");
     }
 
     // ── Inventory skew (Task 4.3) ──────────────────────────────────────────────

@@ -52,6 +52,32 @@ pub fn adjusted_mid(best_bid: f64, best_ask: f64) -> f64 {
     (best_bid + best_ask) / 2.0
 }
 
+/// Balanced base sizes leaned against signed inventory `net` (shares).
+/// Long (net>0) -> bigger ask; short -> bigger bid. Ratio clamped to
+/// `max_ratio`; both sides floored at `min_size` to preserve the 2-sided bonus.
+///
+/// Express a view by skewing SIZES, never prices (spec §2/§8.3) — the reward
+/// score is quadratic in tightness, so prices stay pinned at the tight reward
+/// band ([`reward_quote_prices`]) while the lean lives entirely in the sizes.
+/// `r = clamp(net / cap_shares, -1, 1)` scales the lean by how full the
+/// per-market inventory cap is. The lean is split HALF onto each side
+/// (`lean = max_ratio^(r/2)`, ask×lean and bid÷lean), so the bigger:smaller
+/// (`ask/bid` when long) ratio is `lean² = max_ratio^r` — reaching the full
+/// `max_ratio` (the spec's ≤2:1 TWO-SIDED cap) only at the inventory cap and
+/// exactly `1` (balanced) when flat. Splitting matters: a per-side
+/// `max_ratio^r` would let `ask/bid` reach `max_ratio²` (4:1 at a 2.0 cap),
+/// breaking the ≤2:1 invariant. The `min_size` floor can push the realized
+/// ratio BELOW `max_ratio` (never above), which keeps both sides earning the
+/// two-sided bonus.
+pub fn skewed_sizes(base: f64, net: f64, cap_shares: f64, max_ratio: f64, min_size: f64) -> (f64, f64) {
+    let r = if cap_shares > 0.0 { (net / cap_shares).clamp(-1.0, 1.0) } else { 0.0 };
+    // HALF the lean per side → ask/bid = max_ratio^r ≤ max_ratio (the ≤2:1 cap).
+    let lean = max_ratio.powf(r / 2.0); // r>0 (long) -> lean>1 -> ask bigger
+    let ask = (base * lean).max(min_size);
+    let bid = (base / lean).max(min_size);
+    (bid, ask)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
     SpreadCapture,
@@ -120,5 +146,28 @@ mod tests {
         // max_spread_cents = 0 (not reward-eligible) -> skip, even though mid is on-grid
         assert_eq!(reward_quote_prices(0.50, 0.48, 0.52, 0.01, 0.0), (None, None));
         assert_eq!(reward_quote_prices(0.50, 0.40, 0.60, 0.01, 0.0), (None, None));
+    }
+
+    #[test]
+    fn size_skew_leans_against_inventory_within_ratio() {
+        let (bid_sz, ask_sz) = skewed_sizes(10.0, /*net*/ 8.0, /*cap*/ 10.0, /*max_ratio*/ 2.0, /*min*/ 5.0);
+        assert!(ask_sz >= bid_sz);
+        assert!(ask_sz / bid_sz <= 2.0 + 1e-9);
+        assert!(bid_sz >= 5.0 && ask_sz >= 5.0, "both stay >= min_incentive_size");
+    }
+
+    #[test]
+    fn flat_inventory_is_balanced() {
+        let (b, a) = skewed_sizes(10.0, 0.0, 10.0, 2.0, 5.0);
+        assert!((a - b).abs() < 1e-9);
+    }
+
+    #[test]
+    fn size_skew_short_inventory_leans_bid_bigger() {
+        // Short (net<0) -> lean<1 -> bid bigger, ask smaller (buy to reduce short).
+        let (bid_sz, ask_sz) = skewed_sizes(10.0, /*net*/ -8.0, /*cap*/ 10.0, /*max_ratio*/ 2.0, /*min*/ 5.0);
+        assert!(bid_sz >= ask_sz);
+        assert!(bid_sz / ask_sz <= 2.0 + 1e-9);
+        assert!(bid_sz >= 5.0 && ask_sz >= 5.0, "both stay >= min_incentive_size");
     }
 }
