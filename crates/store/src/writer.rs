@@ -7,7 +7,7 @@ use tracing::error;
 
 use crate::{
     ConversionRow, FillRow, HaltRow, MarketRow, OppRow, OrderEventRow, OrderRow, PnlRow, RelRow,
-    Store,
+    RfDecisionRow, RfOutcomeRow, Store,
 };
 
 pub type Ack = Option<oneshot::Sender<()>>;
@@ -28,6 +28,15 @@ pub enum StoreMsg {
     Conversion(ConversionRow, Ack),
     PnlSnapshot(PnlRow),
     Halt(HaltRow),
+    /// RewardFarm DECISION telemetry (Task 10, spec §12): best-effort, un-acked
+    /// (like `Opportunity` / `PnlSnapshot`). A failed write only bumps
+    /// `write_errors` — it never blocks the trading path.
+    RfDecision(RfDecisionRow),
+    /// RewardFarm OUTCOME telemetry (Task 10, spec §12): the writer correlates it
+    /// to the most-recent decision for its market key; an outcome with no matching
+    /// decision is dropped (NOT an error), so the un-acked, best-effort contract
+    /// holds even right after a restart.
+    RfOutcome(RfOutcomeRow),
 }
 
 /// Run until the channel closes; returns the store for final inspection
@@ -57,6 +66,27 @@ pub async fn run_writer(mut store: Store, mut rx: mpsc::Receiver<StoreMsg>) -> S
             }
             StoreMsg::PnlSnapshot(r) => (store.insert_pnl_snapshot(&r), None, "pnl_snapshot"),
             StoreMsg::Halt(r) => (store.insert_halt(&r), None, "halt"),
+            StoreMsg::RfDecision(r) => (
+                store
+                    .record_rf_decision(r.ts_ms, &r.market, &r.state_json, &r.action_json)
+                    .map(|_| ()),
+                None,
+                "rf_decision",
+            ),
+            StoreMsg::RfOutcome(r) => (
+                store
+                    .record_rf_outcome_for_latest(
+                        &r.market,
+                        r.ts_ms,
+                        r.reward_score_delta_micro,
+                        r.rebate_micro,
+                        r.adverse_pnl_micro,
+                        r.inv_penalty_micro,
+                    )
+                    .map(|_| ()),
+                None,
+                "rf_outcome",
+            ),
         };
         match result {
             Ok(()) => {
@@ -79,7 +109,7 @@ pub async fn run_writer(mut store: Store, mut rx: mpsc::Receiver<StoreMsg>) -> S
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::{FillRow, OrderEventRow, OrderRow, Store};
+    use crate::{FillRow, OrderEventRow, OrderRow, RfDecisionRow, RfOutcomeRow, Store};
 
     fn order_row(id: &str) -> OrderRow {
         OrderRow {
@@ -203,5 +233,57 @@ mod tests {
         assert_eq!(store.write_errors, 0, "the signed short-open must not error");
         assert_eq!(store.count_fills().unwrap(), 1, "the short fill persisted");
         assert_eq!(store.position(7).unwrap(), (-1_000_000, -500_000));
+    }
+
+    #[tokio::test]
+    async fn rf_decision_then_outcome_correlates_via_writer() {
+        // Task 10: the RewardFarm telemetry variants flow through the writer like
+        // any other message. An outcome with NO prior decision is silently DROPPED
+        // (best-effort), while one AFTER a decision correlates to it — neither
+        // bumps `write_errors` (telemetry is never a trading-path failure).
+        let store = Store::open_in_memory().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let writer = tokio::spawn(run_writer(store, rx));
+
+        // Outcome before any decision for market "7" → dropped, not an error.
+        tx.send(StoreMsg::RfOutcome(RfOutcomeRow {
+            market: "7".into(),
+            ts_ms: 1,
+            reward_score_delta_micro: 0,
+            rebate_micro: 0,
+            adverse_pnl_micro: 0,
+            inv_penalty_micro: 0,
+        }))
+        .await
+        .unwrap();
+
+        // Decision (id 1 on a fresh DB) then an outcome → correlated.
+        tx.send(StoreMsg::RfDecision(RfDecisionRow {
+            ts_ms: 2,
+            market: "7".into(),
+            state_json: "{}".into(),
+            action_json: "{}".into(),
+        }))
+        .await
+        .unwrap();
+        tx.send(StoreMsg::RfOutcome(RfOutcomeRow {
+            market: "7".into(),
+            ts_ms: 3,
+            reward_score_delta_micro: 0,
+            rebate_micro: 9,
+            adverse_pnl_micro: -2,
+            inv_penalty_micro: 0,
+        }))
+        .await
+        .unwrap();
+
+        drop(tx);
+        let store = writer.await.unwrap();
+        assert_eq!(store.write_errors, 0, "dropped + correlated writes never error");
+        assert_eq!(
+            store.count_rf_outcomes_for(1).unwrap(),
+            1,
+            "exactly the correlated outcome attached to decision id 1"
+        );
     }
 }

@@ -81,7 +81,7 @@ use pm_ingestion::supervisor::OnApplyFn;
 use pm_risk::inventory::{InventoryConfig, InventoryRisk, Marks, QuoteIntent, QuoteVerdict};
 use pm_store::read::ReadStore;
 use pm_store::writer::StoreMsg;
-use pm_store::{FillRow, OrderRow, PnlRow, usdc_to_i64, utc_day_from_ms};
+use pm_store::{FillRow, OrderRow, PnlRow, RfDecisionRow, RfOutcomeRow, usdc_to_i64, utc_day_from_ms};
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::warn;
@@ -924,6 +924,16 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                     "mm quote: compute_quotes produced NO sides (extreme price / no interior room)"
                 );
             }
+            // Task 10 — RewardFarm DECISION instrumentation (spec §12): log this
+            // token's (state, action) as best-effort telemetry for the future
+            // Spec-3 tuner. RewardFarm-only (SpreadCapture writes nothing new) and
+            // fire-and-forget (a full/closed writer channel drops the row, never
+            // stalls the quote loop). Emitted BEFORE the veto / no-naked-short /
+            // inventory gating so it records the POLICY's chosen quote; `bid`/`ask`
+            // are borrowed (`as_ref`) so the gating loop below still consumes them.
+            if self.policy == Policy::RewardFarm {
+                self.log_rf_decision(token, &book, net_micro, bid.as_ref(), ask.as_ref());
+            }
             for o in [bid, ask].into_iter().flatten() {
                 // Operator VETO (dashboard per-order cancel): this (token, side)
                 // was manually cancelled — leave it OUT of `desired` so reconcile
@@ -1050,6 +1060,60 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         }
     }
 
+    /// Emit a best-effort RewardFarm DECISION row (Task 10, spec §12): the state
+    /// features (adjusted mid, best bid/ask, signed inventory net, reward band)
+    /// and the action taken (the chosen bid/ask price + size in shares, or skip).
+    /// Fire-and-forget via `try_send` — a full/closed writer channel DROPS the
+    /// record rather than ever blocking the quote loop (telemetry is never a
+    /// trading-path failure). Keyed by the token id: Spec 1 quotes a single token
+    /// two-sided (spec §9), so the token IS the quoting unit, and using it as the
+    /// `market` key gives the tightest decision↔outcome correlation (no YES/NO
+    /// cross-attribution). The JSON is opaque to the store; only the future Spec-3
+    /// tuner reads it.
+    fn log_rf_decision(
+        &self,
+        token: TokenId,
+        book: &Book,
+        net_micro: i128,
+        bid: Option<&MakerOrder>,
+        ask: Option<&MakerOrder>,
+    ) {
+        let ts = book.ts();
+        let bb = book.bids.best().map(|p| p.microusdc(ts) as f64 / 1_000_000.0);
+        let ba = book.asks.best().map(|p| p.microusdc(ts) as f64 / 1_000_000.0);
+        let adj_mid = bb.zip(ba).map(|(b, a)| adjusted_mid(b, a));
+        // `.1` is the per-market reward scoring band (max_spread_cents); `0.0`
+        // when the token is not reward-eligible / has no metrics.
+        let max_spread_cents = self.reward_by_token.get(&token).map_or(0.0, |r| r.1);
+        let side = |o: Option<&MakerOrder>| {
+            o.map(|o| {
+                serde_json::json!({
+                    "px": o.price.microusdc(ts) as f64 / 1_000_000.0,
+                    "size_shares": o.size.0 as f64 / 1_000_000.0,
+                })
+            })
+        };
+        let state = serde_json::json!({
+            "adj_mid": adj_mid,
+            "best_bid": bb,
+            "best_ask": ba,
+            "inv_net_micro": net_micro as i64,
+            "max_spread_cents": max_spread_cents,
+        });
+        let action = serde_json::json!({
+            "bid": side(bid),
+            "ask": side(ask),
+            "skip": bid.is_none() && ask.is_none(),
+        });
+        let row = RfDecisionRow {
+            ts_ms: now_ms(),
+            market: token.0.to_string(),
+            state_json: state.to_string(),
+            action_json: action.to_string(),
+        };
+        let _ = self.store_tx.try_send(StoreMsg::RfDecision(row));
+    }
+
     /// Poll the venue for fills and book each into inventory + positions + the
     /// store (`"mm"`-tagged, via the SIGNED store route so sell-to-open SHORTS
     /// persist). Makers pay 0 fee on CLOB V2.
@@ -1097,8 +1161,13 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             };
             // Authoritative signed inventory + realized/unrealized.
             let basis_before = self.inv.basis(token).0;
+            // Task 10 — RewardFarm outcome telemetry reads the realized-P&L delta
+            // this fill books (negative ⇒ adverse selection); cheap getters, only
+            // consumed in the RewardFarm-gated outcome write below.
+            let realized_before = self.inv.realized(token).0;
             self.inv.on_fill(token, signed_qty, cash);
             let basis_after = self.inv.basis(token).0;
+            let realized_after = self.inv.realized(token).0;
             // Mirror into the reporting PositionBook in lock-step: the cost-basis
             // delta tracks inventory exactly, and `qty` (the filled volume) keeps
             // the token present in `pnl` even for shorts (value comes from the
@@ -1115,8 +1184,9 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             // out-of-band estimate; folding it would inflate position P&L).
             let fill_notional_micro =
                 i128::from(px_micro) * i128::from(f.qty.0) / 1_000_000;
-            self.rebate_accrued_micro +=
+            let fill_rebate_micro =
                 i128::from(self.params.rebate_bps) * fill_notional_micro / 10_000;
+            self.rebate_accrued_micro += fill_rebate_micro;
             let row = FillRow {
                 order_id: f.order_id.0.clone(),
                 ts_ms: now_ms(),
@@ -1132,6 +1202,27 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             // SIGNED route: an ask-fill opens a SHORT (no long holdings), which
             // the strict `Fill` path would Oversell-drop — `FillSigned` persists it.
             let _ = self.store_tx.send(StoreMsg::FillSigned(row, None)).await;
+            // Task 10 — RewardFarm OUTCOME instrumentation (spec §12): the realized
+            // components of the reward signal for this fill. RewardFarm-only and
+            // fire-and-forget (`try_send` drops on a full/closed channel, never
+            // blocks). The writer correlates it to the most-recent decision for this
+            // token (`record_rf_outcome_for_latest`). Only the cheap components are
+            // filled: `rebate` (the per-fill maker-rebate estimate) and `adverse_pnl`
+            // (this fill's realized-P&L delta — negative when we were run over);
+            // `reward_score_delta` / `inv_penalty` need the §9 estimator + marks and
+            // are deferred (0 for now).
+            if self.policy == Policy::RewardFarm {
+                let outcome = RfOutcomeRow {
+                    market: token.0.to_string(),
+                    ts_ms: now_ms(),
+                    reward_score_delta_micro: 0,
+                    rebate_micro: i64::try_from(fill_rebate_micro).unwrap_or(0),
+                    adverse_pnl_micro: i64::try_from(realized_after - realized_before)
+                        .unwrap_or(0),
+                    inv_penalty_micro: 0,
+                };
+                let _ = self.store_tx.try_send(StoreMsg::RfOutcome(outcome));
+            }
         }
     }
 
@@ -2158,6 +2249,79 @@ mod tests {
         mm.quote().await;
         let bid_id1 = mm.qm.tracked().get(&(TokenId(1), Side::Bid)).cloned().expect("bid still resting");
         assert_ne!(bid_id1, bid_id0, "SpreadCapture must re-quote on a tick move (id re-keys)");
+    }
+
+    // ── RewardFarm instrumentation telemetry (Task 10, spec §12) ────────────────
+
+    /// Under RewardFarm a quote cycle emits a best-effort `RfDecision` for the
+    /// quoted token, and a consumed fill emits a best-effort `RfOutcome` — both
+    /// fire-and-forget on the SAME store channel as fills/pnl, keyed by the token
+    /// id so the writer can correlate the outcome to the decision.
+    #[tokio::test]
+    async fn rewardfarm_emits_decision_and_outcome_telemetry() {
+        let tokens = vec![TokenId(1)];
+        let (fetcher, shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        let params = mk_params(200, 5.0);
+        let (mut mm, mut store_rx, _status_rx) =
+            build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+        mm.policy = Policy::RewardFarm;
+        mm.reward_by_token.insert(TokenId(1), (1.0, 3.0));
+
+        // Cycle rests bid 0.50 / ask 0.51; logs a decision for token 1.
+        mm.quote().await;
+        // Cross the resting bid (best_ask 0.49 ≤ 0.50) so a fill is booked.
+        shared
+            .lock()
+            .unwrap()
+            .insert(TokenId(1), (cent_book(&[(48, 100 * SH)], &[(49, 100 * SH)]), true));
+        mm.consume_fills().await;
+
+        let mut decisions = Vec::new();
+        let mut outcomes = Vec::new();
+        while let Ok(msg) = store_rx.try_recv() {
+            match msg {
+                StoreMsg::RfDecision(row) => decisions.push(row),
+                StoreMsg::RfOutcome(row) => outcomes.push(row),
+                _ => {}
+            }
+        }
+        assert!(!decisions.is_empty(), "a RewardFarm quote logs a decision row");
+        let d = &decisions[0];
+        assert_eq!(d.market, "1", "decision is keyed by the token id (Spec-1 quoting unit)");
+        assert!(d.state_json.contains("adj_mid"), "state JSON carries the features");
+        assert!(d.action_json.contains("bid"), "action JSON carries the chosen quote");
+
+        assert_eq!(outcomes.len(), 1, "the consumed fill logs exactly one outcome");
+        assert_eq!(outcomes[0].market, "1", "outcome shares the token-id key for correlation");
+    }
+
+    /// Isolation LOCK: `SpreadCapture` writes NOTHING new — a full quote+fill
+    /// cycle emits zero RewardFarm telemetry (the instrumentation is gated behind
+    /// `Policy::RewardFarm`), so the legacy/arb paths are byte-for-byte unaffected.
+    #[tokio::test]
+    async fn spreadcapture_emits_no_rf_telemetry() {
+        let tokens = vec![TokenId(1)];
+        let (fetcher, shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        let params = mk_params(200, 5.0); // SpreadCapture (mk_params default)
+        let (mut mm, mut store_rx, _status_rx) =
+            build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+
+        mm.quote().await; // bid 0.49 / ask 0.51
+        shared
+            .lock()
+            .unwrap()
+            .insert(TokenId(1), (cent_book(&[(48, 100 * SH)], &[(49, 100 * SH)]), true));
+        mm.consume_fills().await;
+
+        let mut rf_msgs = 0usize;
+        while let Ok(msg) = store_rx.try_recv() {
+            if matches!(msg, StoreMsg::RfDecision(_) | StoreMsg::RfOutcome(_)) {
+                rf_msgs += 1;
+            }
+        }
+        assert_eq!(rf_msgs, 0, "SpreadCapture must emit no rf_decision/rf_outcome telemetry");
     }
 
     // ── Inventory skew (Task 4.3) ──────────────────────────────────────────────

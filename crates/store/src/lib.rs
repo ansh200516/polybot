@@ -186,6 +186,35 @@ pub struct HaltRow {
     pub detail: String,
 }
 
+/// A reward-farm DECISION row (Task 10, spec §12): the per-cycle `(state,
+/// action)` the RewardFarm policy logged for one quoting unit. `market` is an
+/// opaque TEXT key the writer correlates outcomes against (the MM keys it by
+/// token id — the Spec-1 single-token quoting unit). `state_json` / `action_json`
+/// are caller-built JSON blobs (state features + the chosen quote / skip); the
+/// store treats them as opaque text. Append-only; no Spec-1 consumer reads it.
+#[derive(Debug, Clone)]
+pub struct RfDecisionRow {
+    pub ts_ms: i64,
+    pub market: String,
+    pub state_json: String,
+    pub action_json: String,
+}
+
+/// A reward-farm OUTCOME row (Task 10, spec §12): the realized components of the
+/// reward signal for a decision. `market` is the SAME key the decision used; the
+/// writer resolves it to the most-recent `rf_decisions.id` for that market (the
+/// fire-and-forget telemetry path never returns the autoincrement id to the MM).
+/// All amounts are µUSDC; components not computed in Spec 1 are `0`.
+#[derive(Debug, Clone)]
+pub struct RfOutcomeRow {
+    pub market: String,
+    pub ts_ms: i64,
+    pub reward_score_delta_micro: i64,
+    pub rebate_micro: i64,
+    pub adverse_pnl_micro: i64,
+    pub inv_penalty_micro: i64,
+}
+
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
@@ -234,6 +263,13 @@ CREATE TABLE IF NOT EXISTS pnl_snapshots (
   strategy TEXT NOT NULL DEFAULT 'arb');
 CREATE TABLE IF NOT EXISTS halts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, reason TEXT NOT NULL, detail TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rf_decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL,
+  market TEXT NOT NULL, state_json TEXT NOT NULL, action_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rf_outcomes (
+  decision_id INTEGER NOT NULL, ts_ms INTEGER NOT NULL,
+  reward_score_delta_micro INTEGER NOT NULL, rebate_micro INTEGER NOT NULL,
+  adverse_pnl_micro INTEGER NOT NULL, inv_penalty_micro INTEGER NOT NULL);
 ";
 
 const TERMINAL_STATES: [&str; 4] = ["Filled", "Cancelled", "Rejected", "Expired"];
@@ -693,6 +729,109 @@ impl Store {
             rusqlite::params![r.ts_ms, r.reason, r.detail],
         )?;
         Ok(())
+    }
+
+    /// Append a reward-farm DECISION (Task 10, spec §12) and return its
+    /// autoincrement `id` (`last_insert_rowid()`), the handle an outcome
+    /// references. `state_json` / `action_json` are stored verbatim (opaque to
+    /// the store). Append-only instrumentation; no Spec-1 consumer reads it yet.
+    pub fn record_rf_decision(
+        &mut self,
+        ts_ms: i64,
+        market: &str,
+        state_json: &str,
+        action_json: &str,
+    ) -> Result<i64, StoreError> {
+        self.conn.execute(
+            "INSERT INTO rf_decisions (ts_ms, market, state_json, action_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![ts_ms, market, state_json, action_json],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Append a reward-farm OUTCOME (Task 10, spec §12) for an EXPLICIT
+    /// `decision_id`. All amounts are µUSDC; components not computed in Spec 1
+    /// are passed as `0`. The FK is intentionally NOT enforced (append-only
+    /// telemetry) so a late/best-effort outcome never errors the write path.
+    pub fn record_rf_outcome(
+        &mut self,
+        decision_id: i64,
+        ts_ms: i64,
+        reward_score_delta_micro: i64,
+        rebate_micro: i64,
+        adverse_pnl_micro: i64,
+        inv_penalty_micro: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO rf_outcomes (decision_id, ts_ms, reward_score_delta_micro,
+             rebate_micro, adverse_pnl_micro, inv_penalty_micro)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                decision_id,
+                ts_ms,
+                reward_score_delta_micro,
+                rebate_micro,
+                adverse_pnl_micro,
+                inv_penalty_micro
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Append a reward-farm OUTCOME attributed to the MOST RECENT decision logged
+    /// for `market`, returning whether one was found (`false` ⇒ the outcome is
+    /// dropped). This is the correlation the fire-and-forget writer path uses: the
+    /// MM never learns a decision's autoincrement id, so an outcome is tied to the
+    /// latest `rf_decisions` row for its market key. Best-effort and heuristic
+    /// (NOT a guarantee the filling order belongs to exactly that decision —
+    /// sticky quotes mean a fill can post against a quote from an earlier cycle);
+    /// it degrades cleanly to a drop after a restart, before this session's first
+    /// decision for the market lands.
+    pub fn record_rf_outcome_for_latest(
+        &mut self,
+        market: &str,
+        ts_ms: i64,
+        reward_score_delta_micro: i64,
+        rebate_micro: i64,
+        adverse_pnl_micro: i64,
+        inv_penalty_micro: i64,
+    ) -> Result<bool, StoreError> {
+        let decision_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM rf_decisions WHERE market = ?1 ORDER BY id DESC LIMIT 1",
+                [market],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        match decision_id {
+            Some(id) => {
+                self.record_rf_outcome(
+                    id,
+                    ts_ms,
+                    reward_score_delta_micro,
+                    rebate_micro,
+                    adverse_pnl_micro,
+                    inv_penalty_micro,
+                )?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Count outcomes recorded for `decision_id` (test/inspection helper).
+    pub fn count_rf_outcomes_for(&self, decision_id: i64) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM rf_outcomes WHERE decision_id = ?1",
+            [decision_id],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn count_fills(&self) -> Result<i64, StoreError> {
@@ -1751,5 +1890,87 @@ mod tests {
             (100_000_000, 44_000_000),
             "mm long untouched by arb's rolled-back sell"
         );
+    }
+
+    // ── Task 10: reward-farm instrumentation tables (feed future Spec 3) ────────
+
+    #[test]
+    fn rf_decision_and_outcome_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(&dir.path().join("rf.sqlite")).unwrap();
+        let id = s
+            .record_rf_decision(1_000, "0xcond", r#"{"mid":0.5}"#, r#"{"bid":0.49}"#)
+            .unwrap();
+        s.record_rf_outcome(id, 2_000, 12_000, 0, -3_000, -1_000).unwrap();
+        assert!(id > 0);
+        assert_eq!(s.count_rf_outcomes_for(id).unwrap(), 1);
+    }
+
+    #[test]
+    fn legacy_db_gains_rf_tables_additively() {
+        // A pre-Task-10 database lacks the rf_* tables (here only a legacy
+        // pnl_snapshots table with one row). Opening must ADD them via the
+        // additive `CREATE TABLE IF NOT EXISTS` path WITHOUT disturbing existing
+        // data — the new tables are purely additive, no migration logic needed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_rf.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pnl_snapshots (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL,
+                   cash_micro INTEGER NOT NULL, realized_micro INTEGER NOT NULL,
+                   unrealized_micro INTEGER NOT NULL, equity_micro INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pnl_snapshots
+                   (ts_ms, cash_micro, realized_micro, unrealized_micro, equity_micro)
+                 VALUES (7, 1, 2, 3, 4)",
+                [],
+            )
+            .unwrap();
+            let rf_tables: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name IN ('rf_decisions','rf_outcomes')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(rf_tables, 0, "legacy DB starts WITHOUT the rf_* tables");
+        }
+
+        // Opening creates the rf_* tables additively; they now accept rows.
+        let mut s = Store::open(&path).unwrap();
+        let id = s.record_rf_decision(1_000, "0xcond", "{}", "{}").unwrap();
+        s.record_rf_outcome(id, 2_000, 0, 0, 0, 0).unwrap();
+        assert_eq!(s.count_rf_outcomes_for(id).unwrap(), 1);
+        drop(s);
+
+        // The pre-existing legacy pnl row is intact (back-filled to 'arb').
+        let r = crate::read::ReadStore::open(&path).unwrap();
+        let arb = r.recent_pnl_by_strategy("arb", 10).unwrap();
+        assert_eq!(arb.len(), 1);
+        assert_eq!(arb[0].equity_micro, 4);
+    }
+
+    #[test]
+    fn rf_outcome_for_latest_correlates_to_newest_decision_per_market() {
+        // The writer's fire-and-forget correlation: an outcome attaches to the
+        // MOST RECENT decision for its market key (the MM never learns the id).
+        let mut s = Store::open_in_memory().unwrap();
+        let _a1 = s.record_rf_decision(1, "A", "{}", "{}").unwrap();
+        let b1 = s.record_rf_decision(2, "B", "{}", "{}").unwrap();
+        let a2 = s.record_rf_decision(3, "A", "{}", "{}").unwrap();
+
+        // "A" → A's LATEST decision (a2), never the earlier a1 or the other market.
+        assert!(s.record_rf_outcome_for_latest("A", 4, 0, 5, -2, 0).unwrap());
+        assert_eq!(s.count_rf_outcomes_for(a2).unwrap(), 1);
+        assert_eq!(s.count_rf_outcomes_for(_a1).unwrap(), 0);
+        assert_eq!(s.count_rf_outcomes_for(b1).unwrap(), 0);
+
+        // A market with no decision yet → the outcome is dropped (Ok(false)).
+        assert!(!s.record_rf_outcome_for_latest("ZZZ", 5, 0, 0, 0, 0).unwrap());
     }
 }
