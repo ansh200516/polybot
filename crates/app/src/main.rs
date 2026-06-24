@@ -220,6 +220,65 @@ async fn build_confluence(
     top_trader_markets(&client, &params).await
 }
 
+/// LIVE inventory-seed reconcile. The SQLite seed (`store.open_positions`) can
+/// carry STALE lots — paper fills and prior sessions whose markets have since
+/// RESOLVED (the bot never recorded the resolution). Seeding those on a live run
+/// makes the long-only MM post asks to sell tokens it does NOT actually hold, and
+/// the CLOB rejects every one (`balance: 0`) on each cycle. So keep only seed
+/// tokens the DEPOSIT WALLET really holds AND that are still tradeable
+/// (`!redeemable && size > 0`, via the public Data API), CLAMPED to the real
+/// on-chain size; drop the rest. Returns `Err` on any fetch failure so the caller
+/// seeds FLAT — bid-only is safe; a phantom ask is not.
+async fn reconcile_seed_against_chain(
+    seed: &[(pm_core::instrument::TokenId, i128, pm_core::num::Usdc)],
+    deposit_wallet: alloy_primitives::Address,
+    reg: &pm_registry::Registry,
+) -> Result<Vec<(pm_core::instrument::TokenId, i128, pm_core::num::Usdc)>, String> {
+    if seed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let client = DataApiClient::new(None).map_err(|e| e.to_string())?;
+    // The Data API keys positions by the lowercased on-chain address.
+    let positions = client
+        .positions(&deposit_wallet.to_string().to_lowercase(), 0.0)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(reconcile_seed_with_positions(seed, &positions, reg))
+}
+
+/// Pure seed↔positions reconcile (no I/O), split out of
+/// [`reconcile_seed_against_chain`] for unit testing. Keeps only seed tokens the
+/// wallet still holds AND can trade (`!redeemable && size > 0`), clamped to the
+/// real on-chain size, with the cost basis scaled down to the clamped size.
+fn reconcile_seed_with_positions(
+    seed: &[(pm_core::instrument::TokenId, i128, pm_core::num::Usdc)],
+    positions: &[pm_ingestion::data_api::Position],
+    reg: &pm_registry::Registry,
+) -> Vec<(pm_core::instrument::TokenId, i128, pm_core::num::Usdc)> {
+    // Real, still-tradeable holdings: venue token id (`asset`) -> size in shares.
+    let real: std::collections::HashMap<&str, f64> = positions
+        .iter()
+        .filter(|p| !p.redeemable && p.size > 0.0)
+        .map(|p| (p.asset.as_str(), p.size))
+        .collect();
+    seed.iter()
+        .filter_map(|(tok, net, cost)| {
+            let vid = reg.token_venue_id(*tok)?;
+            let &real_size = real.get(vid)?; // not held on-chain → drop the stale lot
+            let real_net_micro = (real_size * 1e6) as i128;
+            // Clamp to the real holding; a non-positive result (short/zero) drops —
+            // we can only ASK against tokens we genuinely hold.
+            let clamped = (*net).min(real_net_micro);
+            if clamped <= 0 {
+                return None;
+            }
+            // Scale the cost basis to the clamped size (net > 0 here → safe divide).
+            let scaled_cost = pm_core::num::Usdc(cost.0.saturating_mul(clamped) / *net);
+            Some((*tok, clamped, scaled_cost))
+        })
+        .collect()
+}
+
 /// Advisory soft ceiling (USD) for a LIVE market-maker capital slice (Task 4.5).
 /// Live MM is a tiny canary, so a slice above this almost certainly is NOT
 /// intended for a first live run and earns a loud WARN. It is NOT a hard cap —
@@ -845,6 +904,10 @@ async fn main() {
     // MM is wired — so MM's LiveVenue is identical to arb's with NO second key
     // derivation. Stays `None` on the paper arm (and whenever MM is paper).
     let mut mm_live_inputs: Option<MmLiveInputs> = None;
+    // Capture the deposit-wallet address BEFORE `live_rt` is consumed below — the
+    // MM's live seed reconcile (further down) reads its on-chain holdings. `Some`
+    // iff this is a live run.
+    let live_deposit_wallet = live_rt.as_ref().map(|(_, _, _, dw)| *dw);
     // Both arms produce the same ExecTaskBuilder so the binding unifies.
     let exec_builder: ExecTaskBuilder = if let Some((secrets, signer, proxy, deposit_wallet)) =
         live_rt
@@ -1397,7 +1460,7 @@ async fn main() {
         // flat. The writer `store` was moved into the writer task, so read via a
         // second read-only WAL connection. Scoped to strategy "mm" and to tokens
         // we will quote, so a held position is actually worked off.
-        let mm_seed: Vec<(pm_core::instrument::TokenId, i128, pm_core::num::Usdc)> =
+        let db_seed: Vec<(pm_core::instrument::TokenId, i128, pm_core::num::Usdc)> =
             pm_store::read::ReadStore::open(Path::new(&config.store.path))
                 .and_then(|rs| rs.open_positions())
                 .map(|rows| {
@@ -1413,6 +1476,31 @@ async fn main() {
                     warn!("MM inventory reload failed (starting flat): {e}");
                     Vec::new()
                 });
+        // LIVE seed reconcile: the DB seed can carry STALE lots (paper fills +
+        // prior sessions whose markets RESOLVED). Seeding those makes the
+        // long-only MM ask for tokens it does not hold → the CLOB rejects every
+        // one ("balance: 0"). So on a live run, keep only what the deposit wallet
+        // really holds + is still tradeable (clamped); a fetch failure seeds FLAT.
+        // Paper runs keep the DB seed as-is.
+        let mm_seed = match live_deposit_wallet {
+            Some(dw) => match reconcile_seed_against_chain(&db_seed, dw, &reg).await {
+                Ok(reconciled) => {
+                    info!(
+                        db_lots = db_seed.len(),
+                        kept = reconciled.len(),
+                        "MM live seed reconciled vs deposit-wallet on-chain positions (stale/resolved lots dropped)"
+                    );
+                    reconciled
+                }
+                Err(e) => {
+                    warn!(
+                        "MM live seed reconcile failed ({e}); seeding FLAT (bid-only is safe, a phantom ask is not)"
+                    );
+                    Vec::new()
+                }
+            },
+            None => db_seed,
+        };
         for (tok, net, cost) in &mm_seed {
             info!(
                 token = tok.0,
@@ -1977,5 +2065,77 @@ mod tests {
             ..base
         };
         assert_eq!(live_exec_params(&base_hold).redeem, RedeemStrategy::Hold);
+    }
+
+    /// The live seed reconcile keeps only tokens the wallet still holds AND can
+    /// trade, clamped to the real size (cost scaled), and drops everything else.
+    /// The empty-positions case is the user's: every stale lot drops → seed FLAT.
+    #[test]
+    fn reconcile_seed_keeps_only_real_tradeable_holdings() {
+        use pm_core::num::{TickSize, Usdc};
+        let mut b = pm_registry::RegistryBuilder::default();
+        for (c, y) in [
+            ("0xc1", "tok_keep"),
+            ("0xc2", "tok_redeem"),
+            ("0xc3", "tok_absent"),
+            ("0xc4", "tok_clamp"),
+            ("0xc5", "tok_short"),
+        ] {
+            b.add_market(
+                c,
+                y,
+                &format!("{y}_no"),
+                TickSize::Cent,
+                0,
+                false,
+                None,
+                true,
+                false,
+                None,
+            );
+        }
+        let reg = b.finish("").unwrap();
+        let tid = |v: &str| reg.venue_token_id(v).unwrap();
+        let pos = |asset: &str, size: f64, redeemable: bool| pm_ingestion::data_api::Position {
+            condition_id: String::new(),
+            asset: asset.to_string(),
+            size,
+            outcome: String::new(),
+            outcome_index: 0,
+            cur_price: 0.0,
+            redeemable,
+        };
+
+        let seed = vec![
+            (tid("tok_keep"), 10_000_000i128, Usdc(5_000_000)), // exact hold → kept as-is
+            (tid("tok_redeem"), 10_000_000, Usdc(5_000_000)),   // resolved → drop
+            (tid("tok_absent"), 10_000_000, Usdc(5_000_000)),   // not on-chain → drop
+            (tid("tok_clamp"), 20_000_000, Usdc(8_000_000)),    // seed 20 > real 12 → clamp
+            (tid("tok_short"), -10_000_000, Usdc(0)),           // short → drop
+        ];
+        let positions = vec![
+            pos("tok_keep", 10.0, false),
+            pos("tok_redeem", 10.0, true), // redeemable ⇒ not tradeable
+            pos("tok_clamp", 12.0, false), // real 12 < seed 20
+            pos("tok_short", 10.0, false), // held, but the seed lot is a short
+        ];
+
+        let out = reconcile_seed_with_positions(&seed, &positions, &reg);
+        let m: std::collections::HashMap<_, _> =
+            out.iter().map(|(t, n, c)| (*t, (*n, c.0))).collect();
+        assert_eq!(out.len(), 2, "only the two real, tradeable longs survive");
+        // Exact hold: net + cost unchanged.
+        assert_eq!(m.get(&tid("tok_keep")), Some(&(10_000_000i128, 5_000_000i128)));
+        // Clamp: net→12M; cost scales 8M * 12/20 = 4.8M.
+        assert_eq!(m.get(&tid("tok_clamp")), Some(&(12_000_000i128, 4_800_000i128)));
+        assert!(!m.contains_key(&tid("tok_redeem")));
+        assert!(!m.contains_key(&tid("tok_absent")));
+        assert!(!m.contains_key(&tid("tok_short")));
+
+        // The user's account: no live holdings match → every lot drops → seed FLAT.
+        assert!(
+            reconcile_seed_with_positions(&seed, &[], &reg).is_empty(),
+            "no on-chain holdings ⇒ bid-only flat seed"
+        );
     }
 }
