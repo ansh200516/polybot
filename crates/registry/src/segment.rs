@@ -261,6 +261,14 @@ mod tests {
         };
         assert!(m.reward_eligible());
         assert!(!MarketMetrics::default().reward_eligible());
+        // AND-boundary: a positive scoring band ALONE (zero rate) is ineligible,
+        // so a future `||` typo in `reward_eligible` would fail here.
+        let band_only = MarketMetrics {
+            reward_max_spread_cents: 3.0,
+            reward_daily_rate_usd: 0.0,
+            ..MarketMetrics::default()
+        };
+        assert!(!band_only.reward_eligible());
     }
 
     #[test]

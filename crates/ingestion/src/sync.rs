@@ -1569,6 +1569,54 @@ mod tests {
         );
     }
 
+    /// End-to-end coverage of the CLOB→metrics REWARD mapping (Task 2): a
+    /// reward-bearing CLOB market must thread `rewards.{min_size, max_spread,
+    /// daily_rate}` into the registry's [`MarketMetrics`] with the CORRECT field
+    /// correspondence. The three values are distinct, so a silent field-swap
+    /// (e.g. `reward_max_spread_cents = clob.rewards.min_size`) fails an assert.
+    #[test]
+    fn assemble_records_reward_metrics_from_clob() {
+        use pm_registry::gamma::{ClobRewardRate, ClobRewards};
+
+        let ev = make_event("ev_rw", "0xrw", "y_rw", "n_rw", false, true);
+
+        // A reward-bearing CLOB market. `make_clob` leaves `rewards` all-zero;
+        // its `rewards` field is `pub`, so set it without touching `ClobSpec`.
+        let mut clob = make_clob(ClobSpec {
+            condition_id: "0xrw",
+            tick: 0.01,
+            taker_fee: 0,
+            active: true,
+            closed: false,
+            neg_risk: false,
+            yes_token: "y_rw",
+            no_token: "n_rw",
+        });
+        clob.rewards = ClobRewards {
+            max_spread: 3.0,
+            min_size: 100.0,
+            rates: Some(vec![ClobRewardRate {
+                rewards_daily_rate: 50.0,
+            }]),
+        };
+
+        let mut clob_by_condition = HashMap::new();
+        clob_by_condition.insert("0xrw".to_string(), clob);
+
+        let universe =
+            assemble_registry(&[ev], &clob_by_condition, "", &UniverseFilter::default()).unwrap();
+        let reg = &universe.registry;
+
+        // Resolve condition → id → metrics (mirrors the SPAIN/FED/IRAN test).
+        let id = reg.market_by_condition("0xrw").unwrap().id;
+        let m = reg.metrics(id).unwrap();
+        // Exact mapping with distinct values: a field-swap fails one of these.
+        assert_eq!(m.reward_max_spread_cents, 3.0);
+        assert_eq!(m.reward_min_size, 100.0);
+        assert_eq!(m.reward_daily_rate_usd, 50.0);
+        assert!(m.reward_eligible());
+    }
+
     // ---- Test 7: keyset envelope parser ------------------------------------
 
     #[test]
