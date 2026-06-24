@@ -1395,31 +1395,70 @@ async fn main() {
                 })
                 .collect();
             let eligible = cands.len();
+            // Per-market cost diagnostics, computed BEFORE the budget fit (which
+            // consumes `cands`). `reward_eligible()` already guarantees
+            // `daily_rate > 0`, so the ONLY non-budget drop inside
+            // `select_reward_markets` is `per_market_cost == 0` — a degenerate
+            // `reward_min_size`. Surfacing that count (vs. budget drops) and the
+            // cheapest POSITIVE cost lets an operator see WHY funding is low.
+            let unfundable_zero_cost =
+                cands.iter().filter(|(_, _, _, cost)| *cost <= 0.0).count();
+            let cheapest_cost = cands
+                .iter()
+                .map(|&(_, _, _, cost)| cost)
+                .filter(|c| *c > 0.0)
+                .reduce(f64::min);
             let picked = pm_app::strategy::quote_policy::select_reward_markets(
                 cands,
                 config.strategies.mm.capital_usd,
             );
+            // Hardened: ids round-trip from `MarketId(u32)` → u64 and back, so the
+            // narrowing is safe today, but `try_from` makes a future widening of
+            // `MarketId` fail loudly instead of silently truncating.
             let selected: Vec<pm_core::instrument::MarketId> = picked
                 .into_iter()
-                .map(|id| pm_core::instrument::MarketId(id as u32))
+                .map(|id| {
+                    pm_core::instrument::MarketId(u32::try_from(id).expect("market id fits u32"))
+                })
                 .collect();
-            // `reward_farm.min_markets` is ADVISORY: quote whatever is eligible +
-            // funded, never synthesize (spec §7). Under-shooting only warns.
-            if (selected.len() as u32) < config.reward_farm.min_markets {
-                warn!(
-                    eligible,
-                    funded = selected.len(),
-                    min_markets = config.reward_farm.min_markets,
-                    budget_usd = config.strategies.mm.capital_usd,
-                    "MM reward-farm: fewer funded markets than reward_farm.min_markets — quoting what is eligible (no synthesis)"
-                );
-            }
+            let funded = selected.len();
+            let budget = config.strategies.mm.capital_usd;
+            // Always record the full breakdown: eligible vs funded, and WHY the
+            // rest dropped (degenerate zero-cost vs budget).
             info!(
                 eligible,
-                funded = selected.len(),
-                budget_usd = config.strategies.mm.capital_usd,
+                funded,
+                unfundable_zero_cost,
+                budget_usd = budget,
+                cheapest_cost_usd = ?cheapest_cost,
                 "MM reward-farm selection: reward-eligible markets ranked by edge=daily_rate/competing_depth (competing_depth=1.0, mid=0.5 at selection time), budget-capped"
             );
+            // Funding nothing — or fewer than `reward_farm.min_markets` — is a
+            // budget/min_size ECONOMICS issue, not a bug (`min_markets` is
+            // advisory; we never synthesize, spec §7). Spell out the likely fix so
+            // the operator isn't left guessing why the MM quotes (almost) nothing.
+            if funded == 0 || funded < config.reward_farm.min_markets as usize {
+                let min_markets = config.reward_farm.min_markets;
+                match cheapest_cost {
+                    Some(c) => warn!(
+                        eligible,
+                        funded,
+                        unfundable_zero_cost,
+                        min_markets,
+                        budget_usd = budget,
+                        cheapest_cost_usd = c,
+                        "MM reward-farm funded {funded} markets (eligible {eligible}, budget ${budget:.2}, cheapest per-market cost ~${c:.2}) — capital_usd too small for the per-market cost; increase capital_usd or target lower-min_size markets"
+                    ),
+                    None => warn!(
+                        eligible,
+                        funded,
+                        unfundable_zero_cost,
+                        min_markets,
+                        budget_usd = budget,
+                        "MM reward-farm: no fundable reward-eligible markets (eligible {eligible}, {unfundable_zero_cost} with per_market_cost == 0 / degenerate reward_min_size) — nothing to quote; check rewards data and target positive-min_size reward markets"
+                    ),
+                }
+            }
             selected
         } else {
             // SPREAD-CAPTURE (Task 5.2 per-segment routing) — UNCHANGED.
