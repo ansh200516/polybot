@@ -33,9 +33,9 @@ use pm_app::strategy::mm::{MmFillsSource, MmLive, MmParams, MmStrategy};
 use pm_app::strategy::stub::HeartbeatStrategy;
 use pm_app::strategy::StrategyId;
 use pm_app::wiring::{
-    BookFetcher, PlatformEnvelopes, build_component_index, directional_quote_tokens, engine_params,
-    fee_map, inventory_config, mm_allowed_segments, mm_market_selection, mm_use_live,
-    pack_components, risk_config, segment_thresholds, strategy_envelopes, token_maps, user_ws_url,
+    BookFetcher, PlatformEnvelopes, build_component_index, engine_params, fee_map, inventory_config,
+    mm_allowed_segments, mm_market_selection, mm_quote_tokens, mm_use_live, pack_components,
+    risk_config, segment_thresholds, strategy_envelopes, token_maps, user_ws_url,
 };
 use pm_config::Config;
 use pm_core::instrument::Relationship;
@@ -1521,10 +1521,14 @@ async fn main() {
             String,
             (pm_core::instrument::TokenId, pm_core::num::TickSize),
         > = HashMap::new();
-        // CONFLUENCE directional: when the confluence universe is active we quote
-        // ONLY the favored outcome per market (the side the top traders hold — a
-        // directional lean). With no confluence the set is empty and
-        // `directional_quote_tokens` returns BOTH sides (the normal MM universe).
+        // TOKEN SELECTION per market (`mm_quote_tokens`):
+        //  * reward_farm (spec §9) — a SINGLE token (the `yes` outcome): Spec 1 is
+        //    single-token two-sided quoting; the complement is a Spec-2 hedging
+        //    concern. Mapping both would under-budget each market 2× (per_market_cost
+        //    is 2 orders on ONE token) and double-count its reward pool in the
+        //    per-token estimator.
+        //  * confluence — ONLY the favored outcome (the side the top traders hold).
+        //  * neither — BOTH sides (the normal spread-capture MM universe).
         // Either way we still REGISTER + WS-resolve BOTH tokens on the venue so a
         // stray fill on the unquoted side always resolves to a known token.
         for &mid in &mm_markets {
@@ -1533,7 +1537,7 @@ async fn main() {
             if mm_live && let Some(cid) = reg.market_condition(m.id) {
                 mm_condition_ids.push(cid.to_string());
             }
-            let quote_toks = directional_quote_tokens(&reg, &m, &favored_venue_ids);
+            let quote_toks = mm_quote_tokens(&reg, &m, &favored_venue_ids, reward_farm_mode);
             for tok in [m.yes, m.no] {
                 if let Some(vid) = reg.token_venue_id(tok) {
                     if mm_live {

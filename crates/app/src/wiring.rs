@@ -364,6 +364,34 @@ pub fn directional_quote_tokens(
         .collect()
 }
 
+/// The token(s) the MARKET MAKER quotes for `market`, by policy:
+///
+/// * `reward_farm_mode` ⇒ a SINGLE token — the `yes` outcome. Spec §9 scopes
+///   Spec 1 to **single-token two-sided quoting** (bid + ask on ONE token);
+///   quoting the complement (`no`) is a Spec-2 hedging concern. This keeps the
+///   selection's `per_market_cost` (2 orders on the one quoted token) honest and
+///   stops the per-token reward estimator from double-counting a market's single
+///   reward pool across both of its tokens.
+/// * otherwise ⇒ [`directional_quote_tokens`] unchanged — the confluence-favored
+///   side, or BOTH sides when confluence is off (the normal spread-capture
+///   universe).
+///
+/// Either way the caller still REGISTERS both outcome tokens on the venue so a
+/// stray fill on the unquoted side resolves to a known token; this governs only
+/// which tokens the MM actively QUOTES.
+pub fn mm_quote_tokens(
+    reg: &Registry,
+    market: &Market,
+    favored_venue_ids: &HashSet<String>,
+    reward_farm_mode: bool,
+) -> Vec<TokenId> {
+    if reward_farm_mode {
+        vec![market.yes]
+    } else {
+        directional_quote_tokens(reg, market, favored_venue_ids)
+    }
+}
+
 /// Everything a detector needs about one connected component.
 pub struct ComponentEntry {
     pub markets: Vec<Market>,
@@ -929,6 +957,33 @@ mod tests {
             .into_iter()
             .collect();
         assert!(directional_quote_tokens(&r, m, &fav_other).is_empty());
+    }
+
+    #[test]
+    fn mm_quote_tokens_reward_farm_single_token_else_directional() {
+        let r = reg();
+        let m = r.market_by_condition("0xa").unwrap();
+
+        // REWARD-FARM (spec §9, single-token two-sided): exactly ONE token — the
+        // `yes` outcome — EVEN with confluence off (empty favored set). The
+        // complement `no` is NOT quoted (it would 2× the budget and double-count
+        // the reward pool in the per-token estimator).
+        let rf = mm_quote_tokens(&r, m, &HashSet::new(), true);
+        assert_eq!(rf, vec![m.yes], "reward_farm quotes a single (yes) token");
+        assert!(!rf.contains(&m.no), "reward_farm must NOT quote the complement");
+
+        // SPREAD-CAPTURE (reward_farm_mode = false), confluence off → BOTH sides,
+        // identical to `directional_quote_tokens` (the path is unchanged).
+        assert_eq!(
+            mm_quote_tokens(&r, m, &HashSet::new(), false),
+            vec![m.yes, m.no],
+            "spread_capture still maps both outcome tokens"
+        );
+
+        // SPREAD-CAPTURE with a favored side still delegates to directional → the
+        // favored token only (confluence lean preserved).
+        let fav_yes: HashSet<String> = ["ya".to_string()].into_iter().collect();
+        assert_eq!(mm_quote_tokens(&r, m, &fav_yes, false), vec![m.yes]);
     }
 
     #[test]
