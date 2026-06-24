@@ -680,7 +680,8 @@ pub struct RewardFarm {
     pub sample_interval_ms: u64,
     /// Minimum reward-eligible markets to quote.
     pub min_markets: u32,
-    /// Book levels used for microprice + imbalance.
+    /// Book levels summed for the order-book IMBALANCE depth. (The microprice
+    /// fair value itself is strictly top-of-book; this knob does not widen it.)
     pub microprice_levels: u16,
     /// Rolling window (ms) for the momentum signal.
     pub signal_window_ms: u64,
