@@ -760,6 +760,7 @@ mod tests {
             volume_24hr: None,
             liquidity: Some(liquidity),
             category: None,
+            ..Default::default()
         });
     }
 
@@ -796,6 +797,7 @@ mod tests {
             volume_24hr: None,
             liquidity: Some(liquidity),
             category: None,
+            ..Default::default()
         });
     }
 

@@ -51,6 +51,26 @@ pub struct MarketMetrics {
     /// carry no explicit category — see `gamma::GammaMarket::category`). Exposed
     /// so 5.2 routing can branch on it if a future feed provides it.
     pub category: Option<String>,
+    /// Reward-program minimum order size (shares); `0.0` = none. Mirrors the
+    /// CLOB market's `rewards.min_size` (sourced from CLOB, not Gamma).
+    pub reward_min_size: f64,
+    /// Reward scoring-band half-width: the max distance (cents) from the
+    /// adjusted mid that still scores; `0.0` = ineligible. Mirrors the CLOB
+    /// market's `rewards.max_spread`.
+    pub reward_max_spread_cents: f64,
+    /// Configured reward rate (USD/day); `0.0` = ineligible. The summed CLOB
+    /// `rewards.rates` daily rates (see `gamma::ClobRewards::daily_rate_usd`).
+    pub reward_daily_rate_usd: f64,
+}
+
+impl MarketMetrics {
+    /// Whether this market is in the liquidity-reward program: a positive
+    /// scoring band AND a positive configured rate. Mirrors the CLOB
+    /// `gamma::ClobRewards::is_eligible` check, carried into the per-market
+    /// metrics so the strategy can gate on it without re-reading CLOB data.
+    pub fn reward_eligible(&self) -> bool {
+        self.reward_max_spread_cents > 0.0 && self.reward_daily_rate_usd > 0.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +247,20 @@ mod tests {
             liquidity,
             volume_24hr: None,
             category: None,
+            ..MarketMetrics::default()
         }
+    }
+
+    #[test]
+    fn market_metrics_carries_reward_params() {
+        let m = MarketMetrics {
+            reward_min_size: 100.0,
+            reward_max_spread_cents: 3.0,
+            reward_daily_rate_usd: 50.0,
+            ..MarketMetrics::default()
+        };
+        assert!(m.reward_eligible());
+        assert!(!MarketMetrics::default().reward_eligible());
     }
 
     #[test]

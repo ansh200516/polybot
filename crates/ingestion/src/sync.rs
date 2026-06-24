@@ -258,8 +258,14 @@ fn add_accepted_market(
         event_key,
     );
     // Phase-5 segmentation: capture the per-market Gamma liquidity metrics
-    // (with the event-level fallback — see `market_metrics`).
-    builder.record_market_metrics(market_metrics(gm, event));
+    // (with the event-level fallback — see `market_metrics`). The liquidity-
+    // reward params come from the CLOB market (`clob.rewards`), not Gamma, so
+    // they are set here where the fetched `ClobMarket` is in scope.
+    let mut metrics = market_metrics(gm, event);
+    metrics.reward_min_size = clob.rewards.min_size;
+    metrics.reward_max_spread_cents = clob.rewards.max_spread;
+    metrics.reward_daily_rate_usd = clob.rewards.daily_rate_usd();
+    builder.record_market_metrics(metrics);
 }
 
 /// Build the Phase-5 [`MarketMetrics`] for a market, falling back to its EVENT's
@@ -283,6 +289,10 @@ fn market_metrics(gm: &GammaMarket, event: &GammaEvent) -> MarketMetrics {
             .or(event.liquidity_clob)
             .or(event.liquidity),
         category: gm.category.clone(),
+        // Reward-program params are NOT in the Gamma feed; they come from the
+        // CLOB market and are set by the caller (`add_accepted_market`), where
+        // the fetched `ClobMarket` is in scope. Default to 0 (= ineligible) here.
+        ..Default::default()
     }
 }
 

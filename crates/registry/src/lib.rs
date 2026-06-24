@@ -617,6 +617,7 @@ mod tests {
             volume_24hr: Some(40_000.0),
             liquidity: Some(250_000.0),
             category: None,
+            ..MarketMetrics::default()
         });
         // Thin market (no metrics recorded → all None).
         b.add_market(
