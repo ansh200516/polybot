@@ -907,6 +907,15 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     /// Re-armed each time the live signal endangers the side, read each cycle;
     /// RewardFarm-only (SpreadCapture never inserts or reads it).
     pulled_until: HashMap<(TokenId, Side), i64>,
+    /// RewardFarm Phase-A (spec §4) TUI surfacing: the strongest-magnitude blended
+    /// adverse signal seen on the most recent [`quote`](Self::quote) cycle, folded
+    /// into the next [`RewardFarmStatus`] sample so the dashboard's "rew" line
+    /// shows the live pull pressure. `0.0` under SpreadCapture (never sampled).
+    last_signal: f64,
+    /// RewardFarm Phase-A (spec §4) TUI surfacing: whether the most recent quote
+    /// cycle PULLED any side. Folded into [`RewardFarmStatus::pulled`] for the
+    /// dashboard's "rew" PULL indicator. `false` under SpreadCapture.
+    last_pulled: bool,
 }
 
 /// Read BOTH arms of the persistent UTC-day loss gate for `"mm"` on `utc_day`,
@@ -1006,6 +1015,11 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 let mut st = self.sample_reward_estimate().await;
                 self.reward_cumulative_est += st.est_reward_usd_day;
                 st.cumulative_est = self.reward_cumulative_est;
+                // Phase-A TUI surfacing (Task A7): carry the latest cycle's
+                // adverse signal + pull state into the published status so the
+                // dashboard "rew" line shows the live pull pressure.
+                st.signal = self.last_signal;
+                st.pulled = self.last_pulled;
                 self.reward_status = Some(st);
                 self.last_reward_sample = Some(now);
             }
@@ -1043,6 +1057,11 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             HashMap::new()
         };
         let mut desired: Vec<MakerOrder> = Vec::new();
+        // Phase-A TUI surfacing (Task A7): track the strongest-magnitude blended
+        // signal + whether any side was pulled THIS cycle, folded into the reward
+        // status sample so the dashboard's "rew" line shows the live pull pressure.
+        let mut cycle_signal = 0.0_f64;
+        let mut cycle_pulled = false;
         for token in tokens {
             // Need a VALID two-sided book; skip the token otherwise.
             let fetched = self.fetcher.fetch(token).await;
@@ -1172,6 +1191,13 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                     }
                 }
             }
+            // Phase-A TUI surfacing (Task A7): remember the strongest blended
+            // signal + any pull for the "rew" line (inert under SpreadCapture:
+            // `sig_blend` stays 0 and the pull flags stay false there).
+            if sig_blend.abs() >= cycle_signal.abs() {
+                cycle_signal = sig_blend;
+            }
+            cycle_pulled |= pull_bid || pull_ask;
             if bid.is_none() && ask.is_none() {
                 let bb = book.bids.best().map(|p| p.get());
                 let ba = book.asks.best().map(|p| p.get());
@@ -1309,6 +1335,11 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 }
             }
         }
+        // Phase-A TUI surfacing (Task A7): publish this cycle's signal/pull state
+        // onto the loop so the next reward-status sample carries it to the "rew"
+        // line. Inert for SpreadCapture (it never samples a reward status).
+        self.last_signal = cycle_signal;
+        self.last_pulled = cycle_pulled;
         // QuoteManager leaves consistent state on error and the next tick
         // retries (reconnect orchestration is the Task-3.5/4.5 seam). Record
         // placements even on a PARTIAL error: `reconcile` only ever tracks
@@ -1747,6 +1778,10 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             balance_ratio,
             // The caller adds this sample to (and copies in) the session total.
             cumulative_est: 0.0,
+            // The caller overwrites these from the loop's latest quote cycle
+            // (Phase-A TUI surfacing); the scorer itself has no signal context.
+            signal: 0.0,
+            pulled: false,
         }
     }
 
@@ -1975,6 +2010,8 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
         reward_cumulative_est: 0.0,
         signals: HashMap::new(),
         pulled_until: HashMap::new(),
+        last_signal: 0.0,
+        last_pulled: false,
     };
     if start_paused {
         tracing::info!("mm: live held — quoting PAUSED until release (press `l`)");
@@ -2226,6 +2263,8 @@ mod tests {
             reward_cumulative_est: 0.0,
             signals: HashMap::new(),
             pulled_until: HashMap::new(),
+            last_signal: 0.0,
+            last_pulled: false,
         };
         (mm, store_rx, status_rx)
     }
@@ -3252,6 +3291,173 @@ mod tests {
         );
     }
 
+    // ── Task A7: integration A/B — quote-pull lowers adverse fills (spec §4) ────
+
+    /// Per-run outcome of [`reward_farm_pull_reduces_adverse_fills_on_adverse_feed`]'s
+    /// scripted feed: the ASK-fill count plus, per phase, whether each side was
+    /// QUOTING (tracked) right after that cycle's `quote()` — captured BEFORE
+    /// fills settle so a same-cycle full fill can't mask a side that WAS quoted.
+    struct AdverseRun {
+        /// Total ASK ("Sell") fills booked across the whole feed (the proxy).
+        ask_fills: u32,
+        /// Per adverse cycle: was the ASK still quoting after `quote()`?
+        ask_quoting_adverse: Vec<bool>,
+        /// Per adverse cycle: was the (safe) BID still quoting after `quote()`?
+        bid_quoting_adverse: Vec<bool>,
+        /// Per balanced cycle: was the ASK quoting after `quote()`?
+        ask_quoting_balanced: Vec<bool>,
+    }
+
+    /// Integration A/B proving the Phase-A quote-pull (Task A5) reduces adverse
+    /// selection on a synthetic *adverse* feed. Two RewardFarm loops run the SAME
+    /// scripted book sequence with the paper taker-fill sim ON; the ONLY
+    /// difference is `pull_threshold`:
+    ///   * pull-ON  (0.3): the blended signal clears the threshold during the
+    ///     adverse up-move ⇒ the endangered ASK is pulled.
+    ///   * pull-OFF (1.0): `combined_signal = (imbalance + clamp(momentum))/2` is
+    ///     HALVED, so on this feed it tops out well under 1.0 ⇒ the ASK is NEVER
+    ///     pulled (the spec's "pull effectively off" arm).
+    ///
+    /// SIGNAL SETUP (the implementer's job, spec note): `combined_signal` averages
+    /// imbalance + momentum, so a coherent pull needs BOTH. The feed scripts a
+    /// balanced phase (imbalance 0, flat microprice ⇒ momentum 0 ⇒ no pull), then
+    /// a strongly bid-imbalanced + upward-trending phase: heavy bid depth BEHIND a
+    /// balanced 100-share touch (⇒ summed top-3 imbalance ~0.9) while the whole
+    /// book ticks UP one cent per cycle (⇒ the size-weighted microprice rises ⇒
+    /// positive momentum). Blended ⇒ signal ~0.45 (clears 0.3, far below 1.0).
+    ///
+    /// PROXY (cleanest the paper harness measures): ASK ("Sell") fill COUNT. Both
+    /// runs take IDENTICAL ask fills in the balanced phase (neither pulls); then
+    /// pull-ON takes ZERO further ask fills in the adverse phase (ask omitted)
+    /// while pull-OFF keeps resting the ask into the up-move and is repeatedly
+    /// lifted — so pull-ON ends with STRICTLY FEWER adverse ask fills (less
+    /// adverse exposure). Asserted as `pull_on_ask_fills < pull_off_ask_fills`.
+    #[tokio::test]
+    async fn reward_farm_pull_reduces_adverse_fills_on_adverse_feed() {
+        const N_BAL: usize = 2; // balanced cycles
+        const N_ADV: usize = 5; // adverse (bid-heavy, rising) cycles
+
+        // Balanced book: symmetric top-3 depth ⇒ imbalance 0; equal touch sizes
+        // pin the microprice flat at 0.505 across cycles ⇒ momentum 0 ⇒ no pull.
+        fn balanced() -> Book {
+            cent_book(
+                &[(50, 100 * SH), (49, 100 * SH), (48, 100 * SH)],
+                &[(51, 100 * SH), (52, 100 * SH), (53, 100 * SH)],
+            )
+        }
+        // Adverse cycle k: heavy bid depth BEHIND a 100-share touch (⇒ summed
+        // top-3 imbalance ~0.9) with the whole book ticked UP one cent per cycle
+        // (⇒ the size-weighted microprice rises 0.505→… ⇒ positive momentum). The
+        // 100-share touch keeps the microprice ON the mid so momentum comes purely
+        // from the rising price, and the depth behind it drives the imbalance.
+        fn adverse(k: u16) -> Book {
+            cent_book(
+                &[(50 + k, 100 * SH), (49 + k, 1000 * SH), (48 + k, 1000 * SH)],
+                &[(51 + k, 100 * SH)],
+            )
+        }
+
+        async fn run_adverse_feed(pull_threshold: f64) -> AdverseRun {
+            let token = TokenId(1);
+            let tokens = vec![token];
+            let (fetcher, shared) =
+                controllable_fetcher(&tokens, HashMap::from([(token, (balanced(), true))]));
+            let mut params = mk_params(200, 5.0);
+            params.policy = Policy::RewardFarm;
+            params.pull_threshold = pull_threshold;
+            // The adverse signal re-fires EVERY adverse cycle, so a 0 cooldown
+            // keeps the proxy a clean function of the live feed (not a lingering
+            // cooldown) — the cooldown's own effect is covered by its dedicated test.
+            params.pull_cooldown_ms = 0;
+            // Steady taker flow so a RESTING side actually fills each cycle.
+            params.paper_taker_fill_pct = 25;
+            let (mut mm, mut store_rx, _produced) =
+                build_loop_tally(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+            // A funded, eligible reward market: min_incentive_size 1 sh (below the
+            // 100-sh touch ⇒ no size-cutoff), 3¢ band, $100/day.
+            mm.reward_by_token.insert(token, (1.0, 3.0, 100.0));
+
+            let mut run = AdverseRun {
+                ask_fills: 0,
+                ask_quoting_adverse: Vec::new(),
+                bid_quoting_adverse: Vec::new(),
+                ask_quoting_balanced: Vec::new(),
+            };
+            for i in 0..(N_BAL + N_ADV) {
+                let adverse_phase = i >= N_BAL;
+                let book = if adverse_phase {
+                    adverse((i - N_BAL) as u16)
+                } else {
+                    balanced()
+                };
+                shared.lock().unwrap().insert(token, (book, true));
+                mm.quote().await;
+                // Inspect the PLACEMENT decision before fills settle this cycle.
+                let ask_quoting = mm.qm.tracked().contains_key(&(token, Side::Ask));
+                let bid_quoting = mm.qm.tracked().contains_key(&(token, Side::Bid));
+                if adverse_phase {
+                    run.ask_quoting_adverse.push(ask_quoting);
+                    run.bid_quoting_adverse.push(bid_quoting);
+                } else {
+                    run.ask_quoting_balanced.push(ask_quoting);
+                }
+                mm.consume_fills().await;
+                // Count ASK ("Sell") fills booked this cycle; drain the rest so the
+                // store channel never backs up.
+                while let Ok(msg) = store_rx.try_recv() {
+                    if let StoreMsg::FillSigned(row, _) = msg
+                        && row.action == side_action(Side::Ask)
+                    {
+                        run.ask_fills += 1;
+                    }
+                }
+            }
+            run
+        }
+
+        let on = run_adverse_feed(0.3).await; // pull ON
+        let off = run_adverse_feed(1.0).await; // pull effectively OFF
+
+        // (a) The pull is a ONE-SIDED, signal-specific step-aside:
+        //   - balanced phase: pull-ON still quotes the ask (proves it's not a
+        //     blanket stop), and
+        //   - adverse phase: pull-ON omits the ask but KEEPS the safe bid, while
+        //     pull-OFF keeps quoting the ask throughout the up-move.
+        assert!(
+            on.ask_quoting_balanced.iter().all(|&q| q),
+            "pull-ON still quotes the ask in the BALANCED phase (pull is adverse-specific): {:?}",
+            on.ask_quoting_balanced
+        );
+        assert!(
+            on.ask_quoting_adverse.iter().all(|&q| !q),
+            "pull-ON must OMIT the ask every adverse cycle: {:?}",
+            on.ask_quoting_adverse
+        );
+        assert!(
+            on.bid_quoting_adverse.iter().all(|&q| q),
+            "pull-ON keeps the safe BID quoting (one-sided pull): {:?}",
+            on.bid_quoting_adverse
+        );
+        assert!(
+            off.ask_quoting_adverse.iter().all(|&q| q),
+            "pull-OFF (threshold 1.0) keeps quoting the ask through the adverse phase: {:?}",
+            off.ask_quoting_adverse
+        );
+
+        // (b) PROXY: pull-ON books strictly FEWER adverse ASK fills than pull-OFF.
+        eprintln!(
+            "A7 adverse-feed A/B: pull_on_ask_fills={} pull_off_ask_fills={}",
+            on.ask_fills, off.ask_fills
+        );
+        assert!(off.ask_fills > 0, "sanity: pull-OFF must take some ask fills");
+        assert!(
+            on.ask_fills < off.ask_fills,
+            "quote-pull must lower adverse ask fills: pull_on={} !< pull_off={}",
+            on.ask_fills,
+            off.ask_fills
+        );
+    }
+
     // ── Inventory skew (Task 4.3) ──────────────────────────────────────────────
 
     /// $5 per-market cap valued at the 0.50 mid → 10 shares = full inventory.
@@ -4226,6 +4432,8 @@ mod tests {
             reward_cumulative_est: 0.0,
             signals: HashMap::new(),
             pulled_until: HashMap::new(),
+            last_signal: 0.0,
+            last_pulled: false,
         };
         (mm, store_rx, produced)
     }
@@ -4306,6 +4514,8 @@ mod tests {
             reward_cumulative_est: 0.0,
             signals: HashMap::new(),
             pulled_until: HashMap::new(),
+            last_signal: 0.0,
+            last_pulled: false,
         };
         // We placed this order on YES (an Ask). The fill must follow THIS token.
         mm.placed.insert(

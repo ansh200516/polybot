@@ -127,6 +127,14 @@ pub struct RewardFarmStatus {
     /// Session-cumulative sum of the per-sample `est_reward_usd_day` — a running
     /// estimate proxy, NOT a realized payout.
     pub cumulative_est: f64,
+    /// Phase-A (spec §4) latest blended adverse-selection pressure in [-1, 1]
+    /// (positive = upward pressure that endangers the ASK; negative endangers the
+    /// BID). The strongest-magnitude token's `combined_signal` from the most
+    /// recent quote cycle — surfaced so the dashboard shows WHY a side was pulled.
+    pub signal: f64,
+    /// Phase-A (spec §4): `true` when the most recent quote cycle PULLED a side
+    /// (omitted it on a strong adverse signal / active cooldown). Display-only.
+    pub pulled: bool,
 }
 
 /// One row of the dashboard's open-orders panel: a resting maker quote, OR a

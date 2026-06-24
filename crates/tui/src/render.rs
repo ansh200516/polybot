@@ -382,12 +382,16 @@ fn draw_health(f: &mut Frame, s: &AppState, area: Rect) {
         // for non-reward strategies, so the line is otherwise unchanged.
         if let Some(r) = &line.reward {
             text.push_str(&format!(
-                "\n  rew est ${:.2}/d qmin {:.1} {} bal {:.2} cum ${:.2}",
+                "\n  rew est ${:.2}/d qmin {:.1} {} bal {:.2} cum ${:.2} sig {:+.2}{}",
                 r.est_usd_day,
                 r.q_min,
                 if r.in_band { "in-band" } else { "OUT" },
                 r.balance_ratio,
                 r.cumulative_est,
+                // Phase-A (spec §4) adverse signal + a compact PULL flag when the
+                // MM stepped a side aside this cycle.
+                r.signal,
+                if r.pulled { " PULL" } else { "" },
             ));
         }
     }
@@ -1074,6 +1078,9 @@ mod tests {
                 in_band: true,
                 balance_ratio: 0.80,
                 cumulative_est: 2.46,
+                // Phase-A (spec §4): a strong UP signal that pulled a side.
+                signal: 0.45,
+                pulled: true,
             }),
         }];
         // Wide so the reward segment is not clipped by the Health panel width.
@@ -1083,6 +1090,9 @@ mod tests {
         assert!(text.contains("in-band"), "reward in-band flag missing:\n{text}");
         assert!(text.contains("bal 0.80"), "reward balance missing:\n{text}");
         assert!(text.contains("cum $2.46"), "reward cumulative missing:\n{text}");
+        // Phase-A signal + PULL indicator (Task A7 TUI surfacing).
+        assert!(text.contains("sig +0.45"), "reward signal missing:\n{text}");
+        assert!(text.contains("PULL"), "reward PULL indicator missing:\n{text}");
 
         // A non-reward strategy renders no "rew" segment.
         let mut bare = sample_state();

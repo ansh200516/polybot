@@ -98,6 +98,9 @@ pub fn strategy_lines(view: &[(StrategyId, StrategyStatus)]) -> Vec<StrategyLine
                 in_band: r.in_band,
                 balance_ratio: r.balance_ratio,
                 cumulative_est: r.cumulative_est,
+                // Phase-A (spec §4) adverse-selection signal + pull indicator.
+                signal: r.signal,
+                pulled: r.pulled,
             }),
         })
         .collect()
@@ -973,6 +976,8 @@ mod tests {
                         in_band: true,
                         balance_ratio: 0.9,
                         cumulative_est: 3.0,
+                        signal: 0.45,
+                        pulled: true,
                     }),
                     ..Default::default()
                 },
@@ -988,6 +993,8 @@ mod tests {
         assert!(r.in_band);
         assert!((r.balance_ratio - 0.9).abs() < 1e-9);
         assert!((r.cumulative_est - 3.0).abs() < 1e-9);
+        assert!((r.signal - 0.45).abs() < 1e-9, "Phase-A signal carried up");
+        assert!(r.pulled, "Phase-A pull flag carried up");
     }
 
     /// Task 1.7: fed the host's aggregated per-strategy view, the publisher

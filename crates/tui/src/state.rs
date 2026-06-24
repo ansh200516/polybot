@@ -106,6 +106,12 @@ pub struct RewardLine {
     pub balance_ratio: f64,
     /// Session-cumulative estimated reward, $ (a running proxy).
     pub cumulative_est: f64,
+    /// Phase-A (spec §4) latest blended adverse-selection signal in [-1, 1]
+    /// (+ endangers the ask, − the bid). Rendered as `sig {:+.2}`.
+    pub signal: f64,
+    /// Phase-A (spec §4): the latest quote cycle pulled a side. Rendered as a
+    /// `PULL` flag on the "rew" line.
+    pub pulled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
