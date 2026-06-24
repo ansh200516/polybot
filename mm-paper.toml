@@ -29,7 +29,8 @@ max_edge_bps = 400
 [strategies.mm]
 enabled          = true     # turn the market-maker ON (default is off)
 live             = false    # PAPER: fills come from the simulator, never the venue
-capital_usd      = 50.0     # MM's slice of the bankroll; arb's risk cap shrinks to match
+policy           = "reward_farm"  # REWARD FARMING (Spec 1): tight two-sided sticky quotes on reward-eligible markets, ranked by reward$/competition; confluence forced off. "spread_capture" = the legacy path.
+capital_usd      = 2000.0   # PAPER bankroll, bumped so the budget funds several reward markets (per-market cost ~= 2*min_size*mid ~= $100 at min_size 100). Lower it to fund fewer; raise to fund more.
 max_markets      = 60       # quote at most this many DISTINCT (busiest eligible) markets
 max_per_event    = 2        # ...but at most 2 from any one event/component (NegRisk events
                             # collapse to one component), so a big multi-outcome event can't
@@ -45,6 +46,20 @@ paper_taker_fill_pct = 30   # PAPER demo aid: simulate takers lifting 30% of eac
                             # conservative adverse-only sim (idle in a calm market). Optimistic
                             # (no queue modelling); ignored on the live path.
 # live_fills_source only matters when live = true ("ws" = low-latency user feed, "rest" = poll).
+
+# ---------------------------------------------------------------------------
+# Reward farming (Spec 1) — only consulted when [strategies.mm] policy = "reward_farm".
+# The MM quotes BOTH sides as tight to the size-cutoff-adjusted mid as post-only
+# allows (within each market's max_incentive_spread), STICKY (re-quote only when a
+# side drifts out of the reward band, so cancels don't reset the time-weighted
+# score), with delta-neutral SIZE skew (prices stay tight). The dashboard "rew"
+# line shows the local estimate of daily reward $, Q_min, in-band, and balance.
+# ---------------------------------------------------------------------------
+[reward_farm]
+size_skew_max_ratio = 2.0      # max bid:ask SIZE lean against inventory (1.0 = never skew)
+requote_band_ticks  = 1        # re-place a side only when it drifts > this many ticks from target (anti-flicker)
+sample_interval_ms  = 60000    # estimator sampling cadence, mirroring Polymarket's ~1/min book sampling
+min_markets         = 1        # advisory floor; warns (doesn't synthesize) if fewer reward-eligible markets fund
 
 # ---------------------------------------------------------------------------
 # Inventory risk (caps the MM takes on; halts latch and pull/cancel quotes)
