@@ -90,7 +90,9 @@ use crate::coordinator::now_ms;
 use crate::positions::PositionBook;
 use crate::wiring::BookFetcher;
 
-use super::quote_policy::{Policy, adjusted_mid, needs_requote, reward_quote_prices, skewed_sizes};
+use super::quote_policy::{
+    Policy, adjusted_mid, microprice, needs_requote, reward_quote_prices, skewed_sizes,
+};
 use super::reward_score::{ScoredOrder, est_daily_reward_usd, order_score, quote_set_q_min};
 use super::{
     RestingOrderSnapshot, RewardFarmStatus, Strategy, StrategyCommand, StrategyCtx, StrategyId,
@@ -672,9 +674,9 @@ fn compute_quotes(
 ///
 /// The pure pricing seam works in DOLLARS (0..1); each returned price is already
 /// floored/ceiled to the tick grid, so [`reward_price_to_px`] maps it back to an
-/// interior [`Px`]. The size-cutoff-adjusted mid (dropping sub-`min_size` levels,
-/// spec §8.1) needs per-level sizes the [`Book`] does not expose here, so this
-/// still uses the RAW mid; the size cutoff is deferred to a later task.
+/// interior [`Px`]. The fair value is the size-weighted [`microprice`] of the top
+/// of book with sub-`min_size` levels dropped (spec §8.1, closes Spec-1 deferral
+/// I2) via [`reward_fair_value`], NOT the raw mid.
 #[allow(clippy::too_many_arguments)]
 fn reward_compute_quotes(
     book: &Book,
@@ -693,8 +695,11 @@ fn reward_compute_quotes(
     let tick = ts.unit_microusdc() as f64 / 1_000_000.0;
     let bb = best_bid.microusdc(ts) as f64 / 1_000_000.0;
     let ba = best_ask.microusdc(ts) as f64 / 1_000_000.0;
-    // TODO(reward-farm sizing, later task): drop sub-`min_size` levels first.
-    let adj_mid = adjusted_mid(bb, ba);
+    // Size-weighted fair value (spec §8.1, closes I2): microprice of the top of
+    // book with sub-`min_size` levels dropped. Both best levels exist (checked
+    // above) so this is always `Some`; the raw-mid fallback is unreachable.
+    let adj_mid =
+        reward_fair_value(book, ts, min_size_shares).unwrap_or_else(|| adjusted_mid(bb, ba));
     let (bid_px, ask_px) = reward_quote_prices(adj_mid, bb, ba, tick, max_spread_cents);
 
     // BALANCED, INVENTORY-SKEWED SIZES (spec §8.3), all in SHARES so the reward
@@ -733,6 +738,38 @@ fn reward_compute_quotes(
         bid_px.and_then(|p| order(Side::Bid, p, bid_shares)),
         ask_px.and_then(|p| order(Side::Ask, p, ask_shares)),
     )
+}
+
+/// Reward-farm fair value (spec §8.1, closes Spec-1 deferral I2): the
+/// size-weighted [`microprice`] of the top of book with the sub-`min_size`
+/// size-cutoff applied. THE single source of fair value for the reward path —
+/// quoting ([`reward_compute_quotes`]), the estimator ([`MmLoop::sample_reward_estimate`])
+/// and the decision telemetry ([`MmLoop::log_rf_decision`]) all route through it
+/// so they price off an IDENTICAL mid.
+///
+/// SIZE-CUTOFF: a top level resting LESS than `min_size_shares` (below the reward
+/// two-sided floor) is a sub-incentive level we don't want defining fair value,
+/// so its qty is treated as `0.0` in the microprice weighting. With one side
+/// dropped the microprice resolves via the surviving side; with BOTH dropped it
+/// falls back to the raw midpoint (`microprice`'s own zero-size fallback).
+///
+/// `Qty` is µshares (`pm_core::num`: "sizes are micro-shares"), so each resting
+/// size is divided by 1e6 to shares — both to compare against `min_size_shares`
+/// (shares) and to weight the microprice in that same unit. Returns `None` when
+/// the book is one-sided/empty (no mid to anchor on); callers skip the token.
+fn reward_fair_value(book: &Book, ts: TickSize, min_size_shares: f64) -> Option<f64> {
+    let (best_bid, best_ask) = (book.bids.best()?, book.asks.best()?);
+    let bb = best_bid.microusdc(ts) as f64 / 1_000_000.0;
+    let ba = best_ask.microusdc(ts) as f64 / 1_000_000.0;
+    // µshares → shares, then drop the level (qty 0) if it is below the reward
+    // min_incentive_size so a sub-incentive top can't skew the fair value.
+    let cutoff = |raw_micro: u64| {
+        let shares = raw_micro as f64 / 1_000_000.0;
+        if shares < min_size_shares { 0.0 } else { shares }
+    };
+    let bid_qty = cutoff(book.bids.qty_at(best_bid).0);
+    let ask_qty = cutoff(book.asks.qty_at(best_ask).0);
+    Some(microprice(bb, ba, bid_qty, ask_qty))
 }
 
 /// Map a reward-farm dollar price (already a tick multiple from
@@ -1227,10 +1264,13 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         let ts = book.ts();
         let bb = book.bids.best().map(|p| p.microusdc(ts) as f64 / 1_000_000.0);
         let ba = book.asks.best().map(|p| p.microusdc(ts) as f64 / 1_000_000.0);
-        let adj_mid = bb.zip(ba).map(|(b, a)| adjusted_mid(b, a));
-        // `.1` is the per-market reward scoring band (max_spread_cents); `0.0`
-        // when the token is not reward-eligible / has no metrics.
-        let max_spread_cents = self.reward_by_token.get(&token).map_or(0.0, |r| r.1);
+        // `.0` = min_incentive_size (shares), `.1` = the per-market reward scoring
+        // band (max_spread_cents); `(0.0, 0.0)` when not reward-eligible / no metrics.
+        let (min_size_shares, max_spread_cents) =
+            self.reward_by_token.get(&token).map_or((0.0, 0.0), |r| (r.0, r.1));
+        // Log the SAME size-weighted fair value (spec §8.1) that drove the quote,
+        // so the recorded state matches the decision the future Spec-3 tuner reads.
+        let adj_mid = reward_fair_value(book, ts, min_size_shares);
         let side = |o: Option<&MakerOrder>| {
             o.map(|o| {
                 serde_json::json!({
@@ -1501,7 +1541,7 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             // `.1` = max_spread_cents (scoring band `v`), `.2` = daily_rate_usd.
             // A token with no metrics / not reward-eligible (band ≤ 0) scores 0,
             // so it is skipped (it earns nothing and would divide by a 0 band).
-            let (_, max_spread_cents, daily_rate) =
+            let (min_size_shares, max_spread_cents, daily_rate) =
                 self.reward_by_token.get(&token).copied().unwrap_or((0.0, 0.0, 0.0));
             if max_spread_cents <= 0.0 {
                 continue;
@@ -1512,13 +1552,13 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 continue;
             };
             let ts = book.ts();
-            let (Some(bb), Some(ba)) = (book.bids.best(), book.asks.best()) else {
+            // SAME size-weighted fair value the quoting path prices off (spec §8.1,
+            // closes I2): microprice with the sub-`min_size` cutoff, so the scored
+            // distance-from-mid matches what we actually quoted. `None` ⇒ the book
+            // is one-sided/empty — skip (no mid to score against).
+            let Some(adj_mid) = reward_fair_value(&book, ts, min_size_shares) else {
                 continue;
             };
-            let adj_mid = adjusted_mid(
-                bb.microusdc(ts) as f64 / 1_000_000.0,
-                ba.microusdc(ts) as f64 / 1_000_000.0,
-            );
 
             let mut bids: Vec<ScoredOrder> = Vec::new();
             let mut asks: Vec<ScoredOrder> = Vec::new();
@@ -2472,6 +2512,44 @@ mod tests {
         let bid = bid.expect("bid");
         let ask = ask.expect("ask");
         assert!(bid.size.0 > ask.size.0, "short → bigger bid size");
+    }
+
+    // ── RewardFarm microprice fair value + size-cutoff (Task A2, spec §8.1) ─────
+
+    /// The reward fair value is the size-weighted microprice, and a top level
+    /// resting BELOW the reward `min_incentive_size` is dropped from the
+    /// weighting (spec §8.1, closes Spec-1 deferral I2) so a sub-incentive level
+    /// can't define our fair value. With one side dropped the microprice resolves
+    /// via the surviving side; with BOTH dropped it falls back to the raw mid.
+    #[test]
+    fn reward_fair_value_microprice_and_size_cutoff() {
+        // Wide Cent book bid 0.50 / ask 0.60 (raw mid 0.55); min_incentive_size 5 sh.
+
+        // (a) Both tops are REAL (≥ 5 sh) and the bid is heavier → microprice
+        //     leans UP toward the ask, strictly ABOVE the raw 0.55 mid.
+        let book = cent_book(&[(50, 300 * SH)], &[(60, 100 * SH)]);
+        let fv = reward_fair_value(&book, TickSize::Cent, 5.0).expect("two-sided");
+        assert!(fv > 0.55 && fv < 0.60, "bid-heavy microprice leans up past mid: {fv}");
+
+        // (b) A sub-min top BID (4 sh < 5) is dropped → its qty is 0 in the
+        //     weighting, so it no longer skews fair value: the microprice resolves
+        //     via the surviving ask to the bid price 0.50 (NOT the raw 0.55 mid).
+        let book = cent_book(&[(50, 4 * SH)], &[(60, 100 * SH)]);
+        let fv = reward_fair_value(&book, TickSize::Cent, 5.0).expect("two-sided");
+        assert!((fv - 0.50).abs() < 1e-9, "sub-min bid dropped → resolves to bid, got {fv}");
+
+        // (c) BOTH tops sub-min (4 sh / 2 sh) → both dropped → fall back to the
+        //     raw midpoint 0.55.
+        let book = cent_book(&[(50, 4 * SH)], &[(60, 2 * SH)]);
+        let fv = reward_fair_value(&book, TickSize::Cent, 5.0).expect("two-sided");
+        assert!((fv - 0.55).abs() < 1e-9, "both tops sub-min → raw mid, got {fv}");
+
+        // A one-sided book has no mid to anchor on → None (callers skip the token).
+        let one_sided = cent_book(&[(50, 100 * SH)], &[]);
+        assert!(
+            reward_fair_value(&one_sided, TickSize::Cent, 5.0).is_none(),
+            "one-sided book ⇒ None"
+        );
     }
 
     // ── RewardFarm sticky re-quoting (Task 8, anti-flicker) ─────────────────────

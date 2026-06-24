@@ -52,6 +52,18 @@ pub fn adjusted_mid(best_bid: f64, best_ask: f64) -> f64 {
     (best_bid + best_ask) / 2.0
 }
 
+/// Size-weighted fair value. `bid`/`ask` are top-of-book prices ($), `bid_qty`/
+/// `ask_qty` the resting sizes there. Weights the bid price by ask qty and vice
+/// versa, so a heavier bid (buy pressure) pulls fair value UP toward the ask.
+/// Falls back to the midpoint when both sizes are 0.
+pub fn microprice(bid: f64, ask: f64, bid_qty: f64, ask_qty: f64) -> f64 {
+    let denom = bid_qty + ask_qty;
+    if denom <= 0.0 {
+        return (bid + ask) / 2.0;
+    }
+    (bid * ask_qty + ask * bid_qty) / denom
+}
+
 /// Balanced base sizes leaned against signed inventory `net` (shares).
 /// Long (net>0) -> bigger ask; short -> bigger bid. Ratio clamped to
 /// `max_ratio`; both sides floored at `min_size` to preserve the 2-sided bonus.
@@ -228,5 +240,13 @@ mod tests {
         // resting at 0.49; band 1 tick (0.01). target 0.495 -> keep; target 0.51 -> replace.
         assert!(!needs_requote(0.49, 0.495, 0.01, 1));
         assert!(needs_requote(0.49, 0.51, 0.01, 1));
+    }
+
+    #[test]
+    fn microprice_leans_to_heavier_side_and_falls_back_to_mid() {
+        assert!((microprice(0.50, 0.52, 100.0, 100.0) - 0.51).abs() < 1e-9); // equal -> mid
+        let mp = microprice(0.50, 0.52, 300.0, 100.0); // bid-heavy -> up toward ask
+        assert!(mp > 0.51 && mp < 0.52, "got {mp}");
+        assert!((microprice(0.50, 0.52, 0.0, 0.0) - 0.51).abs() < 1e-9); // zero -> mid
     }
 }
