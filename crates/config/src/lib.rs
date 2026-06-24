@@ -947,12 +947,16 @@ impl Config {
             ));
         }
         // Reward-farming tuning (`[reward_farm]`, top-level). The size lean is a
-        // bid:ask ratio, so it must be ≥ 1.0 (1.0 = no lean); a sub-1 value would
-        // invert the lean. Checked unconditionally — cheap, and the section is
-        // inert unless the reward_farm policy is selected.
-        if self.reward_farm.size_skew_max_ratio < 1.0 {
+        // bid:ask ratio, so it must be FINITE and ≥ 1.0 (1.0 = no lean): a sub-1
+        // value would invert the lean, and toml can parse `nan`/`inf`, so a
+        // non-finite ratio must be rejected too — mirroring the finiteness
+        // convention of the other float checks. Checked unconditionally — cheap,
+        // and the section is inert unless the reward_farm policy is selected.
+        if self.reward_farm.size_skew_max_ratio < 1.0
+            || !self.reward_farm.size_skew_max_ratio.is_finite()
+        {
             return Err(ConfigError::BadMoney(
-                "reward_farm.size_skew_max_ratio must be >= 1.0",
+                "reward_farm.size_skew_max_ratio must be finite and >= 1.0",
             ));
         }
         // MM capital must be finite + non-negative always; when ENABLED it is
@@ -1909,5 +1913,11 @@ mod tests {
         let mut c2 = Config::default();
         c2.reward_farm.size_skew_max_ratio = 0.5; // must be >= 1.0
         assert!(c2.validate().is_err());
+        let mut c3 = Config::default();
+        c3.reward_farm.size_skew_max_ratio = f64::NAN;
+        assert!(c3.validate().is_err());
+        let mut c4 = Config::default();
+        c4.reward_farm.size_skew_max_ratio = f64::INFINITY;
+        assert!(c4.validate().is_err());
     }
 }
