@@ -1450,7 +1450,7 @@ async fn main() {
             }
         }
 
-        let mm_params = MmParams::from_config(&config.strategies.mm)
+        let mm_params = MmParams::from_config(&config.strategies.mm, &config.reward_farm)
             .unwrap_or_else(|e| fatal(format!("MmParams::from_config: {e}")));
         let mm_inv_cfg =
             inventory_config(&config).unwrap_or_else(|e| fatal(format!("inventory_config: {e}")));

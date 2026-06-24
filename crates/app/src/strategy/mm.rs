@@ -132,17 +132,21 @@ pub struct MmParams {
     ///
     /// SOURCE: the operator knob is `[reward_farm].size_skew_max_ratio`
     /// (validated finite & ≥ 1.0 in `pm_config`). That section is a SIBLING of
-    /// `[strategies.mm]`, so [`MmParams::from_config`] — which only receives
-    /// `&pm_config::Mm` — cannot reach it without a new `from_config` argument
-    /// (a `main.rs` call-site change). Until that is threaded, this defaults to
-    /// the validated `RewardFarm` default; see [`MmParams::from_config`].
+    /// `[strategies.mm]`, so [`MmParams::from_config`] takes
+    /// `&pm_config::RewardFarm` alongside `&pm_config::Mm` and copies the value
+    /// through; main passes `&config.reward_farm` at the call site.
     pub size_skew_max_ratio: f64,
 }
 
 impl MmParams {
-    /// Resolve `[strategies.mm]` config into runtime params (the USD notional is
-    /// converted to µUSDC here). The seam the Task-4.5 main wiring uses.
-    pub fn from_config(mm: &pm_config::Mm) -> Result<Self, pm_config::ConfigError> {
+    /// Resolve `[strategies.mm]` + `[reward_farm]` config into runtime params
+    /// (the USD notional is converted to µUSDC here). The seam the Task-4.5 main
+    /// wiring uses. `rf` supplies `[reward_farm].size_skew_max_ratio` — a SIBLING
+    /// section of `[strategies.mm]`, validated finite & ≥ 1.0 by `pm_config`.
+    pub fn from_config(
+        mm: &pm_config::Mm,
+        rf: &pm_config::RewardFarm,
+    ) -> Result<Self, pm_config::ConfigError> {
         Ok(MmParams {
             spread_bps: mm.spread_bps,
             quote_refresh: Duration::from_millis(mm.quote_refresh_ms),
@@ -151,13 +155,9 @@ impl MmParams {
             rebate_bps: mm.rebate_bps,
             paper_taker_fill_pct: mm.paper_taker_fill_pct,
             policy: Policy::from_cfg(&mm.policy),
-            // The operator knob lives on `[reward_farm]` (a sibling section), not
-            // on `mm`, so it is NOT reachable here without an extra `from_config`
-            // argument — which would change main's call site. Default to the
-            // validated `RewardFarm` default (2.0); threading the real
-            // `[reward_farm].size_skew_max_ratio` is a one-line main.rs change
-            // (pass `&config.reward_farm` in and read it here).
-            size_skew_max_ratio: pm_config::RewardFarm::default().size_skew_max_ratio,
+            // `[reward_farm]` is a sibling of `[strategies.mm]`; main passes it in
+            // (`&config.reward_farm`) so the operator's cap reaches the loop.
+            size_skew_max_ratio: rf.size_skew_max_ratio,
         })
     }
 }
@@ -1524,6 +1524,28 @@ mod tests {
         assert!(
             matches!(mm.live_venue, Some(MmLive::Rest(_))),
             "with_live_venue (set only when mm_use_live) puts MM on the live venue"
+        );
+    }
+
+    /// Task 6 wiring LOCK: the operator's `[reward_farm].size_skew_max_ratio`
+    /// must flow through [`MmParams::from_config`] into the runtime params (where
+    /// `reward_compute_quotes` reads it). A NON-default `1.5` proves the SIBLING
+    /// `[reward_farm]` section is threaded — guarding against silently defaulting
+    /// back to `2.0`. The default config still flows its own default.
+    #[test]
+    fn from_config_threads_reward_farm_size_skew_ratio() {
+        let mm = pm_config::Mm::default();
+        let rf = pm_config::RewardFarm { size_skew_max_ratio: 1.5, ..Default::default() };
+        let params = MmParams::from_config(&mm, &rf).expect("from_config");
+        assert_eq!(params.size_skew_max_ratio, 1.5, "operator ratio reaches the loop");
+
+        // Default config flows the validated default (not a stale hardcoded 2.0).
+        let params_def =
+            MmParams::from_config(&pm_config::Mm::default(), &pm_config::RewardFarm::default())
+                .expect("from_config default");
+        assert_eq!(
+            params_def.size_skew_max_ratio,
+            pm_config::RewardFarm::default().size_skew_max_ratio
         );
     }
 
