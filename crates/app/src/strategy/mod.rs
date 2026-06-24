@@ -26,6 +26,7 @@ pub mod host;
 pub mod mm;
 pub mod quote_policy;
 pub mod reward_score;
+pub mod signals;
 pub mod stub;
 
 /// Stable identity for a strategy (e.g. `"arb"`, `"mm"`). A `&'static str`
