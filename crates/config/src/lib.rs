@@ -24,6 +24,7 @@ pub struct Config {
     pub strategies: Strategies,
     pub segments: Segments,
     pub confluence: Confluence,
+    pub reward_farm: RewardFarm,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -556,6 +557,13 @@ pub struct Mm {
     /// queue-position modelling) and IGNORED on the live path — realistic fills
     /// come from real taker flow in a live canary.
     pub paper_taker_fill_pct: u32,
+    /// Quote policy: "spread_capture" (default, legacy) or "reward_farm".
+    #[serde(default = "default_mm_policy")]
+    pub policy: String,
+}
+
+fn default_mm_policy() -> String {
+    "spread_capture".into()
 }
 
 impl Default for Mm {
@@ -585,6 +593,9 @@ impl Default for Mm {
             // OFF by default → the conservative adverse-only paper sim (no
             // synthetic fills); a paper-MM demo sets this > 0.
             paper_taker_fill_pct: 0,
+            // Legacy spread-capture quoting by default; opt into "reward_farm"
+            // (tuned by the top-level [reward_farm] section) deliberately.
+            policy: default_mm_policy(),
         }
     }
 }
@@ -651,6 +662,28 @@ impl Default for Segments {
             mm_segments: vec!["LiquidStable".to_string(), "Liquid".to_string()],
             mm_exclude_fee_free: true,
         }
+    }
+}
+
+/// Reward-farming MM tuning (`[reward_farm]`). A TOP-LEVEL section (sibling of
+/// `[segments]` / `[universe]`), inert unless `[strategies.mm].policy =
+/// "reward_farm"` selects the reward-farming quoting engine. The defaults mirror
+/// Polymarket's maker-rewards mechanics (e.g. 1/min sampling).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RewardFarm {
+    /// Re-quote a side only when it drifts this many ticks past target (anti-flicker).
+    pub requote_band_ticks: u16,
+    /// Max bid:ask size lean for inventory skew.
+    pub size_skew_max_ratio: f64,
+    /// Estimator sampling cadence (ms), mirroring Polymarket's 1/min sampling.
+    pub sample_interval_ms: u64,
+    /// Minimum reward-eligible markets to quote.
+    pub min_markets: u32,
+}
+impl Default for RewardFarm {
+    fn default() -> Self {
+        RewardFarm { requote_band_ticks: 1, size_skew_max_ratio: 2.0, sample_interval_ms: 60_000, min_markets: 1 }
     }
 }
 
@@ -904,6 +937,22 @@ impl Config {
         if self.strategies.mm.paper_taker_fill_pct > 100 {
             return Err(ConfigError::BadMoney(
                 "strategies.mm.paper_taker_fill_pct must be 0–100",
+            ));
+        }
+        // Quote policy (Task 3): exactly "spread_capture" (legacy) or
+        // "reward_farm" (mirrors the execution.redeem_strategy string-enum style).
+        if !matches!(self.strategies.mm.policy.as_str(), "spread_capture" | "reward_farm") {
+            return Err(ConfigError::BadMoney(
+                "strategies.mm.policy must be spread_capture or reward_farm",
+            ));
+        }
+        // Reward-farming tuning (`[reward_farm]`, top-level). The size lean is a
+        // bid:ask ratio, so it must be ≥ 1.0 (1.0 = no lean); a sub-1 value would
+        // invert the lean. Checked unconditionally — cheap, and the section is
+        // inert unless the reward_farm policy is selected.
+        if self.reward_farm.size_skew_max_ratio < 1.0 {
+            return Err(ConfigError::BadMoney(
+                "reward_farm.size_skew_max_ratio must be >= 1.0",
             ));
         }
         // MM capital must be finite + non-negative always; when ENABLED it is
@@ -1837,5 +1886,28 @@ mod tests {
     #[test]
     fn segments_unknown_field_is_rejected() {
         assert!(Config::from_toml_str("[segments]\nbogus = 1.0\n").is_err());
+    }
+
+    #[test]
+    fn reward_farm_config_parses_and_defaults() {
+        let c = Config::from_toml_str(
+            "[strategies.mm]\nenabled=true\npolicy=\"reward_farm\"\n\
+             [reward_farm]\nrequote_band_ticks=2\nsize_skew_max_ratio=2.0\nsample_interval_ms=60000\n",
+        ).unwrap();
+        assert_eq!(c.strategies.mm.policy, "reward_farm");
+        assert_eq!(c.reward_farm.requote_band_ticks, 2);
+        let d = Config::default();
+        assert_eq!(d.strategies.mm.policy, "spread_capture");
+        assert_eq!(d.reward_farm.size_skew_max_ratio, 2.0);
+    }
+
+    #[test]
+    fn reward_farm_rejects_bad_policy_and_ratio() {
+        let mut c = Config::default();
+        c.strategies.mm.policy = "nonsense".into();
+        assert!(c.validate().is_err());
+        let mut c2 = Config::default();
+        c2.reward_farm.size_skew_max_ratio = 0.5; // must be >= 1.0
+        assert!(c2.validate().is_err());
     }
 }
