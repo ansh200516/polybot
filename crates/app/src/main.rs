@@ -606,12 +606,29 @@ async fn main() {
     )
     .unwrap_or_else(|e| fatal(format!("ClobRest init: {e}")));
 
+    // REWARD-FARM mode (Task 7) forces confluence OFF: confluence is a TAKER
+    // (smart-money directional) signal, while the reward farmer wants
+    // reward-ELIGIBLE markets ranked by reward$/competition (built later in the
+    // MM block from `MarketMetrics::reward_eligible`). Leaving confluence on would
+    // also restrict the synced universe (`with_confluence_conditions`) to
+    // smart-money conditions, starving the reward-eligible selection. So we guard
+    // both the `build_confluence` call AND its `with_confluence_conditions`
+    // application below on `!reward_farm_mode`. Spread-capture is untouched. Only
+    // meaningful when the MM is enabled (the policy field is inert otherwise), so
+    // arb-only / spread-capture runs keep confluence exactly as today.
+    let reward_farm_mode = config.strategies.mm.enabled
+        && pm_app::strategy::quote_policy::Policy::from_cfg(&config.strategies.mm.policy)
+            == pm_app::strategy::quote_policy::Policy::RewardFarm;
+    if reward_farm_mode && config.confluence.enabled {
+        info!("reward_farm policy active: forcing confluence OFF (it is a taker signal); MM quotes reward-eligible markets");
+    }
+
     // [confluence] — "follow the smart money": build the universe from the top
     // leaderboard traders' OPEN positions (their favored side per market) instead
     // of the liquidity-ranked Gamma keyset. Runs at startup, so auto_restart
     // re-runs it each relaunch for a fresh snapshot. Best-effort: on any Data-API
     // failure (or an empty result) we log and FALL BACK to the normal universe.
-    let confluence_markets = if config.confluence.enabled {
+    let confluence_markets = if config.confluence.enabled && !reward_farm_mode {
         if tui_active {
             println!("confluence: querying top-trader leaderboard + open positions ...");
         }
@@ -659,7 +676,7 @@ async fn main() {
         .iter()
         .map(|m| m.favored_token.clone())
         .collect();
-    if config.confluence.enabled {
+    if config.confluence.enabled && !reward_farm_mode {
         info!(
             markets = confluence_markets.len(),
             quoting_conditions = confluence_conditions.as_ref().map_or(0, Vec::len),
@@ -1340,47 +1357,115 @@ async fn main() {
         // (the same `register_token(tok, vid, neg_risk, tick)` shape arb uses) —
         // an order for an unregistered token is rejected before any I/O, so MM
         // can only ever place orders within its own carved universe.
-        let mm_thresholds = segment_thresholds(&config);
-        let mm_allowed = mm_allowed_segments(&config);
-        let mm_markets = mm_market_selection(
-            &reg,
-            &mm_thresholds,
-            &mm_allowed,
-            config.segments.mm_exclude_fee_free,
-            config.strategies.mm.max_markets,
-            config.strategies.mm.max_per_event,
-        );
-        // Eligible-before-cap list, for the routing log only (how many markets
-        // qualified — across how many distinct events/components — vs. how many
-        // we actually quote after the caps). Recomputed UNCAPPED (`usize::MAX`
-        // markets, `0` = no per-event cap) so it reflects the full eligible set;
-        // the selection is a cheap startup-time filter+rank over the registry.
-        let mm_eligible_markets = mm_market_selection(
-            &reg,
-            &mm_thresholds,
-            &mm_allowed,
-            config.segments.mm_exclude_fee_free,
-            usize::MAX,
-            0,
-        );
-        // Distinct events/components among the eligible markets (a NegRisk event's
-        // outcomes share one `component_of`), so the log surfaces how many events
-        // the per-event cap is spreading the MM across.
-        let mm_eligible_events = mm_eligible_markets
-            .iter()
-            .map(|&id| reg.component_of(id))
-            .collect::<std::collections::HashSet<_>>()
-            .len();
-        info!(
-            "MM segment routing: {} eligible across {} events (segments={:?}, \
-             exclude_fee_free={}) → quoting top {} (≤{} per event)",
-            mm_eligible_markets.len(),
-            mm_eligible_events,
-            mm_allowed,
-            config.segments.mm_exclude_fee_free,
-            mm_markets.len(),
-            config.strategies.mm.max_per_event,
-        );
+        // MM UNIVERSE SELECTION — two policies (spec §5/§7):
+        //  * spread_capture (default) → Task 5.2 per-segment routing, UNCHANGED.
+        //  * reward_farm (Task 7) → reward-ELIGIBLE markets ranked by an edge
+        //    proxy (reward$/competition) and greedily capped to the cash budget.
+        let mm_markets: Vec<pm_core::instrument::MarketId> = if reward_farm_mode {
+            // REWARD-FARM universe (Task 7, spec §7): every reward-eligible
+            // registry market, ranked by `edge = daily_rate / competing_depth`,
+            // greedily funded best-edge-first until the cash budget is spent
+            // (`select_reward_markets`).
+            //
+            // DOCUMENTED FALLBACKS — no live book exists at universe-selection
+            // time (sync has assembled the registry, but per-market order books
+            // are streamed by the engine loop only AFTER this wiring), so two
+            // inputs use neutral constants rather than forcing a large refactor:
+            //  * competing_depth = 1.0 → ranking collapses to pure `daily_rate`,
+            //    the only competition-free signal available here.
+            //  * mid = 0.5 → per_market_cost = 2 sides × reward_min_size × mid
+            //    (USD to park the two minimum incentive orders); 0.5 is the
+            //    max-uncertainty price for a binary outcome.
+            // CONCERN (later refinement): rank by real in-band resting depth and
+            // size cost off a real mid once a selection-time book snapshot is
+            // plumbed through to this point.
+            let mid = 0.5_f64;
+            let cands: Vec<(u64, f64, f64, f64)> = reg
+                .markets()
+                .iter()
+                .filter_map(|m| {
+                    let metrics = reg.metrics(m.id)?;
+                    if !metrics.reward_eligible() {
+                        return None;
+                    }
+                    let daily_rate = metrics.reward_daily_rate_usd;
+                    let competing_depth = 1.0; // no book yet → rank by daily_rate alone
+                    let per_market_cost = 2.0 * metrics.reward_min_size * mid;
+                    Some((u64::from(m.id.0), daily_rate, competing_depth, per_market_cost))
+                })
+                .collect();
+            let eligible = cands.len();
+            let picked = pm_app::strategy::quote_policy::select_reward_markets(
+                cands,
+                config.strategies.mm.capital_usd,
+            );
+            let selected: Vec<pm_core::instrument::MarketId> = picked
+                .into_iter()
+                .map(|id| pm_core::instrument::MarketId(id as u32))
+                .collect();
+            // `reward_farm.min_markets` is ADVISORY: quote whatever is eligible +
+            // funded, never synthesize (spec §7). Under-shooting only warns.
+            if (selected.len() as u32) < config.reward_farm.min_markets {
+                warn!(
+                    eligible,
+                    funded = selected.len(),
+                    min_markets = config.reward_farm.min_markets,
+                    budget_usd = config.strategies.mm.capital_usd,
+                    "MM reward-farm: fewer funded markets than reward_farm.min_markets — quoting what is eligible (no synthesis)"
+                );
+            }
+            info!(
+                eligible,
+                funded = selected.len(),
+                budget_usd = config.strategies.mm.capital_usd,
+                "MM reward-farm selection: reward-eligible markets ranked by edge=daily_rate/competing_depth (competing_depth=1.0, mid=0.5 at selection time), budget-capped"
+            );
+            selected
+        } else {
+            // SPREAD-CAPTURE (Task 5.2 per-segment routing) — UNCHANGED.
+            let mm_thresholds = segment_thresholds(&config);
+            let mm_allowed = mm_allowed_segments(&config);
+            let mm_markets = mm_market_selection(
+                &reg,
+                &mm_thresholds,
+                &mm_allowed,
+                config.segments.mm_exclude_fee_free,
+                config.strategies.mm.max_markets,
+                config.strategies.mm.max_per_event,
+            );
+            // Eligible-before-cap list, for the routing log only (how many markets
+            // qualified — across how many distinct events/components — vs. how many
+            // we actually quote after the caps). Recomputed UNCAPPED (`usize::MAX`
+            // markets, `0` = no per-event cap) so it reflects the full eligible set;
+            // the selection is a cheap startup-time filter+rank over the registry.
+            let mm_eligible_markets = mm_market_selection(
+                &reg,
+                &mm_thresholds,
+                &mm_allowed,
+                config.segments.mm_exclude_fee_free,
+                usize::MAX,
+                0,
+            );
+            // Distinct events/components among the eligible markets (a NegRisk event's
+            // outcomes share one `component_of`), so the log surfaces how many events
+            // the per-event cap is spreading the MM across.
+            let mm_eligible_events = mm_eligible_markets
+                .iter()
+                .map(|&id| reg.component_of(id))
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            info!(
+                "MM segment routing: {} eligible across {} events (segments={:?}, \
+                 exclude_fee_free={}) → quoting top {} (≤{} per event)",
+                mm_eligible_markets.len(),
+                mm_eligible_events,
+                mm_allowed,
+                config.segments.mm_exclude_fee_free,
+                mm_markets.len(),
+                config.strategies.mm.max_per_event,
+            );
+            mm_markets
+        };
         // MarketId → Market lookup for the selected ids (registry is dense, but a
         // map keeps the call site independent of that invariant).
         let mm_market_by_id: HashMap<pm_core::instrument::MarketId, pm_core::instrument::Market> =

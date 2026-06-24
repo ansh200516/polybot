@@ -78,6 +78,26 @@ pub fn skewed_sizes(base: f64, net: f64, cap_shares: f64, max_ratio: f64, min_si
     (bid, ask)
 }
 
+/// Rank reward-eligible markets by edge = daily_rate / competing_depth, then
+/// greedily fit to `budget_usd`. Input tuples: (id, daily_rate, competing_depth, per_market_cost).
+pub fn select_reward_markets(mut cands: Vec<(u64, f64, f64, f64)>, budget_usd: f64) -> Vec<u64> {
+    cands.retain(|(_, rate, _, cost)| *rate > 0.0 && *cost > 0.0);
+    cands.sort_by(|a, b| {
+        let ea = a.1 / a.2.max(1e-9);
+        let eb = b.1 / b.2.max(1e-9);
+        eb.partial_cmp(&ea).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut spent = 0.0;
+    let mut out = Vec::new();
+    for (id, _, _, cost) in cands {
+        if spent + cost <= budget_usd + 1e-9 {
+            spent += cost;
+            out.push(id);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
     SpreadCapture,
@@ -169,5 +189,30 @@ mod tests {
         assert!(bid_sz >= ask_sz);
         assert!(bid_sz / ask_sz <= 2.0 + 1e-9);
         assert!(bid_sz >= 5.0 && ask_sz >= 5.0, "both stay >= min_incentive_size");
+    }
+
+    #[test]
+    fn selection_ranks_by_edge_and_caps_to_budget() {
+        // tuples: (id, daily_rate, competing_depth, per_market_cost)
+        let cands = vec![
+            (1u64, 100.0, 1000.0, 10.0), // edge 0.10
+            (2u64, 100.0, 100.0,  10.0), // edge 1.00 (best)
+            (3u64, 0.0,   50.0,   10.0), // ineligible (rate 0)
+        ];
+        let picked = select_reward_markets(cands, /*budget*/ 10.0); // only one fits
+        assert_eq!(picked, vec![2]);
+    }
+
+    #[test]
+    fn selection_fits_multiple_best_edge_first_within_budget() {
+        // Same cost each; budget fits exactly two → greedy takes the two
+        // highest-edge markets in rank order and stops before the third.
+        let cands = vec![
+            (1u64, 10.0,  100.0, 10.0), // edge 0.10 (worst)
+            (2u64, 100.0, 100.0, 10.0), // edge 1.00 (best)
+            (3u64, 50.0,  100.0, 10.0), // edge 0.50
+        ];
+        let picked = select_reward_markets(cands, /*budget*/ 25.0);
+        assert_eq!(picked, vec![2, 3]);
     }
 }
