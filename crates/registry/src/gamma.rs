@@ -247,6 +247,52 @@ pub struct ClobMarket {
     /// CLOB taker fee in basis points (0 or 200 on legacy entries). RECON §4/8.
     #[serde(default)]
     pub taker_base_fee: i64,
+    /// Liquidity-rewards program parameters for this market. Absent or `null`
+    /// fields default; an ineligible market deserializes to all-zero. See
+    /// [`ClobRewards`].
+    #[serde(default)]
+    pub rewards: ClobRewards,
+}
+
+// ---------------------------------------------------------------------------
+// CLOB rewards (within a market)
+// ---------------------------------------------------------------------------
+
+/// One reward-asset rate entry within a market's `rewards.rates` array.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClobRewardRate {
+    #[serde(default)]
+    pub rewards_daily_rate: f64,
+}
+
+/// Liquidity-rewards program parameters from the CLOB `/markets` `rewards`
+/// object. `rates` is `null` on reward-ineligible markets and an array of
+/// per-asset rates on eligible ones; `min_size`/`max_spread` are `0` when
+/// the market is not in the program.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClobRewards {
+    #[serde(default)]
+    pub rates: Option<Vec<ClobRewardRate>>,
+    /// `min_incentive_size` — minimum order size (shares) to qualify.
+    #[serde(default)]
+    pub min_size: f64,
+    /// `max_incentive_spread` — max distance from mid (cents) that scores.
+    #[serde(default)]
+    pub max_spread: f64,
+}
+
+impl ClobRewards {
+    /// Total configured daily reward rate (USD/day) across reward assets.
+    pub fn daily_rate_usd(&self) -> f64 {
+        self.rates
+            .as_ref()
+            .map(|r| r.iter().map(|x| x.rewards_daily_rate).sum())
+            .unwrap_or(0.0)
+    }
+    /// Reward-eligible iff there is a positive scoring band AND a positive rate.
+    pub fn is_eligible(&self) -> bool {
+        self.max_spread > 0.0 && self.daily_rate_usd() > 0.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +485,34 @@ mod tests {
         for m in &page.data {
             assert!(m.minimum_tick_size > 0.0);
         }
+    }
+
+    #[test]
+    fn clob_market_parses_rewards_object() {
+        let json = r#"{
+            "condition_id": "0xabc",
+            "minimum_tick_size": 0.01,
+            "tokens": [],
+            "active": true,
+            "rewards": { "rates": [{"rewards_daily_rate": 50.0}], "min_size": 100.0, "max_spread": 3.0 }
+        }"#;
+        let m: ClobMarket = serde_json::from_str(json).unwrap();
+        assert_eq!(m.rewards.min_size, 100.0);
+        assert_eq!(m.rewards.max_spread, 3.0);
+        assert_eq!(m.rewards.daily_rate_usd(), 50.0);
+    }
+
+    #[test]
+    fn clob_market_rewards_defaults_when_absent_or_null() {
+        let json = r#"{"condition_id":"0xabc","minimum_tick_size":0.01,"tokens":[],"active":true,
+            "rewards":{"rates":null,"min_size":0,"max_spread":0}}"#;
+        let m: ClobMarket = serde_json::from_str(json).unwrap();
+        assert_eq!(m.rewards.daily_rate_usd(), 0.0);
+        assert!(!m.rewards.is_eligible());
+        // entirely missing `rewards` key also defaults
+        let m2: ClobMarket = serde_json::from_str(
+            r#"{"condition_id":"0x1","minimum_tick_size":0.01,"tokens":[],"active":true}"#).unwrap();
+        assert!(!m2.rewards.is_eligible());
     }
 
     #[test]
