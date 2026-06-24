@@ -3404,6 +3404,50 @@ mod tests {
         );
     }
 
+    /// I3 per-cycle RE-LATCH: a session that started UNDER the cap must still
+    /// halt MID-session once the cumulative day-realized ledger crosses it — not
+    /// only at the next auto-restart. Start un-halted, attach a read handle whose
+    /// ledger (seeded for TODAY, since `tick` keys off `now_ms()`) is past the
+    /// cap, then a single `tick()` must latch the gate and place nothing.
+    #[tokio::test]
+    async fn day_loss_re_latches_mid_session_from_ledger() {
+        use pm_store::Store;
+        use pm_store::read::ReadStore;
+
+        let tokens = vec![TokenId(1)];
+        let (fetcher, _shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        let mut inv_cfg = generous_inv();
+        inv_cfg.daily_loss_usd = Usdc(6_000_000); // $6 cap
+        let params = mk_params(200, 5.0);
+        let (mut mm, _store_rx, _status_rx) =
+            build_loop(fetcher, inv_cfg, params, tokens, Usdc(1_000_000_000));
+        assert!(!mm.day_loss_halted, "starts un-halted (no handle armed yet)");
+
+        // Seed the LEDGER past the cap for TODAY via several sub-cap adds (−$8 >
+        // −$6), then attach the read handle exactly as run_mm_loop retains it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("midsession.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        let today = utc_day_from_ms(now_ms());
+        for _ in 0..4 {
+            s.add_day_realized(today, "mm", -2_000_000).unwrap();
+        }
+        drop(s);
+        mm.day_loss_read = Some(ReadStore::open(&path).unwrap());
+
+        // One cycle must RE-LATCH from the ledger and quote nothing thereafter.
+        mm.tick().await;
+        assert!(
+            mm.day_loss_halted,
+            "per-cycle re-check latches once the cumulative ledger crosses the cap mid-session"
+        );
+        assert!(
+            mm.venue.open_orders().await.unwrap().is_empty(),
+            "no quotes placed on the tick that trips the mid-session latch"
+        );
+    }
+
     // ── Kill → cancel + clean exit (drives the real run_mm_loop) ───────────────
 
     #[tokio::test]
