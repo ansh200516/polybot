@@ -259,6 +259,8 @@ fn coord_status_to_strategy(cs: &CoordStatus) -> StrategyStatus {
         rebate_micro: 0,
         // Arb holds no resting maker quotes — the open-orders panel is MM-only.
         resting_orders: Vec::new(),
+        // Arb earns no liquidity reward — the estimate is RewardFarm-MM-specific.
+        reward_farm: None,
     }
 }
 

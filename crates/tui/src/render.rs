@@ -376,6 +376,20 @@ fn draw_health(f: &mut Frame, s: &AppState, area: Rect) {
         } else if line.paused {
             text.push_str(" PAUSED");
         }
+        // RewardFarm liquidity-reward ESTIMATE (Task 11): a single compact
+        // segment for the MM in reward-farm mode — est $/day, Q_min, in-band
+        // ✓/✗, and the size balance. Display-only estimates (spec §9). Absent
+        // for non-reward strategies, so the line is otherwise unchanged.
+        if let Some(r) = &line.reward {
+            text.push_str(&format!(
+                "\n  rew est ${:.2}/d qmin {:.1} {} bal {:.2} cum ${:.2}",
+                r.est_usd_day,
+                r.q_min,
+                if r.in_band { "in-band" } else { "OUT" },
+                r.balance_ratio,
+                r.cumulative_est,
+            ));
+        }
     }
     let block = Block::default().borders(Borders::ALL).title(" Health ");
     let para = Paragraph::new(text).block(block);
@@ -1000,6 +1014,8 @@ mod tests {
                 open_positions: 3,
                 paused: true,
                 halted: None,
+                // arb earns no liquidity reward → no reward segment.
+                reward: None,
             },
             crate::state::StrategyLine {
                 id: "mm".into(),
@@ -1010,6 +1026,7 @@ mod tests {
                 open_positions: 1,
                 paused: false,
                 halted: Some("DailyDrawdown".into()),
+                reward: None,
             },
         ];
         let text = render_to_text(&s, &UiState::default(), 200, 60);
@@ -1034,6 +1051,54 @@ mod tests {
         // No per_strategy ⇒ no breakdown lines (unchanged single-strategy panel).
         let bare = render_to_text(&sample_state(), &UiState::default(), 200, 60);
         assert!(!bare.contains("eq 7.00"), "breakdown must be empty without per_strategy");
+    }
+
+    /// Task 11: an MM strategy line carrying a RewardFarm estimate renders a
+    /// compact "rew" segment (est $/day, Q_min, in-band, balance, cumulative);
+    /// a strategy with no reward (`reward: None`) renders no such segment.
+    #[test]
+    fn health_panel_shows_reward_farm_estimate() {
+        let mut s = sample_state();
+        s.per_strategy = vec![crate::state::StrategyLine {
+            id: "mm".into(),
+            equity_usd: 3.00,
+            cash_usd: 0.00,
+            realized_usd: 0.00,
+            unrealized_usd: 0.00,
+            open_positions: 2,
+            paused: false,
+            halted: None,
+            reward: Some(crate::state::RewardLine {
+                est_usd_day: 1.23,
+                q_min: 4.5,
+                in_band: true,
+                balance_ratio: 0.80,
+                cumulative_est: 2.46,
+            }),
+        }];
+        // Wide so the reward segment is not clipped by the Health panel width.
+        let text = render_to_text(&s, &UiState::default(), 200, 60);
+        assert!(text.contains("rew est $1.23/d"), "reward est $/day missing:\n{text}");
+        assert!(text.contains("qmin 4.5"), "reward q_min missing:\n{text}");
+        assert!(text.contains("in-band"), "reward in-band flag missing:\n{text}");
+        assert!(text.contains("bal 0.80"), "reward balance missing:\n{text}");
+        assert!(text.contains("cum $2.46"), "reward cumulative missing:\n{text}");
+
+        // A non-reward strategy renders no "rew" segment.
+        let mut bare = sample_state();
+        bare.per_strategy = vec![crate::state::StrategyLine {
+            id: "arb".into(),
+            equity_usd: 1.00,
+            cash_usd: 1.00,
+            realized_usd: 0.00,
+            unrealized_usd: 0.00,
+            open_positions: 0,
+            paused: false,
+            halted: None,
+            reward: None,
+        }];
+        let bare_text = render_to_text(&bare, &UiState::default(), 200, 60);
+        assert!(!bare_text.contains("rew est"), "no reward segment without reward:\n{bare_text}");
     }
 
     #[test]

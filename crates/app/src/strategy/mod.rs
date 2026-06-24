@@ -95,6 +95,37 @@ pub struct StrategyStatus {
     /// suppressed) `(token, side)` slots — the dashboard's open-orders panel.
     /// Empty for strategies with no resting book (arb, the heartbeat).
     pub resting_orders: Vec<RestingOrderSnapshot>,
+    /// RewardFarm liquidity-reward ESTIMATE telemetry (Task 11, spec §9).
+    /// `Some` ONLY for the MM under [`Policy::RewardFarm`](crate::strategy::quote_policy::Policy);
+    /// `None` for SpreadCapture / arb / the heartbeat (which earn no liquidity
+    /// reward). Like `rebate_micro` it is a DISPLAY-ONLY estimate, never folded
+    /// into the money fields above — the true payout needs the epoch-wide maker
+    /// totals only Polymarket has (spec §9/§17).
+    pub reward_farm: Option<RewardFarmStatus>,
+}
+
+/// RewardFarm liquidity-reward ESTIMATE telemetry (Task 11, spec §9), computed
+/// each sample on our OWN resting reward quotes via the pure
+/// [`reward_score`](crate::strategy::reward_score) scoring. Every field is an
+/// ESTIMATE: the true daily payout needs epoch-wide maker totals only
+/// Polymarket has, so the `$/day` figure especially is a rough proxy (spec
+/// §9/§17). Surfaced on the dashboard; never fed back into accounting.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RewardFarmStatus {
+    /// Rough $/day reward estimate aggregated across the quoted tokens this
+    /// sample (`daily_rate · our_depth / (our_depth + competing_depth)`).
+    pub est_reward_usd_day: f64,
+    /// Two-sided minimum score `Q_min` (spec §9), summed across quoted tokens.
+    /// `> 0` means we hold a scoring two-sided position.
+    pub q_min: f64,
+    /// `true` when the quotes are two-sided in-band this sample (`q_min > 0`).
+    pub in_band: bool,
+    /// Size/score balance `min(Q1,Q2) / max(Q1,Q2)`: `1.0` = perfectly
+    /// balanced, `0.0` if a side is missing (single-sided / nothing resting).
+    pub balance_ratio: f64,
+    /// Session-cumulative sum of the per-sample `est_reward_usd_day` — a running
+    /// estimate proxy, NOT a realized payout.
+    pub cumulative_est: f64,
 }
 
 /// One row of the dashboard's open-orders panel: a resting maker quote, OR a

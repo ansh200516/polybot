@@ -84,6 +84,28 @@ pub struct StrategyLine {
     pub open_positions: usize,
     pub paused: bool,
     pub halted: Option<String>,
+    /// RewardFarm liquidity-reward ESTIMATE summary (Task 11); `Some` only for
+    /// the MM in reward-farm mode, `None` otherwise. Display-only — rendered as a
+    /// compact "rew" segment on this strategy's Health line.
+    pub reward: Option<RewardLine>,
+}
+
+/// RewardFarm liquidity-reward ESTIMATE summary for a [`StrategyLine`] (Task 11,
+/// spec §9). Display-only estimates carried up from the strategy's status; the
+/// `$/day` figure especially is a rough proxy (true payout needs epoch-wide
+/// maker totals only Polymarket has).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RewardLine {
+    /// Rough estimated reward, $/day.
+    pub est_usd_day: f64,
+    /// Two-sided minimum score `Q_min` (> 0 ⇒ a scoring position).
+    pub q_min: f64,
+    /// Whether the quotes are two-sided in-band this sample.
+    pub in_band: bool,
+    /// Score balance `min(Q1,Q2)/max(Q1,Q2)` (1.0 = balanced).
+    pub balance_ratio: f64,
+    /// Session-cumulative estimated reward, $ (a running proxy).
+    pub cumulative_est: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

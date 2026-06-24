@@ -18,7 +18,8 @@ use pm_core::num::{Qty, sell_proceeds};
 use pm_registry::Registry;
 use pm_store::read::ReadStore;
 use pm_tui::state::{
-    AppState, FillLine, Health, OpenOrderLine, OppLine, OrderLine, PositionLine, StrategyLine,
+    AppState, FillLine, Health, OpenOrderLine, OppLine, OrderLine, PositionLine, RewardLine,
+    StrategyLine,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -89,6 +90,15 @@ pub fn strategy_lines(view: &[(StrategyId, StrategyStatus)]) -> Vec<StrategyLine
             open_positions: s.open_positions,
             paused: s.paused,
             halted: s.halted.clone(),
+            // RewardFarm liquidity-reward ESTIMATE (Task 11): carried up verbatim
+            // (already f64 estimates), `Some` only for the MM in reward-farm mode.
+            reward: s.reward_farm.map(|r| RewardLine {
+                est_usd_day: r.est_reward_usd_day,
+                q_min: r.q_min,
+                in_band: r.in_band,
+                balance_ratio: r.balance_ratio,
+                cumulative_est: r.cumulative_est,
+            }),
         })
         .collect()
 }
@@ -942,6 +952,42 @@ mod tests {
             m.equity_micro, 10_000_000,
             "rebate must not inflate the summed equity"
         );
+    }
+
+    /// Task 11: `strategy_lines` carries the per-strategy RewardFarm ESTIMATE up
+    /// into the display `StrategyLine.reward` — `Some` only when the status has
+    /// it (the MM in reward-farm mode), `None` for everything else.
+    #[test]
+    fn strategy_lines_carries_reward_farm_estimate() {
+        let view: Vec<(StrategyId, StrategyStatus)> = vec![
+            (
+                StrategyId("arb"),
+                StrategyStatus { reward_farm: None, ..Default::default() },
+            ),
+            (
+                StrategyId("mm"),
+                StrategyStatus {
+                    reward_farm: Some(crate::strategy::RewardFarmStatus {
+                        est_reward_usd_day: 1.5,
+                        q_min: 4.0,
+                        in_band: true,
+                        balance_ratio: 0.9,
+                        cumulative_est: 3.0,
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let lines = strategy_lines(&view);
+        let arb = lines.iter().find(|l| l.id == "arb").unwrap();
+        assert!(arb.reward.is_none(), "arb has no reward estimate");
+        let mm = lines.iter().find(|l| l.id == "mm").unwrap();
+        let r = mm.reward.unwrap();
+        assert!((r.est_usd_day - 1.5).abs() < 1e-9);
+        assert!((r.q_min - 4.0).abs() < 1e-9);
+        assert!(r.in_band);
+        assert!((r.balance_ratio - 0.9).abs() < 1e-9);
+        assert!((r.cumulative_est - 3.0).abs() < 1e-9);
     }
 
     /// Task 1.7: fed the host's aggregated per-strategy view, the publisher

@@ -91,8 +91,10 @@ use crate::positions::PositionBook;
 use crate::wiring::BookFetcher;
 
 use super::quote_policy::{Policy, adjusted_mid, needs_requote, reward_quote_prices, skewed_sizes};
+use super::reward_score::{ScoredOrder, est_daily_reward_usd, order_score, quote_set_q_min};
 use super::{
-    RestingOrderSnapshot, Strategy, StrategyCommand, StrategyCtx, StrategyId, StrategyStatus,
+    RestingOrderSnapshot, RewardFarmStatus, Strategy, StrategyCommand, StrategyCtx, StrategyId,
+    StrategyStatus,
 };
 
 /// Resolved quote-loop parameters (USD → µUSDC done once, up front).
@@ -149,6 +151,17 @@ pub struct MmParams {
     /// SIBLING `[reward_farm]` section), threaded through [`MmParams::from_config`]
     /// exactly like `size_skew_max_ratio`.
     pub requote_band_ticks: u16,
+    /// RewardFarm ESTIMATOR sampling cadence (Task 11, spec §9): how often the
+    /// loop recomputes the local liquidity-reward estimate (`q_min`, est $/day,
+    /// balance) on our resting quotes, mirroring Polymarket's per-minute
+    /// sampling. The FIRST cycle always samples (so the dashboard shows a figure
+    /// immediately); thereafter [`MmLoop::tick`] re-samples only once this
+    /// interval has elapsed. Inert under SpreadCapture (no estimator runs).
+    ///
+    /// SOURCE: the operator knob is `[reward_farm].sample_interval_ms` (the
+    /// SIBLING `[reward_farm]` section), threaded through [`MmParams::from_config`]
+    /// exactly like `size_skew_max_ratio` / `requote_band_ticks`.
+    pub sample_interval: Duration,
 }
 
 impl MmParams {
@@ -173,6 +186,8 @@ impl MmParams {
             size_skew_max_ratio: rf.size_skew_max_ratio,
             // Same SIBLING-section threading: the anti-flicker re-quote band.
             requote_band_ticks: rf.requote_band_ticks,
+            // Same SIBLING-section threading: the estimator sampling cadence.
+            sample_interval: Duration::from_millis(rf.sample_interval_ms),
         })
     }
 }
@@ -440,6 +455,17 @@ fn signed_value(net: i128, price_micro: u64) -> i128 {
 /// ("Size (N) lower than the minimum: 5"). The MM skips a quote below this
 /// rather than placing it to be rejected.
 const MM_MIN_ORDER_SHARES_MICRO: i128 = 5_000_000;
+
+/// Competing in-band depth FALLBACK for the reward $/day estimator (Task 11,
+/// spec §9), reused from main's selection-time constant (`competing_depth =
+/// 1.0` when no live book depth is plumbed). The live book's resting in-band
+/// depth (excluding our own orders) is NOT threaded into the quote loop here, so
+/// the estimator pins the competing term to this constant — which makes the
+/// `$/day` figure OPTIMISTIC (our share ≈ `our_depth / (our_depth + 1)`). It is
+/// an explicit, documented estimate (spec §9/§17 label the dollar figure
+/// approximate); real depth plumbing + live midnight-payout reconciliation are
+/// deferred. `q_min` / `balance_ratio` are exact (they need no competing depth).
+const REWARD_COMPETING_DEPTH_FALLBACK: f64 = 1.0;
 
 /// Build one resting `postOnly` Gtc maker order sized by `notional_micro /
 /// price`. `None` when the price/size is non-positive OR below the venue's
@@ -738,12 +764,14 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     /// [`Policy::RewardFarm`] (tight two-sided reward quoting). Set from
     /// [`MmParams::policy`] in [`run_mm_loop`].
     policy: Policy,
-    /// Per-token reward-program params `(min_size_shares, max_spread_cents)`,
-    /// resolved ONCE at construction from the registry [`MarketMetrics`] for each
-    /// token's market (spec §6). RewardFarm reads `max_spread_cents` (`.1`) as the
-    /// scoring band; `min_size` (`.0`) is threaded for Task-6 sizing. A token with
-    /// no metrics / not reward-eligible maps to zeros, gating its quotes out.
-    reward_by_token: HashMap<TokenId, (f64, f64)>,
+    /// Per-token reward-program params `(min_size_shares, max_spread_cents,
+    /// daily_rate_usd)`, resolved ONCE at construction from the registry
+    /// [`MarketMetrics`] for each token's market (spec §6). RewardFarm reads
+    /// `max_spread_cents` (`.1`) as the scoring band; `min_size` (`.0`) is the
+    /// Task-6 sizing floor; `daily_rate_usd` (`.2`) feeds the Task-11 reward
+    /// $/day estimator. A token with no metrics / not reward-eligible maps to
+    /// zeros, gating its quotes (and estimator contribution) out.
+    reward_by_token: HashMap<TokenId, (f64, f64, f64)>,
     /// Per-side notional cap: `min(max_quote_usd, capital)`, µUSDC.
     notional_micro: i128,
     /// `order_id → resting-order metadata`, for fill→side resolution and the
@@ -784,6 +812,20 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     /// MM stops re-quoting it until the operator un-vetoes. Published in the
     /// status snapshot so the dashboard can show + un-veto them.
     vetoed: HashSet<(TokenId, Side)>,
+    /// RewardFarm ESTIMATOR (Task 11, spec §9): last sample instant. `None`
+    /// until the first sample, so the first RewardFarm cycle always samples;
+    /// thereafter [`tick`](Self::tick) re-samples once `params.sample_interval`
+    /// has elapsed. Untouched under SpreadCapture (the estimator never runs).
+    last_reward_sample: Option<Instant>,
+    /// Cached reward estimate from the last sample, published by
+    /// [`publish_status`](Self::publish_status). `None` until first sampled and
+    /// always `None` under SpreadCapture — so the dashboard field is populated
+    /// ONLY for RewardFarm.
+    reward_status: Option<RewardFarmStatus>,
+    /// Session-cumulative sum of the per-sample est $/day (a running estimate
+    /// proxy, NOT a realized payout); surfaced as
+    /// [`RewardFarmStatus::cumulative_est`].
+    reward_cumulative_est: f64,
 }
 
 impl<V: MakerVenue + UserFillSource> MmLoop<V> {
@@ -813,6 +855,25 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         // settle in-flight, and inventory/accounting must stay correct.
         self.consume_fills().await;
         self.mark_and_check().await;
+        // Task 11 — REWARD ESTIMATOR sampling (RewardFarm only, spec §9): after
+        // quoting/fills settle, recompute the local liquidity-reward estimate on
+        // our CURRENT resting quotes, at most once per `sample_interval` (mirrors
+        // Polymarket's per-minute sampling). The first cycle always samples
+        // (`last_reward_sample` is `None`) so the dashboard shows a figure right
+        // away. SpreadCapture never enters here, so its status stays reward-free.
+        if self.policy == Policy::RewardFarm {
+            let now = Instant::now();
+            let due = self
+                .last_reward_sample
+                .is_none_or(|t| now.duration_since(t) >= self.params.sample_interval);
+            if due {
+                let mut st = self.sample_reward_estimate().await;
+                self.reward_cumulative_est += st.est_reward_usd_day;
+                st.cumulative_est = self.reward_cumulative_est;
+                self.reward_status = Some(st);
+                self.last_reward_sample = Some(now);
+            }
+        }
         self.publish_status().await;
     }
 
@@ -900,8 +961,8 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                     // 0.0 gates BOTH sides out (skip). `net_micro` /
                     // `max_inventory_micro` (read above) drive the SIZE lean,
                     // capped by `size_skew_max_ratio` (spec §8.3) — prices stay tight.
-                    let (min_size_shares, max_spread_cents) =
-                        self.reward_by_token.get(&token).copied().unwrap_or((0.0, 0.0));
+                    let (min_size_shares, max_spread_cents, _daily_rate) =
+                        self.reward_by_token.get(&token).copied().unwrap_or((0.0, 0.0, 0.0));
                     reward_compute_quotes(
                         &book,
                         token,
@@ -1299,6 +1360,114 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         }
     }
 
+    /// Compute the local liquidity-reward ESTIMATE (Task 11, spec §9) on our
+    /// CURRENT resting reward quotes, REUSING the pure
+    /// [`reward_score`](super::reward_score) scoring (never reimplemented here).
+    ///
+    /// Per quoted token (grouped from [`QuoteManager::resting_orders`]): fetch
+    /// the book for the adjusted mid, build a [`ScoredOrder`] per resting side
+    /// (`spread_cents = |price − adj_mid|·100`, `size` in shares), then
+    /// - `q_min` via [`quote_set_q_min`] (spec §9 two-sided minimum);
+    /// - `Q1`/`Q2` via [`order_score`] for the `balance_ratio = min/max`;
+    /// - the rough $/day via [`est_daily_reward_usd`] using the per-token
+    ///   `daily_rate` and our in-band depth (USD notional of in-band sides),
+    ///   with the competing term pinned to [`REWARD_COMPETING_DEPTH_FALLBACK`]
+    ///   (no live book depth is plumbed — a documented, optimistic estimate).
+    ///
+    /// Contributions are AGGREGATED across quoted tokens (Spec 1 typically
+    /// quotes a single token two-sided): `q_min`/est sum, and `balance_ratio`
+    /// is taken from the summed `Q1`/`Q2`. `cumulative_est` is filled by the
+    /// caller. Takes `&mut self` only to match the loop's other async methods
+    /// (a shared `&self` across `.await` is not `Send` for the live venue); it
+    /// mutates no trading state — it just reads the resting set + books.
+    async fn sample_reward_estimate(&mut self) -> RewardFarmStatus {
+        // Group our resting quotes by token so each token scores against its own
+        // adjusted mid + reward band.
+        let mut by_token: HashMap<TokenId, Vec<MakerOrder>> = HashMap::new();
+        for (_, o) in self.qm.resting_orders() {
+            by_token.entry(o.token).or_default().push(o);
+        }
+
+        let mut q1_total = 0.0_f64;
+        let mut q2_total = 0.0_f64;
+        let mut q_min_total = 0.0_f64;
+        let mut est_total = 0.0_f64;
+        for (token, orders) in by_token {
+            // `.1` = max_spread_cents (scoring band `v`), `.2` = daily_rate_usd.
+            // A token with no metrics / not reward-eligible (band ≤ 0) scores 0,
+            // so it is skipped (it earns nothing and would divide by a 0 band).
+            let (_, max_spread_cents, daily_rate) =
+                self.reward_by_token.get(&token).copied().unwrap_or((0.0, 0.0, 0.0));
+            if max_spread_cents <= 0.0 {
+                continue;
+            }
+            // Adjusted mid from the live book; skip the token if it is gone /
+            // one-sided (we cannot score a distance-from-mid without a mid).
+            let Some((book, true)) = self.fetcher.fetch(token).await else {
+                continue;
+            };
+            let ts = book.ts();
+            let (Some(bb), Some(ba)) = (book.bids.best(), book.asks.best()) else {
+                continue;
+            };
+            let adj_mid = adjusted_mid(
+                bb.microusdc(ts) as f64 / 1_000_000.0,
+                ba.microusdc(ts) as f64 / 1_000_000.0,
+            );
+
+            let mut bids: Vec<ScoredOrder> = Vec::new();
+            let mut asks: Vec<ScoredOrder> = Vec::new();
+            let mut our_in_band_depth = 0.0_f64; // USD notional of in-band sides
+            for o in &orders {
+                let price = o.price.microusdc(ts) as f64 / 1_000_000.0;
+                let shares = o.size.0 as f64 / 1_000_000.0;
+                let so = ScoredOrder {
+                    spread_cents: (price - adj_mid).abs() * 100.0,
+                    size: shares,
+                };
+                // In-band (score > 0) sides contribute to our reward depth, in
+                // USD (shares × price) to stay consistent with the competing
+                // in-band depth a future live-book plumb would supply (spec §7).
+                if order_score(max_spread_cents, so.spread_cents) > 0.0 {
+                    our_in_band_depth += shares * price;
+                }
+                match o.side {
+                    Side::Bid => bids.push(so),
+                    Side::Ask => asks.push(so),
+                }
+            }
+
+            // Q1/Q2 (per-side score sums) drive the balance ratio; `q_min` is the
+            // two-sided minimum from the same primitives via `quote_set_q_min`.
+            let q1: f64 = bids
+                .iter()
+                .map(|o| order_score(max_spread_cents, o.spread_cents) * o.size)
+                .sum();
+            let q2: f64 = asks
+                .iter()
+                .map(|o| order_score(max_spread_cents, o.spread_cents) * o.size)
+                .sum();
+            q1_total += q1;
+            q2_total += q2;
+            q_min_total += quote_set_q_min(max_spread_cents, adj_mid, &bids, &asks);
+            est_total +=
+                est_daily_reward_usd(daily_rate, our_in_band_depth, REWARD_COMPETING_DEPTH_FALLBACK);
+        }
+
+        let balance_ratio = {
+            let hi = q1_total.max(q2_total);
+            if hi > 0.0 { q1_total.min(q2_total) / hi } else { 0.0 }
+        };
+        RewardFarmStatus {
+            est_reward_usd_day: est_total,
+            q_min: q_min_total,
+            in_band: q_min_total > 0.0,
+            balance_ratio,
+            // The caller adds this sample to (and copies in) the session total.
+            cumulative_est: 0.0,
+        }
+    }
+
     /// Compute bid- and mid-marked P&L and publish the full [`StrategyStatus`]
     /// (+ a durable, bid-marked `PnlRow`). Held tokens are valued from the
     /// SIGNED net at the current book — long at the best bid, short at the best
@@ -1395,6 +1564,10 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             // NOT folded into the marked equity/cash/realized above.
             rebate_micro: usdc_to_i64(Usdc(self.rebate_accrued_micro)).unwrap_or(i64::MAX),
             resting_orders,
+            // Task 11 — RewardFarm liquidity-reward ESTIMATE (spec §9): the last
+            // sample's cached telemetry. `Some` ONLY under RewardFarm (the sampler
+            // never runs otherwise), so SpreadCapture/arb publish `None` here.
+            reward_farm: self.reward_status,
         });
     }
 
@@ -1475,11 +1648,18 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
     // the RewardFarm policy; harmlessly built (and ignored) under SpreadCapture. A
     // token with no metrics maps to zeros → not reward-eligible → gated out. The
     // registry `Arc` is dropped after this — only the resolved map is retained.
-    let reward_by_token: HashMap<TokenId, (f64, f64)> = tokens
+    let reward_by_token: HashMap<TokenId, (f64, f64, f64)> = tokens
         .iter()
         .filter_map(|t| {
             let m = registry.metrics(*token_market.get(t)?)?;
-            Some((*t, (m.reward_min_size, m.reward_max_spread_cents)))
+            Some((
+                *t,
+                (
+                    m.reward_min_size,
+                    m.reward_max_spread_cents,
+                    m.reward_daily_rate_usd,
+                ),
+            ))
         })
         .collect();
     let mut mm = MmLoop {
@@ -1507,6 +1687,9 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
         day_loss_halted: false,
         no_naked_shorts,
         vetoed: HashSet::new(),
+        last_reward_sample: None,
+        reward_status: None,
+        reward_cumulative_est: 0.0,
     };
     if start_paused {
         tracing::info!("mm: live held — quoting PAUSED until release (press `l`)");
@@ -1652,6 +1835,10 @@ mod tests {
             // 1 = the `RewardFarm` default 1-tick anti-flicker band; the sticky
             // re-quote test below sets it (and the policy) explicitly.
             requote_band_ticks: 1,
+            // 60s = the `RewardFarm` default estimator cadence. The first cycle
+            // always samples regardless, so the estimator tests see a figure
+            // after one tick without waiting out the interval.
+            sample_interval: Duration::from_millis(60_000),
         }
     }
 
@@ -1740,6 +1927,9 @@ mod tests {
             day_loss_halted: false,
             no_naked_shorts: false,
             vetoed: HashSet::new(),
+            last_reward_sample: None,
+            reward_status: None,
+            reward_cumulative_est: 0.0,
         };
         (mm, store_rx, status_rx)
     }
@@ -1808,9 +1998,19 @@ mod tests {
     #[test]
     fn from_config_threads_reward_farm_size_skew_ratio() {
         let mm = pm_config::Mm::default();
-        let rf = pm_config::RewardFarm { size_skew_max_ratio: 1.5, ..Default::default() };
+        let rf = pm_config::RewardFarm {
+            size_skew_max_ratio: 1.5,
+            // Task 11: the estimator cadence is threaded through the SAME seam.
+            sample_interval_ms: 30_000,
+            ..Default::default()
+        };
         let params = MmParams::from_config(&mm, &rf).expect("from_config");
         assert_eq!(params.size_skew_max_ratio, 1.5, "operator ratio reaches the loop");
+        assert_eq!(
+            params.sample_interval,
+            Duration::from_millis(30_000),
+            "operator estimator cadence reaches the loop"
+        );
 
         // Default config flows the validated default (not a stale hardcoded 2.0).
         let params_def =
@@ -1819,6 +2019,10 @@ mod tests {
         assert_eq!(
             params_def.size_skew_max_ratio,
             pm_config::RewardFarm::default().size_skew_max_ratio
+        );
+        assert_eq!(
+            params_def.sample_interval,
+            Duration::from_millis(pm_config::RewardFarm::default().sample_interval_ms)
         );
     }
 
@@ -2185,7 +2389,7 @@ mod tests {
         // Drive the REWARD-FARM path with a reward-eligible 3¢ band (min_size 1 sh)
         // for token 1; `build_loop` defaults to SpreadCapture / empty metrics.
         mm.policy = Policy::RewardFarm;
-        mm.reward_by_token.insert(TokenId(1), (1.0, 3.0));
+        mm.reward_by_token.insert(TokenId(1), (1.0, 3.0, 100.0));
 
         // Cycle 1 (bid 0.48 / ask 0.52 → mid 0.50): the tight two-sided reward
         // quote rests at bid 0.50 / ask 0.51.
@@ -2251,6 +2455,177 @@ mod tests {
         assert_ne!(bid_id1, bid_id0, "SpreadCapture must re-quote on a tick move (id re-keys)");
     }
 
+    // ── RewardFarm paper integration (Task 11, spec §9/§15) ─────────────────────
+
+    /// PRIORITY-2 paper integration (spec §9/§15): drive a RewardFarm `MmLoop`
+    /// over the `PaperMakerVenue` on a synthetic ~mid-0.50 book with real reward
+    /// params (min_size 5 sh, max_spread 3¢, $100/day) and assert the spec's
+    /// paper success criteria end to end in one quote cycle:
+    ///   (a) BOTH a bid and an ask are placed (two-sided),
+    ///   (b) both within `max_spread` of the mid (in-band),
+    ///   (c) sizes are balanced when flat,
+    ///   (d) a second cycle on the UNCHANGED book does NOT replace (sticky), and
+    ///   (e) the PUBLISHED estimator reports `q_min > 0` (a scoring position).
+    /// Drives the whole loop via [`MmLoop::tick`] so the estimator sample +
+    /// status publish are exercised exactly as in production.
+    #[tokio::test]
+    async fn reward_farm_paper_quotes_in_band_two_sided_balanced() {
+        let tokens = vec![TokenId(1)];
+        // `_shared` is never mutated: the book stays at mid 0.50 for both cycles,
+        // which is what makes cycle 2 the sticky no-replace case (d).
+        let (fetcher, _shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        // RewardFarm with the default 1-tick sticky band + 60s estimator cadence
+        // (the first cycle samples regardless of the interval). $5 per-side quote,
+        // ample capital + inventory caps so flat stays balanced (no size lean).
+        let mut params = mk_params(200, 5.0);
+        params.policy = Policy::RewardFarm;
+        let (mut mm, _store_rx, status_rx) =
+            build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+        // Reward params for token 1: min_size 5 sh, max_spread 3¢, $100/day —
+        // set on the loop's `reward_by_token` exactly as the other mm tests do.
+        mm.reward_by_token.insert(TokenId(1), (5.0, 3.0, 100.0));
+
+        // Cycle 1: quote → consume (no cross → no fills) → sample → publish.
+        mm.tick().await;
+
+        // (a) TWO-SIDED: both a bid and an ask rest (capture ids for the sticky
+        // check (d) — the paper venue re-keys a replaced order, so an UNCHANGED
+        // id is message-independent proof that no cancel+place happened).
+        let bid_id0 = mm
+            .qm
+            .tracked()
+            .get(&(TokenId(1), Side::Bid))
+            .cloned()
+            .expect("a bid is placed (two-sided)");
+        let ask_id0 = mm
+            .qm
+            .tracked()
+            .get(&(TokenId(1), Side::Ask))
+            .cloned()
+            .expect("an ask is placed (two-sided)");
+
+        let resting: HashMap<Side, MakerOrder> = mm
+            .qm
+            .resting_orders()
+            .into_iter()
+            .map(|(_, o)| (o.side, o))
+            .collect();
+        let bid = resting.get(&Side::Bid).expect("resting bid");
+        let ask = resting.get(&Side::Ask).expect("resting ask");
+
+        // (b) IN-BAND: |price − mid| ≤ max_spread (3¢). Mid = 0.50 on this book.
+        let mid = 0.50_f64;
+        let max_spread = 0.03_f64;
+        let bid_px = bid.price.microusdc(TickSize::Cent) as f64 / 1_000_000.0;
+        let ask_px = ask.price.microusdc(TickSize::Cent) as f64 / 1_000_000.0;
+        assert!(
+            (bid_px - mid).abs() <= max_spread + 1e-9,
+            "bid within max_spread of mid: {bid_px}"
+        );
+        assert!(
+            (ask_px - mid).abs() <= max_spread + 1e-9,
+            "ask within max_spread of mid: {ask_px}"
+        );
+
+        // (c) BALANCED when flat: equal SHARE sizes (the quadratic reward score
+        // rewards size balance, not notional balance).
+        assert_eq!(bid.size.0, ask.size.0, "flat → balanced share sizes");
+
+        // (e) PUBLISHED estimator (RewardFarm only): q_min > 0 ⇒ a two-sided
+        // scoring position; in_band set; a funded market ⇒ a positive $/day.
+        let rf = status_rx
+            .borrow()
+            .reward_farm
+            .expect("RewardFarm publishes reward telemetry");
+        assert!(rf.q_min > 0.0, "published q_min must be > 0, got {}", rf.q_min);
+        assert!(rf.in_band, "two-sided in-band quotes ⇒ in_band");
+        assert!(
+            rf.est_reward_usd_day > 0.0,
+            "a funded reward market ⇒ est $/day > 0, got {}",
+            rf.est_reward_usd_day
+        );
+        assert!(
+            rf.cumulative_est >= rf.est_reward_usd_day - 1e-9,
+            "cumulative est accrues the sample"
+        );
+
+        // (d) STICKY: a second cycle on the UNCHANGED book keeps both sides
+        // verbatim — unchanged venue ids prove NO cancel+place (which would reset
+        // Polymarket's time-weighted reward score).
+        mm.tick().await;
+        assert_eq!(
+            mm.qm.tracked().get(&(TokenId(1), Side::Bid)).cloned(),
+            Some(bid_id0),
+            "in-band bid must NOT be re-quoted on an unchanged book (sticky)"
+        );
+        assert_eq!(
+            mm.qm.tracked().get(&(TokenId(1), Side::Ask)).cloned(),
+            Some(ask_id0),
+            "in-band ask must NOT be re-quoted on an unchanged book (sticky)"
+        );
+    }
+
+    /// PRIORITY-4 (light) A/B (spec §15): run BOTH policies over the SAME
+    /// synthetic mid-0.50 book with identical simulated taker flow and surface
+    /// each one's estimated reward + realized P&L so the difference is VISIBLE.
+    /// Uses [`build_loop_tally`] so `paper_taker_fill_pct` actually drives fills
+    /// (so realized P&L is non-trivial). The realized figure is NOT hard-asserted
+    /// (the paper sim models no adverse selection — it only captures the quoted
+    /// spread, which inverts the live reality the spec warns about); the firm
+    /// invariant is qualitative: RewardFarm surfaces a positive-`Q_min` reward
+    /// estimate, SpreadCapture surfaces NONE. Returns `(reward_estimate,
+    /// realized_µUSDC)` per policy (the cached sample `publish_status` would
+    /// emit, read directly since `build_loop_tally` keeps no status receiver).
+    #[tokio::test]
+    async fn ab_reward_farm_vs_spread_capture_same_book() {
+        async fn run_policy(policy: Policy) -> (Option<RewardFarmStatus>, i128) {
+            let tokens = vec![TokenId(1)];
+            // Same synthetic book + identical taker flow for both policies.
+            let (fetcher, _shared) =
+                controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+            let mut params = mk_params(200, 5.0);
+            params.policy = policy;
+            params.paper_taker_fill_pct = 20; // wired by build_loop_tally
+            let (mut mm, _store_rx, _produced) =
+                build_loop_tally(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+            if policy == Policy::RewardFarm {
+                mm.reward_by_token.insert(TokenId(1), (5.0, 3.0, 100.0));
+            }
+            // Several cycles over the unchanged book: quote → taker fills → mark
+            // → (RewardFarm) sample. `reward_status` holds what `publish_status`
+            // would emit; `inv.realized` is the realized P&L both policies book.
+            for _ in 0..5 {
+                mm.tick().await;
+            }
+            (mm.reward_status, mm.inv.realized(TokenId(1)).0)
+        }
+
+        let (rf_reward, rf_realized) = run_policy(Policy::RewardFarm).await;
+        let (sc_reward, sc_realized) = run_policy(Policy::SpreadCapture).await;
+
+        // Visible A/B summary (the numbers differ between policies; the hard
+        // assert below is the qualitative reward-vs-no-reward distinction).
+        let rf_est = rf_reward.map_or(0.0, |r| r.est_reward_usd_day);
+        let rf_qmin = rf_reward.map_or(0.0, |r| r.q_min);
+        eprintln!(
+            "A/B same-book: reward_farm est ${rf_est:.2}/day q_min {rf_qmin:.2} realized {rf_realized}µ \
+             | spread_capture reward {sc_reward:?} realized {sc_realized}µ"
+        );
+
+        let rf = rf_reward.expect("RewardFarm surfaces a reward estimate");
+        assert!(rf.q_min > 0.0, "RewardFarm two-sided ⇒ q_min > 0, got {}", rf.q_min);
+        assert!(
+            rf.est_reward_usd_day > 0.0,
+            "funded reward market ⇒ est $/day > 0, got {}",
+            rf.est_reward_usd_day
+        );
+        assert!(
+            sc_reward.is_none(),
+            "SpreadCapture earns no liquidity reward (reward telemetry must be None)"
+        );
+    }
+
     // ── RewardFarm instrumentation telemetry (Task 10, spec §12) ────────────────
 
     /// Under RewardFarm a quote cycle emits a best-effort `RfDecision` for the
@@ -2266,7 +2641,7 @@ mod tests {
         let (mut mm, mut store_rx, _status_rx) =
             build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
         mm.policy = Policy::RewardFarm;
-        mm.reward_by_token.insert(TokenId(1), (1.0, 3.0));
+        mm.reward_by_token.insert(TokenId(1), (1.0, 3.0, 100.0));
 
         // Cycle rests bid 0.50 / ask 0.51; logs a decision for token 1.
         mm.quote().await;
@@ -3169,6 +3544,9 @@ mod tests {
             day_loss_halted: false,
             no_naked_shorts: false,
             vetoed: HashSet::new(),
+            last_reward_sample: None,
+            reward_status: None,
+            reward_cumulative_est: 0.0,
         };
         (mm, store_rx, produced)
     }
@@ -3243,6 +3621,9 @@ mod tests {
             day_loss_halted: false,
             no_naked_shorts: true,
             vetoed: HashSet::new(),
+            last_reward_sample: None,
+            reward_status: None,
+            reward_cumulative_est: 0.0,
         };
         // We placed this order on YES (an Ask). The fill must follow THIS token.
         mm.placed.insert(
