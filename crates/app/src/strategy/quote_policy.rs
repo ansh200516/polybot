@@ -98,6 +98,13 @@ pub fn select_reward_markets(mut cands: Vec<(u64, f64, f64, f64)>, budget_usd: f
     out
 }
 
+/// True when a resting order must be replaced: it has drifted more than
+/// `band_ticks` from the new target price. Keeps quotes sticky (frequent
+/// cancels reset the time-weighted reward score).
+pub fn needs_requote(resting_price: f64, target_price: f64, tick: f64, band_ticks: u16) -> bool {
+    (resting_price - target_price).abs() > (f64::from(band_ticks) * tick) + 1e-9
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
     SpreadCapture,
@@ -214,5 +221,12 @@ mod tests {
         ];
         let picked = select_reward_markets(cands, /*budget*/ 25.0);
         assert_eq!(picked, vec![2, 3]);
+    }
+
+    #[test]
+    fn requote_only_when_out_of_band() {
+        // resting at 0.49; band 1 tick (0.01). target 0.495 -> keep; target 0.51 -> replace.
+        assert!(!needs_requote(0.49, 0.495, 0.01, 1));
+        assert!(needs_requote(0.49, 0.51, 0.01, 1));
     }
 }

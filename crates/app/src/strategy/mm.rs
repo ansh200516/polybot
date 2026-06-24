@@ -89,7 +89,7 @@ use crate::coordinator::now_ms;
 use crate::positions::PositionBook;
 use crate::wiring::BookFetcher;
 
-use super::quote_policy::{Policy, adjusted_mid, reward_quote_prices, skewed_sizes};
+use super::quote_policy::{Policy, adjusted_mid, needs_requote, reward_quote_prices, skewed_sizes};
 use super::{
     RestingOrderSnapshot, Strategy, StrategyCommand, StrategyCtx, StrategyId, StrategyStatus,
 };
@@ -136,6 +136,18 @@ pub struct MmParams {
     /// `&pm_config::RewardFarm` alongside `&pm_config::Mm` and copies the value
     /// through; main passes `&config.reward_farm` at the call site.
     pub size_skew_max_ratio: f64,
+    /// RewardFarm STICKY re-quote band (Task 8, spec §8): keep a resting quote
+    /// in place until its target price drifts more than this many ticks away,
+    /// instead of replacing it every cycle. A replace is a cancel+place, which
+    /// resets Polymarket's TIME-WEIGHTED reward score — so re-quoting on every
+    /// sub-band wiggle would erode the very reward this policy farms. `0` means
+    /// "replace on any tick change" (no stickiness). Read by [`MmLoop::quote`]
+    /// via [`needs_requote`]; inert under SpreadCapture.
+    ///
+    /// SOURCE: the operator knob is `[reward_farm].requote_band_ticks` (the
+    /// SIBLING `[reward_farm]` section), threaded through [`MmParams::from_config`]
+    /// exactly like `size_skew_max_ratio`.
+    pub requote_band_ticks: u16,
 }
 
 impl MmParams {
@@ -158,6 +170,8 @@ impl MmParams {
             // `[reward_farm]` is a sibling of `[strategies.mm]`; main passes it in
             // (`&config.reward_farm`) so the operator's cap reaches the loop.
             size_skew_max_ratio: rf.size_skew_max_ratio,
+            // Same SIBLING-section threading: the anti-flicker re-quote band.
+            requote_band_ticks: rf.requote_band_ticks,
         })
     }
 }
@@ -759,6 +773,21 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         // Per-market inventory cap (µUSDC) the skew normalizes against — read
         // once; the skew is otherwise a pure function of the per-token net.
         let max_inventory_micro = self.inv.config().max_inventory_usd.0;
+        // Task 8 — STICKY RE-QUOTING (RewardFarm only): snapshot what is resting
+        // ONCE up front (reconcile mutates it only at the end of this pass), keyed
+        // by `(token, side)`, so the sticky check below can keep an in-band resting
+        // quote VERBATIM rather than churn it. A replace is a cancel+place, which
+        // resets Polymarket's time-weighted reward score. Empty (never consulted)
+        // under SpreadCapture, so that path stays byte-for-byte unchanged.
+        let resting: HashMap<(TokenId, Side), MakerOrder> = if self.policy == Policy::RewardFarm {
+            self.qm
+                .resting_orders()
+                .into_iter()
+                .map(|(_, o)| ((o.token, o.side), o))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let mut desired: Vec<MakerOrder> = Vec::new();
         for token in tokens {
             // Need a VALID two-sided book; skip the token otherwise.
@@ -878,6 +907,31 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 };
                 // Inventory cap gate (Task 2.2): only quote sides it approves.
                 if matches!(self.inv.check_quote(&intent), QuoteVerdict::Approve) {
+                    // Task 8 — STICKY RE-QUOTING (RewardFarm only; the SpreadCapture
+                    // path is byte-for-byte unchanged). When a quote for this
+                    // `(token, side)` is ALREADY resting AND its target price has NOT
+                    // drifted past `requote_band_ticks`, keep the RESTING order
+                    // VERBATIM: `reconcile` then value-compares it equal (MakerOrder:
+                    // Eq) and leaves it untouched — no cancel+place, which would reset
+                    // Polymarket's TIME-WEIGHTED reward score. Gated on PRICE drift
+                    // ONLY; the per-cycle size lean is deliberately ignored here (a
+                    // documented Task-8 scope choice) — re-leaning sizes every tick
+                    // would re-introduce exactly the churn this anti-flicker rule
+                    // exists to prevent. Prices compare in DOLLARS, matching
+                    // `reward_compute_quotes`.
+                    let o = if self.policy == Policy::RewardFarm
+                        && let Some(r) = resting.get(&(token, o.side))
+                        && !needs_requote(
+                            r.price.microusdc(ts) as f64 / 1_000_000.0,
+                            o.price.microusdc(ts) as f64 / 1_000_000.0,
+                            ts.unit_microusdc() as f64 / 1_000_000.0,
+                            self.params.requote_band_ticks,
+                        ) {
+                        tracing::debug!(token = token.0, side = ?o.side, resting_tick = r.price.get(), target_tick = o.price.get(), "mm quote: STICKY keep (within band)");
+                        r.clone()
+                    } else {
+                        o
+                    };
                     tracing::debug!(token = token.0, side = ?o.side, tick = o.price.get(), "mm quote: DESIRED");
                     desired.push(o);
                 } else {
@@ -1381,6 +1435,9 @@ mod tests {
             // 2.0 = the spec/§8.3 + `RewardFarm` default ≤2:1 lean cap; the
             // reward-farm sizing tests below set inventory/cap explicitly.
             size_skew_max_ratio: 2.0,
+            // 1 = the `RewardFarm` default 1-tick anti-flicker band; the sticky
+            // re-quote test below sets it (and the policy) explicitly.
+            requote_band_ticks: 1,
         }
     }
 
@@ -1880,6 +1937,102 @@ mod tests {
         let bid = bid.expect("bid");
         let ask = ask.expect("ask");
         assert!(bid.size.0 > ask.size.0, "short → bigger bid size");
+    }
+
+    // ── RewardFarm sticky re-quoting (Task 8, anti-flicker) ─────────────────────
+
+    /// Task 8 (mm-loop level): under `RewardFarm`, a resting quote whose fresh
+    /// target price is still WITHIN `requote_band_ticks` must NOT be re-quoted —
+    /// a replace is a cancel+place that resets Polymarket's time-weighted reward
+    /// score. We place a two-sided reward quote, nudge the book ONE tick (so each
+    /// side's new target lands exactly one tick away, inside the 1-tick band), and
+    /// re-quote: both sides must stay put — same resting PRICE and same venue id.
+    /// The paper venue re-keys a replaced order, so an UNCHANGED id is a direct,
+    /// message-independent proof that NO cancel/replace happened (the count stays 0).
+    #[tokio::test]
+    async fn rewardfarm_sticky_requote_keeps_in_band_resting_order() {
+        fn resting_px(qm: &QuoteManager, side: Side) -> Px {
+            qm.resting_orders()
+                .into_iter()
+                .find(|(_, o)| o.side == side)
+                .map(|(_, o)| o.price)
+                .expect("a resting order for this side")
+        }
+
+        let tokens = vec![TokenId(1)];
+        let (fetcher, shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        // `requote_band_ticks` defaults to 1 in `mk_params`; $5 per-side quote.
+        let params = mk_params(200, 5.0);
+        let (mut mm, _store_rx, _status_rx) =
+            build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+        // Drive the REWARD-FARM path with a reward-eligible 3¢ band (min_size 1 sh)
+        // for token 1; `build_loop` defaults to SpreadCapture / empty metrics.
+        mm.policy = Policy::RewardFarm;
+        mm.reward_by_token.insert(TokenId(1), (1.0, 3.0));
+
+        // Cycle 1 (bid 0.48 / ask 0.52 → mid 0.50): the tight two-sided reward
+        // quote rests at bid 0.50 / ask 0.51.
+        mm.quote().await;
+        let bid_id0 = mm.qm.tracked().get(&(TokenId(1), Side::Bid)).cloned().expect("bid placed");
+        let ask_id0 = mm.qm.tracked().get(&(TokenId(1), Side::Ask)).cloned().expect("ask placed");
+        assert_eq!(resting_px(&mm.qm, Side::Bid), px(50), "cycle-1 bid rests at 0.50");
+        assert_eq!(resting_px(&mm.qm, Side::Ask), px(51), "cycle-1 ask rests at 0.51");
+
+        // Nudge the book up ONE tick (bid 0.49 / ask 0.53 → mid 0.51). The fresh
+        // reward target becomes bid 0.51 / ask 0.52 — each exactly one tick from
+        // its resting quote, i.e. INSIDE the 1-tick band (would-replace without
+        // the sticky gate).
+        shared
+            .lock()
+            .unwrap()
+            .insert(TokenId(1), (cent_book(&[(49, 100 * SH)], &[(53, 100 * SH)]), true));
+
+        // Cycle 2: STICKY — both in-band sides are kept verbatim, so reconcile
+        // value-compares equal and issues NO cancel/replace.
+        mm.quote().await;
+        assert_eq!(
+            mm.qm.tracked().get(&(TokenId(1), Side::Bid)).cloned(),
+            Some(bid_id0),
+            "in-band bid must NOT be re-quoted (unchanged id ⇒ no cancel+place)"
+        );
+        assert_eq!(
+            mm.qm.tracked().get(&(TokenId(1), Side::Ask)).cloned(),
+            Some(ask_id0),
+            "in-band ask must NOT be re-quoted (unchanged id ⇒ no cancel+place)"
+        );
+        assert_eq!(resting_px(&mm.qm, Side::Bid), px(50), "bid stays at its resting 0.50, not the 0.51 target");
+        assert_eq!(resting_px(&mm.qm, Side::Ask), px(51), "ask stays at its resting 0.51, not the 0.52 target");
+    }
+
+    /// Task 8 isolation LOCK: `SpreadCapture` must be UNAFFECTED by the sticky
+    /// gate. The same one-tick book nudge that the reward path holds through must
+    /// still RE-QUOTE under SpreadCapture (its prices track the mid every cycle),
+    /// so the resting quote moves and the venue id re-keys (a replace happened).
+    #[tokio::test]
+    async fn spreadcapture_still_requotes_on_tick_move() {
+        let tokens = vec![TokenId(1)];
+        let (fetcher, shared) =
+            controllable_fetcher(&tokens, HashMap::from([(TokenId(1), (mid50_book(), true))]));
+        let params = mk_params(200, 5.0); // SpreadCapture (mk_params default)
+        let (mut mm, _store_rx, _status_rx) =
+            build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+
+        // Cycle 1 (mid 0.50): symmetric spread quote bid 0.49 / ask 0.51.
+        mm.quote().await;
+        let bid_id0 = mm.qm.tracked().get(&(TokenId(1), Side::Bid)).cloned().expect("bid placed");
+
+        // Same one-tick nudge as the sticky test (mid 0.50 → 0.51).
+        shared
+            .lock()
+            .unwrap()
+            .insert(TokenId(1), (cent_book(&[(49, 100 * SH)], &[(53, 100 * SH)]), true));
+
+        // Cycle 2: SpreadCapture re-quotes (no stickiness) — the bid moves and the
+        // venue re-keys it, proving the Task-8 gate did not leak into this path.
+        mm.quote().await;
+        let bid_id1 = mm.qm.tracked().get(&(TokenId(1), Side::Bid)).cloned().expect("bid still resting");
+        assert_ne!(bid_id1, bid_id0, "SpreadCapture must re-quote on a tick move (id re-keys)");
     }
 
     // ── Inventory skew (Task 4.3) ──────────────────────────────────────────────
