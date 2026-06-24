@@ -680,10 +680,30 @@ pub struct RewardFarm {
     pub sample_interval_ms: u64,
     /// Minimum reward-eligible markets to quote.
     pub min_markets: u32,
+    /// Book levels used for microprice + imbalance.
+    pub microprice_levels: u16,
+    /// Rolling window (ms) for the momentum signal.
+    pub signal_window_ms: u64,
+    /// |signal| above this pulls the endangered side ([0,1]).
+    pub pull_threshold: f64,
+    /// Suppress re-quoting a pulled side this long (ms).
+    pub pull_cooldown_ms: u64,
+    /// Re-place a side when its size lean drifts more than this fraction.
+    pub size_rebalance_pct: f64,
 }
 impl Default for RewardFarm {
     fn default() -> Self {
-        RewardFarm { requote_band_ticks: 1, size_skew_max_ratio: 2.0, sample_interval_ms: 60_000, min_markets: 1 }
+        RewardFarm {
+            requote_band_ticks: 1,
+            size_skew_max_ratio: 2.0,
+            sample_interval_ms: 60_000,
+            min_markets: 1,
+            microprice_levels: 3,
+            signal_window_ms: 3000,
+            pull_threshold: 0.6,
+            pull_cooldown_ms: 5000,
+            size_rebalance_pct: 0.25,
+        }
     }
 }
 
@@ -958,6 +978,15 @@ impl Config {
             return Err(ConfigError::BadMoney(
                 "reward_farm.size_skew_max_ratio must be finite and >= 1.0",
             ));
+        }
+        if self.reward_farm.microprice_levels < 1 {
+            return Err(ConfigError::BadMoney("reward_farm.microprice_levels must be >= 1"));
+        }
+        if !(0.0..=1.0).contains(&self.reward_farm.pull_threshold) || !self.reward_farm.pull_threshold.is_finite() {
+            return Err(ConfigError::BadMoney("reward_farm.pull_threshold must be in [0,1]"));
+        }
+        if !(0.0..=1.0).contains(&self.reward_farm.size_rebalance_pct) || !self.reward_farm.size_rebalance_pct.is_finite() {
+            return Err(ConfigError::BadMoney("reward_farm.size_rebalance_pct must be in [0,1]"));
         }
         // MM capital must be finite + non-negative always; when ENABLED it is
         // carved out of the bankroll (arb's cap shrinks by it), so it can never
@@ -1919,5 +1948,27 @@ mod tests {
         let mut c4 = Config::default();
         c4.reward_farm.size_skew_max_ratio = f64::INFINITY;
         assert!(c4.validate().is_err());
+    }
+
+    #[test]
+    fn reward_farm_phase_a_knobs_parse_and_default() {
+        let c = Config::from_toml_str(
+            "[reward_farm]\nmicroprice_levels=3\nsignal_window_ms=3000\npull_threshold=0.6\npull_cooldown_ms=5000\nsize_rebalance_pct=0.25\n",
+        ).unwrap();
+        assert_eq!(c.reward_farm.microprice_levels, 3);
+        assert_eq!(c.reward_farm.pull_threshold, 0.6);
+        let d = Config::default();
+        assert_eq!(d.reward_farm.microprice_levels, 3);
+        assert_eq!(d.reward_farm.pull_cooldown_ms, 5000);
+    }
+
+    #[test]
+    fn reward_farm_phase_a_validation() {
+        let mut c = Config::default();
+        c.reward_farm.pull_threshold = 1.5; // must be in [0,1]
+        assert!(c.validate().is_err());
+        let mut c2 = Config::default();
+        c2.reward_farm.microprice_levels = 0; // must be >= 1
+        assert!(c2.validate().is_err());
     }
 }

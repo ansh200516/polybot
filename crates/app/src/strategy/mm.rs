@@ -162,6 +162,22 @@ pub struct MmParams {
     /// SIBLING `[reward_farm]` section), threaded through [`MmParams::from_config`]
     /// exactly like `size_skew_max_ratio` / `requote_band_ticks`.
     pub sample_interval: Duration,
+    /// RewardFarm Phase-A: book levels used for the microprice + imbalance
+    /// signal. Threaded from `[reward_farm].microprice_levels` exactly like
+    /// `size_skew_max_ratio`; consumed by the Phase-A adverse-selection logic.
+    pub microprice_levels: u16,
+    /// RewardFarm Phase-A: rolling window (ms) for the momentum signal.
+    /// Threaded from `[reward_farm].signal_window_ms` (sibling section).
+    pub signal_window_ms: u64,
+    /// RewardFarm Phase-A: `|signal|` above this pulls the endangered side
+    /// ([0,1]). Threaded from `[reward_farm].pull_threshold` (sibling section).
+    pub pull_threshold: f64,
+    /// RewardFarm Phase-A: suppress re-quoting a pulled side this long (ms).
+    /// Threaded from `[reward_farm].pull_cooldown_ms` (sibling section).
+    pub pull_cooldown_ms: u64,
+    /// RewardFarm Phase-A: re-place a side when its size lean drifts more than
+    /// this fraction. Threaded from `[reward_farm].size_rebalance_pct` (sibling).
+    pub size_rebalance_pct: f64,
 }
 
 impl MmParams {
@@ -188,6 +204,12 @@ impl MmParams {
             requote_band_ticks: rf.requote_band_ticks,
             // Same SIBLING-section threading: the estimator sampling cadence.
             sample_interval: Duration::from_millis(rf.sample_interval_ms),
+            // Phase-A adverse-selection knobs — same SIBLING-section threading.
+            microprice_levels: rf.microprice_levels,
+            signal_window_ms: rf.signal_window_ms,
+            pull_threshold: rf.pull_threshold,
+            pull_cooldown_ms: rf.pull_cooldown_ms,
+            size_rebalance_pct: rf.size_rebalance_pct,
         })
     }
 }
@@ -1924,6 +1946,13 @@ mod tests {
             // always samples regardless, so the estimator tests see a figure
             // after one tick without waiting out the interval.
             sample_interval: Duration::from_millis(60_000),
+            // Phase-A adverse-selection knobs at their `RewardFarm` defaults; the
+            // Phase-A tests that exercise them set them explicitly.
+            microprice_levels: 3,
+            signal_window_ms: 3000,
+            pull_threshold: 0.6,
+            pull_cooldown_ms: 5000,
+            size_rebalance_pct: 0.25,
         }
     }
 
