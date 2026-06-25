@@ -1648,6 +1648,11 @@ async fn main() {
         // otherwise, so non-hedging / paper / arb runs thread an empty map.
         let mut mm_cond_by_token: HashMap<pm_core::instrument::TokenId, alloy_primitives::B256> =
             HashMap::new();
+        // R2 (auto-redeem): token → CLOB asset id for the quoted reward-farm
+        // universe — the resolved-winner redeem sweep matches a Data-API
+        // `Position.asset` back to our `TokenId` (for the resolved-price lookup).
+        // Populated alongside the conditionId map (hedging only); empty otherwise.
+        let mut mm_venue_by_token: HashMap<pm_core::instrument::TokenId, String> = HashMap::new();
         // Task 4.6 user-WS inputs (live only): the markets' condition_ids to
         // subscribe to, and the asset_id→(TokenId, TickSize) map the WS fills
         // source resolves each trade's `asset_id` against (the SAME shape the
@@ -1682,6 +1687,13 @@ async fn main() {
             if mm_hedging {
                 mm_complement.insert(m.yes, m.no);
                 mm_complement.insert(m.no, m.yes);
+                // R2 (auto-redeem): record both legs' CLOB asset ids so the redeem
+                // sweep can match a resolved `Position.asset` back to the leg.
+                for tok in [m.yes, m.no] {
+                    if let Some(vid) = reg.token_venue_id(tok) {
+                        mm_venue_by_token.insert(tok, vid.to_owned());
+                    }
+                }
                 // M6-7: map BOTH legs to the market's single on-chain conditionId
                 // (hex from the registry) so the live merge sweep can build its
                 // `mergePositions` batch. A market with no / an unparseable
@@ -1800,6 +1812,25 @@ async fn main() {
                 "MM inventory reloaded (resuming held position to manage/offload)"
             );
         }
+        // R2 (auto-redeem): the resolved-winner feed — built ONLY on a relayer-backed
+        // reward-farm live run (`mm_merger` present). The keyless Data-API positions
+        // client polls the deposit wallet for `redeemable` (resolved) markets; the
+        // redeem sweep then claims each via the SAME relayer. `None` everywhere else
+        // (paper / arb / non-relayer live), so those paths thread None + an empty map.
+        let mm_data_api = if mm_merger.is_some() {
+            match DataApiClient::new(None) {
+                Ok(c) => Some(std::sync::Arc::new(c)),
+                Err(e) => {
+                    warn!(error = %e, "MM redeem: Data-API client build failed — auto-redeem disabled this run");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // The Data API keys positions by the LOWERCASED on-chain address (matches
+        // `reconcile_seed_against_chain`). `Some` only on a live run.
+        let mm_deposit_wallet = live_deposit_wallet.map(|dw| dw.to_string().to_lowercase());
         let mut mm = MmStrategy::new(mm_tokens, mm_token_market, mm_params, mm_inv_cfg, mm_capital)
             .with_seed(mm_seed)
             // Spec-2 Phase B (§5.1): the yes↔no complement map for the quoted
@@ -1813,6 +1844,13 @@ async fn main() {
             // (paper / arb / non-relayer live) byte-for-byte unchanged.
             .with_merger(mm_merger)
             .with_conditions(mm_cond_by_token)
+            // R2 (auto-redeem): the resolved-winner feed — token→asset map + Data-API
+            // positions client + lowercased deposit wallet. All empty/None unless a
+            // relayer-backed reward-farm live run, so other paths are unchanged. The
+            // sweep claims RESOLVED markets via the same relayer (non-blocking).
+            .with_venue_ids(mm_venue_by_token)
+            .with_data_api(mm_data_api)
+            .with_deposit_wallet(mm_deposit_wallet)
             // Task 9 — PERSISTENT UTC-day loss cap: thread the store path so the
             // loop reads today's persisted "mm" P&L at startup and refuses to quote
             // when the day is already at/under the daily-loss cap, making the cap

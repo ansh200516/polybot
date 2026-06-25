@@ -618,6 +618,11 @@ const MM_MIN_ORDER_SHARES_MICRO: i128 = 5_000_000;
 /// are latched so a slow confirm is never re-submitted within the interval.
 const MERGE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// R2 (auto-redeem): the resolved-winner redeem sweep fires at most once per this
+/// interval — slower than the merge sweep because market resolutions are
+/// infrequent. Bounds the Data-API + relayer load of the (non-blocking) sweep.
+const REDEEM_SWEEP_INTERVAL: Duration = Duration::from_secs(120);
+
 /// Competing in-band depth FALLBACK for the reward $/day estimator (Task 11,
 /// spec §9), reused from main's selection-time constant (`competing_depth =
 /// 1.0` when no live book depth is plumbed). The live book's resting in-band
@@ -1114,25 +1119,34 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     /// quote loop. Initialised to "now" at construction (the first sweep waits one
     /// interval).
     last_merge_sweep: Instant,
-    /// R1 (auto-redeem): `token → CLOB asset id` for the quoted reward-farm
+    /// R1/R2 (auto-redeem): `token → CLOB asset id` for the quoted reward-farm
     /// universe — lets the resolved-position feed match a Data-API
     /// `Position.asset` back to this loop's `TokenId`. Built by main from the
-    /// registry; empty off reward-farm-redeem-live. HELD by R1; READ by the
-    /// resolved-winner redeem sweep in R2.
-    #[allow(dead_code)] // R2: read by the resolved-position redeem sweep.
+    /// registry; empty off reward-farm-redeem-live. Read by the redeem sweep.
     venue_by_token: HashMap<TokenId, String>,
-    /// R1 (auto-redeem): the Polymarket Data-API positions feed, `Some` ONLY on a
-    /// relayer-backed reward-farm live run (main builds it; `None` on paper, arb,
-    /// non-relayer live). HELD by R1; the redeem sweep that polls it for
-    /// `redeemable` (resolved) markets is R2. `Arc` so a spawned sweep can share
-    /// the one client.
-    #[allow(dead_code)] // R2: polled by the resolved-position redeem sweep.
+    /// R1/R2 (auto-redeem): the Polymarket Data-API positions feed, `Some` ONLY on
+    /// a relayer-backed reward-farm live run (main builds it; `None` on paper, arb,
+    /// non-relayer live). Polled by the redeem sweep for `redeemable` (resolved)
+    /// markets. `Arc` so a spawned sweep can share the one client.
     data_api: Option<Arc<pm_ingestion::data_api::DataApiClient>>,
-    /// R1 (auto-redeem): the LOWERCASED deposit-wallet address the positions query
-    /// is keyed on. `Some` only alongside [`data_api`](Self::data_api); `None` by
-    /// default. HELD by R1; used by the R2 redeem sweep's positions query.
-    #[allow(dead_code)] // R2: used by the resolved-position redeem sweep.
+    /// R1/R2 (auto-redeem): the LOWERCASED deposit-wallet address the positions
+    /// query is keyed on. `Some` only alongside [`data_api`](Self::data_api);
+    /// `None` by default. Used by the redeem sweep's positions query.
     deposit_wallet: Option<String>,
+    /// R2: confirmed redeem sweeps flow back here as the set of successfully
+    /// redeemed [`RedeemTarget`]s. The spawned sweep SENDS once it finishes;
+    /// [`drain_redeem_outcomes`](Self::drain_redeem_outcomes) RECEIVES + settles.
+    /// Unbounded so the spawn never blocks; the volume is tiny (resolutions rare).
+    redeem_tx: mpsc::UnboundedSender<Vec<RedeemTarget>>,
+    redeem_rx: mpsc::UnboundedReceiver<Vec<RedeemTarget>>,
+    /// R2: a single redeem sweep IN FLIGHT (spawned, not yet drained). Only one at
+    /// a time — resolutions are infrequent, so a per-condition set is unneeded;
+    /// cleared when the sweep's outcome is drained.
+    redeem_sweep_inflight: bool,
+    /// R2: last redeem-sweep instant — the sweep fires at most once per
+    /// [`REDEEM_SWEEP_INTERVAL`]. Initialised to "now" (the first sweep waits one
+    /// interval).
+    last_redeem_sweep: Instant,
 }
 
 /// Read BOTH arms of the persistent UTC-day loss gate for `"mm"` on `utc_day`,
@@ -1216,6 +1230,13 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         // settled inventory/accounting must stay correct regardless of quoting. A
         // no-op until a relayer-backed live merge sweep produces outcomes.
         self.drain_merge_outcomes();
+        // R2 (auto-redeem): settle confirmed redeems + (rate-limited) kick off the
+        // next resolved-winner sweep. Run EVERY cycle regardless of pause/halt —
+        // claiming a RESOLVED winner frees locked capital and must not wait on
+        // quoting. Both are internally gated to a relayer-backed reward-farm live
+        // run (no-op otherwise) and never block the loop (non-blocking spawn/drain).
+        self.drain_redeem_outcomes();
+        self.sweep_onchain_redeems();
         if !self.paused && !self.halted && !self.day_loss_halted {
             self.quote().await;
         }
@@ -1859,18 +1880,129 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         }
     }
 
-    // TODO(M6-redeem): wire resolution feed (Data API `redeemable`) → relayer.redeem.
-    // The relayer this loop already holds (`self.merger`) ALSO exposes
-    // `redeem(condition_id)` to recover a RESOLVED position to collateral. Wiring it
-    // needs a resolved-market signal the quote loop does NOT yet have: a feed of the
-    // deposit wallet's `redeemable` markets (Polymarket Data API positions). That
-    // feed would drive a SIBLING non-blocking `sweep_onchain_redeems` — spawn
-    // `self.merger.redeem(self.cond_by_token[token])`, then drain the outcome to
-    // flatten the resolved leg + credit recovered cash (the same spawn/drain pattern
-    // as the merge sweep, reusing `cond_by_token` + `merge_tx`/`merge_rx`). Building
-    // that resolution feed is OUT OF SCOPE for M6-7 (which implements the MERGE
-    // sweep only) — add it before enabling redeem so a resolved leg is never
-    // double-redeemed or redeemed before resolution.
+    /// R2 LIVE redeem sweep — RATE-LIMITED + NON-BLOCKING. Claims RESOLVED winners:
+    /// fetches the deposit wallet's positions (Data API), selects the RESOLVED
+    /// conditions still held ([`redeem_targets`]), and SPAWNS the multi-second
+    /// relayer `redeem` for each OFF the quote hot path, sending the confirmed
+    /// targets back to [`drain_redeem_outcomes`](Self::drain_redeem_outcomes). At
+    /// most ONE sweep in flight (`redeem_sweep_inflight`) and one per
+    /// [`REDEEM_SWEEP_INTERVAL`], so the loop is never stalled. Gated to a
+    /// relayer-backed reward-farm live run (merger + data_api + deposit_wallet all
+    /// present); a no-op otherwise. The resolved market gets NO new fills, so the
+    /// net SNAPSHOT below is the redeem amount (the drain re-clamps to current net).
+    fn sweep_onchain_redeems(&mut self) {
+        let (Some(merger), Some(data_api), Some(wallet)) = (
+            self.merger.clone(),
+            self.data_api.clone(),
+            self.deposit_wallet.clone(),
+        ) else {
+            return;
+        };
+        if self.redeem_sweep_inflight {
+            return;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.last_redeem_sweep) < REDEEM_SWEEP_INTERVAL {
+            return;
+        }
+        self.last_redeem_sweep = now;
+        // Snapshot current nets for the quoted-condition tokens to DECIDE what to
+        // redeem (the spawned task has no inventory access). The drain applies at
+        // the CURRENT net, so a stale snapshot can never over-reduce.
+        let net_snapshot: HashMap<TokenId, i128> = self
+            .cond_by_token
+            .keys()
+            .map(|&t| (t, self.inv.net(t)))
+            .collect();
+        let cond_by_token = self.cond_by_token.clone();
+        let venue_by_token = self.venue_by_token.clone();
+        let tx = self.redeem_tx.clone();
+        self.redeem_sweep_inflight = true;
+        tokio::spawn(async move {
+            // A fetch failure sends an empty set — the drain just clears the
+            // in-flight latch so the next interval retries; never panics.
+            let positions = match data_api.positions(&wallet, 0.0).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %e, "mm: redeem sweep — positions fetch failed; retry next sweep");
+                    let _ = tx.send(Vec::new());
+                    return;
+                }
+            };
+            let targets = redeem_targets(&positions, &cond_by_token, &venue_by_token, |t| {
+                net_snapshot.get(&t).copied().unwrap_or(0)
+            });
+            let mut done = Vec::new();
+            for target in targets {
+                match merger.redeem(target.condition_id).await {
+                    Ok(_) => {
+                        tracing::info!(
+                            condition = %target.condition_id,
+                            legs = target.legs.len(),
+                            "mm: LIVE on-chain redeem CONFIRMED — resolved winner claimed"
+                        );
+                        done.push(target);
+                    }
+                    Err(e) => tracing::warn!(
+                        condition = %target.condition_id,
+                        error = %e,
+                        "mm: redeem FAILED — retry next sweep"
+                    ),
+                }
+            }
+            let _ = tx.send(done);
+        });
+    }
+
+    /// R2: DRAIN every redeem sweep that finished since the last cycle — called
+    /// once per loop cycle (even when paused, like [`drain_merge_outcomes`]). For
+    /// each confirmed target, REBUILD its legs at the CURRENT net (clamped ≥ 0) —
+    /// the on-chain `redeemPositions` cleared the whole holding, so flatten exactly
+    /// what we hold now at the same resolved prices — and settle via the shared
+    /// [`apply_redeem`] (credit the recovered µUSDC, release basis), persisting the
+    /// realized delta to the day-loss ledger like a fill. Receiving ANY message
+    /// (incl. an empty set on fetch failure / no targets) clears the in-flight
+    /// latch so the next interval can sweep. Non-blocking (`try_recv`); never panics.
+    fn drain_redeem_outcomes(&mut self) {
+        while let Ok(done) = self.redeem_rx.try_recv() {
+            self.redeem_sweep_inflight = false;
+            for target in done {
+                let legs: Vec<RedeemLeg> = target
+                    .legs
+                    .iter()
+                    .filter_map(|l| {
+                        let net = self.inv.net(l.token).max(0);
+                        (net > 0).then_some(RedeemLeg {
+                            token: l.token,
+                            resolved_price: l.resolved_price,
+                            net_micro: net,
+                        })
+                    })
+                    .collect();
+                if legs.is_empty() {
+                    continue;
+                }
+                let rebuilt = RedeemTarget {
+                    condition_id: target.condition_id,
+                    legs,
+                };
+                let realized_delta =
+                    apply_redeem(&mut self.inv, &mut self.positions, &self.token_market, &rebuilt);
+                if realized_delta != 0 {
+                    let _ = self.store_tx.try_send(StoreMsg::DayRealized {
+                        utc_day: utc_day_from_ms(now_ms()),
+                        strategy: "mm".into(),
+                        delta_micro: realized_delta,
+                    });
+                }
+                tracing::info!(
+                    condition = %rebuilt.condition_id,
+                    realized_delta = realized_delta as i64,
+                    "mm: redeem settled — resolved position flattened + collateral credited"
+                );
+            }
+        }
+    }
 
     /// Record every newly-tracked resting order into `placed` (so a later fill
     /// always resolves its side + tick size) and emit its write-ahead order row
@@ -2699,7 +2831,6 @@ fn apply_merge_result(
 /// BOTH outcome slots of a resolved condition at once, so the loser leg is
 /// redeemed too (at ~$0) — hence a leg per held outcome.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // R1 emits the pure selection; the redeem sweep that reads it is R2.
 pub(crate) struct RedeemLeg {
     pub token: TokenId,
     pub resolved_price: f64,
@@ -2710,7 +2841,6 @@ pub(crate) struct RedeemLeg {
 /// Data-API resolved price. Emitted by [`redeem_targets`] and settled by
 /// [`apply_redeem`]; the on-chain redeem (R2) is keyed on `condition_id`.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // R1 emits the pure selection; the redeem sweep that reads it is R2.
 pub(crate) struct RedeemTarget {
     pub condition_id: B256,
     pub legs: Vec<RedeemLeg>,
@@ -2728,7 +2858,6 @@ pub(crate) struct RedeemTarget {
 /// redeemable (the resolved loser is often dropped from the positions feed).
 /// Deterministic order (legs by token id, targets by condition_id) for stable
 /// callers + tests.
-#[allow(dead_code)] // R1 selection; the redeem sweep that calls it is R2.
 pub(crate) fn redeem_targets(
     positions: &[pm_ingestion::data_api::Position],
     cond_by_token: &HashMap<TokenId, B256>,
@@ -2794,7 +2923,6 @@ pub(crate) fn redeem_targets(
 /// mirror it into the reporting [`PositionBook`] like [`apply_merge_result`]
 /// (cash in, basis released, qty 0). Returns the aggregate realized delta
 /// (µUSDC) so the caller can persist it to the day-loss ledger like a fill.
-#[allow(dead_code)] // R1 apply; the redeem sweep that calls it is R2.
 fn apply_redeem(
     inv: &mut InventoryRisk,
     positions: &mut PositionBook,
@@ -2892,6 +3020,8 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
     // M6-7: the spawned on-chain merge tasks send their outcomes back to the loop
     // over this channel; `drain_merge_outcomes` receives + settles them each cycle.
     let (merge_tx, merge_rx) = mpsc::unbounded_channel();
+    // R2: the spawned redeem sweeps send their confirmed targets back here.
+    let (redeem_tx, redeem_rx) = mpsc::unbounded_channel();
     let mut mm = MmLoop {
         venue,
         qm,
@@ -2936,6 +3066,10 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
         venue_by_token,
         data_api,
         deposit_wallet,
+        redeem_tx,
+        redeem_rx,
+        redeem_sweep_inflight: false,
+        last_redeem_sweep: Instant::now(),
     };
     if start_paused {
         tracing::info!("mm: live held — quoting PAUSED until release (press `l`)");
@@ -3164,6 +3298,7 @@ mod tests {
         let notional_micro = params.max_quote_micro.min(capital.0).max(0);
         let token_market = token_market_for(&tokens);
         let (merge_tx, merge_rx) = mpsc::unbounded_channel();
+        let (redeem_tx, redeem_rx) = mpsc::unbounded_channel();
         let mm = MmLoop {
             venue,
             qm: QuoteManager::new(),
@@ -3206,6 +3341,10 @@ mod tests {
             venue_by_token: HashMap::new(),
             data_api: None,
             deposit_wallet: None,
+            redeem_tx,
+            redeem_rx,
+            redeem_sweep_inflight: false,
+            last_redeem_sweep: Instant::now(),
         };
         (mm, store_rx, status_rx)
     }
@@ -4772,6 +4911,114 @@ mod tests {
         assert_eq!(positions.cash(), Usdc(100_000_000), "recovered resolved value credited");
         // Aggregate realized = recovered $100 − basis $80 = +$20.
         assert_eq!(realized_delta, 20_000_000, "returned realized_delta == the aggregate");
+    }
+
+    // ── R2: resolved-winner redeem — sweep drain + gating ───────────────────────
+
+    /// R2: [`drain_redeem_outcomes`] settles a CONFIRMED redeem at the CURRENT net
+    /// — clears every held leg of the resolved condition (winner credited ≈
+    /// $1/share, loser $0), credits the recovered cash once, and clears the
+    /// in-flight latch. No HTTP — the sweep's confirmed targets are pushed directly
+    /// onto the channel.
+    #[tokio::test]
+    async fn drain_redeem_applies_at_current_net_and_credits() {
+        let (winner, loser) = (TokenId(1), TokenId(2));
+        let tokens = vec![winner, loser];
+        let (fetcher, _shared) = controllable_fetcher(&tokens, HashMap::new());
+        let (mut mm, _store_rx, _status_rx) = build_loop(
+            fetcher,
+            generous_inv(),
+            mk_params(200, 5.0),
+            tokens,
+            Usdc(1_000_000_000),
+        );
+        mm.inv.seed(winner, 100 * SH as i128, Usdc(40_000_000));
+        mm.inv.seed(loser, 100 * SH as i128, Usdc(40_000_000));
+        mm.redeem_sweep_inflight = true;
+        let cond: B256 = format!("0x{}", "ab".repeat(32)).parse().unwrap();
+        mm.redeem_tx
+            .send(vec![RedeemTarget {
+                condition_id: cond,
+                legs: vec![
+                    RedeemLeg { token: winner, resolved_price: 1.0, net_micro: 100 * SH as i128 },
+                    RedeemLeg { token: loser, resolved_price: 0.0, net_micro: 100 * SH as i128 },
+                ],
+            }])
+            .unwrap();
+
+        mm.drain_redeem_outcomes();
+
+        assert_eq!(mm.inv.net(winner), 0, "winner leg flattened on redeem");
+        assert_eq!(mm.inv.net(loser), 0, "loser leg flattened on redeem");
+        assert_eq!(
+            mm.positions.cash(),
+            Usdc(100_000_000),
+            "recovered resolved value credited once ($100 winner + $0 loser)"
+        );
+        assert!(!mm.redeem_sweep_inflight, "a finished sweep clears the in-flight latch");
+    }
+
+    /// R2: the drain applies at the CURRENT net, NOT the (possibly stale) snapshot
+    /// baked into the target — so a leg whose `net_micro` exceeds the current
+    /// holding is CLAMPED to the current net (never an over-reduction / phantom
+    /// short), and only the current holding is credited.
+    #[tokio::test]
+    async fn drain_redeem_clamps_to_current_net() {
+        let winner = TokenId(1);
+        let tokens = vec![winner];
+        let (fetcher, _shared) = controllable_fetcher(&tokens, HashMap::new());
+        let (mut mm, _store_rx, _status_rx) = build_loop(
+            fetcher,
+            generous_inv(),
+            mk_params(200, 5.0),
+            tokens,
+            Usdc(1_000_000_000),
+        );
+        // Hold only 30 shares NOW; the sweep's snapshot target over-claims 100.
+        mm.inv.seed(winner, 30 * SH as i128, Usdc(12_000_000));
+        let cond: B256 = format!("0x{}", "cd".repeat(32)).parse().unwrap();
+        mm.redeem_tx
+            .send(vec![RedeemTarget {
+                condition_id: cond,
+                legs: vec![RedeemLeg {
+                    token: winner,
+                    resolved_price: 1.0,
+                    net_micro: 100 * SH as i128,
+                }],
+            }])
+            .unwrap();
+
+        mm.drain_redeem_outcomes();
+
+        assert_eq!(mm.inv.net(winner), 0, "cleared to flat — never driven negative");
+        assert_eq!(
+            mm.positions.cash(),
+            Usdc(30_000_000),
+            "credited the CURRENT 30 shares × $1, not the stale 100"
+        );
+    }
+
+    /// R2 GATING: `sweep_onchain_redeems` only fires on a relayer-backed reward-farm
+    /// live run. With no positions feed (`data_api`/`merger`/`deposit_wallet` all
+    /// `None`, the `build_loop` default) it spawns NOTHING and leaves the in-flight
+    /// latch clear — so paper / arb / non-relayer live are byte-for-byte unchanged
+    /// (the per-cycle drain is an inert empty `try_recv`).
+    #[tokio::test]
+    async fn redeem_sweep_gated_without_feed() {
+        let tokens = vec![TokenId(1)];
+        let (fetcher, _shared) = controllable_fetcher(&tokens, HashMap::new());
+        let (mut mm, _store_rx, _status_rx) = build_loop(
+            fetcher,
+            generous_inv(),
+            mk_params(200, 5.0),
+            tokens,
+            Usdc(1_000_000_000),
+        );
+        mm.sweep_onchain_redeems();
+        assert!(
+            !mm.redeem_sweep_inflight,
+            "no positions feed (data_api/merger/deposit_wallet None) → nothing spawned"
+        );
     }
 
     // ── RewardFarm Phase-B integration (Task B6, spec §5.1) ─────────────────────
@@ -6353,6 +6600,7 @@ mod tests {
         let notional_micro = params.max_quote_micro.min(capital.0).max(0);
         let token_market = token_market_for(&tokens);
         let (merge_tx, merge_rx) = mpsc::unbounded_channel();
+        let (redeem_tx, redeem_rx) = mpsc::unbounded_channel();
         let mm = MmLoop {
             venue,
             qm: QuoteManager::new(),
@@ -6395,6 +6643,10 @@ mod tests {
             venue_by_token: HashMap::new(),
             data_api: None,
             deposit_wallet: None,
+            redeem_tx,
+            redeem_rx,
+            redeem_sweep_inflight: false,
+            last_redeem_sweep: Instant::now(),
         };
         (mm, store_rx, produced)
     }
@@ -6447,6 +6699,7 @@ mod tests {
         let (store_tx, _store_rx) = mpsc::channel(64);
         let (status_tx, _status_rx) = watch::channel(StrategyStatus::default());
         let (merge_tx, merge_rx) = mpsc::unbounded_channel();
+        let (redeem_tx, redeem_rx) = mpsc::unbounded_channel();
         let mut mm = MmLoop {
             venue: ScriptVenue { fill: Some(fill) },
             qm: QuoteManager::new(),
@@ -6489,6 +6742,10 @@ mod tests {
             venue_by_token: HashMap::new(),
             data_api: None,
             deposit_wallet: None,
+            redeem_tx,
+            redeem_rx,
+            redeem_sweep_inflight: false,
+            last_redeem_sweep: Instant::now(),
         };
         // We placed this order on YES (an Ask). The fill must follow THIS token.
         mm.placed.insert(
