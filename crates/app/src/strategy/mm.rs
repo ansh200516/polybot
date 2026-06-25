@@ -182,6 +182,14 @@ pub struct MmParams {
     /// RewardFarm Phase-A: re-place a side when its size lean drifts more than
     /// this fraction. Threaded from `[reward_farm].size_rebalance_pct` (sibling).
     pub size_rebalance_pct: f64,
+    /// RewardFarm Phase-B: opt-in complement-pair quoting (BID-YES + BID-NO) for
+    /// two-sided-from-flat reward farming. Threaded from
+    /// `[reward_farm].hedging_enabled` (sibling section); consumed by Phase-B.
+    pub hedging_enabled: bool,
+    /// RewardFarm Phase-B: merge a held complete YES+NO set once the matched
+    /// pair exceeds this (USD). Threaded from `[reward_farm].merge_threshold_usd`
+    /// (sibling section); consumed by Phase-B.
+    pub merge_threshold_usd: f64,
 }
 
 impl MmParams {
@@ -214,6 +222,9 @@ impl MmParams {
             pull_threshold: rf.pull_threshold,
             pull_cooldown_ms: rf.pull_cooldown_ms,
             size_rebalance_pct: rf.size_rebalance_pct,
+            // Phase-B complement-pair + merge knobs — same SIBLING-section threading.
+            hedging_enabled: rf.hedging_enabled,
+            merge_threshold_usd: rf.merge_threshold_usd,
         })
     }
 }
@@ -2169,6 +2180,11 @@ mod tests {
             pull_threshold: 0.6,
             pull_cooldown_ms: 5000,
             size_rebalance_pct: 0.25,
+            // Phase-B complement-pair + merge knobs at their `RewardFarm`
+            // defaults (off / $5); the Phase-B tests that exercise them set
+            // them explicitly.
+            hedging_enabled: false,
+            merge_threshold_usd: 5.0,
         }
     }
 

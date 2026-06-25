@@ -691,6 +691,13 @@ pub struct RewardFarm {
     pub pull_cooldown_ms: u64,
     /// Re-place a side when its size lean drifts more than this fraction.
     pub size_rebalance_pct: f64,
+    /// Opt-in: quote the complement pair (BID-YES + BID-NO) for two-sided-from-flat
+    /// reward farming (required for live, which has no naked short). Off = Spec-1
+    /// single-token bid+ask.
+    pub hedging_enabled: bool,
+    /// Merge a held complete YES+NO set once the matched pair exceeds this (USD),
+    /// recycling locked collateral. Paper-simulated; live merge is deferred.
+    pub merge_threshold_usd: f64,
 }
 impl Default for RewardFarm {
     fn default() -> Self {
@@ -704,6 +711,8 @@ impl Default for RewardFarm {
             pull_threshold: 0.6,
             pull_cooldown_ms: 5000,
             size_rebalance_pct: 0.25,
+            hedging_enabled: false,
+            merge_threshold_usd: 5.0,
         }
     }
 }
@@ -988,6 +997,9 @@ impl Config {
         }
         if !(0.0..=1.0).contains(&self.reward_farm.size_rebalance_pct) || !self.reward_farm.size_rebalance_pct.is_finite() {
             return Err(ConfigError::BadMoney("reward_farm.size_rebalance_pct must be in [0,1]"));
+        }
+        if self.reward_farm.merge_threshold_usd < 0.0 || !self.reward_farm.merge_threshold_usd.is_finite() {
+            return Err(ConfigError::BadMoney("reward_farm.merge_threshold_usd must be finite and >= 0"));
         }
         // MM capital must be finite + non-negative always; when ENABLED it is
         // carved out of the bankroll (arb's cap shrinks by it), so it can never
@@ -1970,6 +1982,26 @@ mod tests {
         assert!(c.validate().is_err());
         let mut c2 = Config::default();
         c2.reward_farm.microprice_levels = 0; // must be >= 1
+        assert!(c2.validate().is_err());
+    }
+
+    #[test]
+    fn reward_farm_phase_b_knobs() {
+        let c = Config::from_toml_str("[reward_farm]\nhedging_enabled=true\nmerge_threshold_usd=5.0\n").unwrap();
+        assert!(c.reward_farm.hedging_enabled);
+        assert_eq!(c.reward_farm.merge_threshold_usd, 5.0);
+        let d = Config::default();
+        assert!(!d.reward_farm.hedging_enabled);
+        assert_eq!(d.reward_farm.merge_threshold_usd, 5.0);
+    }
+
+    #[test]
+    fn reward_farm_merge_threshold_must_be_finite_nonneg() {
+        let mut c = Config::default();
+        c.reward_farm.merge_threshold_usd = -1.0;
+        assert!(c.validate().is_err());
+        let mut c2 = Config::default();
+        c2.reward_farm.merge_threshold_usd = f64::NAN;
         assert!(c2.validate().is_err());
     }
 }
