@@ -2577,6 +2577,17 @@ fn apply_merge_result(
     b: TokenId,
     amount_micro: i128,
 ) -> i128 {
+    // Defensive clamp: a merge can reduce at most each leg's CURRENT long net.
+    // By construction this holds (the live sweep runs ONLY under bid-only
+    // hedging, so between selection and this drain-time apply a leg's net only
+    // GROWS via bid fills; the paper path applies the same cycle it selects).
+    // The clamp keeps the money path a pure reduction — never a phantom short —
+    // even if asks were ever re-enabled for these legs. No-op when the
+    // invariant holds, so paper recycle + the existing tests are unchanged.
+    let amount_micro = amount_micro.max(0).min(inv.net(a).max(0)).min(inv.net(b).max(0));
+    if amount_micro == 0 {
+        return 0;
+    }
     // A complete set redeems to EXACTLY $1, so recovered µUSDC == merged µshares.
     let recovered_micro = amount_micro;
     let realized_before = inv.realized(a).0 + inv.realized(b).0;
