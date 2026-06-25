@@ -10,8 +10,10 @@
 //! `shadow` mode signs and logs but performs NO network I/O (no limiter, no
 //! POST) — the operator's pre-funding readiness check (Task 13).
 //!
-//! split/merge are on-chain ops deferred to M6; they return
-//! `VenueError::NotSupportedLive`.
+//! `split`/`merge` here take a `MarketId` (the arb basket path) and stay
+//! `VenueError::NotSupportedLive`: MM-driven on-chain merge/redeem is handled by
+//! `relayer::RelayerClient` (M6) in on-chain `conditionId` terms; this
+//! `MarketId`-based arb wire is a future step.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -722,6 +724,11 @@ impl ExecutionVenue for LiveVenue {
         }
     }
 
+    /// NOT wired on live — returns `NotSupportedLive`. MM-driven on-chain
+    /// merge/redeem is handled by [`crate::relayer::RelayerClient`] (M6) in
+    /// on-chain `conditionId` terms; this `MarketId`-based arb path — and split,
+    /// which reward farming never needs (design §4) — remains deferred (the arb
+    /// wire is a future step).
     async fn split(
         &mut self,
         _market: pm_core::instrument::MarketId,
@@ -732,6 +739,11 @@ impl ExecutionVenue for LiveVenue {
         ))
     }
 
+    /// NOT wired on live — returns `NotSupportedLive`. MM-driven on-chain
+    /// merge/redeem is handled by [`crate::relayer::RelayerClient`] (M6) in
+    /// on-chain `conditionId` terms; this `MarketId`-based arb path remains
+    /// deferred (the arb wire is a future step). The MM (M6-7) holds an
+    /// `Option<RelayerClient>` and calls it directly, NOT through this trait.
     async fn merge(
         &mut self,
         _market: pm_core::instrument::MarketId,

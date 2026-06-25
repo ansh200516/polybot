@@ -18,10 +18,11 @@ use alloy_primitives::{Address, B256, U256, address, b256, hex, keccak256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolStruct, eip712_domain, sol};
+use pm_config::Live;
 use serde_json::json;
 
 use crate::auth::l2_signature;
-use crate::secrets::BuilderCreds;
+use crate::secrets::{BuilderCreds, LiveSecrets};
 
 // ---------------------------------------------------------------------------
 // Polygon-137 contracts
@@ -496,14 +497,19 @@ fn parse_transaction_response(v: &serde_json::Value) -> (RelayerState, Option<St
     (state, hash)
 }
 
-/// Unix seconds as a decimal string (the builder-auth timestamp). Mirrors
+/// Unix time in whole seconds. Backs the builder-auth timestamp (stringified
+/// via [`unix_seconds_string`]) AND the typed batch `deadline`. Mirrors
 /// `live.rs::unix_seconds_string`.
-fn unix_seconds_string() -> String {
+fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-        .to_string()
+}
+
+/// Unix seconds as a decimal string (the builder-auth timestamp).
+fn unix_seconds_string() -> String {
+    now_secs().to_string()
 }
 
 /// Submit a signed WALLET batch: `POST {relayer_url}/submit` with builder-auth
@@ -614,6 +620,302 @@ pub async fn poll_until_confirmed(
             )));
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (D) Relayer WALLET nonce (the corrected M6-5)
+// ---------------------------------------------------------------------------
+
+/// Parse the relayer `/nonce` response into the next WALLET batch nonce. The
+/// relayer returns `{ "nonce": <n> }` where `<n>` is EITHER a JSON number OR a
+/// decimal string (current docs show both shapes), so we accept either; any
+/// other shape is a [`RelayerError::Response`]. Factored out so the parse is
+/// unit-testable without HTTP.
+fn parse_nonce(v: &serde_json::Value) -> Result<u64, RelayerError> {
+    let n = v
+        .get("nonce")
+        .ok_or_else(|| RelayerError::Response(format!("missing nonce field: {v}")))?;
+    if let Some(u) = n.as_u64() {
+        return Ok(u);
+    }
+    if let Some(s) = n.as_str() {
+        return s
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| RelayerError::Response(format!("nonce string not a u64: {s:?}: {e}")));
+    }
+    Err(RelayerError::Response(format!(
+        "nonce is neither number nor string: {n}"
+    )))
+}
+
+/// Fetch the deposit wallet's next batch nonce from the RELAYER:
+/// `GET {relayer_url}/nonce?address={owner}&type=WALLET` → `{ "nonce": <n> }`.
+///
+/// CORRECTION (folded into M6-6): the M6 plan's M6-5 read the nonce on-chain via
+/// a Polygon RPC `nonce()` view, but per the current Polymarket docs the relayer
+/// itself serves the WALLET nonce — and since the relayer is the authority for
+/// the next batch nonce it will accept, asking it directly is the correct source
+/// and drops the RPC round-trip (the `RPC_URL` secret is now unused by the merge/
+/// redeem path).
+///
+/// The builder-auth HMAC signs the query-LESS path `/nonce` (same GET rule as the
+/// CLOB L2 HMAC and the `/transaction` poll); the `address`/`type` query is
+/// appended after. `owner` renders EIP-55 checksummed (alloy `Address` Display)
+/// — the exact accepted address form is a staging-confirmation item, but the
+/// relayer keys the nonce off the recovered owner regardless. Accepts a number
+/// OR string nonce (see [`parse_nonce`]). Every failure maps to a
+/// [`RelayerError`]; this never panics.
+pub async fn fetch_wallet_nonce(
+    http: &reqwest::Client,
+    relayer_url: &str,
+    creds: &BuilderCreds,
+    owner: Address,
+) -> Result<u64, RelayerError> {
+    let base = relayer_url.trim_end_matches('/');
+    let path = "/nonce";
+    let ts = unix_seconds_string();
+    let headers = builder_headers(creds, &ts, "GET", path, None)?;
+    let url = format!("{base}{path}?address={owner}&type=WALLET");
+    let mut req = http.get(&url);
+    for (k, v) in &headers {
+        req = req.header(*k, v);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| RelayerError::Http(format!("GET {path}: {e}")))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| RelayerError::Http(format!("GET {path}: read body: {e}")))?;
+    if !status.is_success() {
+        return Err(RelayerError::Http(format!("GET {path}: HTTP {status}: {text}")));
+    }
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| RelayerError::Response(format!("GET {path}: invalid JSON: {e}: {text}")))?;
+    parse_nonce(&json)
+}
+
+// ---------------------------------------------------------------------------
+// (E) RelayerClient — assembled merge/redeem orchestration (M6-6)
+// ---------------------------------------------------------------------------
+
+/// Native USDC.e on Polygon 137 — the DEFAULT merge/redeem collateral token.
+///
+/// CONCERN / STAGING-ITEM: the pUSD-native `CtfCollateralAdapter` may pull/return
+/// pUSD rather than USDC.e (design §6 Unknown B / §7). Both are 6-decimal tokens,
+/// so the micro-USDC accounting (1 complete set = $1 = 1e6 base units) is
+/// IDENTICAL regardless of which one the adapter uses; only the token ADDRESS
+/// differs. The address is a configurable [`RelayerClient`] field (defaulted
+/// here) so the operator can switch to pUSD at the first funded staging run
+/// without a code change.
+pub const USDC_E_COLLATERAL: Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
+
+/// Default submit→`STATE_CONFIRMED` budget for one merge/redeem batch. The MM
+/// runs merge/redeem as a periodic, off-hot-path sweep (design §3/§7), so a
+/// generous timeout is fine (Polygon blocks are ~2 s).
+const DEFAULT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Seconds added to `now` for the WALLET batch `deadline` — the window the
+/// relayer has to land the batch on-chain before the signed `Batch` expires.
+const DEADLINE_SECS: u64 = 600;
+
+/// The assembled deposit-wallet relayer client (M6-6): fetch the WALLET nonce,
+/// build the signed WALLET request body for a merge/redeem, submit it, and poll
+/// to `STATE_CONFIRMED`. Built in on-chain `conditionId` terms (NOT the
+/// `MarketId`-based [`crate::venue::ExecutionVenue`] trait — see `live.rs`); the
+/// MM (M6-7) holds an `Option<RelayerClient>` and calls `merge`/`redeem`
+/// directly off the quote hot path.
+///
+/// Constructed ONLY when the relayer is enabled AND builder creds + the deposit
+/// wallet + a valid EOA key are present (see [`RelayerClient::new`]); otherwise
+/// live merge/redeem stays the hold-to-resolution no-op (design §7). OFF by
+/// default + staging-first.
+pub struct RelayerClient {
+    /// Shared HTTP client (reqwest is internally `Arc`, cheap to clone/share).
+    http: reqwest::Client,
+    /// Staging or prod base URL, from config (no trailing slash assumed; the I/O
+    /// helpers trim it). Override > `relayer_staging` ? staging : prod.
+    relayer_url: String,
+    /// Builder/relayer HMAC credentials (the relayer rejects unauthenticated
+    /// WALLET batches, design §1).
+    creds: BuilderCreds,
+    /// The owner EOA private key (0x-stripped hex, the `expose_key_hex` form the
+    /// rest of the app feeds `PrivateKeySigner`). Signs the EIP-712 `Batch` AND
+    /// is the WALLET request `from`/owner. Validated to parse in `new`.
+    pk: String,
+    /// EIP-712 domain `chainId` (Polygon 137 — [`crate::sign::CHAIN_ID`]).
+    chain_id: u64,
+    /// The deposit wallet (`PM_DEPOSIT_WALLET`): the `Batch` verifyingContract,
+    /// the request `depositWallet`, and the on-chain holder of the positions.
+    wallet: Address,
+    /// The WALLET request `to` — the deposit-wallet factory (default
+    /// [`DEPOSIT_WALLET_FACTORY`]; configurable).
+    factory: Address,
+    /// The merge/redeem call TARGET — the `CtfCollateralAdapter` (default
+    /// [`CTF_COLLATERAL_ADAPTER`]; configurable, e.g. the NegRisk adapter).
+    adapter: Address,
+    /// The collateral token the adapter pulls/returns (default
+    /// [`USDC_E_COLLATERAL`]; configurable — pUSD is a staging item).
+    collateral: Address,
+    /// Per-batch submit→confirm timeout passed to [`poll_until_confirmed`].
+    submit_timeout: Duration,
+}
+
+impl RelayerClient {
+    /// Build the client from the `[live]` config + resolved live secrets, or
+    /// `None` when the relayer must NOT be constructed. Returns `Some` ONLY when
+    /// ALL of:
+    /// - `live_cfg.relayer_enabled` is true (the master switch, default OFF),
+    /// - builder creds are present (`BUILDER_*`, all-or-none from the env loader),
+    /// - the deposit wallet is present AND parses to an `Address`, and
+    /// - the EOA key parses to a `PrivateKeySigner` (validated up-front so
+    ///   `owner`/`sign_batch` never surprise the sweep at submit time).
+    ///
+    /// `relayer_url` = the explicit `live_cfg.relayer_url` override if set, else
+    /// [`RELAYER_URL_STAGING`] when `relayer_staging` (the default, staging-first)
+    /// or [`RELAYER_URL_PROD`] otherwise. factory/adapter/collateral default to
+    /// the pinned Polygon-137 consts (USDC.e collateral).
+    pub fn new(live_cfg: &Live, secrets: &LiveSecrets, http: reqwest::Client) -> Option<Self> {
+        // Gate 1: the relayer master switch (default OFF — opt in deliberately).
+        if !live_cfg.relayer_enabled {
+            return None;
+        }
+        // Gate 2: builder creds (all-or-none; absent → relayer not configured).
+        let creds = secrets.builder.clone()?;
+        // Gate 3: the deposit wallet must be present AND a valid address.
+        let wallet: Address = secrets.deposit_wallet.as_deref()?.parse().ok()?;
+        // Gate 4: the EOA key must parse to a signer. Store the 0x-stripped hex
+        // (the `expose_key_hex` form the app feeds PrivateKeySigner elsewhere);
+        // validate it parses now so `owner()`/`sign_batch` can't fail mid-sweep
+        // on a malformed key.
+        let pk = secrets.private_key.expose_key_hex();
+        if pk.parse::<PrivateKeySigner>().is_err() {
+            return None;
+        }
+        // URL: explicit override wins; else staging-vs-prod from the flag.
+        let relayer_url = match live_cfg.relayer_url.as_deref() {
+            Some(u) => u.to_string(),
+            None if live_cfg.relayer_staging => RELAYER_URL_STAGING.to_string(),
+            None => RELAYER_URL_PROD.to_string(),
+        };
+        Some(RelayerClient {
+            http,
+            relayer_url,
+            creds,
+            pk,
+            chain_id: crate::sign::CHAIN_ID,
+            wallet,
+            factory: DEPOSIT_WALLET_FACTORY,
+            adapter: CTF_COLLATERAL_ADAPTER,
+            collateral: USDC_E_COLLATERAL,
+            submit_timeout: DEFAULT_SUBMIT_TIMEOUT,
+        })
+    }
+
+    /// The owner EOA address derived from `pk` — both the WALLET request
+    /// `from`/owner and the EIP-712 `Batch` signer. The key is validated in
+    /// `new`, so this only errors on a corrupted key; surfaced (never panics) as
+    /// [`RelayerError::BadKey`].
+    fn owner(&self) -> Result<Address, RelayerError> {
+        self.pk
+            .parse::<PrivateKeySigner>()
+            .map(|s| s.address())
+            .map_err(|e| RelayerError::BadKey(e.to_string()))
+    }
+
+    /// Build the signed WALLET request body for a MERGE of a complete YES+NO set
+    /// (`amount` base units) on `condition_id`. Pure (no HTTP): nonce/deadline in
+    /// → signed JSON body out. The single [`merge_call`] is signed via
+    /// [`sign_batch`] and wrapped by [`build_wallet_request`]. UNIT-TESTED.
+    fn build_merge_batch(
+        &self,
+        condition_id: B256,
+        amount: U256,
+        nonce: u64,
+        deadline: u64,
+    ) -> Result<serde_json::Value, RelayerError> {
+        let calls = [merge_call(self.adapter, self.collateral, condition_id, amount)];
+        let sig = sign_batch(&self.pk, self.chain_id, self.wallet, nonce, deadline, &calls)?;
+        Ok(build_wallet_request(
+            self.owner()?,
+            self.factory,
+            self.wallet,
+            nonce,
+            deadline,
+            &calls,
+            &sig,
+        ))
+    }
+
+    /// Build the signed WALLET request body for a REDEEM of the resolved
+    /// `condition_id` (binary `indexSets = [1, 2]`). Pure (no HTTP), the redeem
+    /// mirror of [`build_merge_batch`]. UNIT-TESTED.
+    fn build_redeem_batch(
+        &self,
+        condition_id: B256,
+        nonce: u64,
+        deadline: u64,
+    ) -> Result<serde_json::Value, RelayerError> {
+        let calls = [redeem_call(self.adapter, self.collateral, condition_id)];
+        let sig = sign_batch(&self.pk, self.chain_id, self.wallet, nonce, deadline, &calls)?;
+        Ok(build_wallet_request(
+            self.owner()?,
+            self.factory,
+            self.wallet,
+            nonce,
+            deadline,
+            &calls,
+            &sig,
+        ))
+    }
+
+    /// Live MERGE of a complete YES+NO set back to collateral on `condition_id`:
+    /// fetch nonce → build the signed body → `POST /submit` → poll to
+    /// `STATE_CONFIRMED`. Returns the recovered amount in MICRO-USDC.
+    ///
+    /// A merged complete set redeems at exactly $1/set, and `amount` is in CTF
+    /// base units (6 decimals — the adapter's 6-decimal collateral), which is 1:1
+    /// with micro-USDC; so the recovered micro-USDC == `amount`. Saturates into
+    /// `i128` (real inventory is far below `i128::MAX`; `unwrap_or` keeps the
+    /// money path panic-free). The LIVE round-trip (auth + endpoints) is the
+    /// operator's funded staging validation — every failure here is a typed
+    /// [`RelayerError`], never a panic.
+    pub async fn merge(&self, condition_id: B256, amount: U256) -> Result<i128, RelayerError> {
+        let owner = self.owner()?;
+        let nonce = fetch_wallet_nonce(&self.http, &self.relayer_url, &self.creds, owner).await?;
+        let deadline = now_secs() + DEADLINE_SECS;
+        let body = self.build_merge_batch(condition_id, amount, nonce, deadline)?;
+        let tx_id = submit_wallet_batch(&self.http, &self.relayer_url, &self.creds, &body).await?;
+        let _hash =
+            poll_until_confirmed(&self.http, &self.relayer_url, &self.creds, &tx_id, self.submit_timeout)
+                .await?;
+        Ok(i128::try_from(amount).unwrap_or(i128::MAX))
+    }
+
+    /// Live REDEEM of the resolved `condition_id`: fetch nonce → build the signed
+    /// body → `POST /submit` → poll to `STATE_CONFIRMED`. Returns the recovered
+    /// amount in MICRO-USDC.
+    ///
+    /// `redeemPositions` pays out the WINNING-slot balance the CTF holds for this
+    /// wallet — there is no `amount` argument and we do NOT know the resolved
+    /// balance pre-call. So on success we return `0` micro ("confirmed, amount
+    /// unknown") rather than guessing; M6-7 reconciles the actual credit from the
+    /// Polymarket Data API (the same `redeemable`/positions read the reconcile
+    /// path already uses). Failures map to a typed [`RelayerError`]; never panics.
+    pub async fn redeem(&self, condition_id: B256) -> Result<i128, RelayerError> {
+        let owner = self.owner()?;
+        let nonce = fetch_wallet_nonce(&self.http, &self.relayer_url, &self.creds, owner).await?;
+        let deadline = now_secs() + DEADLINE_SECS;
+        let body = self.build_redeem_batch(condition_id, nonce, deadline)?;
+        let tx_id = submit_wallet_batch(&self.http, &self.relayer_url, &self.creds, &body).await?;
+        let _hash =
+            poll_until_confirmed(&self.http, &self.relayer_url, &self.creds, &tx_id, self.submit_timeout)
+                .await?;
+        Ok(0)
     }
 }
 
@@ -1016,5 +1318,199 @@ mod tests {
         );
         // Missing → None (submit_wallet_batch maps this to RelayerError::Response).
         assert!(parse_submit_response(&serde_json::json!({"state": "STATE_NEW"})).is_none());
+    }
+
+    // -- (D) relayer WALLET nonce ------------------------------------------
+
+    /// `parse_nonce` accepts the relayer's number OR string nonce, and maps every
+    /// other shape (missing / wrong-typed / non-numeric / negative) to a
+    /// `RelayerError::Response` — never a panic. No HTTP.
+    #[test]
+    fn parse_nonce_accepts_number_or_string() {
+        // JSON number.
+        assert_eq!(parse_nonce(&serde_json::json!({"nonce": 5})).unwrap(), 5);
+        assert_eq!(parse_nonce(&serde_json::json!({"nonce": 0})).unwrap(), 0);
+        // Decimal string (the relayer may return either form).
+        assert_eq!(parse_nonce(&serde_json::json!({"nonce": "42"})).unwrap(), 42);
+        // A full-range nonce as a STRING still parses (the string form is exactly
+        // why we accept it — JSON numbers lose precision past 2^53 in some stacks).
+        assert_eq!(
+            parse_nonce(&serde_json::json!({"nonce": "18446744073709551615"})).unwrap(),
+            u64::MAX
+        );
+        // Missing / non-numeric string / wrong type / negative → Response error.
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"nonce": "abc"}),
+            serde_json::json!({"nonce": true}),
+            serde_json::json!({"nonce": -1}),
+        ] {
+            assert!(
+                matches!(parse_nonce(&bad), Err(RelayerError::Response(_))),
+                "unparseable nonce must be a Response error, got {:?}",
+                parse_nonce(&bad)
+            );
+        }
+    }
+
+    // -- (E) RelayerClient (M6-6) ------------------------------------------
+
+    /// A valid EOA key (the public anvil key) that parses to a `PrivateKeySigner`.
+    const TEST_PK: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    /// A deposit-wallet address fixture (the golden-vector wallet; canonical EIP-55).
+    const TEST_WALLET: &str = "0xa2927E7834648F1C03b4961CeeA4597292e3c025";
+
+    /// Build `LiveSecrets` through the REAL env loader, toggling whether the
+    /// builder creds / deposit wallet are present so the gating paths are
+    /// exercised end-to-end (`PM_PRIVATE_KEY` is always present — the loader
+    /// requires it).
+    fn test_secrets(builder: bool, deposit_wallet: bool) -> LiveSecrets {
+        LiveSecrets::from_lookup(|k| match k {
+            "PM_PRIVATE_KEY" => Some(TEST_PK.to_string()),
+            "PM_DEPOSIT_WALLET" if deposit_wallet => Some(TEST_WALLET.to_string()),
+            "BUILDER_API_KEY" if builder => Some("703629aa-builder-key".to_string()),
+            "BUILDER_SECRET" if builder => Some("QQ==".to_string()),
+            "BUILDER_PASS_PHRASE" if builder => Some("builder-pass".to_string()),
+            _ => None,
+        })
+        .unwrap()
+    }
+
+    /// A `[live]` config with the relayer knobs set; all other fields default.
+    /// Struct-update from `Live::default()` (avoids `field_reassign_with_default`).
+    fn live_cfg(enabled: bool, staging: bool, url: Option<&str>) -> Live {
+        Live {
+            relayer_enabled: enabled,
+            relayer_staging: staging,
+            relayer_url: url.map(str::to_string),
+            ..Live::default()
+        }
+    }
+
+    /// Gating: `None` unless enabled AND builder creds AND deposit wallet present;
+    /// when `Some`, the URL follows the override > staging-vs-prod rule and the
+    /// factory/adapter/collateral/chain defaults are the pinned consts. No HTTP
+    /// (constructing a `reqwest::Client` needs no runtime).
+    #[test]
+    fn relayer_client_new_gating() {
+        let http = reqwest::Client::new();
+
+        // Disabled → None, even with full creds.
+        assert!(
+            RelayerClient::new(&live_cfg(false, true, None), &test_secrets(true, true), http.clone())
+                .is_none(),
+            "relayer must not be constructed when disabled"
+        );
+        // Enabled but builder creds absent → None.
+        assert!(
+            RelayerClient::new(&live_cfg(true, true, None), &test_secrets(false, true), http.clone())
+                .is_none(),
+            "no builder creds → None"
+        );
+        // Enabled + creds but deposit wallet absent → None.
+        assert!(
+            RelayerClient::new(&live_cfg(true, true, None), &test_secrets(true, false), http.clone())
+                .is_none(),
+            "no deposit wallet → None"
+        );
+
+        // Enabled + creds + wallet → Some, staging URL + the const defaults.
+        let c = RelayerClient::new(&live_cfg(true, true, None), &test_secrets(true, true), http.clone())
+            .unwrap();
+        assert_eq!(c.relayer_url, RELAYER_URL_STAGING, "staging-first by default");
+        assert_eq!(c.factory, DEPOSIT_WALLET_FACTORY);
+        assert_eq!(c.adapter, CTF_COLLATERAL_ADAPTER);
+        assert_eq!(c.collateral, USDC_E_COLLATERAL);
+        assert_eq!(c.chain_id, 137, "Polygon mainnet chain id");
+        assert_eq!(c.wallet, TEST_WALLET.parse::<Address>().unwrap());
+        // owner() derives the EOA from the pk deterministically (no panic).
+        assert_eq!(c.owner().unwrap(), c.owner().unwrap());
+
+        // staging = false → prod URL.
+        let c =
+            RelayerClient::new(&live_cfg(true, false, None), &test_secrets(true, true), http.clone())
+                .unwrap();
+        assert_eq!(c.relayer_url, RELAYER_URL_PROD, "staging=false → prod URL");
+
+        // Explicit override wins over the staging flag.
+        let c = RelayerClient::new(
+            &live_cfg(true, true, Some("https://relayer.example")),
+            &test_secrets(true, true),
+            http,
+        )
+        .unwrap();
+        assert_eq!(c.relayer_url, "https://relayer.example", "explicit URL override wins");
+    }
+
+    /// `build_merge_batch` assembles a WALLET request (no HTTP) whose body is the
+    /// `to=factory`, `depositWallet=wallet`, single-call `target=adapter`
+    /// `mergePositions` batch with a 132-char `0x` signature.
+    #[test]
+    fn build_merge_batch_produces_wallet_request_with_merge_calldata() {
+        let c = RelayerClient::new(
+            &live_cfg(true, true, None),
+            &test_secrets(true, true),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let condition_id: B256 =
+            "0xabcdef0000000000000000000000000000000000000000000000000000000123".parse().unwrap();
+        let body = c
+            .build_merge_batch(condition_id, U256::from(1_500_000u64), 7, 1234567890)
+            .unwrap();
+
+        assert_eq!(body["type"], "WALLET");
+        assert_eq!(body["to"], DEPOSIT_WALLET_FACTORY.to_string(), "`to` is the factory");
+        assert_eq!(body["from"], c.owner().unwrap().to_string(), "`from` is the owner EOA");
+        assert_eq!(body["nonce"], "7");
+        let p = &body["depositWalletParams"];
+        assert_eq!(p["depositWallet"], TEST_WALLET, "depositWallet is the wallet");
+        assert_eq!(p["deadline"], "1234567890");
+        let calls = p["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0]["target"],
+            CTF_COLLATERAL_ADAPTER.to_string(),
+            "calls[0].target is the adapter"
+        );
+        assert_eq!(calls[0]["value"], "0");
+        // calls[0].data starts with the mergePositions selector.
+        let data = calls[0]["data"].as_str().unwrap();
+        assert!(data.starts_with("0x"), "data is 0x-hex: {data}");
+        let selector =
+            keccak256("mergePositions(address,bytes32,bytes32,uint256[],uint256)".as_bytes());
+        assert_eq!(&data[2..10], hex::encode(&selector[..4]).as_str(), "mergePositions selector");
+        // signature is a 132-char 0x string (0x + 65 bytes).
+        let sig = body["signature"].as_str().unwrap();
+        assert!(sig.starts_with("0x"), "signature is 0x-hex: {sig}");
+        assert_eq!(sig.len(), 132, "0x + 65-byte signature");
+    }
+
+    /// `build_redeem_batch` mirror of the merge assembly test: the single call
+    /// targets the adapter and carries the `redeemPositions` selector.
+    #[test]
+    fn build_redeem_batch_produces_wallet_request_with_redeem_calldata() {
+        let c = RelayerClient::new(
+            &live_cfg(true, false, None),
+            &test_secrets(true, true),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let condition_id: B256 =
+            "0x00000000000000000000000000000000000000000000000000000000deadbeef".parse().unwrap();
+        let body = c.build_redeem_batch(condition_id, 0, 1234567890).unwrap();
+
+        assert_eq!(body["type"], "WALLET");
+        assert_eq!(body["to"], DEPOSIT_WALLET_FACTORY.to_string());
+        assert_eq!(body["nonce"], "0");
+        let calls = body["depositWalletParams"]["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["target"], CTF_COLLATERAL_ADAPTER.to_string());
+        assert_eq!(calls[0]["value"], "0");
+        let data = calls[0]["data"].as_str().unwrap();
+        let selector = keccak256("redeemPositions(address,bytes32,bytes32,uint256[])".as_bytes());
+        assert_eq!(&data[2..10], hex::encode(&selector[..4]).as_str(), "redeemPositions selector");
+        let sig = body["signature"].as_str().unwrap();
+        assert_eq!(sig.len(), 132, "0x + 65-byte signature");
     }
 }

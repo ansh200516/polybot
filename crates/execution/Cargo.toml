@@ -7,6 +7,9 @@ edition.workspace = true
 pm-core = { workspace = true }
 pm-engine = { workspace = true }
 pm-store = { workspace = true }
+# M6 RelayerClient::new gates on the `[live]` relayer knobs; pm-config is a leaf
+# crate (serde structs only), so this introduces no dependency cycle.
+pm-config = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
