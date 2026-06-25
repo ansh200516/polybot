@@ -335,6 +335,24 @@ pub struct MmStrategy {
     /// registry; empty by default (only populated for reward-farm hedging). Set
     /// via [`with_conditions`](Self::with_conditions).
     cond_by_token: HashMap<TokenId, B256>,
+    /// R1 (auto-redeem): `token → CLOB asset id` string for the quoted reward-farm
+    /// universe, so the resolved-position feed can match a Data-API
+    /// [`Position.asset`](pm_ingestion::data_api::Position) back to the MM's
+    /// internal `TokenId`. main builds it from the registry (`token_venue_id`);
+    /// empty by default, so non-redeem paths never consult it. Set via
+    /// [`with_venue_ids`](Self::with_venue_ids).
+    venue_by_token: HashMap<TokenId, String>,
+    /// R1 (auto-redeem): the Polymarket Data-API positions feed used to discover
+    /// RESOLVED (`redeemable`) markets the MM still holds. main passes `Some` ONLY
+    /// on a relayer-backed reward-farm live run; `None` (the default) on paper /
+    /// arb / non-relayer live keeps the redeem feed inert. Set via
+    /// [`with_data_api`](Self::with_data_api).
+    data_api: Option<Arc<pm_ingestion::data_api::DataApiClient>>,
+    /// R1 (auto-redeem): the LOWERCASED deposit-wallet address the positions query
+    /// is keyed on (the wallet that actually holds the resolved positions). `Some`
+    /// only alongside [`data_api`](Self::data_api); `None` by default. Set via
+    /// [`with_deposit_wallet`](Self::with_deposit_wallet).
+    deposit_wallet: Option<String>,
 }
 
 impl MmStrategy {
@@ -365,6 +383,9 @@ impl MmStrategy {
             store_path: None,
             merger: None,
             cond_by_token: HashMap::new(),
+            venue_by_token: HashMap::new(),
+            data_api: None,
+            deposit_wallet: None,
         }
     }
 
@@ -386,6 +407,37 @@ impl MmStrategy {
     /// unaffected.
     pub fn with_conditions(mut self, cond_by_token: HashMap<TokenId, B256>) -> Self {
         self.cond_by_token = cond_by_token;
+        self
+    }
+
+    /// R1 (auto-redeem): attach the `token → CLOB asset id` map the resolved-position
+    /// feed needs to match a Data-API `Position.asset` back to the MM's `TokenId`.
+    /// main builds it from the registry for the quoted reward-farm universe; the
+    /// default is empty, so non-redeem paths are unaffected. Mirrors
+    /// [`with_conditions`](Self::with_conditions).
+    pub fn with_venue_ids(mut self, venue_by_token: HashMap<TokenId, String>) -> Self {
+        self.venue_by_token = venue_by_token;
+        self
+    }
+
+    /// R1 (auto-redeem): attach the Polymarket Data-API positions feed used to
+    /// discover RESOLVED markets the MM still holds. main passes `Some` ONLY on a
+    /// relayer-backed reward-farm live run; `None` (the default) keeps the redeem
+    /// feed inert. (R1 only HOLDS the client — the redeem sweep that polls it is R2;
+    /// the client is NOT constructed here.)
+    pub fn with_data_api(
+        mut self,
+        data_api: Option<Arc<pm_ingestion::data_api::DataApiClient>>,
+    ) -> Self {
+        self.data_api = data_api;
+        self
+    }
+
+    /// R1 (auto-redeem): attach the LOWERCASED deposit-wallet address the positions
+    /// query is keyed on. main passes `Some` alongside
+    /// [`with_data_api`](Self::with_data_api); `None` (the default) otherwise.
+    pub fn with_deposit_wallet(mut self, deposit_wallet: Option<String>) -> Self {
+        self.deposit_wallet = deposit_wallet;
         self
     }
 
@@ -466,6 +518,9 @@ impl Strategy for MmStrategy {
                 store_path,
                 merger,
                 cond_by_token,
+                venue_by_token,
+                data_api,
+                deposit_wallet,
             } = *self;
             // Per-strategy state is identical for both venues; build it once.
             let qm = QuoteManager::new();
@@ -494,14 +549,16 @@ impl Strategy for MmStrategy {
                 Some(MmLive::Rest(live)) => {
                     run_mm_loop(
                         live, qm, inv, positions, ctx, params, tokens, token_market, complement,
-                        merger, cond_by_token, capital, true, start_paused, store_path,
+                        merger, cond_by_token, venue_by_token, data_api, deposit_wallet,
+                        capital, true, start_paused, store_path,
                     )
                     .await;
                 }
                 Some(MmLive::Ws(split)) => {
                     run_mm_loop(
                         split, qm, inv, positions, ctx, params, tokens, token_market, complement,
-                        merger, cond_by_token, capital, true, start_paused, store_path,
+                        merger, cond_by_token, venue_by_token, data_api, deposit_wallet,
+                        capital, true, start_paused, store_path,
                     )
                     .await;
                 }
@@ -514,7 +571,8 @@ impl Strategy for MmStrategy {
                         .with_taker_fill_pct(params.paper_taker_fill_pct);
                     run_mm_loop(
                         venue, qm, inv, positions, ctx, params, tokens, token_market, complement,
-                        merger, cond_by_token, capital, false, start_paused, store_path,
+                        merger, cond_by_token, venue_by_token, data_api, deposit_wallet,
+                        capital, false, start_paused, store_path,
                     )
                     .await;
                 }
@@ -1056,6 +1114,25 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     /// quote loop. Initialised to "now" at construction (the first sweep waits one
     /// interval).
     last_merge_sweep: Instant,
+    /// R1 (auto-redeem): `token → CLOB asset id` for the quoted reward-farm
+    /// universe — lets the resolved-position feed match a Data-API
+    /// `Position.asset` back to this loop's `TokenId`. Built by main from the
+    /// registry; empty off reward-farm-redeem-live. HELD by R1; READ by the
+    /// resolved-winner redeem sweep in R2.
+    #[allow(dead_code)] // R2: read by the resolved-position redeem sweep.
+    venue_by_token: HashMap<TokenId, String>,
+    /// R1 (auto-redeem): the Polymarket Data-API positions feed, `Some` ONLY on a
+    /// relayer-backed reward-farm live run (main builds it; `None` on paper, arb,
+    /// non-relayer live). HELD by R1; the redeem sweep that polls it for
+    /// `redeemable` (resolved) markets is R2. `Arc` so a spawned sweep can share
+    /// the one client.
+    #[allow(dead_code)] // R2: polled by the resolved-position redeem sweep.
+    data_api: Option<Arc<pm_ingestion::data_api::DataApiClient>>,
+    /// R1 (auto-redeem): the LOWERCASED deposit-wallet address the positions query
+    /// is keyed on. `Some` only alongside [`data_api`](Self::data_api); `None` by
+    /// default. HELD by R1; used by the R2 redeem sweep's positions query.
+    #[allow(dead_code)] // R2: used by the resolved-position redeem sweep.
+    deposit_wallet: Option<String>,
 }
 
 /// Read BOTH arms of the persistent UTC-day loss gate for `"mm"` on `utc_day`,
@@ -2612,6 +2689,142 @@ fn apply_merge_result(
     (inv.realized(a).0 + inv.realized(b).0) - realized_before
 }
 
+// ---------------------------------------------------------------------------
+// Pure resolved-winner REDEEM selection + apply (R1)
+// ---------------------------------------------------------------------------
+
+/// One held leg of a RESOLVED condition to redeem: the `token`, its Data-API
+/// resolved `cur_price` (≈1.0 for the winner, ≈0.0 for the loser), and the long
+/// `net_micro` (µshares) currently held. The on-chain `redeemPositions` clears
+/// BOTH outcome slots of a resolved condition at once, so the loser leg is
+/// redeemed too (at ~$0) — hence a leg per held outcome.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // R1 emits the pure selection; the redeem sweep that reads it is R2.
+pub(crate) struct RedeemLeg {
+    pub token: TokenId,
+    pub resolved_price: f64,
+    pub net_micro: i128,
+}
+
+/// A RESOLVED condition the MM still holds, with every held leg priced at its
+/// Data-API resolved price. Emitted by [`redeem_targets`] and settled by
+/// [`apply_redeem`]; the on-chain redeem (R2) is keyed on `condition_id`.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // R1 emits the pure selection; the redeem sweep that reads it is R2.
+pub(crate) struct RedeemTarget {
+    pub condition_id: B256,
+    pub legs: Vec<RedeemLeg>,
+}
+
+/// THE R1 selection (pure, unit-tested): the RESOLVED conditions the MM still
+/// HOLDS, each with its held legs priced at the Data-API resolved `cur_price`.
+///
+/// A condition is "resolved" when ANY of its tokens appears as a `redeemable`
+/// [`Position`](pm_ingestion::data_api::Position) (the market settled). For each
+/// such condition EVERY held (`net_of > 0`) leg is included — winner AND loser —
+/// because the on-chain `redeemPositions` clears both outcome slots in one call.
+/// Each leg is priced at the resolved `cur_price` for its CLOB asset (≈1.0 the
+/// winner, ≈0.0 the loser), defaulting to `0.0` when the leg isn't itself listed
+/// redeemable (the resolved loser is often dropped from the positions feed).
+/// Deterministic order (legs by token id, targets by condition_id) for stable
+/// callers + tests.
+#[allow(dead_code)] // R1 selection; the redeem sweep that calls it is R2.
+pub(crate) fn redeem_targets(
+    positions: &[pm_ingestion::data_api::Position],
+    cond_by_token: &HashMap<TokenId, B256>,
+    venue_by_token: &HashMap<TokenId, String>,
+    net_of: impl Fn(TokenId) -> i128,
+) -> Vec<RedeemTarget> {
+    // RESOLVED conditions = the conditionId of every `redeemable` position (skip
+    // an unparseable id), plus the resolved price per CLOB asset for leg pricing.
+    let mut resolved: HashSet<B256> = HashSet::new();
+    let mut price_by_asset: HashMap<&str, f64> = HashMap::new();
+    for p in positions {
+        if !p.redeemable {
+            continue;
+        }
+        if let Ok(cid) = p.condition_id.parse::<B256>() {
+            resolved.insert(cid);
+        }
+        price_by_asset.insert(p.asset.as_str(), p.cur_price);
+    }
+    if resolved.is_empty() {
+        return Vec::new();
+    }
+    // Every HELD (net > 0) leg of a resolved condition, grouped by conditionId —
+    // winner AND loser, because `redeemPositions` clears both slots at once.
+    let mut by_cond: HashMap<B256, Vec<RedeemLeg>> = HashMap::new();
+    for (&token, &cond) in cond_by_token {
+        if !resolved.contains(&cond) {
+            continue;
+        }
+        let net_micro = net_of(token);
+        if net_micro <= 0 {
+            continue;
+        }
+        // Resolved price for this leg's CLOB asset; the loser (not itself listed
+        // redeemable) defaults to 0.0.
+        let resolved_price = venue_by_token
+            .get(&token)
+            .and_then(|asset| price_by_asset.get(asset.as_str()).copied())
+            .unwrap_or(0.0);
+        by_cond.entry(cond).or_default().push(RedeemLeg {
+            token,
+            resolved_price,
+            net_micro,
+        });
+    }
+    // Deterministic order: legs by token id, targets by condition_id.
+    let mut out: Vec<RedeemTarget> = by_cond
+        .into_iter()
+        .map(|(condition_id, mut legs)| {
+            legs.sort_by_key(|l| l.token.0);
+            RedeemTarget { condition_id, legs }
+        })
+        .collect();
+    out.sort_by_key(|t| t.condition_id);
+    out
+}
+
+/// Settle one RESOLVED condition's held legs at their resolved prices (pure, no
+/// async/IO — unit-tested, and the SHARED sell path so a future live redeem
+/// drain CONVERGES with it). For each leg: credit the resolved value
+/// `round(net_micro · resolved_price)` µUSDC (clamped ≥ 0; winner ≈ $1/share,
+/// loser $0) via the tested signed-lot [`InventoryRisk::on_fill`] sell path and
+/// mirror it into the reporting [`PositionBook`] like [`apply_merge_result`]
+/// (cash in, basis released, qty 0). Returns the aggregate realized delta
+/// (µUSDC) so the caller can persist it to the day-loss ledger like a fill.
+#[allow(dead_code)] // R1 apply; the redeem sweep that calls it is R2.
+fn apply_redeem(
+    inv: &mut InventoryRisk,
+    positions: &mut PositionBook,
+    token_market: &HashMap<TokenId, MarketId>,
+    target: &RedeemTarget,
+) -> i128 {
+    let realized_before: i128 = target.legs.iter().map(|l| inv.realized(l.token).0).sum();
+    let mut book_rows: Vec<(TokenId, Qty, Usdc)> = Vec::with_capacity(target.legs.len());
+    let mut recovered_micro: i128 = 0;
+    for leg in &target.legs {
+        // Resolved value of the held leg, integer µUSDC, never negative (a price
+        // is in [0, 1]; clamp defensively so a bad mark can't credit a debit).
+        let cash_micro = ((leg.net_micro as f64) * leg.resolved_price).round() as i128;
+        let cash_micro = cash_micro.max(0);
+        let basis_before = inv.basis(leg.token).0;
+        // The shared signed-lot SELL: reduce the long by `net_micro`, credit the
+        // recovered cash (winner ≈ $1/share, loser $0) and release basis pro-rata.
+        inv.on_fill(leg.token, -leg.net_micro, Usdc(cash_micro));
+        // Mirror into the reporting book in lock-step (cash + released basis); qty
+        // 0 — the book derives value from `inv.net` marks, so a REDUCTION must not
+        // grow phantom qty (exactly as `apply_merge_result`).
+        let cost_delta = Usdc(inv.basis(leg.token).0 - basis_before);
+        book_rows.push((leg.token, Qty(0), cost_delta));
+        recovered_micro += cash_micro;
+    }
+    positions.apply(&book_rows, Usdc(recovered_micro), token_market);
+    let realized_after: i128 = target.legs.iter().map(|l| inv.realized(l.token).0).sum();
+    realized_after - realized_before
+}
+
 /// The market maker's owned async loop, generic over the venue (Task 4.5 passes
 /// a live one). Mirrors the [`stub`](super::stub) lifecycle: a `quote_refresh`
 /// interval, honoring `ctx.kill` each iteration and draining `ctl_rx` for
@@ -2633,6 +2846,15 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
     // those paths are byte-for-byte unchanged.
     merger: Option<Arc<RelayerClient>>,
     cond_by_token: HashMap<TokenId, B256>,
+    // R1 (auto-redeem): the resolved-position feed inputs — the `token → CLOB asset`
+    // map, the Data-API positions client, and the deposit wallet to query. All
+    // default empty/None on paper / arb / non-relayer live (only populated on a
+    // relayer-backed reward-farm live run), so those paths are byte-for-byte
+    // unchanged. R1 only HOLDS them in the loop; the redeem sweep that consumes
+    // them is R2.
+    venue_by_token: HashMap<TokenId, String>,
+    data_api: Option<Arc<pm_ingestion::data_api::DataApiClient>>,
+    deposit_wallet: Option<String>,
     capital: Usdc,
     no_naked_shorts: bool,
     start_paused: bool,
@@ -2711,6 +2933,9 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
         merge_rx,
         merge_inflight: HashSet::new(),
         last_merge_sweep: Instant::now(),
+        venue_by_token,
+        data_api,
+        deposit_wallet,
     };
     if start_paused {
         tracing::info!("mm: live held — quoting PAUSED until release (press `l`)");
@@ -2978,6 +3203,9 @@ mod tests {
             merge_rx,
             merge_inflight: HashSet::new(),
             last_merge_sweep: Instant::now(),
+            venue_by_token: HashMap::new(),
+            data_api: None,
+            deposit_wallet: None,
         };
         (mm, store_rx, status_rx)
     }
@@ -4378,6 +4606,174 @@ mod tests {
         assert!(paper.merge_inflight.is_empty(), "paper never marks an in-flight merge");
     }
 
+    // ── R1: resolved-winner redeem — pure selection (`redeem_targets`) ──────────
+
+    /// One Data-API position row for the redeem tests. Only the fields
+    /// `redeem_targets` reads matter (`condition_id`, `asset`, `cur_price`,
+    /// `redeemable`); the rest are zeroed. `cond_hex` is the SAME hex string the
+    /// test parses into the `cond_by_token` B256, so the parsed ids match exactly.
+    fn mk_data_pos(
+        cond_hex: &str,
+        asset: &str,
+        cur_price: f64,
+        redeemable: bool,
+    ) -> pm_ingestion::data_api::Position {
+        pm_ingestion::data_api::Position {
+            condition_id: cond_hex.to_string(),
+            asset: asset.to_string(),
+            size: 0.0,
+            outcome: String::new(),
+            outcome_index: 0,
+            cur_price,
+            redeemable,
+        }
+    }
+
+    /// R1 (pure): a RESOLVED condition where the MM holds BOTH legs is one target
+    /// with two legs — winner (curPrice 1.0) AND loser (curPrice 0.0), since the
+    /// on-chain `redeemPositions` clears both slots — at their resolved prices and
+    /// held nets, sorted by token id.
+    #[test]
+    fn redeem_targets_includes_both_held_legs_of_resolved_condition() {
+        let (yes, no) = (TokenId(1), TokenId(2));
+        let cond_hex = format!("0x{}", "ab".repeat(32));
+        let cond: B256 = cond_hex.parse().unwrap();
+        let cond_by_token = HashMap::from([(yes, cond), (no, cond)]);
+        let venue_by_token =
+            HashMap::from([(yes, "asset_yes".to_string()), (no, "asset_no".to_string())]);
+        // RESOLVED: both legs listed redeemable — winner curPrice 1.0, loser 0.0.
+        let positions = vec![
+            mk_data_pos(&cond_hex, "asset_yes", 1.0, true),
+            mk_data_pos(&cond_hex, "asset_no", 0.0, true),
+        ];
+        // We hold BOTH legs long.
+        let net = HashMap::from([(yes, 100 * SH as i128), (no, 60 * SH as i128)]);
+        let got = redeem_targets(&positions, &cond_by_token, &venue_by_token, |t| {
+            net.get(&t).copied().unwrap_or(0)
+        });
+
+        assert_eq!(got.len(), 1, "one resolved+held condition → one target");
+        assert_eq!(got[0].condition_id, cond);
+        assert_eq!(
+            got[0].legs,
+            vec![
+                RedeemLeg { token: yes, resolved_price: 1.0, net_micro: 100 * SH as i128 },
+                RedeemLeg { token: no, resolved_price: 0.0, net_micro: 60 * SH as i128 },
+            ],
+            "both held legs, sorted by token id, at their resolved prices/nets"
+        );
+    }
+
+    /// R1 (pure): a resolved condition's LOSER leg that the feed doesn't list as
+    /// redeemable is STILL redeemed (held + resolved), priced at the default 0.0.
+    #[test]
+    fn redeem_targets_includes_unlisted_loser_leg_at_zero() {
+        let (yes, no) = (TokenId(1), TokenId(2));
+        let cond_hex = format!("0x{}", "bc".repeat(32));
+        let cond: B256 = cond_hex.parse().unwrap();
+        let cond_by_token = HashMap::from([(yes, cond), (no, cond)]);
+        let venue_by_token =
+            HashMap::from([(yes, "asset_yes".to_string()), (no, "asset_no".to_string())]);
+        // Only the WINNER (yes) is listed redeemable; the resolved LOSER (no) is
+        // dropped from the positions feed entirely.
+        let positions = vec![mk_data_pos(&cond_hex, "asset_yes", 1.0, true)];
+        let net = HashMap::from([(yes, 50 * SH as i128), (no, 70 * SH as i128)]);
+        let got = redeem_targets(&positions, &cond_by_token, &venue_by_token, |t| {
+            net.get(&t).copied().unwrap_or(0)
+        });
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].legs,
+            vec![
+                RedeemLeg { token: yes, resolved_price: 1.0, net_micro: 50 * SH as i128 },
+                RedeemLeg { token: no, resolved_price: 0.0, net_micro: 70 * SH as i128 },
+            ],
+            "the held loser is still redeemed, defaulted to price 0.0"
+        );
+    }
+
+    /// R1 (pure): a still-LIVE condition (no `redeemable` position) is never a
+    /// redeem target, even when fully held.
+    #[test]
+    fn redeem_targets_skips_still_live_condition() {
+        let (yes, no) = (TokenId(1), TokenId(2));
+        let cond_hex = format!("0x{}", "cd".repeat(32));
+        let cond: B256 = cond_hex.parse().unwrap();
+        let cond_by_token = HashMap::from([(yes, cond), (no, cond)]);
+        let venue_by_token =
+            HashMap::from([(yes, "asset_yes".to_string()), (no, "asset_no".to_string())]);
+        // Held, but the market has NOT resolved (redeemable = false).
+        let positions = vec![
+            mk_data_pos(&cond_hex, "asset_yes", 0.55, false),
+            mk_data_pos(&cond_hex, "asset_no", 0.45, false),
+        ];
+        let net = HashMap::from([(yes, 100 * SH as i128), (no, 100 * SH as i128)]);
+        let got = redeem_targets(&positions, &cond_by_token, &venue_by_token, |t| {
+            net.get(&t).copied().unwrap_or(0)
+        });
+
+        assert!(got.is_empty(), "a still-live (non-redeemable) condition is never a target");
+    }
+
+    /// R1 (pure): a RESOLVED condition the MM doesn't hold (net 0) is not a
+    /// target — `redeemPositions` would clear nothing.
+    #[test]
+    fn redeem_targets_skips_resolved_condition_we_dont_hold() {
+        let (yes, no) = (TokenId(1), TokenId(2));
+        let cond_hex = format!("0x{}", "de".repeat(32));
+        let cond: B256 = cond_hex.parse().unwrap();
+        let cond_by_token = HashMap::from([(yes, cond), (no, cond)]);
+        let venue_by_token =
+            HashMap::from([(yes, "asset_yes".to_string()), (no, "asset_no".to_string())]);
+        // RESOLVED, but we hold NOTHING (net 0 on both legs).
+        let positions = vec![
+            mk_data_pos(&cond_hex, "asset_yes", 1.0, true),
+            mk_data_pos(&cond_hex, "asset_no", 0.0, true),
+        ];
+        let got = redeem_targets(&positions, &cond_by_token, &venue_by_token, |_| 0);
+
+        assert!(got.is_empty(), "resolved but net 0 (nothing held) → not a target");
+    }
+
+    // ── R1: resolved-winner redeem — pure apply (`apply_redeem`) ────────────────
+
+    /// R1 (pure): [`apply_redeem`] is the SHARED settlement — it credits each held
+    /// leg's resolved value (winner ≈ $1/share, loser $0) via the signed-lot sell
+    /// path, clears both legs to flat, mirrors the recovered cash into the
+    /// reporting book, and returns the aggregate realized delta (recovered − basis).
+    #[test]
+    fn apply_redeem_clears_legs_and_credits_resolved_value() {
+        let (winner, loser) = (TokenId(1), TokenId(2));
+        let token_market = HashMap::from([(winner, MarketId(0)), (loser, MarketId(0))]);
+        let mut inv = InventoryRisk::new(generous_inv());
+        let mut positions = PositionBook::default();
+        // 100 shares each: winner bought @ $0.40 ($40 basis), loser @ $0.40 ($40 basis).
+        inv.seed(winner, 100 * SH as i128, Usdc(40_000_000));
+        inv.seed(loser, 100 * SH as i128, Usdc(40_000_000));
+        let cond: B256 = format!("0x{}", "ef".repeat(32)).parse().unwrap();
+        let target = RedeemTarget {
+            condition_id: cond,
+            legs: vec![
+                RedeemLeg { token: winner, resolved_price: 1.0, net_micro: 100 * SH as i128 },
+                RedeemLeg { token: loser, resolved_price: 0.0, net_micro: 100 * SH as i128 },
+            ],
+        };
+
+        let realized_delta = apply_redeem(&mut inv, &mut positions, &token_market, &target);
+
+        // Winner: recovered $100, basis $40 → realized +$60, cleared to flat.
+        assert_eq!(inv.net(winner), 0, "winner leg cleared to net 0");
+        assert_eq!(inv.realized(winner), Usdc(60_000_000), "recovered $100 − basis $40");
+        // Loser: recovered $0, basis $40 → realized −$40, cleared to flat.
+        assert_eq!(inv.net(loser), 0, "loser leg cleared to net 0");
+        assert_eq!(inv.realized(loser), Usdc(-40_000_000), "recovered $0 − basis $40");
+        // Recovered cash credited to the reporting book: winner $100 + loser $0.
+        assert_eq!(positions.cash(), Usdc(100_000_000), "recovered resolved value credited");
+        // Aggregate realized = recovered $100 − basis $80 = +$20.
+        assert_eq!(realized_delta, 20_000_000, "returned realized_delta == the aggregate");
+    }
+
     // ── RewardFarm Phase-B integration (Task B6, spec §5.1) ─────────────────────
 
     /// Spec-2 Phase B (Task B6) END-TO-END: a RewardFarm + `hedging_enabled` loop
@@ -5701,6 +6097,9 @@ mod tests {
             HashMap::new(),
             None,            // merger (M6-7): no relayer in this loop-lifecycle test
             HashMap::new(),  // cond_by_token (M6-7)
+            HashMap::new(),  // venue_by_token (R1)
+            None,            // data_api (R1)
+            None,            // deposit_wallet (R1)
             Usdc(1_000_000_000),
             false,
             false,
@@ -5993,6 +6392,9 @@ mod tests {
             merge_rx,
             merge_inflight: HashSet::new(),
             last_merge_sweep: Instant::now(),
+            venue_by_token: HashMap::new(),
+            data_api: None,
+            deposit_wallet: None,
         };
         (mm, store_rx, produced)
     }
@@ -6084,6 +6486,9 @@ mod tests {
             merge_rx,
             merge_inflight: HashSet::new(),
             last_merge_sweep: Instant::now(),
+            venue_by_token: HashMap::new(),
+            data_api: None,
+            deposit_wallet: None,
         };
         // We placed this order on YES (an Ask). The fill must follow THIS token.
         mm.placed.insert(
@@ -6265,6 +6670,9 @@ mod tests {
             HashMap::new(),
             None,            // merger (M6-7): no relayer in this control-channel test
             HashMap::new(),  // cond_by_token (M6-7)
+            HashMap::new(),  // venue_by_token (R1)
+            None,            // data_api (R1)
+            None,            // deposit_wallet (R1)
             Usdc(1_000_000_000),
             false,
             false,
