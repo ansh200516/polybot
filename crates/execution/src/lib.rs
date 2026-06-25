@@ -28,6 +28,7 @@ pub mod maker;
 pub mod paper_maker;
 pub mod quote_manager;
 pub mod reconcile;
+pub mod relayer;
 pub mod secrets;
 pub mod sign;
 pub mod split_venue;

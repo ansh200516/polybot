@@ -399,6 +399,18 @@ pub struct Live {
     pub min_leg_value_usd: f64,
     /// Phrase typed at startup (headless --live) to release dispatch.
     pub confirm_phrase: String,
+    /// M6 deposit-wallet relayer (live on-chain merge/redeem) master switch.
+    /// `false` (default) → no relayer is constructed and live merge/redeem stays
+    /// the hold-to-resolution no-op; the relayer also requires builder creds +
+    /// `RPC_URL` from env (spec 2026-06-25 §7). Opt in deliberately.
+    pub relayer_enabled: bool,
+    /// Staging-first: `true` (default) targets Polymarket's relayer STAGING
+    /// environment so the first funded batch is off prod. The live MM constructor
+    /// picks the staging-vs-prod URL from this flag unless `relayer_url` overrides.
+    pub relayer_staging: bool,
+    /// Explicit relayer base URL override. `None` (default) → derive the URL from
+    /// `relayer_staging`. When `Some`, it MUST be non-empty (validated).
+    pub relayer_url: Option<String>,
 }
 
 impl Default for Live {
@@ -409,6 +421,10 @@ impl Default for Live {
             min_leg_shares: 5.0,
             min_leg_value_usd: 1.0,
             confirm_phrase: "I understand this trades real money".into(),
+            // M6 relayer: OFF by default, staging-first, no URL override.
+            relayer_enabled: false,
+            relayer_staging: true,
+            relayer_url: None,
         }
     }
 }
@@ -899,6 +915,16 @@ impl Config {
         }
         if self.live.confirm_phrase.is_empty() {
             return Err(ConfigError::BadMoney("live.confirm_phrase must not be empty"));
+        }
+        // M6 relayer knobs (spec 2026-06-25 §7). `relayer_enabled`/`relayer_staging`
+        // are plain booleans (default OFF / staging-first) and need no check; the
+        // relayer is additionally gated at runtime on builder creds + RPC_URL. A
+        // `relayer_url` OVERRIDE, if set, must be non-empty — an empty string is a
+        // silent misconfig (the URL is what reaches the relayer).
+        if self.live.relayer_url.as_deref().is_some_and(str::is_empty) {
+            return Err(ConfigError::BadMoney(
+                "live.relayer_url, if set, must be non-empty",
+            ));
         }
         if self.risk.mid_spread_cap_ticks == 0 {
             return Err(ConfigError::BadMoney("risk.mid_spread_cap_ticks must be ≥ 1"));
@@ -1519,6 +1545,41 @@ mod tests {
         let mut c = Config::default();
         c.live.min_leg_value_usd = f64::NAN;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn live_relayer_knobs_parse_and_default() {
+        // M6 defaults: relayer OFF, staging-first, no URL override.
+        let d = Config::default();
+        assert!(!d.live.relayer_enabled, "relayer is OFF by default");
+        assert!(d.live.relayer_staging, "staging-first by default");
+        assert_eq!(d.live.relayer_url, None);
+        d.validate().unwrap();
+
+        // Explicit override parses + round-trips.
+        let c = Config::from_toml_str(
+            "[live]\nrelayer_enabled = true\nrelayer_staging = false\nrelayer_url = \"https://x\"\n",
+        )
+        .unwrap();
+        assert!(c.live.relayer_enabled);
+        assert!(!c.live.relayer_staging);
+        assert_eq!(c.live.relayer_url.as_deref(), Some("https://x"));
+        // Untouched [live] fields keep their canary defaults.
+        assert!((c.live.basket_cap_usd - 10.0).abs() < 1e-9);
+        assert_eq!(c.live.confirm_phrase, "I understand this trades real money");
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn live_relayer_url_if_set_must_be_non_empty() {
+        // An explicit empty relayer_url is a silent misconfig → rejected.
+        assert!(Config::from_toml_str("[live]\nrelayer_url = \"\"\n").is_err());
+        // Enabling the relayer without a URL override is fine (URL derives from
+        // the staging flag), and the default (None) validates.
+        Config::from_toml_str("[live]\nrelayer_enabled = true\n")
+            .unwrap()
+            .validate()
+            .unwrap();
     }
 
     #[test]
