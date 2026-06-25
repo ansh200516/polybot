@@ -7,7 +7,10 @@
 //! calldata, the relayer I/O). NO signing, ABI encoding, or network I/O happens
 //! here yet — this is foundational scaffolding only.
 
-use alloy_primitives::{Address, address};
+use alloy_primitives::{Address, U256, address, hex};
+use alloy_signer::SignerSync;
+use alloy_signer_local::PrivateKeySigner;
+use alloy_sol_types::{SolStruct, eip712_domain, sol};
 
 // ---------------------------------------------------------------------------
 // Polygon-137 contracts
@@ -58,9 +61,123 @@ pub const CTF_COLLATERAL_ADAPTER: Address =
 pub const NEGRISK_CTF_COLLATERAL_ADAPTER: Address =
     address!("0xadA2005600Dec949baf300f4C6120000bDB6eAab");
 
+// ---------------------------------------------------------------------------
+// EIP-712 deposit-wallet `Batch` signing (M6-2 — THE golden-vector gate)
+// ---------------------------------------------------------------------------
+
+sol! {
+    /// One call inside a deposit-wallet batch. Field NAMES, ORDER, and TYPES
+    /// are the EIP-712 typestring — never reorder or rename. `value` is
+    /// `uint256` (NOT u64) and `data` is dynamic `bytes` (NOT a fixed array);
+    /// the golden vector enforces this.
+    #[derive(Debug)]
+    struct Call {
+        address target;
+        uint256 value;
+        bytes data;
+    }
+
+    /// The deposit-wallet batch the owner EOA signs (primaryType `Batch`).
+    /// `calls` is a struct array — EIP-712 encodes it as the keccak of the
+    /// concatenated `Call` member hashes. Matches
+    /// `py-builder-relayer-client@e7108cd` `builder/deposit_wallet.py`
+    /// (design §2.1); field order `wallet,nonce,deadline,calls` is load-bearing.
+    #[derive(Debug)]
+    struct Batch {
+        address wallet;
+        uint256 nonce;
+        uint256 deadline;
+        Call[] calls;
+    }
+}
+
+#[derive(Debug)]
+pub enum RelayerError {
+    /// The owner EOA private key string could not be parsed into a signer.
+    BadKey(String),
+    /// The local signer failed to produce a signature.
+    Sign(String),
+}
+
+impl std::fmt::Display for RelayerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelayerError::BadKey(e) => write!(f, "invalid signer key: {e}"),
+            RelayerError::Sign(e) => write!(f, "batch signing error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RelayerError {}
+
+/// Sign a deposit-wallet `Batch` (EIP-712) with the owner EOA `pk`, returning
+/// the 65-byte `r || s || v` signature as a `0x`-prefixed hex string (132
+/// chars). This is the offline-validatable core of M6 — proven byte-identical
+/// to Polymarket's golden vector by `sign_batch_matches_polymarket_golden_vector`.
+///
+/// The EIP-712 domain is `{ name: "DepositWallet", version: "1", chainId,
+/// verifyingContract: <wallet> }` — the verifying contract is the DEPOSIT
+/// WALLET itself (NOT the factory). `v` is encoded as 27/28 (Electrum
+/// notation, via `Signature::as_bytes`), matching the eth_account convention
+/// that produced the reference vector — IDENTICAL to `sign::sign_order` and
+/// `auth::l1_signature`.
+pub fn sign_batch(
+    pk: &str,
+    chain_id: u64,
+    wallet: Address,
+    nonce: u64,
+    deadline: u64,
+    calls: &[Call],
+) -> Result<String, RelayerError> {
+    let signer = pk
+        .parse::<PrivateKeySigner>()
+        .map_err(|e| RelayerError::BadKey(e.to_string()))?;
+    let domain = eip712_domain! {
+        name: "DepositWallet",
+        version: "1",
+        chain_id: chain_id,
+        verifying_contract: wallet,
+    };
+    let batch = Batch {
+        wallet,
+        nonce: U256::from(nonce),
+        deadline: U256::from(deadline),
+        calls: calls.to_vec(),
+    };
+    let hash = batch.eip712_signing_hash(&domain);
+    let sig = signer
+        .sign_hash_sync(&hash)
+        .map_err(|e| RelayerError::Sign(e.to_string()))?;
+    Ok(format!("0x{}", hex::encode(sig.as_bytes())))
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// THE M6 GATE (M6-2): reproduce Polymarket's deposit-wallet `Batch` golden
+    /// signature byte-for-byte. Fixture from `py-builder-relayer-client@e7108cd`
+    /// `tests/builder/test_deposit_wallet.py` (chain 137, the public anvil key).
+    /// A mismatch means the EIP-712 typed-data encoding is wrong — do not weaken
+    /// this test; debug the encoding until it is byte-exact.
+    #[test]
+    fn sign_batch_matches_polymarket_golden_vector() {
+        use alloy_primitives::{Address, U256};
+        let pk = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"; // public anvil key
+        let wallet: Address = "0xa2927E7834648F1C03b4961CeeA4597292e3c025".parse().unwrap();
+        let token: Address = "0x0000000000000000000000000000000000000001".parse().unwrap();
+        let data = alloy_primitives::hex::decode(
+            "095ea7b30000000000000000000000000000000000000000000000000000000000000002ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        ).unwrap();
+        let calls = vec![Call { target: token, value: U256::ZERO, data: data.into() }];
+        let sig = sign_batch(pk, 137u64, wallet, 0u64, 1234567890u64, &calls).unwrap();
+        assert_eq!(
+            sig,
+            "0x7827946c566e7860f6c5f2e641587ed6928989c8618e463a00dd56832e7300023b7436c67a2ea82d6d506b1a5eda3e27526e9e2ffaad52128d75c47c2e9d1fac1b"
+        );
+        assert_eq!(sig.len(), 132);
+    }
 
     /// LIVE GATE (M6-B): the collateral-adapter consts MUST be real, non-zero
     /// Polygon-137 addresses before any live merge/redeem batch is built — a
