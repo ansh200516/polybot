@@ -7,10 +7,10 @@
 //! calldata, the relayer I/O). NO signing, ABI encoding, or network I/O happens
 //! here yet — this is foundational scaffolding only.
 
-use alloy_primitives::{Address, U256, address, hex};
+use alloy_primitives::{Address, B256, U256, address, b256, hex, keccak256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::{SolStruct, eip712_domain, sol};
+use alloy_sol_types::{SolCall, SolStruct, eip712_domain, sol};
 
 // ---------------------------------------------------------------------------
 // Polygon-137 contracts
@@ -151,6 +151,149 @@ pub fn sign_batch(
     Ok(format!("0x{}", hex::encode(sig.as_bytes())))
 }
 
+// ---------------------------------------------------------------------------
+// (A) CtfCollateralAdapter merge/redeem CALLDATA (M6-3, design §2.3)
+// ---------------------------------------------------------------------------
+
+sol! {
+    /// `CtfCollateralAdapter.mergePositions` — pulls the deposit wallet's
+    /// YES+NO ERC-1155 legs, merges the complete set via the underlying CTF,
+    /// and returns `amount` of `collateralToken`. The function NAME, ARG
+    /// ORDER, and TYPES form the 4-byte selector preimage
+    /// (`mergePositions(address,bytes32,bytes32,uint256[],uint256)`) — never
+    /// reorder or rename (design §2.3).
+    function mergePositions(
+        address collateralToken,
+        bytes32 parentCollectionId,
+        bytes32 conditionId,
+        uint256[] partition,
+        uint256 amount
+    );
+
+    /// `CtfCollateralAdapter.redeemPositions` — redeems a RESOLVED position
+    /// back to `collateralToken`. `indexSets` selects the outcome slots
+    /// (binary market: `[1, 2]`). Selector preimage
+    /// `redeemPositions(address,bytes32,bytes32,uint256[])`.
+    function redeemPositions(
+        address collateralToken,
+        bytes32 parentCollectionId,
+        bytes32 conditionId,
+        uint256[] indexSets
+    );
+}
+
+/// Build the WALLET-batch [`Call`] that merges a complete YES+NO set back to
+/// `collateral` on `adapter` (the standard or NegRisk `CtfCollateralAdapter`).
+///
+/// `partition = [1, 2]` (the two binary outcome slots) and `parentCollectionId
+/// = 0x0` (top-level condition) are fixed by the protocol; `amount` is the set
+/// count in `collateral` base units. `value` is `0` — no native token moves.
+/// `collateral`/`adapter` are PARAMETERS (the exact pUSD/USDC.e collateral is
+/// reconciled in M6-6); nothing is hardcoded here.
+pub fn merge_call(adapter: Address, collateral: Address, condition_id: B256, amount: U256) -> Call {
+    let data = mergePositionsCall {
+        collateralToken: collateral,
+        parentCollectionId: B256::ZERO,
+        conditionId: condition_id,
+        partition: vec![U256::from(1), U256::from(2)],
+        amount,
+    }
+    .abi_encode();
+    Call {
+        target: adapter,
+        value: U256::ZERO,
+        data: data.into(),
+    }
+}
+
+/// Build the WALLET-batch [`Call`] that redeems a RESOLVED position back to
+/// `collateral` on `adapter`. `indexSets = [1, 2]` and `parentCollectionId =
+/// 0x0` are fixed by the protocol (binary market); `value` is `0`.
+pub fn redeem_call(adapter: Address, collateral: Address, condition_id: B256) -> Call {
+    let data = redeemPositionsCall {
+        collateralToken: collateral,
+        parentCollectionId: B256::ZERO,
+        conditionId: condition_id,
+        indexSets: vec![U256::from(1), U256::from(2)],
+    }
+    .abi_encode();
+    Call {
+        target: adapter,
+        value: U256::ZERO,
+        data: data.into(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (B) Deposit-wallet address derivation (M6-3) — CREATE2 over the ERC-1967 clone
+// ---------------------------------------------------------------------------
+// Ported 1:1 from `py-builder-relayer-client` `builder/derive.py`; proven
+// byte-exact against its golden vector (`derive_deposit_wallet_matches_golden_vector`).
+
+/// Low 10 bytes of the ERC-1967 clone init-code, as a big-endian integer.
+/// The deploy-time `(len(args) << 56)` is folded in by ADDITION (matching the
+/// Python `ERC1967_PREFIX + (n << 56)`), then the low 10 bytes are emitted.
+const ERC1967_PREFIX: u128 = 0x61003D3D8160233D3973;
+
+/// Tail constants of the ERC-1967 minimal-clone init-code (Solady-style).
+/// `CONST2` is emitted BEFORE `CONST1` (load-bearing order, per the Python).
+const ERC1967_CONST1: B256 =
+    b256!("0xcc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3");
+const ERC1967_CONST2: B256 =
+    b256!("0x5155f3363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076");
+
+/// `keccak256` of the ERC-1967 minimal-clone init-code for `implementation`
+/// with trailing immutable `args`. Layout (port of `init_code_hash_erc1967`):
+/// `prefix(10) ‖ implementation(20) ‖ 0x6009 ‖ CONST2(32) ‖ CONST1(32) ‖ args`.
+fn init_code_hash_erc1967(implementation: Address, args: &[u8]) -> B256 {
+    let n = args.len() as u128;
+    let combined = (ERC1967_PREFIX + (n << 56)).to_be_bytes();
+    let mut init_code = Vec::with_capacity(10 + 20 + 2 + 32 + 32 + args.len());
+    init_code.extend_from_slice(&combined[6..16]); // low 10 bytes, big-endian
+    init_code.extend_from_slice(implementation.as_slice());
+    init_code.extend_from_slice(&[0x60, 0x09]);
+    init_code.extend_from_slice(ERC1967_CONST2.as_slice());
+    init_code.extend_from_slice(ERC1967_CONST1.as_slice());
+    init_code.extend_from_slice(args);
+    keccak256(init_code)
+}
+
+/// EIP-1014 CREATE2 address: `keccak256(0xff ‖ from ‖ salt ‖ bytecode_hash)[12:]`.
+/// Port of `get_create2_address`.
+fn get_create2_address(bytecode_hash: B256, from_address: Address, salt: B256) -> Address {
+    let mut buf = [0u8; 85];
+    buf[0] = 0xff;
+    buf[1..21].copy_from_slice(from_address.as_slice());
+    buf[21..53].copy_from_slice(salt.as_slice());
+    buf[53..85].copy_from_slice(bytecode_hash.as_slice());
+    Address::from_word(keccak256(buf))
+}
+
+/// Derive the deterministic deposit-wallet address for `owner` under the
+/// relayer's `factory`/`implementation` (CREATE2 over the ERC-1967 minimal
+/// clone). Port of `derive_deposit_wallet`:
+/// - `wallet_id = keccak256(owner)` (keccak of the 20-byte owner address),
+/// - `args = abi_encode(address factory, bytes32 wallet_id)` (64 bytes),
+/// - `salt = keccak256(args)`,
+/// - `bytecode_hash = init_code_hash_erc1967(implementation, args)`,
+/// - return `CREATE2(from = factory, salt, bytecode_hash)`.
+///
+/// The returned [`Address`] compares byte-for-byte; render with `to_checksum`
+/// for the EIP-55 form. Proven byte-exact by the golden-vector test.
+pub fn derive_deposit_wallet(owner: Address, factory: Address, implementation: Address) -> Address {
+    let wallet_id = keccak256(owner.as_slice());
+
+    // args = ABI encoding of (address factory, bytes32 wallet_id): the address
+    // is right-aligned in the first 32-byte word; wallet_id fills the second.
+    let mut args = [0u8; 64];
+    args[12..32].copy_from_slice(factory.as_slice());
+    args[32..64].copy_from_slice(wallet_id.as_slice());
+
+    let salt = keccak256(args);
+    let bytecode_hash = init_code_hash_erc1967(implementation, &args);
+    get_create2_address(bytecode_hash, factory, salt)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -229,5 +372,83 @@ mod tests {
         assert_ne!(DEPOSIT_WALLET_FACTORY, Address::ZERO);
         assert_ne!(DEPOSIT_WALLET_IMPL, Address::ZERO);
         assert_ne!(DEPOSIT_WALLET_FACTORY, DEPOSIT_WALLET_IMPL);
+    }
+
+    /// (A) `merge_call` must produce the exact `CtfCollateralAdapter.
+    /// mergePositions` calldata: a hand-computed keccak selector over the
+    /// canonical signature, the protocol-fixed `parentCollectionId = 0x0` /
+    /// `partition = [1, 2]`, and a clean round-trip of every arg via the
+    /// generated decoder. `target` is the adapter; `value` is 0.
+    #[test]
+    fn merge_call_selector_and_args() {
+        let adapter = CTF_COLLATERAL_ADAPTER;
+        // Arbitrary non-zero collateral (USDC.e on 137); the real pUSD/USDC.e
+        // address is reconciled in M6-6 — this test only pins the ENCODING.
+        let collateral: Address = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".parse().unwrap();
+        let condition_id: B256 =
+            "0xabcdef0000000000000000000000000000000000000000000000000000000123".parse().unwrap();
+        let amount = U256::from(1_500_000u64);
+
+        let call = merge_call(adapter, collateral, condition_id, amount);
+
+        assert_eq!(call.target, adapter, "merge target must be the adapter");
+        assert_eq!(call.value, U256::ZERO, "merge value must be 0");
+
+        // Selector = keccak256(canonical signature)[..4], hand-computed.
+        let selector = keccak256("mergePositions(address,bytes32,bytes32,uint256[],uint256)".as_bytes());
+        assert_eq!(&call.data[..4], &selector[..4], "mergePositions selector mismatch");
+
+        // Args round-trip through the generated decoder (also re-validates the
+        // 4-byte selector, since `abi_decode` strips and checks it).
+        let decoded = mergePositionsCall::abi_decode(&call.data).unwrap();
+        assert_eq!(decoded.collateralToken, collateral);
+        assert_eq!(decoded.parentCollectionId, B256::ZERO);
+        assert_eq!(decoded.conditionId, condition_id);
+        assert_eq!(decoded.partition, vec![U256::from(1), U256::from(2)]);
+        assert_eq!(decoded.amount, amount);
+    }
+
+    /// (A) `redeem_call` mirror of [`merge_call_selector_and_args`] for
+    /// `redeemPositions(address,bytes32,bytes32,uint256[])` with `indexSets =
+    /// [1, 2]`. Uses the NegRisk adapter to prove `adapter` is a parameter.
+    #[test]
+    fn redeem_call_selector_and_args() {
+        let adapter = NEGRISK_CTF_COLLATERAL_ADAPTER;
+        let collateral: Address = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".parse().unwrap();
+        let condition_id: B256 =
+            "0x00000000000000000000000000000000000000000000000000000000deadbeef".parse().unwrap();
+
+        let call = redeem_call(adapter, collateral, condition_id);
+
+        assert_eq!(call.target, adapter, "redeem target must be the adapter");
+        assert_eq!(call.value, U256::ZERO, "redeem value must be 0");
+
+        let selector = keccak256("redeemPositions(address,bytes32,bytes32,uint256[])".as_bytes());
+        assert_eq!(&call.data[..4], &selector[..4], "redeemPositions selector mismatch");
+
+        let decoded = redeemPositionsCall::abi_decode(&call.data).unwrap();
+        assert_eq!(decoded.collateralToken, collateral);
+        assert_eq!(decoded.parentCollectionId, B256::ZERO);
+        assert_eq!(decoded.conditionId, condition_id);
+        assert_eq!(decoded.indexSets, vec![U256::from(1), U256::from(2)]);
+    }
+
+    /// (B) THE M6-3 derivation GATE: reproduce Polymarket's deposit-wallet
+    /// CREATE2/ERC-1967 golden vector byte-for-byte (from py
+    /// `tests/builder/test_derive.py`). The vector uses the Amoy factory/impl,
+    /// which is fine — it validates the ALGORITHM (keccak owner → wallet_id →
+    /// abi-encoded args → salt + ERC-1967 init-code hash → CREATE2). A mismatch
+    /// means the derivation is wrong; debug until byte-exact, do not weaken.
+    #[test]
+    fn derive_deposit_wallet_matches_golden_vector() {
+        let owner: Address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".parse().unwrap();
+        let factory: Address = "0x801c740Bcd28531d75a5da176D5511F3329Ab049".parse().unwrap();
+        let implementation: Address = "0x24f3257BF9451bA575E864777ab6f8D7Eac0139B".parse().unwrap();
+        let wallet = derive_deposit_wallet(owner, factory, implementation);
+        assert_eq!(
+            wallet,
+            "0x63cB1B4eC2F274Ed553aD5079c6A2542d1c02bd7".parse::<Address>().unwrap(),
+            "deposit-wallet derivation diverged from the Polymarket golden vector"
+        );
     }
 }
