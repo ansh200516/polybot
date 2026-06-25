@@ -1373,13 +1373,24 @@ async fn main() {
             // inputs use neutral constants rather than forcing a large refactor:
             //  * competing_depth = 1.0 → ranking collapses to pure `daily_rate`,
             //    the only competition-free signal available here.
-            //  * mid = 0.5 → per_market_cost = 2 sides × reward_min_size × mid
-            //    (USD to park the two minimum incentive orders); 0.5 is the
-            //    max-uncertainty price for a binary outcome.
+            //  * mid = 0.5 → the per-market cost to PARK the minimum incentive
+            //    orders is sized off this max-uncertainty binary price (a real
+            //    mid replaces it once a selection-time book snapshot is plumbed):
+            //      - NON-hedging (Spec-1, ONE token, bid + ask): 2 × min_size × mid.
+            //      - HEDGING (Spec-2 Phase B, the complement PAIR — bid YES + bid
+            //        NO, BOTH buys): YES-bid notional + NO-bid notional =
+            //        min_size·mid + min_size·(1−mid) ≈ min_size·1.0 at the 0.5
+            //        fallback (a full YES+NO share-set ≈ $1), so the budget funds
+            //        the right number of PAIRS instead of under-counting a leg.
             // CONCERN (later refinement): rank by real in-band resting depth and
             // size cost off a real mid once a selection-time book snapshot is
             // plumbed through to this point.
             let mid = 0.5_f64;
+            // Reward-farm hedging is on only when [reward_farm].hedging_enabled
+            // (this block is already reward-farm-only); it deploys TWO bid legs
+            // per market, so each funded market must reserve BOTH (vs. the
+            // single-token bid+ask under Spec-1).
+            let hedging = config.reward_farm.hedging_enabled;
             let cands: Vec<(u64, f64, f64, f64)> = reg
                 .markets()
                 .iter()
@@ -1390,7 +1401,14 @@ async fn main() {
                     }
                     let daily_rate = metrics.reward_daily_rate_usd;
                     let competing_depth = 1.0; // no book yet → rank by daily_rate alone
-                    let per_market_cost = 2.0 * metrics.reward_min_size * mid;
+                    let per_market_cost = if hedging {
+                        // BOTH bid legs (YES + NO), both buys: min_size·mid_yes +
+                        // min_size·mid_no = min_size·mid + min_size·(1−mid).
+                        metrics.reward_min_size * mid + metrics.reward_min_size * (1.0 - mid)
+                    } else {
+                        // ONE token, two sides (bid + ask): 2 × min_size × mid.
+                        2.0 * metrics.reward_min_size * mid
+                    };
                     Some((u64::from(m.id.0), daily_rate, competing_depth, per_market_cost))
                 })
                 .collect();

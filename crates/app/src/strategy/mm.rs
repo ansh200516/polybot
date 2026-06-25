@@ -94,7 +94,7 @@ use super::quote_policy::{
     Policy, adjusted_mid, combined_signal, imbalance, ladder_depth, microprice, needs_requote,
     needs_requote_size, reward_quote_prices, should_pull, skewed_sizes,
 };
-use super::reward_score::{ScoredOrder, est_daily_reward_usd, order_score, quote_set_q_min};
+use super::reward_score::{ScoredOrder, est_daily_reward_usd, order_score, q_min, quote_set_q_min};
 use super::signals::SignalState;
 use super::{
     RestingOrderSnapshot, RewardFarmStatus, Strategy, StrategyCommand, StrategyCtx, StrategyId,
@@ -521,6 +521,27 @@ const MM_MIN_ORDER_SHARES_MICRO: i128 = 5_000_000;
 /// approximate); real depth plumbing + live midnight-payout reconciliation are
 /// deferred. `q_min` / `balance_ratio` are exact (they need no competing depth).
 const REWARD_COMPETING_DEPTH_FALLBACK: f64 = 1.0;
+
+/// One complement leg's reward contribution for the pair-aware hedging estimator
+/// (Spec-2 Phase B, Task B3): a token's resting orders scored against ITS OWN
+/// adjusted mid + reward band via the pure [`reward_score`](super::reward_score)
+/// primitives (never reimplemented). The caller combines a market's two legs
+/// into one two-sided `q_min` (bids on one token + asks on its complement → Q1,
+/// and vice-versa → Q2).
+struct RewardLeg {
+    /// Σ `order_score(v, s)·size` over the leg's BID orders.
+    q_bids: f64,
+    /// Σ over the leg's ASK orders (0 in bid-only hedging).
+    q_asks: f64,
+    /// In-band USD notional (shares × price) of the leg, for the est-$/day proxy.
+    depth_usd: f64,
+    /// The market's reward pool $/day (identical for both complement tokens, so
+    /// the caller takes it ONCE per market — never summed across the pair).
+    daily_rate: f64,
+    /// The adjusted mid the leg's orders were scored against (the market's
+    /// representative mid for the `q_min` in-band band check).
+    adj_mid: f64,
+}
 
 /// Build one resting `postOnly` Gtc maker order sized by `notional_micro /
 /// price`. `None` when the price/size is non-positive OR below the venue's
@@ -1739,7 +1760,17 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
     /// Contributions are AGGREGATED across quoted tokens (Spec 1 typically
     /// quotes a single token two-sided): `q_min`/est sum, and `balance_ratio`
     /// is taken from the summed `Q1`/`Q2`. `cumulative_est` is filled by the
-    /// caller. Takes `&mut self` only to match the loop's other async methods
+    /// caller.
+    ///
+    /// HEDGING (Spec-2 Phase B, Task B3): when `hedging_enabled`, a market's
+    /// reward score is two-sided ACROSS the complement pair — the YES bid scores
+    /// on book `m` (Q1), the NO bid on book `m'` (Q2). The resting orders are
+    /// grouped by MARKET via the `complement` map and each market is scored ONCE
+    /// (its two legs paired into one `q_min` via [`Self::score_reward_leg`]), so
+    /// a bid-only token is NOT penalized as single-sided. The non-hedging path
+    /// is unchanged (each token scores against its own mid, two-sided per token).
+    ///
+    /// Takes `&mut self` only to match the loop's other async methods
     /// (a shared `&self` across `.await` is not `Send` for the live venue); it
     /// mutates no trading state — it just reads the resting set + books.
     async fn sample_reward_estimate(&mut self) -> RewardFarmStatus {
@@ -1754,66 +1785,124 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         let mut q2_total = 0.0_f64;
         let mut q_min_total = 0.0_f64;
         let mut est_total = 0.0_f64;
-        for (token, orders) in by_token {
-            // `.1` = max_spread_cents (scoring band `v`), `.2` = daily_rate_usd.
-            // A token with no metrics / not reward-eligible (band ≤ 0) scores 0,
-            // so it is skipped (it earns nothing and would divide by a 0 band).
-            let (min_size_shares, max_spread_cents, daily_rate) =
-                self.reward_by_token.get(&token).copied().unwrap_or((0.0, 0.0, 0.0));
-            if max_spread_cents <= 0.0 {
-                continue;
-            }
-            // Adjusted mid from the live book; skip the token if it is gone /
-            // one-sided (we cannot score a distance-from-mid without a mid).
-            let Some((book, true)) = self.fetcher.fetch(token).await else {
-                continue;
-            };
-            let ts = book.ts();
-            // SAME size-weighted fair value the quoting path prices off (spec §8.1,
-            // closes I2): microprice with the sub-`min_size` cutoff, so the scored
-            // distance-from-mid matches what we actually quoted. `None` ⇒ the book
-            // is one-sided/empty — skip (no mid to score against).
-            let Some(adj_mid) = reward_fair_value(&book, ts, min_size_shares) else {
-                continue;
-            };
 
-            let mut bids: Vec<ScoredOrder> = Vec::new();
-            let mut asks: Vec<ScoredOrder> = Vec::new();
-            let mut our_in_band_depth = 0.0_f64; // USD notional of in-band sides
-            for o in &orders {
-                let price = o.price.microusdc(ts) as f64 / 1_000_000.0;
-                let shares = o.size.0 as f64 / 1_000_000.0;
-                let so = ScoredOrder {
-                    spread_cents: (price - adj_mid).abs() * 100.0,
-                    size: shares,
+        if self.params.hedging_enabled {
+            // PAIR-AWARE (Spec-2 Phase B, Task B3): under hedging the MM bids
+            // YES + bids NO, and the reward score is two-sided ACROSS the
+            // complement pair — the YES bid scores on book `m` (Q1), the NO bid
+            // on book `m'` (Q2). Group the resting orders by MARKET via the
+            // `complement` map and score each market ONCE, so a bid-only token is
+            // PAIRED into a two-sided market score rather than penalized as
+            // single-sided (the 1/C floor) per token. `reward_score::q_min` is
+            // symmetric in (Q1, Q2), so the market score is independent of which
+            // complement we start from; the `processed` set counts each market
+            // exactly once (no double-counting) and the shared reward pool /
+            // daily rate is taken ONCE per market (never summed across the pair).
+            let mut processed: HashSet<TokenId> = HashSet::new();
+            let heads: Vec<TokenId> = by_token.keys().copied().collect();
+            for token in heads {
+                if !processed.insert(token) {
+                    continue; // this market was already scored via its complement
+                }
+                let complement = self.complement.get(&token).copied();
+                if let Some(c) = complement {
+                    processed.insert(c);
+                }
+                // Own + complement resting orders, cloned so neither immutable
+                // borrow of `by_token` is held across the two async leg scorings.
+                let my_orders = by_token.get(&token).cloned().unwrap_or_default();
+                let comp_orders = complement.and_then(|c| by_token.get(&c).cloned());
+                let leg = self.score_reward_leg(token, &my_orders).await;
+                let comp_leg = match (complement, comp_orders) {
+                    (Some(c), Some(orders)) => self.score_reward_leg(c, &orders).await,
+                    _ => None,
                 };
-                // In-band (score > 0) sides contribute to our reward depth, in
-                // USD (shares × price) to stay consistent with the competing
-                // in-band depth a future live-book plumb would supply (spec §7).
-                if order_score(max_spread_cents, so.spread_cents) > 0.0 {
-                    our_in_band_depth += shares * price;
-                }
-                match o.side {
-                    Side::Bid => bids.push(so),
-                    Side::Ask => asks.push(so),
-                }
+                // Cross-complement two-sided sums (spec §2): Q1 = this leg's bids
+                // + the complement's asks; Q2 = this leg's asks + the complement's
+                // bids. Hedging is bid-only, so this reduces to Q1 = our bids /
+                // Q2 = complement bids, but the full form stays correct if an
+                // inventory-offload ask ever rests. A missing leg contributes 0.
+                let market_q1 = leg.as_ref().map_or(0.0, |l| l.q_bids)
+                    + comp_leg.as_ref().map_or(0.0, |l| l.q_asks);
+                let market_q2 = leg.as_ref().map_or(0.0, |l| l.q_asks)
+                    + comp_leg.as_ref().map_or(0.0, |l| l.q_bids);
+                // The market's representative mid + reward pool: both complement
+                // tokens share the SAME pool, so the daily rate is taken ONCE
+                // (never summed) and the depth is the pair's combined in-band
+                // notional. Skip the market if neither leg had a scorable mid.
+                let Some(repr) = leg.as_ref().or(comp_leg.as_ref()) else {
+                    continue;
+                };
+                let depth = leg.as_ref().map_or(0.0, |l| l.depth_usd)
+                    + comp_leg.as_ref().map_or(0.0, |l| l.depth_usd);
+                q1_total += market_q1;
+                q2_total += market_q2;
+                q_min_total += q_min(market_q1, market_q2, repr.adj_mid);
+                est_total +=
+                    est_daily_reward_usd(repr.daily_rate, depth, REWARD_COMPETING_DEPTH_FALLBACK);
             }
+        } else {
+            for (token, orders) in by_token {
+                // `.1` = max_spread_cents (scoring band `v`), `.2` = daily_rate_usd.
+                // A token with no metrics / not reward-eligible (band ≤ 0) scores 0,
+                // so it is skipped (it earns nothing and would divide by a 0 band).
+                let (min_size_shares, max_spread_cents, daily_rate) =
+                    self.reward_by_token.get(&token).copied().unwrap_or((0.0, 0.0, 0.0));
+                if max_spread_cents <= 0.0 {
+                    continue;
+                }
+                // Adjusted mid from the live book; skip the token if it is gone /
+                // one-sided (we cannot score a distance-from-mid without a mid).
+                let Some((book, true)) = self.fetcher.fetch(token).await else {
+                    continue;
+                };
+                let ts = book.ts();
+                // SAME size-weighted fair value the quoting path prices off (spec §8.1,
+                // closes I2): microprice with the sub-`min_size` cutoff, so the scored
+                // distance-from-mid matches what we actually quoted. `None` ⇒ the book
+                // is one-sided/empty — skip (no mid to score against).
+                let Some(adj_mid) = reward_fair_value(&book, ts, min_size_shares) else {
+                    continue;
+                };
 
-            // Q1/Q2 (per-side score sums) drive the balance ratio; `q_min` is the
-            // two-sided minimum from the same primitives via `quote_set_q_min`.
-            let q1: f64 = bids
-                .iter()
-                .map(|o| order_score(max_spread_cents, o.spread_cents) * o.size)
-                .sum();
-            let q2: f64 = asks
-                .iter()
-                .map(|o| order_score(max_spread_cents, o.spread_cents) * o.size)
-                .sum();
-            q1_total += q1;
-            q2_total += q2;
-            q_min_total += quote_set_q_min(max_spread_cents, adj_mid, &bids, &asks);
-            est_total +=
-                est_daily_reward_usd(daily_rate, our_in_band_depth, REWARD_COMPETING_DEPTH_FALLBACK);
+                let mut bids: Vec<ScoredOrder> = Vec::new();
+                let mut asks: Vec<ScoredOrder> = Vec::new();
+                let mut our_in_band_depth = 0.0_f64; // USD notional of in-band sides
+                for o in &orders {
+                    let price = o.price.microusdc(ts) as f64 / 1_000_000.0;
+                    let shares = o.size.0 as f64 / 1_000_000.0;
+                    let so = ScoredOrder {
+                        spread_cents: (price - adj_mid).abs() * 100.0,
+                        size: shares,
+                    };
+                    // In-band (score > 0) sides contribute to our reward depth, in
+                    // USD (shares × price) to stay consistent with the competing
+                    // in-band depth a future live-book plumb would supply (spec §7).
+                    if order_score(max_spread_cents, so.spread_cents) > 0.0 {
+                        our_in_band_depth += shares * price;
+                    }
+                    match o.side {
+                        Side::Bid => bids.push(so),
+                        Side::Ask => asks.push(so),
+                    }
+                }
+
+                // Q1/Q2 (per-side score sums) drive the balance ratio; `q_min` is the
+                // two-sided minimum from the same primitives via `quote_set_q_min`.
+                let q1: f64 = bids
+                    .iter()
+                    .map(|o| order_score(max_spread_cents, o.spread_cents) * o.size)
+                    .sum();
+                let q2: f64 = asks
+                    .iter()
+                    .map(|o| order_score(max_spread_cents, o.spread_cents) * o.size)
+                    .sum();
+                q1_total += q1;
+                q2_total += q2;
+                q_min_total += quote_set_q_min(max_spread_cents, adj_mid, &bids, &asks);
+                est_total +=
+                    est_daily_reward_usd(daily_rate, our_in_band_depth, REWARD_COMPETING_DEPTH_FALLBACK);
+            }
         }
 
         let balance_ratio = {
@@ -1832,6 +1921,48 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             signal: 0.0,
             pulled: false,
         }
+    }
+
+    /// Score ONE complement leg's resting orders for the pair-aware hedging
+    /// estimator (Task B3): each order scores against the token's OWN adjusted
+    /// mid (`reward_fair_value`, spec §8.1) and reward band, via the pure
+    /// [`reward_score`](super::reward_score) primitives. Returns `None` when the
+    /// token is not reward-eligible (band ≤ 0) or its book has no two-sided mid
+    /// to score against — the caller then treats this leg as absent (its `Q`
+    /// contribution is 0). Mirrors the non-hedging per-token scoring exactly; the
+    /// only difference is the caller pairs two legs into a market-level `q_min`.
+    async fn score_reward_leg(&mut self, token: TokenId, orders: &[MakerOrder]) -> Option<RewardLeg> {
+        // `.1` = max_spread_cents (scoring band `v`), `.2` = daily_rate_usd.
+        let (min_size_shares, max_spread_cents, daily_rate) =
+            self.reward_by_token.get(&token).copied().unwrap_or((0.0, 0.0, 0.0));
+        if max_spread_cents <= 0.0 {
+            return None;
+        }
+        // One-sided/empty book ⇒ no mid to anchor distance-from-mid → leg absent.
+        let Some((book, true)) = self.fetcher.fetch(token).await else {
+            return None;
+        };
+        let ts = book.ts();
+        let adj_mid = reward_fair_value(&book, ts, min_size_shares)?;
+
+        let mut q_bids = 0.0_f64;
+        let mut q_asks = 0.0_f64;
+        let mut depth_usd = 0.0_f64; // USD notional of in-band sides
+        for o in orders {
+            let price = o.price.microusdc(ts) as f64 / 1_000_000.0;
+            let shares = o.size.0 as f64 / 1_000_000.0;
+            let score = order_score(max_spread_cents, (price - adj_mid).abs() * 100.0);
+            // In-band (score > 0) sides count toward our reward depth, in USD
+            // (shares × price), mirroring the non-hedging path.
+            if score > 0.0 {
+                depth_usd += shares * price;
+            }
+            match o.side {
+                Side::Bid => q_bids += score * shares,
+                Side::Ask => q_asks += score * shares,
+            }
+        }
+        Some(RewardLeg { q_bids, q_asks, depth_usd, daily_rate, adj_mid })
     }
 
     /// Compute bid- and mid-marked P&L and publish the full [`StrategyStatus`]
@@ -3161,6 +3292,81 @@ mod tests {
         assert!(
             mm.qm.tracked().contains_key(&(yes, Side::Ask)),
             "non-hedging RewardFarm still places the ASK (Spec-1 single-token two-sided)"
+        );
+    }
+
+    /// Spec-2 Phase B (Task B3): in hedging mode a market's reward score is
+    /// two-sided ACROSS the complement pair — the YES bid scores on book `m`
+    /// (Q1) and the NO bid on book `m'` (Q2). The estimator must therefore PAIR
+    /// a market's two complement bids into ONE market-level `q_min`, NOT score
+    /// each bid-only token alone (which would penalize each as single-sided at
+    /// the 1/C floor). We rest a bid on YES and a bid on NO (the B2 hedging
+    /// path), then assert the published `q_min` equals the two-sided
+    /// `q_min(Q_bidYES, Q_bidNO, mid)` of the combined legs — strictly MORE than
+    /// the single-sided sum `Q_bidYES/C + Q_bidNO/C` the per-token path yields.
+    #[tokio::test]
+    async fn rewardfarm_hedging_estimator_pairs_yes_no_into_qmin() {
+        let yes = TokenId(1);
+        let no = TokenId(2);
+        let tokens = vec![yes, no];
+        // Both outcomes sit at mid 0.50 (a YES 0.48/0.52 ⇒ its NO complement is
+        // also 0.48/0.52), each with a valid two-sided book of its own.
+        let (fetcher, _shared) = controllable_fetcher(
+            &tokens,
+            HashMap::from([(yes, (mid50_book(), true)), (no, (mid50_book(), true))]),
+        );
+        let mut params = mk_params(200, 5.0);
+        params.policy = Policy::RewardFarm;
+        params.hedging_enabled = true;
+        let (mut mm, _store_rx, _status_rx) =
+            build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+        // Both outcomes funded + reward-eligible (min_size 1 sh, 3¢ band, $100/day).
+        mm.reward_by_token.insert(yes, (1.0, 3.0, 100.0));
+        mm.reward_by_token.insert(no, (1.0, 3.0, 100.0));
+        // The yes↔no complement map main wires under hedging (consumed by B3).
+        mm.complement.insert(yes, no);
+        mm.complement.insert(no, yes);
+
+        // B2 hedging path: a BID rests on BOTH complement tokens.
+        mm.quote().await;
+
+        // Per-leg score from the SAME primitives the estimator uses (order_score
+        // against each token's reward_fair_value), so the assertion tracks the
+        // exact tick each bid lands on rather than a hardcoded figure.
+        let v = 3.0_f64;
+        let adj_mid = reward_fair_value(&mid50_book(), TickSize::Cent, 1.0).expect("two-sided mid");
+        let mut q_yes = 0.0_f64;
+        let mut q_no = 0.0_f64;
+        for (_, o) in mm.qm.resting_orders() {
+            let price = o.price.microusdc(TickSize::Cent) as f64 / 1_000_000.0;
+            let shares = o.size.0 as f64 / 1_000_000.0;
+            let s = order_score(v, (price - adj_mid).abs() * 100.0) * shares;
+            if o.token == yes {
+                q_yes += s;
+            } else if o.token == no {
+                q_no += s;
+            }
+        }
+        assert!(q_yes > 0.0 && q_no > 0.0, "both complement bids rest and score in-band");
+
+        // PAIRED (desired): the two bids combine into one market Q_min.
+        let expected_paired = q_min(q_yes, q_no, adj_mid);
+        // SINGLE-SIDED (the old per-token path): each bid-only token scored alone
+        // collapses to the 1/C floor, so the sum is strictly smaller.
+        let single_sided = q_min(q_yes, 0.0, adj_mid) + q_min(0.0, q_no, adj_mid);
+
+        let st = mm.sample_reward_estimate().await;
+        assert!(
+            (st.q_min - expected_paired).abs() < 1e-9,
+            "hedging estimator must pair the complement bids: got q_min {}, expected paired {}",
+            st.q_min,
+            expected_paired
+        );
+        assert!(
+            st.q_min > single_sided + 1e-9,
+            "paired q_min {} must EXCEED the single-sided/penalized sum {} (NOT per-token scoring)",
+            st.q_min,
+            single_sided
         );
     }
 
