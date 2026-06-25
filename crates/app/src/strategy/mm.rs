@@ -64,17 +64,20 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use pm_core::book::{Book, Side};
 use pm_core::instrument::{MarketId, TokenId};
 use pm_core::num::{Px, Qty, TickSize, Usdc, buy_cost, sell_proceeds};
+use alloy_primitives::{B256, U256};
 use pm_execution::fills::UserFillSource;
 use pm_execution::live::LiveVenue;
 use pm_execution::maker::{MakerOrder, MakerVenue, OrderId, OrderType};
 use pm_execution::paper_maker::PaperMakerVenue;
 use pm_execution::quote_manager::QuoteManager;
+use pm_execution::relayer::{RelayerClient, RelayerError};
 use pm_execution::split_venue::SplitVenue;
 use pm_execution::user_ws::LiveUserWsFills;
 use pm_ingestion::supervisor::OnApplyFn;
@@ -319,6 +322,19 @@ pub struct MmStrategy {
     /// sets it from `config.store.path`; the seed reload already reads the same
     /// file, so this only opens a second short-lived read connection at startup.
     store_path: Option<std::path::PathBuf>,
+    /// M6-7: the LIVE on-chain merge relayer ([`RelayerClient`], `Arc`-shared into
+    /// each spawned merge task). main builds it via [`RelayerClient::new`] ONLY
+    /// when the relayer is enabled + configured AND MM is cleared for live; `None`
+    /// (the default from [`new`](Self::new)) on paper / arb / non-relayer live, so
+    /// the live merge stays the hold-to-resolution no-op there. Set via
+    /// [`with_merger`](Self::with_merger).
+    merger: Option<Arc<RelayerClient>>,
+    /// M6-7: `token → on-chain conditionId` for the quoted reward-farm universe
+    /// (BOTH legs of a market → its single `conditionId`), so the live merge sweep
+    /// can build the WALLET `mergePositions` batch. main builds it from the
+    /// registry; empty by default (only populated for reward-farm hedging). Set
+    /// via [`with_conditions`](Self::with_conditions).
+    cond_by_token: HashMap<TokenId, B256>,
 }
 
 impl MmStrategy {
@@ -347,7 +363,30 @@ impl MmStrategy {
             seed: Vec::new(),
             start_paused: false,
             store_path: None,
+            merger: None,
+            cond_by_token: HashMap::new(),
         }
+    }
+
+    /// M6-7: attach the LIVE on-chain merge relayer so a reward-farm live run
+    /// RECYCLES a complete YES+NO set on-chain (via a periodic, non-blocking
+    /// sweep) instead of holding it to resolution. main passes `Some` ONLY when
+    /// the relayer is enabled + configured AND MM is cleared for live; `None`
+    /// (the default) keeps the hold-to-resolution no-op. Paired with
+    /// [`with_conditions`](Self::with_conditions) (the sweep needs both).
+    pub fn with_merger(mut self, merger: Option<Arc<RelayerClient>>) -> Self {
+        self.merger = merger;
+        self
+    }
+
+    /// M6-7: attach the `token → on-chain conditionId` map the live merge sweep
+    /// needs to build each `mergePositions` batch. main builds it from the
+    /// registry for the quoted reward-farm universe (both legs of a market map to
+    /// its single conditionId); the default is empty, so non-merge paths are
+    /// unaffected.
+    pub fn with_conditions(mut self, cond_by_token: HashMap<TokenId, B256>) -> Self {
+        self.cond_by_token = cond_by_token;
+        self
     }
 
     /// Spec-2 Phase B (§5.1): attach the yes↔no complement map for the quoted
@@ -425,6 +464,8 @@ impl Strategy for MmStrategy {
                 seed,
                 start_paused,
                 store_path,
+                merger,
+                cond_by_token,
             } = *self;
             // Per-strategy state is identical for both venues; build it once.
             let qm = QuoteManager::new();
@@ -453,25 +494,27 @@ impl Strategy for MmStrategy {
                 Some(MmLive::Rest(live)) => {
                     run_mm_loop(
                         live, qm, inv, positions, ctx, params, tokens, token_market, complement,
-                        capital, true, start_paused, store_path,
+                        merger, cond_by_token, capital, true, start_paused, store_path,
                     )
                     .await;
                 }
                 Some(MmLive::Ws(split)) => {
                     run_mm_loop(
                         split, qm, inv, positions, ctx, params, tokens, token_market, complement,
-                        capital, true, start_paused, store_path,
+                        merger, cond_by_token, capital, true, start_paused, store_path,
                     )
                     .await;
                 }
                 None => {
                     // Paper: optionally enable the passive-taker-flow demo aid so
-                    // resting quotes actually fill in a calm market (0 = off).
+                    // resting quotes actually fill in a calm market (0 = off). The
+                    // relayer/conditions are unused here (no_naked_shorts = false →
+                    // the paper recycle path), keeping paper byte-for-byte unchanged.
                     let venue = PaperMakerVenue::new(ctx.fetcher.clone())
                         .with_taker_fill_pct(params.paper_taker_fill_pct);
                     run_mm_loop(
                         venue, qm, inv, positions, ctx, params, tokens, token_market, complement,
-                        capital, false, start_paused, store_path,
+                        merger, cond_by_token, capital, false, start_paused, store_path,
                     )
                     .await;
                 }
@@ -510,6 +553,12 @@ fn signed_value(net: i128, price_micro: u64) -> i128 {
 /// ("Size (N) lower than the minimum: 5"). The MM skips a quote below this
 /// rather than placing it to be rejected.
 const MM_MIN_ORDER_SHARES_MICRO: i128 = 5_000_000;
+
+/// M6-7: minimum wall-clock between LIVE on-chain merge sweeps. The relayer
+/// submit→`STATE_CONFIRMED` round-trip is multi-second + rate-limited, so the
+/// sweep runs at a relaxed cadence well OFF the quote hot path; in-flight pairs
+/// are latched so a slow confirm is never re-submitted within the interval.
+const MERGE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Competing in-band depth FALLBACK for the reward $/day estimator (Task 11,
 /// spec §9), reused from main's selection-time constant (`competing_depth =
@@ -974,10 +1023,39 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     last_pulled: bool,
     /// RewardFarm Phase-B (Task B5) one-shot log latch: set the FIRST time
     /// [`maybe_merge_sets`](Self::maybe_merge_sets) finds a mergeable complete set
-    /// on a LIVE venue (`no_naked_shorts`), where the on-chain merge is deferred
-    /// to M6 and the pair is held. Prevents the "complete set held" warning from
-    /// spamming every cycle a set sits above the threshold. Never set on paper.
+    /// on a LIVE venue (`no_naked_shorts`) WITHOUT a relayer configured, where the
+    /// on-chain merge stays deferred and the pair is held. Prevents the "complete
+    /// set held" warning from spamming every cycle a set sits above the threshold.
+    /// Never set on paper, and never set on the relayer-backed live sweep (M6-7).
     merge_live_warned: bool,
+    /// M6-7: the LIVE on-chain merge relayer, `Some` ONLY on a reward-farm live
+    /// run with the relayer enabled + configured (main builds it; `None` on paper,
+    /// arb, and non-relayer live). When present, [`maybe_merge_sets`] runs a
+    /// periodic NON-BLOCKING on-chain merge sweep instead of the hold-to-resolution
+    /// no-op; `Arc` so each spawned sweep task shares the one client.
+    merger: Option<Arc<RelayerClient>>,
+    /// M6-7: `token → on-chain conditionId` for the quoted reward-farm universe
+    /// (BOTH legs of a market map to its single `conditionId`). Built by main from
+    /// the registry `market_condition`; empty off reward-farm-hedging-live, so
+    /// non-merge paths never consult it. The sweep needs the conditionId to build
+    /// the WALLET `mergePositions` batch.
+    cond_by_token: HashMap<TokenId, B256>,
+    /// M6-7: outcomes of spawned on-chain merges flow back here. The sweep task
+    /// SENDS a [`MergeOutcome`]; [`drain_merge_outcomes`](Self::drain_merge_outcomes)
+    /// (top of each cycle) RECEIVES + settles it. Unbounded so a spawned task never
+    /// blocks on send; the volume is tiny (one per merged set per sweep).
+    merge_tx: mpsc::UnboundedSender<MergeOutcome>,
+    merge_rx: mpsc::UnboundedReceiver<MergeOutcome>,
+    /// M6-7: ordered complement pairs `(a, b)` with an on-chain merge IN FLIGHT
+    /// (spawned, not yet drained). A pair here is skipped by the sweep so a slow
+    /// submit→confirm is never double-merged; cleared by `drain_merge_outcomes` on
+    /// the outcome (success OR failure).
+    merge_inflight: HashSet<(TokenId, TokenId)>,
+    /// M6-7: last on-chain merge sweep instant — the sweep fires at most once per
+    /// [`MERGE_SWEEP_INTERVAL`] so the slow, rate-limited relayer never stalls the
+    /// quote loop. Initialised to "now" at construction (the first sweep waits one
+    /// interval).
+    last_merge_sweep: Instant,
 }
 
 /// Read BOTH arms of the persistent UTC-day loss gate for `"mm"` on `utc_day`,
@@ -1055,6 +1133,12 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 );
             }
         }
+        // M6-7: apply any LIVE on-chain merges that confirmed since the last cycle
+        // BEFORE quoting, so this cycle's sizing leans off the post-merge (recycled)
+        // inventory. Drained EVERY cycle (even paused/halted) — like consume_fills,
+        // settled inventory/accounting must stay correct regardless of quoting. A
+        // no-op until a relayer-backed live merge sweep produces outcomes.
+        self.drain_merge_outcomes();
         if !self.paused && !self.halted && !self.day_loss_halted {
             self.quote().await;
         }
@@ -1494,125 +1578,72 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         self.record_placed(&desired).await;
     }
 
-    /// Spec-2 Phase B (Task B5): merge any complete YES+NO set back to collateral
-    /// to RECYCLE the capital locked in a hedged pair. Called once per
+    /// Spec-2 Phase B (Task B5) + M6-7: recycle the capital locked in a hedged
+    /// complete YES+NO set by merging it back to collateral. Called once per
     /// [`quote`](Self::quote) cycle (cheap); GATED on `RewardFarm` +
     /// `hedging_enabled`, so SpreadCapture and non-hedging RewardFarm never enter
     /// — their inventory / cash / store rows are untouched (byte-for-byte
-    /// unchanged).
-    ///
-    /// For each complement market-pair (the `complement` map carries yes→no AND
-    /// no→yes; each unordered pair is processed ONCE, in token-id order), the
-    /// mergeable set is `matched = min(net(a).max(0), net(b).max(0))` µshares — the
-    /// matched LONG depth on both legs (a short on either leg is not part of a
-    /// set). A complete set ALWAYS redeems to EXACTLY $1, so recycling `matched`
-    /// sets returns `recovered = matched_shares × $1` collateral; in µUSDC that is
-    /// `matched_micro µshares × $1 µUSDC/share-pair ÷ 1e6 µshares/share` (which for
-    /// a $1 set equals `matched_micro` numerically). The pair is skipped when
-    /// `recovered ≤ merge_threshold_usd` (the per-pair "worth the merge" floor).
+    /// unchanged). The mergeable sets are the pure [`mergeable_pairs`] selection
+    /// (each unordered complement pair's `min(net(a), net(b))` long depth over the
+    /// `merge_threshold_usd` floor); a complete set always redeems to EXACTLY $1.
     ///
     /// VENUE SPLIT — the live/paper discriminator is `no_naked_shorts`:
-    /// - LIVE (`no_naked_shorts == true`): the on-chain merge is UNSUPPORTED
-    ///   (`LiveVenue::merge` → `NotSupportedLive`, deferred to M6). The pair is
-    ///   HELD to resolution and the GROSS inventory cap is the control. We log
-    ///   ONCE (`merge_live_warned`) and change NOTHING — and never call a live
-    ///   merge (merge is not even on the `MakerVenue` trait the loop holds, so the
-    ///   no-op is structural, not just skipped).
-    /// - PAPER (`no_naked_shorts == false`): model the economics directly to
-    ///   validate the capital-recycling. REDUCE both legs' long inventory by
-    ///   `matched` via the tested signed-lot [`InventoryRisk::on_fill`] sell path
-    ///   (a pure reduction — `matched ≤ net` on each leg by construction — which
-    ///   releases each leg's average-cost basis pro-rata and books realized) and
-    ///   CREDIT the recovered `matched × $1` collateral as cash in the reporting
-    ///   [`PositionBook`]. The aggregate realized (`recovered − basis released`)
-    ///   feeds the persistent day-loss ledger exactly like a fill; the recovered
-    ///   cash lands in this same tick's `PnlSnapshot` (`publish_status`).
+    /// - PAPER (`no_naked_shorts == false`): model the economics directly via the
+    ///   shared [`apply_merge_result`] — reduce both legs by the matched set count
+    ///   and credit the recovered $1/set as cash — recycling EACH cycle (the
+    ///   aggregate realized feeds the persistent day-loss ledger like a fill).
+    /// - LIVE (`no_naked_shorts == true`):
+    ///   * WITH a [`RelayerClient`] (M6-7): kick off a RATE-LIMITED, NON-BLOCKING
+    ///     on-chain merge sweep ([`sweep_onchain_merges`]) — the multi-second
+    ///     submit→confirm runs OFF the quote hot path; the confirmed result is
+    ///     applied later by [`drain_merge_outcomes`] via the SAME
+    ///     `apply_merge_result`, so live and paper CONVERGE.
+    ///   * WITHOUT a relayer (the default / non-relayer live): the on-chain merge
+    ///     stays the hold-to-resolution no-op — log ONCE (`merge_live_warned`),
+    ///     change NOTHING (the gross inventory cap is the control), spawn nothing.
     async fn maybe_merge_sets(&mut self) {
         // GATE: RewardFarm + hedging only — the only mode that holds BOTH legs of
         // a complement pair. Everything below is then provably inert elsewhere.
         if self.policy != Policy::RewardFarm || !self.params.hedging_enabled {
             return;
         }
-        // A complete set redeems to EXACTLY $1 = 1e6 µUSDC per YES+NO share-pair.
-        const SET_VALUE_MICRO: i128 = 1_000_000;
-        // Dedup the bidirectional complement map down to each unordered
-        // market-pair, processed in a deterministic (token-id) order.
-        let mut keys: Vec<TokenId> = self.complement.keys().copied().collect();
-        keys.sort_by_key(|t| t.0);
-        let mut seen: HashSet<TokenId> = HashSet::new();
-        let mut pairs: Vec<(TokenId, TokenId)> = Vec::new();
-        for a in keys {
-            if seen.contains(&a) {
-                continue;
-            }
-            if let Some(&b) = self.complement.get(&a) {
-                seen.insert(a);
-                seen.insert(b);
-                pairs.push((a, b));
-            }
+        // The B5 selection (pure, unit-tested): each unordered complement pair
+        // whose matched complete set clears the per-pair µUSDC floor. The floor is
+        // a COARSE gate — `merge_threshold_usd` → µUSDC once — and the money
+        // movement below stays in integer µUSDC.
+        let threshold_micro = (self.params.merge_threshold_usd * 1_000_000.0) as i128;
+        let candidates = mergeable_pairs(&self.complement, &self.inv, threshold_micro);
+        if candidates.is_empty() {
+            return;
         }
-        for (a, b) in pairs {
-            // Mergeable complete set = the matched LONG depth on both legs.
-            let matched_micro = self.inv.net(a).max(0).min(self.inv.net(b).max(0));
-            if matched_micro <= 0 {
-                continue;
+        if self.no_naked_shorts {
+            // LIVE: a relayer-backed NON-BLOCKING on-chain sweep (M6-7) when a
+            // relayer is configured, else the hold-to-resolution no-op.
+            if self.merger.is_some() {
+                self.sweep_onchain_merges(&candidates);
+            } else if !self.merge_live_warned {
+                tracing::warn!(
+                    "reward-farm: complete set held (live merge unsupported — no relayer \
+                     configured, deferred to M6); gross cap is the control"
+                );
+                self.merge_live_warned = true;
             }
-            // Recovered collateral (µUSDC): matched_micro µshares × $1/share-pair
-            // ÷ 1e6 µshares/share. (For a $1 set this equals matched_micro.)
-            let recovered_micro = matched_micro * SET_VALUE_MICRO / 1_000_000;
-            // Per-pair "worth the merge" floor (USD). A coarse gate only — the
-            // money movement below stays in integer µUSDC.
-            let recovered_usd = recovered_micro as f64 / 1_000_000.0;
-            if recovered_usd <= self.params.merge_threshold_usd {
-                continue;
-            }
-            if self.no_naked_shorts {
-                // LIVE: on-chain merge deferred to M6 — HOLD the pair (gross cap
-                // is the control). Log ONCE (don't spam every cycle the set sits
-                // above the threshold); never call a live merge.
-                if !self.merge_live_warned {
-                    tracing::warn!(
-                        "reward-farm: complete set held (live merge unsupported, deferred to M6); \
-                         gross cap is the control"
-                    );
-                    self.merge_live_warned = true;
-                }
-                continue;
-            }
-            // ── PAPER recycle ─────────────────────────────────────────────────
-            // Snapshot realized BEFORE so the merge's realized delta can feed the
-            // persistent day-loss ledger (mirrors `consume_fills`).
-            let realized_before = self.inv.realized(a).0 + self.inv.realized(b).0;
-            let basis_before_a = self.inv.basis(a).0;
-            let basis_before_b = self.inv.basis(b).0;
-            // REDUCE both legs by `matched` via the tested signed-lot sell path.
-            // The basis released is SHARE-based (independent of the cash supplied),
-            // so the per-leg cash split is purely a realized-ATTRIBUTION choice —
-            // the AGGREGATE realized (recovered − basis released) is invariant to
-            // it. Split the recovered $1/set evenly across the two legs; the
-            // economically meaningful figure is the aggregate (matching how the
-            // arb `Ledger`/store treat a merge as one set-level event).
-            let cash_a = recovered_micro / 2;
-            let cash_b = recovered_micro - cash_a;
-            self.inv.on_fill(a, -matched_micro, Usdc(cash_a));
-            self.inv.on_fill(b, -matched_micro, Usdc(cash_b));
-            // Mirror into the reporting `PositionBook` in lock-step (as
-            // `consume_fills` does): credit the recovered collateral as cash and
-            // release each leg's basis. Qty 0 — the append-only book derives
-            // position VALUE from `inv.net`-based marks, so a REDUCTION must not
-            // grow phantom qty here; only cash + basis move.
-            let cost_delta_a = Usdc(self.inv.basis(a).0 - basis_before_a);
-            let cost_delta_b = Usdc(self.inv.basis(b).0 - basis_before_b);
-            self.positions.apply(
-                &[(a, Qty(0), cost_delta_a), (b, Qty(0), cost_delta_b)],
-                Usdc(recovered_micro),
+            return;
+        }
+        // ── PAPER recycle ──────────────────────────────────────────────────────
+        // Apply EXACTLY the shared reduction for each set, then persist the
+        // realized delta to the cumulative UTC-day ledger so the PERSISTENT loss
+        // cap accounts for merge P&L like a fill (fire-and-forget; a closed/full
+        // channel drops it, never blocks).
+        for c in candidates {
+            let realized_delta = apply_merge_result(
+                &mut self.inv,
+                &mut self.positions,
                 &self.token_market,
+                c.a,
+                c.b,
+                c.amount_micro,
             );
-            // Persist the realized delta to the cumulative UTC-day ledger so the
-            // PERSISTENT loss cap accounts for merge P&L just like a fill's
-            // (fire-and-forget; a closed/full channel drops it, never blocks).
-            let realized_delta =
-                (self.inv.realized(a).0 + self.inv.realized(b).0) - realized_before;
             if realized_delta != 0 {
                 let _ = self.store_tx.try_send(StoreMsg::DayRealized {
                     utc_day: utc_day_from_ms(now_ms()),
@@ -1621,15 +1652,148 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 });
             }
             tracing::debug!(
-                market_a = a.0,
-                market_b = b.0,
-                matched_micro = matched_micro as i64,
-                recovered_micro = recovered_micro as i64,
+                market_a = c.a.0,
+                market_b = c.b.0,
+                matched_micro = c.amount_micro as i64,
+                recovered_micro = c.amount_micro as i64,
                 realized_delta = realized_delta as i64,
                 "mm: merged complete YES+NO set (paper) — recycled locked collateral"
             );
         }
     }
+
+    /// M6-7 LIVE merge sweep — RATE-LIMITED + NON-BLOCKING. For each mergeable
+    /// candidate NOT already in flight whose two legs map to the SAME on-chain
+    /// `conditionId`, mark the ordered pair in-flight and SPAWN a task that runs
+    /// the multi-second relayer `merge` (submit → poll to `STATE_CONFIRMED`) OFF
+    /// the quote hot path, sending the typed result back to
+    /// [`drain_merge_outcomes`]. At most ONE sweep per [`MERGE_SWEEP_INTERVAL`]
+    /// (the on-chain op is slow + rate-limited), so the loop is never stalled and
+    /// a pair is never double-merged (the in-flight latch). Only ever reached on a
+    /// LIVE venue with a configured relayer (gated in [`maybe_merge_sets`]).
+    fn sweep_onchain_merges(&mut self, candidates: &[MergeCandidate]) {
+        // The relayer is `Arc`-shared into each spawned task (cheap clone).
+        let Some(merger) = self.merger.clone() else {
+            return;
+        };
+        // Rate-limit the WHOLE sweep (not per pair): the submit→confirm round-trip
+        // is seconds, so a relaxed cadence is plenty and bounds relayer load.
+        let now = Instant::now();
+        if now.duration_since(self.last_merge_sweep) < MERGE_SWEEP_INTERVAL {
+            return;
+        }
+        self.last_merge_sweep = now;
+        for &MergeCandidate { a, b, amount_micro } in candidates {
+            let pair = (a, b);
+            // Never double-merge an in-flight pair (a prior sweep's task is still
+            // submitting/confirming) — its drain clears the latch on completion.
+            if self.merge_inflight.contains(&pair) {
+                continue;
+            }
+            // Both legs of a market share ONE conditionId; require both present +
+            // equal (defensive — main builds the map from the one market).
+            let (Some(&cond_a), Some(&cond_b)) =
+                (self.cond_by_token.get(&a), self.cond_by_token.get(&b))
+            else {
+                continue;
+            };
+            if cond_a != cond_b {
+                tracing::warn!(
+                    token_a = a.0,
+                    token_b = b.0,
+                    "mm: complement legs map to DIFFERENT conditionIds — skipping merge (misconfig)"
+                );
+                continue;
+            }
+            self.merge_inflight.insert(pair);
+            let merger = merger.clone();
+            let tx = self.merge_tx.clone();
+            // µshares → CTF base units (6-decimal, 1:1 with µUSDC). `amount_micro`
+            // is `> threshold_micro ≥ 0` by construction, so the cast is exact.
+            let amount = U256::from(amount_micro.max(0) as u128);
+            tracing::info!(
+                token_a = a.0,
+                token_b = b.0,
+                amount_micro = amount_micro as i64,
+                "mm: spawning LIVE on-chain merge of complete set (non-blocking)"
+            );
+            tokio::spawn(async move {
+                let result = merger.merge(cond_a, amount).await;
+                // The receiver lives for the loop's lifetime; a send error only
+                // means the loop is shutting down — drop the outcome quietly.
+                let _ = tx.send(MergeOutcome { a, b, amount_micro, result });
+            });
+        }
+    }
+
+    /// M6-7: DRAIN every on-chain merge that confirmed (or failed) since the last
+    /// cycle and settle it — called once per loop cycle (even when paused, like
+    /// [`consume_fills`](Self::consume_fills), so settled inventory/accounting
+    /// stays correct). On SUCCESS, apply EXACTLY the paper reduction via the
+    /// shared [`apply_merge_result`] (recycle the matched set + credit the
+    /// recovered µUSDC) and persist the realized delta to the day-loss ledger; on
+    /// a relayer ERROR, log + leave inventory untouched (the set is retried next
+    /// sweep). EITHER WAY the in-flight latch on the pair is CLEARED so the pair
+    /// can be re-swept. Non-blocking (`try_recv`); never panics.
+    fn drain_merge_outcomes(&mut self) {
+        while let Ok(MergeOutcome { a, b, amount_micro, result }) = self.merge_rx.try_recv() {
+            // Clear the in-flight latch on BOTH success and failure so the pair is
+            // eligible again (re-swept next cycle on failure; flat on success).
+            self.merge_inflight.remove(&(a, b));
+            match result {
+                Ok(recovered_micro) => {
+                    // The relayer returns the recovered µUSDC; for a $1 complete
+                    // set it equals the merged amount. Reduce by the µshares
+                    // actually merged on-chain (`amount_micro`) — the shared apply.
+                    let realized_delta = apply_merge_result(
+                        &mut self.inv,
+                        &mut self.positions,
+                        &self.token_market,
+                        a,
+                        b,
+                        amount_micro,
+                    );
+                    if realized_delta != 0 {
+                        let _ = self.store_tx.try_send(StoreMsg::DayRealized {
+                            utc_day: utc_day_from_ms(now_ms()),
+                            strategy: "mm".into(),
+                            delta_micro: realized_delta,
+                        });
+                    }
+                    tracing::info!(
+                        token_a = a.0,
+                        token_b = b.0,
+                        amount_micro = amount_micro as i64,
+                        recovered_micro = recovered_micro as i64,
+                        realized_delta = realized_delta as i64,
+                        "mm: LIVE on-chain merge CONFIRMED — recycled locked collateral"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        token_a = a.0,
+                        token_b = b.0,
+                        amount_micro = amount_micro as i64,
+                        error = %e,
+                        "mm: LIVE on-chain merge FAILED — inventory unchanged, retry next sweep"
+                    );
+                }
+            }
+        }
+    }
+
+    // TODO(M6-redeem): wire resolution feed (Data API `redeemable`) → relayer.redeem.
+    // The relayer this loop already holds (`self.merger`) ALSO exposes
+    // `redeem(condition_id)` to recover a RESOLVED position to collateral. Wiring it
+    // needs a resolved-market signal the quote loop does NOT yet have: a feed of the
+    // deposit wallet's `redeemable` markets (Polymarket Data API positions). That
+    // feed would drive a SIBLING non-blocking `sweep_onchain_redeems` — spawn
+    // `self.merger.redeem(self.cond_by_token[token])`, then drain the outcome to
+    // flatten the resolved leg + credit recovered cash (the same spawn/drain pattern
+    // as the merge sweep, reusing `cond_by_token` + `merge_tx`/`merge_rx`). Building
+    // that resolution feed is OUT OF SCOPE for M6-7 (which implements the MERGE
+    // sweep only) — add it before enabling redeem so a resolved leg is never
+    // double-redeemed or redeemed before resolution.
 
     /// Record every newly-tracked resting order into `placed` (so a later fill
     /// always resolves its side + tick size) and emit its write-ahead order row
@@ -2315,6 +2479,128 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pure complete-set MERGE selection + apply (Task B5 / M6-7)
+// ---------------------------------------------------------------------------
+
+/// A complete YES+NO set worth recycling: the ordered complement pair `(a, b)`
+/// (token-id order, `a.0 <= b.0`) and the matched depth `amount_micro` (µshares)
+/// that can be merged back to collateral. A complete set always redeems to
+/// EXACTLY $1, and the CTF base unit is 6-decimal (1:1 with µUSDC), so
+/// `amount_micro` is BOTH the µshare reduction per leg AND the µUSDC recovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MergeCandidate {
+    a: TokenId,
+    b: TokenId,
+    amount_micro: i128,
+}
+
+/// The result of a (live) on-chain merge, sent back from the spawned sweep task
+/// to the quote loop's [`MmLoop::drain_merge_outcomes`] for inventory/cash
+/// settlement. Carries the ordered pair + the merged `amount_micro` so the
+/// drain can clear the in-flight latch and apply EXACTLY the paper reduction on
+/// success. `result` is the relayer's recovered µUSDC (`Ok`) or a typed
+/// [`RelayerError`] (`Err`, retried next sweep) — never a panic.
+#[derive(Debug)]
+struct MergeOutcome {
+    a: TokenId,
+    b: TokenId,
+    amount_micro: i128,
+    result: Result<i128, RelayerError>,
+}
+
+/// THE B5 selection (pure, unit-tested): the set of mergeable complete YES+NO
+/// sets over `threshold_micro`. Dedups the bidirectional `complement` map down
+/// to each unordered market-pair (processed in deterministic token-id order),
+/// and for each pair computes `matched = min(net(a).max(0), net(b).max(0))`
+/// µshares — the matched LONG depth on both legs (a short on either leg is not
+/// part of a set). A complete set redeems to EXACTLY $1, so the recovered µUSDC
+/// equals `matched` (6-decimal base unit, 1:1 with µUSDC); the pair is INCLUDED
+/// only when that exceeds `threshold_micro` (the per-pair "worth the merge"
+/// floor). Each emitted pair is canonicalised `a.0 <= b.0` so callers can key an
+/// in-flight set on `(a, b)` deterministically.
+fn mergeable_pairs(
+    complement: &HashMap<TokenId, TokenId>,
+    inv: &InventoryRisk,
+    threshold_micro: i128,
+) -> Vec<MergeCandidate> {
+    // Deterministic order: sort the complement keys, take each unordered pair
+    // once (skipping a token already consumed as the other leg of a pair).
+    let mut keys: Vec<TokenId> = complement.keys().copied().collect();
+    keys.sort_by_key(|t| t.0);
+    let mut seen: HashSet<TokenId> = HashSet::new();
+    let mut out: Vec<MergeCandidate> = Vec::new();
+    for key in keys {
+        if seen.contains(&key) {
+            continue;
+        }
+        let Some(&other) = complement.get(&key) else {
+            continue;
+        };
+        seen.insert(key);
+        seen.insert(other);
+        // Canonicalise so the in-flight key / conditionId lookup is order-stable.
+        let (a, b) = if key.0 <= other.0 { (key, other) } else { (other, key) };
+        // Mergeable complete set = the matched LONG depth on both legs (µshares).
+        let matched_micro = inv.net(a).max(0).min(inv.net(b).max(0));
+        if matched_micro <= 0 {
+            continue;
+        }
+        // Recovered µUSDC == matched µshares (a $1 set, 6-decimal base unit). The
+        // threshold is a coarse "worth the merge" floor; the money below stays in
+        // integer µUSDC. Mirrors the B5 `recovered_usd <= merge_threshold_usd`
+        // skip (here `recovered_micro <= threshold_micro`).
+        if matched_micro <= threshold_micro {
+            continue;
+        }
+        out.push(MergeCandidate { a, b, amount_micro: matched_micro });
+    }
+    out
+}
+
+/// Apply EXACTLY the B5 paper-merge reduction for one complete set (pure, no
+/// async/IO — unit-tested, and SHARED by the paper recycle AND the live
+/// drain so the two converge): reduce BOTH legs' long inventory by
+/// `amount_micro` via the tested signed-lot [`InventoryRisk::on_fill`] sell path
+/// (a pure reduction — `amount_micro <= net` on each leg by construction) and
+/// CREDIT the recovered `amount_micro` µUSDC (a complete set redeems to $1) as
+/// cash in the reporting [`PositionBook`], releasing each leg's basis pro-rata.
+/// The recovered $1/set is split evenly across the two legs for realized
+/// ATTRIBUTION only — the AGGREGATE realized (`recovered − basis released`) is
+/// invariant to the split. Returns that aggregate `realized_delta` (µUSDC) so
+/// the caller can persist it to the day-loss ledger exactly like a fill.
+fn apply_merge_result(
+    inv: &mut InventoryRisk,
+    positions: &mut PositionBook,
+    token_market: &HashMap<TokenId, MarketId>,
+    a: TokenId,
+    b: TokenId,
+    amount_micro: i128,
+) -> i128 {
+    // A complete set redeems to EXACTLY $1, so recovered µUSDC == merged µshares.
+    let recovered_micro = amount_micro;
+    let realized_before = inv.realized(a).0 + inv.realized(b).0;
+    let basis_before_a = inv.basis(a).0;
+    let basis_before_b = inv.basis(b).0;
+    // Split the recovered $1/set evenly (attribution only; aggregate invariant).
+    let cash_a = recovered_micro / 2;
+    let cash_b = recovered_micro - cash_a;
+    inv.on_fill(a, -amount_micro, Usdc(cash_a));
+    inv.on_fill(b, -amount_micro, Usdc(cash_b));
+    // Mirror into the reporting book in lock-step: credit the recovered
+    // collateral as cash + release each leg's basis. Qty 0 — the append-only
+    // book derives position VALUE from `inv.net` marks, so a REDUCTION must not
+    // grow phantom qty; only cash + basis move.
+    let cost_delta_a = Usdc(inv.basis(a).0 - basis_before_a);
+    let cost_delta_b = Usdc(inv.basis(b).0 - basis_before_b);
+    positions.apply(
+        &[(a, Qty(0), cost_delta_a), (b, Qty(0), cost_delta_b)],
+        Usdc(recovered_micro),
+        token_market,
+    );
+    (inv.realized(a).0 + inv.realized(b).0) - realized_before
+}
+
 /// The market maker's owned async loop, generic over the venue (Task 4.5 passes
 /// a live one). Mirrors the [`stub`](super::stub) lifecycle: a `quote_refresh`
 /// interval, honoring `ctx.kill` each iteration and draining `ctl_rx` for
@@ -2330,6 +2616,12 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
     tokens: Vec<TokenId>,
     token_market: HashMap<TokenId, MarketId>,
     complement: HashMap<TokenId, TokenId>,
+    // M6-7: the LIVE on-chain merge relayer (`Some` only on reward-farm live with
+    // the relayer configured) + the `token → conditionId` map the merge sweep
+    // needs. Both default to empty/None on paper / arb / non-relayer live, so
+    // those paths are byte-for-byte unchanged.
+    merger: Option<Arc<RelayerClient>>,
+    cond_by_token: HashMap<TokenId, B256>,
     capital: Usdc,
     no_naked_shorts: bool,
     start_paused: bool,
@@ -2364,6 +2656,9 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
             ))
         })
         .collect();
+    // M6-7: the spawned on-chain merge tasks send their outcomes back to the loop
+    // over this channel; `drain_merge_outcomes` receives + settles them each cycle.
+    let (merge_tx, merge_rx) = mpsc::unbounded_channel();
     let mut mm = MmLoop {
         venue,
         qm,
@@ -2399,6 +2694,12 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
         last_signal: 0.0,
         last_pulled: false,
         merge_live_warned: false,
+        merger,
+        cond_by_token,
+        merge_tx,
+        merge_rx,
+        merge_inflight: HashSet::new(),
+        last_merge_sweep: Instant::now(),
     };
     if start_paused {
         tracing::info!("mm: live held — quoting PAUSED until release (press `l`)");
@@ -2626,6 +2927,7 @@ mod tests {
         let venue = PaperMakerVenue::new(fetcher.clone());
         let notional_micro = params.max_quote_micro.min(capital.0).max(0);
         let token_market = token_market_for(&tokens);
+        let (merge_tx, merge_rx) = mpsc::unbounded_channel();
         let mm = MmLoop {
             venue,
             qm: QuoteManager::new(),
@@ -2659,6 +2961,12 @@ mod tests {
             last_signal: 0.0,
             last_pulled: false,
             merge_live_warned: false,
+            merger: None,
+            cond_by_token: HashMap::new(),
+            merge_tx,
+            merge_rx,
+            merge_inflight: HashSet::new(),
+            last_merge_sweep: Instant::now(),
         };
         (mm, store_rx, status_rx)
     }
@@ -3871,6 +4179,192 @@ mod tests {
             "SpreadCapture → merge step inert"
         );
         assert_eq!(spread.positions.cash(), Usdc(0));
+    }
+
+    // ── M6-7: live on-chain merge sweep — pure selection / apply / drain / gate ──
+
+    /// M6-7 (pure): [`mergeable_pairs`] is the B5 selection — it returns ONLY the
+    /// complement pairs whose matched complete set (`min(net(a), net(b))` long
+    /// depth) clears the per-pair µUSDC floor, canonicalised in token-id order
+    /// with the right merged `amount_micro`. A sub-threshold pair is excluded.
+    #[test]
+    fn mergeable_pairs_selects_complete_sets_over_threshold() {
+        let (yes_a, no_a) = (TokenId(1), TokenId(2));
+        let (yes_b, no_b) = (TokenId(3), TokenId(4));
+        // Bidirectional complement map (yes↔no for each market), as main builds it.
+        let complement = HashMap::from([
+            (yes_a, no_a),
+            (no_a, yes_a),
+            (yes_b, no_b),
+            (no_b, yes_b),
+        ]);
+        let mut inv = InventoryRisk::new(generous_inv());
+        // Pair A: matched min(60, 50) = 50 sets = $50 — OVER the $5 floor.
+        inv.seed(yes_a, 60 * SH as i128, Usdc(0));
+        inv.seed(no_a, 50 * SH as i128, Usdc(0));
+        // Pair B: matched min(3, 9) = 3 sets = $3 — UNDER the $5 floor.
+        inv.seed(yes_b, 3 * SH as i128, Usdc(0));
+        inv.seed(no_b, 9 * SH as i128, Usdc(0));
+
+        let threshold_micro = 5 * SH as i128; // $5 floor
+        let got = mergeable_pairs(&complement, &inv, threshold_micro);
+
+        assert_eq!(got.len(), 1, "only the over-threshold pair is selected");
+        assert_eq!(got[0].a, yes_a, "pair canonicalised in token-id order (a.0 <= b.0)");
+        assert_eq!(got[0].b, no_a);
+        assert_eq!(
+            got[0].amount_micro,
+            50 * SH as i128,
+            "amount = matched min(60, 50) = 50 sets"
+        );
+
+        // A SHORT on either leg means there is no complete set — excluded.
+        let mut shorted = InventoryRisk::new(generous_inv());
+        shorted.seed(yes_a, 60 * SH as i128, Usdc(0));
+        shorted.seed(no_a, -50 * SH as i128, Usdc(0));
+        assert!(
+            mergeable_pairs(&complement, &shorted, threshold_micro)
+                .iter()
+                .all(|c| c.a != yes_a),
+            "a short leg yields no mergeable set"
+        );
+    }
+
+    /// M6-7 (pure): [`apply_merge_result`] is the SHARED paper/live reduction —
+    /// it drops BOTH legs' long inventory by `amount_micro`, credits the recovered
+    /// `amount_micro` µUSDC ($1/set) as cash, releases each leg's basis, and
+    /// returns the aggregate realized delta. Mirrors the B5 paper-merge assertion.
+    #[test]
+    fn apply_merge_result_reduces_both_legs_and_credits_cash() {
+        let (yes, no) = (TokenId(1), TokenId(2));
+        let token_market = HashMap::from([(yes, MarketId(0)), (no, MarketId(0))]);
+        let mut inv = InventoryRisk::new(generous_inv());
+        let mut positions = PositionBook::default();
+        // The B5 fixture: 100 YES @ $0.50 ($50 basis) + 80 NO @ $0.45 ($36 basis).
+        inv.seed(yes, 100 * SH as i128, Usdc(50_000_000));
+        inv.seed(no, 80 * SH as i128, Usdc(36_000_000));
+        let matched = 80 * SH as i128; // min(100, 80)
+
+        let realized_delta =
+            apply_merge_result(&mut inv, &mut positions, &token_market, yes, no, matched);
+
+        assert_eq!(inv.net(yes), 100 * SH as i128 - matched, "YES reduced by matched");
+        assert_eq!(inv.net(no), 80 * SH as i128 - matched, "NO reduced by matched (flat)");
+        assert_eq!(
+            positions.cash(),
+            Usdc(matched),
+            "recovered matched × $1 collateral credited as cash"
+        );
+        let realized = inv.realized(yes).0 + inv.realized(no).0;
+        assert_eq!(realized, 4_000_000, "recovered $80 − basis released $76 = +$4");
+        assert_eq!(realized_delta, 4_000_000, "returned realized_delta == the aggregate");
+    }
+
+    /// M6-7: [`drain_merge_outcomes`] applies ONLY a confirmed (`Ok`) merge to
+    /// inventory/cash; a failed (`Err`) merge leaves inventory untouched (retried
+    /// next sweep). EITHER outcome clears the pair's in-flight latch, so it can be
+    /// re-swept. No HTTP — the outcomes are pushed directly onto the channel.
+    #[tokio::test]
+    async fn drain_merge_outcomes_applies_only_success() {
+        let (yes_ok, no_ok) = (TokenId(1), TokenId(2));
+        let (yes_err, no_err) = (TokenId(3), TokenId(4));
+        let tokens = vec![yes_ok, no_ok, yes_err, no_err];
+        let (fetcher, _shared) = controllable_fetcher(&tokens, HashMap::new());
+        let (mut mm, _store_rx, _status_rx) = build_loop(
+            fetcher,
+            generous_inv(),
+            mk_params(200, 5.0),
+            tokens,
+            Usdc(1_000_000_000),
+        );
+        let amount = 40 * SH as i128; // a $40 set on each pair
+        for t in [yes_ok, no_ok, yes_err, no_err] {
+            mm.inv.seed(t, amount, Usdc(0));
+        }
+        // Both pairs were marked in-flight by a prior sweep.
+        mm.merge_inflight.insert((yes_ok, no_ok));
+        mm.merge_inflight.insert((yes_err, no_err));
+        // A confirmed merge (Ok, recovered $40) and a failed one (Err).
+        mm.merge_tx
+            .send(MergeOutcome { a: yes_ok, b: no_ok, amount_micro: amount, result: Ok(amount) })
+            .unwrap();
+        mm.merge_tx
+            .send(MergeOutcome {
+                a: yes_err,
+                b: no_err,
+                amount_micro: amount,
+                result: Err(RelayerError::Http("boom".into())),
+            })
+            .unwrap();
+
+        mm.drain_merge_outcomes();
+
+        // Ok → both legs reduced to flat + recovered $40 credited as cash (once).
+        assert_eq!(mm.inv.net(yes_ok), 0, "confirmed merge reduced the YES leg");
+        assert_eq!(mm.inv.net(no_ok), 0, "confirmed merge reduced the NO leg");
+        assert_eq!(mm.positions.cash(), Usdc(amount), "recovered collateral credited (Ok only)");
+        // Err → inventory untouched.
+        assert_eq!(mm.inv.net(yes_err), amount, "failed merge left the YES leg untouched");
+        assert_eq!(mm.inv.net(no_err), amount, "failed merge left the NO leg untouched");
+        // BOTH outcomes release the in-flight latch.
+        assert!(mm.merge_inflight.is_empty(), "success AND failure clear the in-flight latch");
+    }
+
+    /// M6-7 GATING: on a LIVE venue with NO relayer (`merger = None`),
+    /// `maybe_merge_sets` keeps the hold-to-resolution no-op — inventory UNCHANGED,
+    /// the one-shot warn latched, and NOTHING spawned / marked in-flight (even with
+    /// a conditionId map present). PAPER (`no_naked_shorts = false`) still recycles
+    /// in-line and likewise never marks an in-flight merge. So paper + non-relayer
+    /// live are byte-for-byte unchanged.
+    #[tokio::test]
+    async fn merge_sweep_gating_holds_without_relayer_and_never_spawns_on_paper() {
+        fn seeded(no_naked_shorts: bool) -> (MmLoop<PaperMakerVenue<BookFetcher>>, mpsc::Receiver<StoreMsg>) {
+            let (yes, no) = (TokenId(1), TokenId(2));
+            let tokens = vec![yes, no];
+            let (fetcher, _shared) = controllable_fetcher(
+                &tokens,
+                HashMap::from([(yes, (mid50_book(), true)), (no, (mid50_book(), true))]),
+            );
+            let mut params = mk_params(200, 5.0);
+            params.policy = Policy::RewardFarm;
+            params.hedging_enabled = true;
+            params.merge_threshold_usd = 5.0;
+            let (mut mm, store_rx, _status_rx) =
+                build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+            mm.complement.insert(yes, no);
+            mm.complement.insert(no, yes);
+            mm.no_naked_shorts = no_naked_shorts;
+            // A conditionId map IS present — but with `merger = None` (the build_loop
+            // default) the live branch must still NOT sweep / spawn.
+            mm.cond_by_token.insert(yes, B256::ZERO);
+            mm.cond_by_token.insert(no, B256::ZERO);
+            mm.inv.seed(yes, 100 * SH as i128, Usdc(50_000_000));
+            mm.inv.seed(no, 80 * SH as i128, Usdc(36_000_000));
+            (mm, store_rx)
+        }
+        let (yes, no) = (TokenId(1), TokenId(2));
+
+        // LIVE + merger None → hold-to-resolution no-op.
+        let (mut live, _r1) = seeded(true);
+        live.maybe_merge_sets().await;
+        assert_eq!(live.inv.net(yes), 100 * SH as i128, "no relayer → YES leg held");
+        assert_eq!(live.inv.net(no), 80 * SH as i128, "no relayer → NO leg held");
+        assert_eq!(live.positions.cash(), Usdc(0), "no relayer → no collateral recovered");
+        assert!(live.merge_live_warned, "hold-to-resolution warn latched once");
+        assert!(live.merge_inflight.is_empty(), "no relayer → nothing spawned / in-flight");
+
+        // PAPER → existing in-line recycle, and NEVER an in-flight (live-only) set.
+        let (mut paper, _r2) = seeded(false);
+        paper.maybe_merge_sets().await;
+        assert_eq!(
+            paper.inv.net(yes),
+            100 * SH as i128 - 80 * SH as i128,
+            "paper recycles the matched set (YES surplus remains)"
+        );
+        assert_eq!(paper.inv.net(no), 0, "paper recycles the NO leg to flat");
+        assert_eq!(paper.positions.cash(), Usdc(80_000_000), "paper credits recovered $80");
+        assert!(!paper.merge_live_warned, "paper never sets the live hold latch");
+        assert!(paper.merge_inflight.is_empty(), "paper never marks an in-flight merge");
     }
 
     // ── RewardFarm Phase-B integration (Task B6, spec §5.1) ─────────────────────
@@ -5194,6 +5688,8 @@ mod tests {
             tokens,
             token_market,
             HashMap::new(),
+            None,            // merger (M6-7): no relayer in this loop-lifecycle test
+            HashMap::new(),  // cond_by_token (M6-7)
             Usdc(1_000_000_000),
             false,
             false,
@@ -5446,6 +5942,7 @@ mod tests {
         };
         let notional_micro = params.max_quote_micro.min(capital.0).max(0);
         let token_market = token_market_for(&tokens);
+        let (merge_tx, merge_rx) = mpsc::unbounded_channel();
         let mm = MmLoop {
             venue,
             qm: QuoteManager::new(),
@@ -5479,6 +5976,12 @@ mod tests {
             last_signal: 0.0,
             last_pulled: false,
             merge_live_warned: false,
+            merger: None,
+            cond_by_token: HashMap::new(),
+            merge_tx,
+            merge_rx,
+            merge_inflight: HashSet::new(),
+            last_merge_sweep: Instant::now(),
         };
         (mm, store_rx, produced)
     }
@@ -5530,6 +6033,7 @@ mod tests {
         };
         let (store_tx, _store_rx) = mpsc::channel(64);
         let (status_tx, _status_rx) = watch::channel(StrategyStatus::default());
+        let (merge_tx, merge_rx) = mpsc::unbounded_channel();
         let mut mm = MmLoop {
             venue: ScriptVenue { fill: Some(fill) },
             qm: QuoteManager::new(),
@@ -5563,6 +6067,12 @@ mod tests {
             last_signal: 0.0,
             last_pulled: false,
             merge_live_warned: false,
+            merger: None,
+            cond_by_token: HashMap::new(),
+            merge_tx,
+            merge_rx,
+            merge_inflight: HashSet::new(),
+            last_merge_sweep: Instant::now(),
         };
         // We placed this order on YES (an Ask). The fill must follow THIS token.
         mm.placed.insert(
@@ -5742,6 +6252,8 @@ mod tests {
             tokens,
             token_market,
             HashMap::new(),
+            None,            // merger (M6-7): no relayer in this control-channel test
+            HashMap::new(),  // cond_by_token (M6-7)
             Usdc(1_000_000_000),
             false,
             false,

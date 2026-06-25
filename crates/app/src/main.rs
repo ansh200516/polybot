@@ -921,6 +921,12 @@ async fn main() {
     // MM is wired — so MM's LiveVenue is identical to arb's with NO second key
     // derivation. Stays `None` on the paper arm (and whenever MM is paper).
     let mut mm_live_inputs: Option<MmLiveInputs> = None;
+    // M6-7: the LIVE on-chain MERGE relayer for the reward-farm MM, built in the
+    // live arm below (only when MM is cleared for live) and threaded into the MM.
+    // `None` on paper / arb / non-relayer live — the MM then keeps the hold-to-
+    // resolution no-op, so those paths are byte-for-byte unchanged. `Arc` so each
+    // spawned, non-blocking merge-sweep task shares the one client.
+    let mut mm_merger: Option<std::sync::Arc<pm_execution::relayer::RelayerClient>> = None;
     // Capture the deposit-wallet address BEFORE `live_rt` is consumed below — the
     // MM's live seed reconcile (further down) reads its on-chain holdings. `Some`
     // iff this is a live run.
@@ -929,6 +935,35 @@ async fn main() {
     let exec_builder: ExecTaskBuilder = if let Some((secrets, signer, proxy, deposit_wallet)) =
         live_rt
     {
+        // M6-7: build the LIVE on-chain MERGE relayer for the reward-farm MM BEFORE
+        // `secrets.api` is moved out by the match below (so `&secrets` is still a
+        // whole borrow). Only attempted when MM is cleared for live;
+        // `RelayerClient::new` itself returns `None` unless the relayer is enabled
+        // AND builder creds + deposit wallet + a valid EOA key are present (OFF by
+        // default, staging-first), so arb-only / non-relayer live stay no-op.
+        if config.strategies.mm.enabled && mm_use_live(args.live, config.strategies.mm.live) {
+            let relayer_http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|e| fatal(format!("relayer http client build failed: {e}")));
+            mm_merger =
+                pm_execution::relayer::RelayerClient::new(&config.live, &secrets, relayer_http)
+                    .map(std::sync::Arc::new);
+            if mm_merger.is_some() {
+                warn!(
+                    staging = config.live.relayer_staging,
+                    "M6-7: LIVE on-chain MERGE relayer ENABLED — reward-farm complete sets will \
+                     be recycled on-chain (periodic, NON-blocking sweep). The submit→confirm \
+                     round-trip is validated for real only at the first FUNDED STAGING run."
+                );
+            } else if config.live.relayer_enabled {
+                warn!(
+                    "live.relayer_enabled = true but the relayer could NOT be constructed \
+                     (missing builder creds / deposit wallet / unparseable key) — live merge \
+                     stays the hold-to-resolution no-op"
+                );
+            }
+        }
         // CLOB trading credentials. py-clob-client-v2 derives these from a
         // PLAIN-EOA L1 signature (create_or_derive_api_key): POLY_ADDRESS = the
         // EOA, plain ECDSA, the key binds to the EOA. The deposit wallet / funder
@@ -1538,6 +1573,12 @@ async fn main() {
         // threaded into the MM so the loop/estimator (B3/B4) can pair the two bids.
         let mut mm_complement: HashMap<pm_core::instrument::TokenId, pm_core::instrument::TokenId> =
             HashMap::new();
+        // M6-7: token → on-chain conditionId (B256) for the quoted reward-farm
+        // universe — the LIVE merge sweep needs it to build each `mergePositions`
+        // batch. Populated alongside `mm_complement` (hedging only); empty
+        // otherwise, so non-hedging / paper / arb runs thread an empty map.
+        let mut mm_cond_by_token: HashMap<pm_core::instrument::TokenId, alloy_primitives::B256> =
+            HashMap::new();
         // Task 4.6 user-WS inputs (live only): the markets' condition_ids to
         // subscribe to, and the asset_id→(TokenId, TickSize) map the WS fills
         // source resolves each trade's `asset_id` against (the SAME shape the
@@ -1572,6 +1613,24 @@ async fn main() {
             if mm_hedging {
                 mm_complement.insert(m.yes, m.no);
                 mm_complement.insert(m.no, m.yes);
+                // M6-7: map BOTH legs to the market's single on-chain conditionId
+                // (hex from the registry) so the live merge sweep can build its
+                // `mergePositions` batch. A market with no / an unparseable
+                // condition id simply isn't merge-eligible (held to resolution).
+                match reg
+                    .market_condition(m.id)
+                    .and_then(|c| c.parse::<alloy_primitives::B256>().ok())
+                {
+                    Some(cid) => {
+                        mm_cond_by_token.insert(m.yes, cid);
+                        mm_cond_by_token.insert(m.no, cid);
+                    }
+                    None => warn!(
+                        market = ?m.id,
+                        "MM hedging: market has no parseable condition_id — its complete sets \
+                         can't be merged on-chain (held to resolution)"
+                    ),
+                }
             }
             for tok in [m.yes, m.no] {
                 if let Some(vid) = reg.token_venue_id(tok) {
@@ -1678,6 +1737,13 @@ async fn main() {
             // markets — empty unless reward-farm hedging is on — so the quote loop
             // and estimator can pair the two complement bids (consumed by B3/B4).
             .with_complement(mm_complement)
+            // M6-7: the LIVE on-chain merge relayer + the token→conditionId map so
+            // a reward-farm live run RECYCLES a complete YES+NO set on-chain via a
+            // periodic, non-blocking sweep. `merger` is `None` (and the map empty)
+            // off relayer-enabled reward-farm live, keeping every other path
+            // (paper / arb / non-relayer live) byte-for-byte unchanged.
+            .with_merger(mm_merger)
+            .with_conditions(mm_cond_by_token)
             // Task 9 — PERSISTENT UTC-day loss cap: thread the store path so the
             // loop reads today's persisted "mm" P&L at startup and refuses to quote
             // when the day is already at/under the daily-loss cap, making the cap
