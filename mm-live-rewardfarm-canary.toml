@@ -1,0 +1,99 @@
+# mm-live-rewardfarm-canary.toml — REAL-MONEY reward-farming canary.
+#
+# Validates the LIVE reward-farming path (Spec 1 + 2) with tiny real money,
+# BEFORE investing in M6 on-chain merge. This is the gasless CLOB path only:
+# postOnly GTC limit orders that REST near the midpoint to earn Polymarket's
+# liquidity rewards. hedging_enabled = true → the MM bids the COMPLEMENT PAIR
+# (BID-YES + BID-NO), so it is genuinely two-sided from flat with NO naked short
+# (both legs are buys) — exactly what the reward formula scores two-sided.
+#
+# WHAT THIS PROVES (the canary's job):
+#   * the live path runs clean (no "balance: 0" ask floods — every order is a bid),
+#   * orders rest two-sided in-band → a positive reward Q_min on real markets,
+#   * inventory stays delta-neutral (YES+NO pairs ≈ a locked $1/pair, NOT a
+#     directional bet), bounded by max_gross_inventory_usd,
+#   * a real reward payout lands at the next 00:00 UTC (check your Polymarket
+#     portfolio activity for a "liquidity reward" credit).
+# It does NOT prove meaningful profit: at tiny capital the reward is cents/day.
+#
+# BLAST RADIUS (all caps HARD):
+#   * postOnly bids never cross → you only ever BUY at/below your bid, never lift.
+#   * hedged pairs are ~delta-neutral → directional loss risk is minimal.
+#   * max_gross_inventory_usd caps total LOCKED capital. NOTE: live merge is
+#     NotSupportedLive (M6), so accumulated YES+NO pairs LOCK until the market
+#     resolves (redeem via the Polymarket UI) — the gross cap is the throttle.
+#   * inventory_stop_loss_usd / daily_loss_usd / live.session_loss_usd latch a halt.
+#
+# RUN (WITH the TUI so you can watch the "rew" line — est $/day, q_min, in-band,
+# balance, sig/PULL; press `l` to release live, `k` kill, `q` quit):
+#
+#   export PM_PRIVATE_KEY=…  PM_PROXY_ADDRESS=…  PM_DEPOSIT_WALLET=…
+#   echo "I understand this trades real money" | cargo run --release --bin arb -- \
+#     --live --config mm-live-rewardfarm-canary.toml --db /tmp/rf-canary.sqlite
+#
+# IMPORTANT: set capital_usd at or below your deposit wallet's USDC balance — the
+# budget cap is capital_usd (the live-balance auto-fetch was reverted), so a
+# capital_usd above your real balance will get orders rejected by the venue.
+
+[strategies.mm]
+enabled           = true
+live              = true
+policy            = "reward_farm"   # reward farming (NOT spread capture)
+capital_usd       = 15.0            # <-- SET TO <= your deposit-wallet USDC. Budget cap; funds whole YES+NO pairs (~$1/pair-share).
+max_markets       = 100
+quote_refresh_ms  = 3000            # loop cadence; sticky re-quoting means few actual cancels
+max_quote_usd     = 5.0             # per-leg notional (≥5 shares clears the venue 5-share min)
+live_fills_source = "ws"
+
+# Reward-farming knobs (Spec 2). hedging_enabled is the key live switch.
+[reward_farm]
+hedging_enabled     = true   # complement-pair (BID-YES + BID-NO): two-sided from flat, no naked short
+merge_threshold_usd = 5.0    # paper-only; on LIVE merge is a no-op (M6), pairs lock to resolution
+microprice_levels   = 3
+signal_window_ms    = 3000
+pull_threshold      = 0.6    # pull a leg only on a STRONG adverse signal (preserve calm-market stickiness)
+pull_cooldown_ms    = 5000
+size_skew_max_ratio = 2.0
+requote_band_ticks  = 1
+sample_interval_ms  = 60000
+min_markets         = 1
+
+# Hard inventory caps. With hedging the pairs are ~delta-neutral, so these mainly
+# bound LOCKED capital (no live merge). Keep small for a canary.
+[inventory]
+max_inventory_usd       = 6.0
+max_gross_inventory_usd = 20.0   # hard ceiling on total locked (hedged) capital
+inventory_stop_loss_usd = 5.0
+daily_loss_usd          = 6.0
+vol_pull_ticks          = 6
+vol_window_ms           = 2500
+
+[live]
+session_loss_usd = 6.0
+basket_cap_usd   = 1.0   # moot (arb neutered) but must be > 0
+
+# Neuter arb so the ONLY thing trading is the reward-farm maker path.
+[edges]
+min_edge_class12_bps = 9000
+min_edge_class3_bps  = 9000
+max_edge_bps         = 9500
+
+# Reward-farm selects its universe from REWARD-ELIGIBLE markets (rewards.max_spread
+# > 0 && daily_rate > 0); the [segments] filter is not the selector here, but these
+# stay sane. Confluence is FORCED OFF in reward_farm mode regardless.
+[segments]
+liquid_stable_min_volume    = 50000.0
+liquid_stable_min_liquidity = 10000.0
+liquid_min_volume           = 2000.0
+liquid_min_liquidity        = 1000.0
+mm_segments         = ["LiquidStable", "Liquid"]
+mm_exclude_fee_free = true
+
+[universe]
+max_markets             = 100   # SYNC size — how many markets are fetched; reward-eligible ones are then selected
+prioritize_by_liquidity = true
+candidate_pool          = 150
+auto_restart_secs       = 1800  # 30-min universe refresh; a released live session resumes automatically
+
+[confluence]
+enabled = false   # reward_farm forces this off anyway; explicit here for clarity
