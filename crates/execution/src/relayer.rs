@@ -2,34 +2,53 @@
 //! relayer WALLET batch. See
 //! docs/superpowers/specs/2026-06-25-m6-deposit-wallet-relayer-design.md
 //!
-//! M6-1 lays only the Polygon-137 contract constants + (Step 2) the builder
-//! credentials used by the later tasks (EIP-712 `Batch` signing, merge/redeem
-//! calldata, the relayer I/O). NO signing, ABI encoding, or network I/O happens
-//! here yet — this is foundational scaffolding only.
+//! Build order (per the M6 plan): M6-1 the Polygon-137 contract constants +
+//! builder credentials; M6-2 the golden-vector-validated EIP-712 `Batch`
+//! signing; M6-3 the merge/redeem calldata + deposit-wallet derivation; M6-4
+//! (this task) the relayer I/O — builder-auth headers (reusing the CLOB L2 HMAC
+//! in `auth.rs`), the WALLET request body, `POST /submit`, and the
+//! `/transaction` state-machine poll to `STATE_CONFIRMED`. The live round-trip
+//! is validated only at the operator's first FUNDED STAGING run (design §5/§8);
+//! everything here is unit-tested offline (body shape, header shape, state
+//! parse) with NO network I/O in tests.
+
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, B256, U256, address, b256, hex, keccak256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolStruct, eip712_domain, sol};
+use serde_json::json;
+
+use crate::auth::l2_signature;
+use crate::secrets::BuilderCreds;
 
 // ---------------------------------------------------------------------------
 // Polygon-137 contracts
 // ---------------------------------------------------------------------------
 
-/// Deposit-wallet factory (Polygon 137) — the `to` of a WALLET batch — pinned
-/// to the `py-builder-relayer-client@e7108cd` config this port targets
-/// (design §2.3).
+/// Deposit-wallet factory (Polygon 137) — the `to` field of a WALLET batch.
 ///
-/// NOTE: Polymarket's *current* public docs list a NEWER factory
-/// (`0x00000000000Fb5C9ADea0298D729A0CB3823Cc07`, beacon-based). We deliberately
-/// pin the reference-client value the rest of M6 is ported against; reconcile
-/// against the live factory before the funded staging run if the relayer
-/// rejects the batch.
+/// CORRECTED in M6-4: this is the CURRENT Polymarket Polygon-137 deposit-wallet
+/// factory (the one that created the operator's actual wallet; confirmed via
+/// on-chain reconciliation + current docs whose own WALLET example uses it).
+/// M6-1 had pinned the stale `py-builder-relayer-client@e7108cd`
+/// reference-deployment value `0x894Ee6B254f251518206f709E9B115f214ebDf17`
+/// (impl `0x55913A0bdecCbB77b7Af781A48300e6394B5EEAE`); those stay only as the
+/// derivation-algorithm reference (the M6-3 golden vector uses the Amoy
+/// factory/impl, so the derivation check is unaffected by this correction).
+///
+/// The WALLET request `to` is this factory; a configurable override lands in
+/// M6-6 (the `RelayerClient` threads `relayer_url` + an optional factory) —
+/// [`build_wallet_request`] already takes `factory` as a parameter so the
+/// default const can be overridden without touching the builder.
 pub const DEPOSIT_WALLET_FACTORY: Address =
-    address!("0x894Ee6B254f251518206f709E9B115f214ebDf17");
+    address!("0x00000000000Fb5C9ADea0298D729A0CB3823Cc07");
 
-/// Deposit-wallet implementation (Polygon 137), same pinned reference config.
-/// Consumed by the M6-3 CREATE2 / ERC-1967 address-derivation sanity helper.
+/// Deposit-wallet implementation (Polygon 137) — the `e7108cd` reference-client
+/// value. Consumed ONLY by the M6-3 CREATE2 / ERC-1967 address-derivation
+/// sanity helper (validated against the Amoy golden vector as an algorithm
+/// check), NOT by the live WALLET batch.
 pub const DEPOSIT_WALLET_IMPL: Address =
     address!("0x55913A0bdecCbB77b7Af781A48300e6394B5EEAE");
 
@@ -97,6 +116,20 @@ pub enum RelayerError {
     BadKey(String),
     /// The local signer failed to produce a signature.
     Sign(String),
+    /// Builder-auth HMAC could not be computed (e.g. the builder secret was not
+    /// valid base64url). Wraps the underlying `auth::AuthError`.
+    Auth(String),
+    /// HTTP transport failed, or the relayer returned a non-success status.
+    Http(String),
+    /// The relayer response was unparseable or missing a required field
+    /// (`transactionID` on submit, `transactionHash` on a confirmed poll).
+    Response(String),
+    /// The relayer reported a TERMINAL failure state (`STATE_FAILED` /
+    /// `STATE_INVALID`) — the batch will never confirm.
+    Failed(String),
+    /// `poll_until_confirmed` exhausted its timeout before reaching a terminal
+    /// state (still pending — NOT necessarily a failure on-chain).
+    Timeout(String),
 }
 
 impl std::fmt::Display for RelayerError {
@@ -104,6 +137,11 @@ impl std::fmt::Display for RelayerError {
         match self {
             RelayerError::BadKey(e) => write!(f, "invalid signer key: {e}"),
             RelayerError::Sign(e) => write!(f, "batch signing error: {e}"),
+            RelayerError::Auth(e) => write!(f, "builder auth error: {e}"),
+            RelayerError::Http(e) => write!(f, "relayer http error: {e}"),
+            RelayerError::Response(e) => write!(f, "relayer response error: {e}"),
+            RelayerError::Failed(e) => write!(f, "relayer batch failed: {e}"),
+            RelayerError::Timeout(e) => write!(f, "relayer poll timeout: {e}"),
         }
     }
 }
@@ -294,6 +332,291 @@ pub fn derive_deposit_wallet(owner: Address, factory: Address, implementation: A
     get_create2_address(bytecode_hash, factory, salt)
 }
 
+// ---------------------------------------------------------------------------
+// (C) Relayer I/O (M6-4): builder-auth headers, WALLET request body,
+//     POST /submit, and the /transaction state-machine poll (design §2.2/§6).
+// ---------------------------------------------------------------------------
+
+/// Production relayer base URL (no trailing slash; join with `format!`).
+pub const RELAYER_URL_PROD: &str = "https://relayer-v2.polymarket.com";
+/// Staging relayer base URL — the operator's FIRST funded run targets this
+/// (design §7 "staging-first").
+pub const RELAYER_URL_STAGING: &str = "https://relayer-v2-staging.polymarket.dev";
+
+/// Seconds between `/transaction` polls. Polygon blocks are ~2 s and this runs
+/// off the quote hot path (a periodic sweep — design §3), so a relaxed interval
+/// is fine.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The relayer transaction lifecycle (confirmed states, design §"States"):
+/// `STATE_NEW` → `STATE_EXECUTED` → `STATE_MINED` → `STATE_CONFIRMED` (terminal
+/// OK); `STATE_FAILED` / `STATE_INVALID` are terminal ERRORS. Any unrecognised
+/// value is kept as [`RelayerState::Other`] and treated as NON-terminal (keep
+/// polling until the timeout) so an unexpected string is never mistaken for
+/// success or hard failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayerState {
+    New,
+    Executed,
+    Mined,
+    Confirmed,
+    Failed,
+    Invalid,
+    Other(String),
+}
+
+impl RelayerState {
+    /// Parse a relayer `state` string into the typed state (unknown → `Other`).
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "STATE_NEW" => RelayerState::New,
+            "STATE_EXECUTED" => RelayerState::Executed,
+            "STATE_MINED" => RelayerState::Mined,
+            "STATE_CONFIRMED" => RelayerState::Confirmed,
+            "STATE_FAILED" => RelayerState::Failed,
+            "STATE_INVALID" => RelayerState::Invalid,
+            other => RelayerState::Other(other.to_string()),
+        }
+    }
+
+    /// Whether polling can stop: `STATE_CONFIRMED` (success) or
+    /// `STATE_FAILED`/`STATE_INVALID` (failure). `STATE_MINED` is NOT terminal —
+    /// the design requires `STATE_CONFIRMED` before a batch is considered done.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            RelayerState::Confirmed | RelayerState::Failed | RelayerState::Invalid
+        )
+    }
+
+    /// Whether the batch confirmed successfully (`STATE_CONFIRMED`).
+    pub fn is_success(&self) -> bool {
+        matches!(self, RelayerState::Confirmed)
+    }
+}
+
+/// Builder-auth headers for a relayer request. The builder auth uses the SAME
+/// HMAC scheme as the CLOB L2 auth — `base64url(HMAC-SHA256(base64url-decode(
+/// secret), ts + METHOD + path + body))` — so we REUSE [`auth::l2_signature`]
+/// rather than reimplementing it; only the header NAMES and the secret differ
+/// (`POLY_BUILDER_*` + the builder secret instead of `POLY_*` + the CLOB
+/// secret). Mirrors `auth.rs::l2_headers`.
+///
+/// For a GET, `path` MUST exclude the query string (same rule as the CLOB L2
+/// HMAC); `body` is the EXACT serialized request string for a POST, or `None`.
+/// Header ORDER is not significant to the relayer (HTTP header names are
+/// unordered); we emit key/timestamp/passphrase/signature for a stable test.
+pub fn builder_headers(
+    creds: &BuilderCreds,
+    ts: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<Vec<(&'static str, String)>, RelayerError> {
+    let signature = l2_signature(creds.secret.expose(), ts, method, path, body)
+        .map_err(|e| RelayerError::Auth(e.to_string()))?;
+    Ok(vec![
+        ("POLY_BUILDER_API_KEY", creds.key.clone()),
+        ("POLY_BUILDER_TIMESTAMP", ts.to_string()),
+        ("POLY_BUILDER_PASSPHRASE", creds.passphrase.expose().to_string()),
+        ("POLY_BUILDER_SIGNATURE", signature),
+    ])
+}
+
+/// Build the relayer WALLET-batch request body (design §2.2; matches the py
+/// client `to_dict()`). Field shapes (load-bearing): `type` = `"WALLET"`;
+/// `nonce`/`deadline`/`value` are STRINGS; `data`/`target`/addresses are
+/// `0x`-hex; `to` is the deposit-wallet `factory` (a parameter — the M6-6
+/// client can override the [`DEPOSIT_WALLET_FACTORY`] default). `signature` is
+/// the 65-byte `Batch` signature from [`sign_batch`].
+///
+/// Addresses render EIP-55 checksummed (alloy `Address` Display == web3.py's
+/// `to_checksum_address`, which the py `to_dict()` emits). The relayer recovers
+/// the signer from the `Batch` signature, so the address-field CASE is not the
+/// security boundary, but the exact accepted form is a staging-confirmation
+/// item.
+pub fn build_wallet_request(
+    from: Address,
+    factory: Address,
+    wallet: Address,
+    nonce: u64,
+    deadline: u64,
+    calls: &[Call],
+    signature: &str,
+) -> serde_json::Value {
+    let calls_json: Vec<serde_json::Value> = calls
+        .iter()
+        .map(|c| {
+            json!({
+                "target": c.target.to_string(),
+                "value": c.value.to_string(),
+                "data": format!("0x{}", hex::encode(&c.data[..])),
+            })
+        })
+        .collect();
+    json!({
+        "type": "WALLET",
+        "from": from.to_string(),
+        "to": factory.to_string(),
+        "nonce": nonce.to_string(),
+        "signature": signature,
+        "depositWalletParams": {
+            "depositWallet": wallet.to_string(),
+            "deadline": deadline.to_string(),
+            "calls": calls_json,
+        }
+    })
+}
+
+/// Extract the transaction id from a `POST /submit` response
+/// (`{ "transactionID": "...", "state": "STATE_NEW", ... }`). Tries
+/// `transactionID` then `transactionId` (cheap casing insurance, mirroring
+/// `auth.rs`'s `apiKey`/`api_key` fallback). Factored out so submit parsing is
+/// unit-testable without HTTP.
+fn parse_submit_response(v: &serde_json::Value) -> Option<String> {
+    v.get("transactionID")
+        .or_else(|| v.get("transactionId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// Parse a `GET /transaction` poll response into `(state, transactionHash?)`.
+/// A missing/non-string `state` yields `Other("")` (non-terminal → keep
+/// polling). Factored out so the state-machine logic is unit-testable without
+/// HTTP.
+fn parse_transaction_response(v: &serde_json::Value) -> (RelayerState, Option<String>) {
+    let state = v
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| RelayerState::Other(String::new()), RelayerState::parse);
+    let hash = v
+        .get("transactionHash")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    (state, hash)
+}
+
+/// Unix seconds as a decimal string (the builder-auth timestamp). Mirrors
+/// `live.rs::unix_seconds_string`.
+fn unix_seconds_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        .to_string()
+}
+
+/// Submit a signed WALLET batch: `POST {relayer_url}/submit` with builder-auth
+/// headers + the JSON `body`, returning the relayer `transactionID`.
+///
+/// The body is serialized ONCE to a canonical string; that EXACT string is both
+/// HMAC'd (`builder_headers(.., "POST", "/submit", Some(&body_str))`) and sent
+/// as the request body — they must be byte-identical (same invariant as the
+/// CLOB POST in `live.rs`). Every failure maps to a [`RelayerError`]; this never
+/// panics.
+pub async fn submit_wallet_batch(
+    http: &reqwest::Client,
+    relayer_url: &str,
+    creds: &BuilderCreds,
+    body: &serde_json::Value,
+) -> Result<String, RelayerError> {
+    let base = relayer_url.trim_end_matches('/');
+    let path = "/submit";
+    let body_str = serde_json::to_string(body)
+        .map_err(|e| RelayerError::Response(format!("serialize WALLET body: {e}")))?;
+    let ts = unix_seconds_string();
+    let headers = builder_headers(creds, &ts, "POST", path, Some(&body_str))?;
+
+    let url = format!("{base}{path}");
+    let mut req = http
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(body_str);
+    for (k, v) in &headers {
+        req = req.header(*k, v);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| RelayerError::Http(format!("POST {path}: {e}")))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| RelayerError::Http(format!("POST {path}: read body: {e}")))?;
+    if !status.is_success() {
+        return Err(RelayerError::Http(format!("POST {path}: HTTP {status}: {text}")));
+    }
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| RelayerError::Response(format!("POST {path}: invalid JSON: {e}: {text}")))?;
+    parse_submit_response(&json)
+        .ok_or_else(|| RelayerError::Response(format!("POST {path}: missing transactionID: {text}")))
+}
+
+/// Poll `GET {relayer_url}/transaction?id={tx_id}` until the batch reaches a
+/// terminal state or `timeout` elapses. Returns the `transactionHash` on
+/// `STATE_CONFIRMED`; `Err(Failed)` on `STATE_FAILED`/`STATE_INVALID`;
+/// `Err(Timeout)` if still pending at the deadline. Sleeps [`POLL_INTERVAL`]
+/// between polls. `STATE_MINED` is intentionally NOT accepted — the design
+/// requires `STATE_CONFIRMED`.
+///
+/// The HMAC path is the query-LESS `/transaction` (same GET rule as the CLOB L2
+/// HMAC); builder auth is included even though the read may not require it
+/// ("include it to be safe"). Every failure maps to a [`RelayerError`]; this
+/// never panics.
+pub async fn poll_until_confirmed(
+    http: &reqwest::Client,
+    relayer_url: &str,
+    creds: &BuilderCreds,
+    tx_id: &str,
+    timeout: Duration,
+) -> Result<String, RelayerError> {
+    let base = relayer_url.trim_end_matches('/');
+    let path = "/transaction";
+    let deadline = Instant::now() + timeout;
+    loop {
+        let ts = unix_seconds_string();
+        let headers = builder_headers(creds, &ts, "GET", path, None)?;
+        let url = format!("{base}{path}?id={tx_id}");
+        let mut req = http.get(&url);
+        for (k, v) in &headers {
+            req = req.header(*k, v);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| RelayerError::Http(format!("GET {path}: {e}")))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| RelayerError::Http(format!("GET {path}: read body: {e}")))?;
+        if !status.is_success() {
+            return Err(RelayerError::Http(format!("GET {path}: HTTP {status}: {text}")));
+        }
+        let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            RelayerError::Response(format!("GET {path}: invalid JSON: {e}: {text}"))
+        })?;
+        let (state, hash) = parse_transaction_response(&json);
+        if state.is_success() {
+            return hash.ok_or_else(|| {
+                RelayerError::Response(format!("STATE_CONFIRMED but no transactionHash: {text}"))
+            });
+        }
+        if state.is_terminal() {
+            return Err(RelayerError::Failed(format!(
+                "relayer terminal state {state:?} for tx {tx_id}: {text}"
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(RelayerError::Timeout(format!(
+                "tx {tx_id} still in state {state:?} after {timeout:?}"
+            )));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -357,13 +680,16 @@ mod tests {
         );
     }
 
-    /// The factory/impl are the pinned reference-client values (design §2.3).
-    /// Pin them too so a careless edit is caught; they are distinct and non-zero.
+    /// Pin the factory/impl so a careless edit is caught; they are distinct and
+    /// non-zero. FACTORY is the CURRENT Polygon-137 deposit-wallet factory
+    /// (corrected in M6-4 — it created the operator's actual wallet); IMPL stays
+    /// the `e7108cd` reference value the M6-3 derivation-algorithm check uses.
     #[test]
     fn deposit_wallet_contracts_are_pinned() {
         assert_eq!(
             DEPOSIT_WALLET_FACTORY.to_checksum(None),
-            "0x894Ee6B254f251518206f709E9B115f214ebDf17"
+            "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07",
+            "DEPOSIT_WALLET_FACTORY must be the current Polygon-137 factory (M6-4 correction)"
         );
         assert_eq!(
             DEPOSIT_WALLET_IMPL.to_checksum(None),
@@ -372,6 +698,12 @@ mod tests {
         assert_ne!(DEPOSIT_WALLET_FACTORY, Address::ZERO);
         assert_ne!(DEPOSIT_WALLET_IMPL, Address::ZERO);
         assert_ne!(DEPOSIT_WALLET_FACTORY, DEPOSIT_WALLET_IMPL);
+        // The stale e7108cd reference factory must NOT be the live `to`.
+        assert_ne!(
+            DEPOSIT_WALLET_FACTORY,
+            address!("0x894Ee6B254f251518206f709E9B115f214ebDf17"),
+            "FACTORY must no longer be the stale e7108cd reference value"
+        );
     }
 
     /// (A) `merge_call` must produce the exact `CtfCollateralAdapter.
@@ -450,5 +782,239 @@ mod tests {
             "0x63cB1B4eC2F274Ed553aD5079c6A2542d1c02bd7".parse::<Address>().unwrap(),
             "deposit-wallet derivation diverged from the Polymarket golden vector"
         );
+    }
+
+    // -- (C) Relayer I/O (M6-4) --------------------------------------------
+
+    /// `builder_headers` mirrors `auth.rs::l2_headers_carry_all_five`: the four
+    /// `POLY_BUILDER_*` names in order, key/timestamp/passphrase passthrough,
+    /// and — crucially — the signature REUSES the CLOB L2 HMAC scheme. We feed
+    /// the SAME inputs as the pinned L2 vector (`auth_vectors.json` l2[0]:
+    /// secret `QQ==`, POST `/order`, body `{"hello":"world"}`) and assert the
+    /// builder signature is byte-identical to that vector — proving we did not
+    /// reimplement (or drift from) `l2_signature`.
+    #[test]
+    fn builder_headers_carry_all_four_and_reuse_l2_hmac() {
+        let creds = BuilderCreds {
+            key: "703629aa-builder-key".into(),
+            secret: crate::secrets::Secret::new("QQ==".into()),
+            passphrase: crate::secrets::Secret::new("builder-pass".into()),
+        };
+        let h = builder_headers(
+            &creds,
+            "1750000000",
+            "POST",
+            "/order",
+            Some("{\"hello\":\"world\"}"),
+        )
+        .unwrap();
+
+        let names: Vec<&str> = h.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "POLY_BUILDER_API_KEY",
+                "POLY_BUILDER_TIMESTAMP",
+                "POLY_BUILDER_PASSPHRASE",
+                "POLY_BUILDER_SIGNATURE",
+            ]
+        );
+        assert_eq!(h[0].1, "703629aa-builder-key", "API key passthrough");
+        assert_eq!(h[1].1, "1750000000", "timestamp passthrough");
+        assert_eq!(h[2].1, "builder-pass", "passphrase passthrough");
+        // Same HMAC as the CLOB L2 (auth_vectors.json l2[0]) — REUSE, not reimpl.
+        assert_eq!(
+            h[3].1, "rL5wbSueMIhsnLDR0rvOx2jaeW5-YHxY5zfKwMrZtQY=",
+            "builder signature must equal the pinned L2 HMAC for identical inputs"
+        );
+    }
+
+    /// An invalid (non-base64url) builder secret surfaces as `RelayerError::Auth`
+    /// (mapped from `auth::AuthError`), never a panic.
+    #[test]
+    fn builder_headers_bad_secret_is_auth_error() {
+        let creds = BuilderCreds {
+            key: "k".into(),
+            // '!' is not a valid base64url char → l2_signature's decode fails.
+            secret: crate::secrets::Secret::new("not valid base64!!".into()),
+            passphrase: crate::secrets::Secret::new("p".into()),
+        };
+        let err = builder_headers(&creds, "1", "POST", "/submit", Some("{}")).unwrap_err();
+        assert!(matches!(err, RelayerError::Auth(_)), "got {err:?}");
+    }
+
+    /// `build_wallet_request` matches the py client `to_dict()` shape (design
+    /// §2.2 / `test_client_deposit_wallet.py`): exact top-level + nested keys,
+    /// `type` "WALLET", string `nonce`/`deadline`/`value`, `to` = factory, and a
+    /// single `{target,value,data}` call carrying the `mergePositions` calldata.
+    #[test]
+    fn build_wallet_request_matches_py_to_dict_shape() {
+        let from: Address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".parse().unwrap();
+        let wallet: Address = "0xa2927E7834648F1C03b4961CeeA4597292e3c025".parse().unwrap();
+        let collateral: Address = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".parse().unwrap();
+        let condition_id: B256 =
+            "0xabcdef0000000000000000000000000000000000000000000000000000000123".parse().unwrap();
+        let calls = vec![merge_call(
+            CTF_COLLATERAL_ADAPTER,
+            collateral,
+            condition_id,
+            U256::from(1_500_000u64),
+        )];
+        // Reuse the golden-vector signature string — it is passed through verbatim.
+        let sig = "0x7827946c566e7860f6c5f2e641587ed6928989c8618e463a00dd56832e7300023b7436c67a2ea82d6d506b1a5eda3e27526e9e2ffaad52128d75c47c2e9d1fac1b";
+
+        let req = build_wallet_request(
+            from,
+            DEPOSIT_WALLET_FACTORY,
+            wallet,
+            7u64,
+            1234567890u64,
+            &calls,
+            sig,
+        );
+
+        // Top-level shape + EXACT key set.
+        let mut keys: Vec<&str> = req.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["depositWalletParams", "from", "nonce", "signature", "to", "type"]
+        );
+        assert_eq!(req["type"], "WALLET");
+        // Addresses are EIP-55 checksummed (alloy Display) — pin the literals.
+        assert_eq!(req["from"], "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        assert_eq!(
+            req["to"], "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07",
+            "`to` is the (current) deposit-wallet factory"
+        );
+        // nonce is a STRING, not a JSON number.
+        assert_eq!(req["nonce"], "7");
+        assert!(req["nonce"].is_string(), "nonce must be a string");
+        assert_eq!(req["signature"], sig);
+
+        // Nested depositWalletParams shape + EXACT key set.
+        let p = &req["depositWalletParams"];
+        let mut pkeys: Vec<&str> = p.as_object().unwrap().keys().map(String::as_str).collect();
+        pkeys.sort_unstable();
+        assert_eq!(pkeys, vec!["calls", "deadline", "depositWallet"]);
+        assert_eq!(p["depositWallet"], "0xa2927E7834648F1C03b4961CeeA4597292e3c025");
+        assert_eq!(p["deadline"], "1234567890");
+        assert!(p["deadline"].is_string(), "deadline must be a string");
+
+        // calls[0] shape: {target, value, data}, EXACT key set, value "0" string.
+        let calls_arr = p["calls"].as_array().unwrap();
+        assert_eq!(calls_arr.len(), 1);
+        let mut ckeys: Vec<&str> =
+            calls_arr[0].as_object().unwrap().keys().map(String::as_str).collect();
+        ckeys.sort_unstable();
+        assert_eq!(ckeys, vec!["data", "target", "value"]);
+        assert_eq!(
+            calls_arr[0]["target"], "0xAdA100Db00Ca00073811820692005400218FcE1f",
+            "target is the CtfCollateralAdapter"
+        );
+        assert_eq!(calls_arr[0]["value"], "0", "value is the string \"0\"");
+        let data_str = calls_arr[0]["data"].as_str().unwrap();
+        assert!(data_str.starts_with("0x"), "data is 0x-hex: {data_str}");
+        // data is exactly the ABI-encoded mergePositions calldata for the Call.
+        assert_eq!(data_str, format!("0x{}", hex::encode(&calls[0].data[..])));
+        // …and that calldata carries the mergePositions selector (sanity).
+        let selector =
+            keccak256("mergePositions(address,bytes32,bytes32,uint256[],uint256)".as_bytes());
+        assert_eq!(&calls[0].data[..4], &selector[..4]);
+    }
+
+    /// State parse + `is_terminal`/`is_success` over all six confirmed states
+    /// plus the `Other` fallback (the testable core of the poll loop).
+    #[test]
+    fn relayer_state_parse_terminal_and_success() {
+        // Parse the canonical strings.
+        assert_eq!(RelayerState::parse("STATE_NEW"), RelayerState::New);
+        assert_eq!(RelayerState::parse("STATE_EXECUTED"), RelayerState::Executed);
+        assert_eq!(RelayerState::parse("STATE_MINED"), RelayerState::Mined);
+        assert_eq!(RelayerState::parse("STATE_CONFIRMED"), RelayerState::Confirmed);
+        assert_eq!(RelayerState::parse("STATE_FAILED"), RelayerState::Failed);
+        assert_eq!(RelayerState::parse("STATE_INVALID"), RelayerState::Invalid);
+        assert_eq!(
+            RelayerState::parse("STATE_WHATEVER"),
+            RelayerState::Other("STATE_WHATEVER".to_string())
+        );
+
+        // Non-terminal: NEW/EXECUTED/MINED keep polling (MINED is NOT enough).
+        for s in [RelayerState::New, RelayerState::Executed, RelayerState::Mined] {
+            assert!(!s.is_terminal(), "{s:?} must be non-terminal");
+            assert!(!s.is_success());
+        }
+        // Terminal OK.
+        assert!(RelayerState::Confirmed.is_terminal());
+        assert!(RelayerState::Confirmed.is_success());
+        // Terminal ERROR.
+        for s in [RelayerState::Failed, RelayerState::Invalid] {
+            assert!(s.is_terminal(), "{s:?} must be terminal");
+            assert!(!s.is_success(), "{s:?} must not be success");
+        }
+        // Unknown → non-terminal, non-success (poll to timeout, never mis-judge).
+        let other = RelayerState::Other("x".to_string());
+        assert!(!other.is_terminal());
+        assert!(!other.is_success());
+    }
+
+    /// The poll-loop decision logic exercised through the factored parser on
+    /// mocked relayer JSON — no HTTP. CONFIRMED → success+hash; FAILED/INVALID →
+    /// terminal error; intermediate → keep polling; missing fields handled.
+    #[test]
+    fn parse_transaction_response_drives_state_machine() {
+        // STATE_CONFIRMED with a hash → success, hash extracted.
+        let (state, hash) = parse_transaction_response(&serde_json::json!({
+            "state": "STATE_CONFIRMED",
+            "transactionHash": "0xdeadbeef"
+        }));
+        assert!(state.is_success());
+        assert_eq!(hash.as_deref(), Some("0xdeadbeef"));
+
+        // Intermediate STATE_NEW, no hash yet → non-terminal, keep polling.
+        let (state, hash) = parse_transaction_response(&serde_json::json!({"state": "STATE_NEW"}));
+        assert_eq!(state, RelayerState::New);
+        assert!(!state.is_terminal());
+        assert!(hash.is_none());
+
+        // STATE_MINED is NOT terminal (design requires CONFIRMED).
+        let (state, _) = parse_transaction_response(&serde_json::json!({"state": "STATE_MINED"}));
+        assert!(!state.is_terminal(), "MINED must keep polling, not stop");
+
+        // STATE_FAILED → terminal, not success (poll returns Err(Failed)).
+        let (state, _) = parse_transaction_response(&serde_json::json!({"state": "STATE_FAILED"}));
+        assert!(state.is_terminal() && !state.is_success());
+
+        // STATE_INVALID → terminal, not success.
+        let (state, _) =
+            parse_transaction_response(&serde_json::json!({"state": "STATE_INVALID"}));
+        assert!(state.is_terminal() && !state.is_success());
+
+        // Missing `state` field → Other("") → non-terminal (keep polling).
+        let (state, _) = parse_transaction_response(&serde_json::json!({"foo": "bar"}));
+        assert_eq!(state, RelayerState::Other(String::new()));
+        assert!(!state.is_terminal());
+    }
+
+    /// `parse_submit_response` pulls `transactionID` (with a `transactionId`
+    /// casing fallback) and yields `None` when absent — submit parsing without
+    /// HTTP.
+    #[test]
+    fn parse_submit_response_extracts_transaction_id() {
+        assert_eq!(
+            parse_submit_response(&serde_json::json!({
+                "transactionID": "tx-abc-123",
+                "state": "STATE_NEW"
+            }))
+            .as_deref(),
+            Some("tx-abc-123")
+        );
+        // Casing fallback.
+        assert_eq!(
+            parse_submit_response(&serde_json::json!({"transactionId": "tx-xyz"})).as_deref(),
+            Some("tx-xyz")
+        );
+        // Missing → None (submit_wallet_batch maps this to RelayerError::Response).
+        assert!(parse_submit_response(&serde_json::json!({"state": "STATE_NEW"})).is_none());
     }
 }
