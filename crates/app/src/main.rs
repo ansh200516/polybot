@@ -73,6 +73,10 @@ struct Args {
     /// authenticated L2 read, then exit. No market fetch, no TUI, no orders, no
     /// money. Requires `--live`. Run with `--headless` to see the full logs.
     auth_check: bool,
+    /// `--relayer-check`: one read-only relayer `GET /nonce` (RELAYER_API_KEY auth),
+    /// then exit. Confirms the live relayer accepts our auth headers — NO orders,
+    /// NO money, NO on-chain tx. Requires `--live` (for the signer + relayer creds).
+    relayer_check: bool,
     /// Probe-order: after arming, place ONE tiny 5-share FAK BUY (on a cheap
     /// liquid token, ≤ $0.10) through the real signing/auth/submit path, report
     /// the venue's verdict, then exit. Settles whether a type-3 deposit-wallet
@@ -98,6 +102,7 @@ impl Args {
         let mut live = false;
         let mut shadow = false;
         let mut auth_check = false;
+        let mut relayer_check = false;
         let mut probe_order = false;
 
         while let Some(arg) = args.next() {
@@ -149,6 +154,9 @@ impl Args {
                 "--auth-check" => {
                     auth_check = true;
                 }
+                "--relayer-check" => {
+                    relayer_check = true;
+                }
                 "--probe-order" => {
                     probe_order = true;
                 }
@@ -165,6 +173,9 @@ impl Args {
         if auth_check && !live {
             return Err("--auth-check requires --live".to_string());
         }
+        if relayer_check && !live {
+            return Err("--relayer-check requires --live".to_string());
+        }
         if probe_order && !live {
             return Err("--probe-order requires --live".to_string());
         }
@@ -179,6 +190,7 @@ impl Args {
             live,
             shadow,
             auth_check,
+            relayer_check,
             probe_order,
         })
     }
@@ -459,7 +471,7 @@ async fn main() {
         // RESUME (auto-restart of an already-confirmed, already-released session)
         // skips the prompt — re-confirming on every internal re-sync is both
         // impossible (stdin pipe consumed) and pointless.
-        if !args.shadow && !args.auth_check && !tui_active && !resume_live {
+        if !args.shadow && !args.auth_check && !args.relayer_check && !tui_active && !resume_live {
             eprintln!(
                 "LIVE MODE — type the confirmation phrase to continue:\n  {}",
                 config.live.confirm_phrase
@@ -565,6 +577,63 @@ async fn main() {
                 }
             }
             Err(e) => println!("  FAIL  {e}"),
+        }
+        return;
+    }
+
+    // ---- relayer-check: one read-only relayer GET /nonce, then exit --------
+    // Confirms the live relayer ACCEPTS our RELAYER_API_KEY auth and that the
+    // /nonce endpoint + header scheme are right — the #1 "blind port" unknown —
+    // with ZERO risk: a nonce READ moves no money, places no order, sends no
+    // on-chain tx. Run `--live --relayer-check` (add `--headless` for full logs).
+    // Defaults to the PROD relayer (RELAYER_API_KEY is issued for polymarket.com);
+    // set [live].relayer_url to override.
+    if args.relayer_check {
+        let Some((secrets, signer, _, deposit_wallet)) = &live_rt else {
+            fatal("--relayer-check requires --live");
+        };
+        let Some(creds) = secrets.relayer.as_ref() else {
+            fatal(
+                "--relayer-check needs RELAYER_API_KEY + RELAYER_API_KEY_ADDRESS (copy both from \
+                 Polymarket → Settings → Relayer API keys into your .env)",
+            );
+        };
+        let relayer_url = config
+            .live
+            .relayer_url
+            .clone()
+            .unwrap_or_else(|| pm_execution::relayer::RELAYER_URL_PROD.to_string());
+        let owner = signer.address();
+        println!(
+            "\n=== relayer-check: GET /nonce (READ-ONLY — no orders, no money, no on-chain tx) ==="
+        );
+        println!("owner (signer)          : {owner}");
+        println!("deposit wallet          : {deposit_wallet}");
+        println!("RELAYER_API_KEY_ADDRESS : {}", creds.api_key_address);
+        println!("relayer                 : {relayer_url}\n");
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|e| fatal(format!("relayer-check http build: {e}")));
+        println!("[1/1] GET /nonce?address={owner}&type=WALLET ...");
+        match pm_execution::relayer::fetch_wallet_nonce(&http, &relayer_url, creds, owner).await {
+            Ok(nonce) => {
+                println!("  OK   WALLET nonce = {nonce}");
+                println!(
+                    "\nVerdict: ✅ relayer auth WORKS — the relayer accepted RELAYER_API_KEY and \
+                     returned the WALLET nonce. Merge/redeem submission is reachable; the final \
+                     step is a tiny FUNDED merge to confirm the on-chain round-trip."
+                );
+            }
+            Err(e) => {
+                println!("  FAIL  {e}");
+                println!(
+                    "\nVerdict: ❌ the relayer REJECTED the read. Check RELAYER_API_KEY + \
+                     RELAYER_API_KEY_ADDRESS exactly match Polymarket → Settings → Relayer API \
+                     keys, and that the relayer URL is right (paste the error above)."
+                );
+            }
         }
         return;
     }
