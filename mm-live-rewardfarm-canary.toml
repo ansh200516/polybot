@@ -27,10 +27,10 @@
 # RUN (WITH the TUI so you can watch the "rew" line — est $/day, q_min, in-band,
 # balance, sig/PULL; press `l` to release live, `k` kill, `q` quit):
 #
-# Secrets (PM_PRIVATE_KEY / PM_PROXY_ADDRESS / PM_DEPOSIT_WALLET) load from .env
-# automatically — do NOT re-`export` them (a real env var OVERRIDES .env; exporting
-# a placeholder clobbers your real key). Just run:
-#
+#   # Keys load from .env (PM_PRIVATE_KEY / PM_PROXY_ADDRESS / PM_DEPOSIT_WALLET).
+#   # Do NOT `export PM_...=…` with literal placeholders — an exported value WINS
+#   # over .env, so `…` would shadow your real key ("odd number of digits"). If you
+#   # already did, run:  unset PM_PRIVATE_KEY PM_PROXY_ADDRESS PM_DEPOSIT_WALLET
 #   echo "I understand this trades real money" | cargo run --release --bin arb -- \
 #     --live --config mm-live-rewardfarm-canary.toml --db /tmp/rf-canary.sqlite
 #
