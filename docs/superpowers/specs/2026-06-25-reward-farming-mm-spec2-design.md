@@ -139,11 +139,16 @@ pulled; strong DOWN endangers the YES bid. (Equivalent to Phase A's
 "pull the endangered side," re-expressed for two bids.)
 
 ### 5.3 Merge / redeem to recycle capital
-A held complete set (`min(yes_qty, no_qty)`) is **merged** back to collateral
-($1/set) to free locked capital; resolved markets are **redeemed**. Reuse the
-execution crate's redeem/merge path on live; the paper venue simulates it
-(reduce both inventories by the merged amount, credit cash). Merge runs when the
-matched pair exceeds a `merge_threshold` so we don't churn tiny amounts.
+A held complete set (`min(yes_qty, no_qty)`) merges back to collateral ($1/set)
+to free locked capital; resolved markets redeem. **Live constraint:**
+`LiveVenue::merge`/`split` are `NotSupportedLive` (on-chain ops deferred to "M6",
+exactly like the arb side), so on **live** the bot cannot merge programmatically
+— pairs lock until market resolution (redeemed out-of-band), and the
+`max_gross_inventory_usd` cap is the live capital control. The **paper** venue
+*simulates* merge (reduce both legs by the matched amount, credit cash) so the
+capital-recycling economics are validatable now; the live on-chain merge is a
+documented M6 follow-up. Merge (paper) runs once the matched pair exceeds
+`merge_threshold` so we don't churn tiny amounts.
 
 ### 5.4 Capital & risk
 A YES+NO pair locks ~$1/share until merge/redeem. Phase B therefore (a) counts
