@@ -111,32 +111,52 @@ Fold `microprice`, `imbalance`, `momentum`, and the pull decision into the
 existing `rf_decisions.state_json` / `action_json` (Spec-1 tables) so Spec 3 can
 learn the pull threshold from logged `(signal, outcome)` pairs.
 
-## 5. Phase B — Complement hedging (after Phase A)
+## 5. Phase B — Complement-pair quoting + merge/redeem (after Phase A)
 
-### 5.1 Mechanism
-For a market with YES+NO=1, a long `x` YES is delta-neutralized by holding `x`
-NO (the pair resolves to `$x` regardless of outcome). When net inventory on the
-quoted token exceeds `hedge_threshold` (µUSDC), the MM **buys the complement**
-to flatten delta instead of waiting for the held side's ask to fill. For NegRisk
-events, use the venue's convert/merge path.
+> Design correction (vs the original §5 draft): Polymarket has **no naked
+> short** — you cannot sell a YES token you don't hold, so an ask cannot be
+> placed from flat and the "sell-then-cover" framing is infeasible. The correct,
+> all-maker mechanism is to **bid the complement pair**. This is also exactly
+> what the reward formula scores (its `Q₁` combines the `m`/YES book, `Q₂` the
+> `m'`/NO book), so bidding both outcomes IS the two-sided structure.
 
-### 5.2 Live two-sided-from-flat (closes M3)
-Because a fill can now be hedged via the complement, the live MM may quote
-**both** sides from flat (no longer bid-only under `no_naked_shorts`): an ask
-that fills creates a short that is immediately covered by buying the complement
-(equivalent to selling the held side). Gated behind a `hedging_enabled` flag and
-the inventory/loss caps.
+### 5.1 Complement-pair quoting (closes M3, two-sided-from-flat)
+When `hedging_enabled` (and required on the live, no-naked-short path), the
+reward-farm MM quotes a **bid on YES and a bid on NO** (both buys) instead of
+Spec-1's single-token bid+ask. From flat this is genuinely two-sided for the
+reward score with zero naked-short risk. As fills land: a YES-bid fill → long
+YES; a NO-bid fill → long NO (≡ short YES). A held YES+NO pair is
+**delta-neutral** (resolves to $1/pair regardless of outcome). This refines I1:
+single-token (bid+ask) stays the default for paper/no-hedging; complement-pair
+(bid+bid) is used when `hedging_enabled`.
 
-### 5.3 Capital & risk
-Hedging consumes cash (buying NO), and a YES+NO pair locks ~$1/share until
-resolution/redemption. Phase B therefore (a) counts the complement leg in the
-cash budget, (b) caps hedged pairs by `max_gross_inventory_usd`, and (c) prefers
-redeeming/merging complete sets when possible to free capital.
+### 5.2 Delta-neutral sizing & the Phase-A pull, across the pair
+Size-skew leans **between the two bids** by net delta: long YES ⇒ smaller
+YES-bid, larger NO-bid (and vice versa), capped by `size_skew_max_ratio`. The
+Phase-A signal maps to the pair: strong UP pressure on YES (≡ DOWN on NO)
+endangers the **NO bid** (you'd buy NO just before it falls), so that bid is
+pulled; strong DOWN endangers the YES bid. (Equivalent to Phase A's
+"pull the endangered side," re-expressed for two bids.)
 
-### 5.4 Config (`[reward_farm]` additions, Phase B)
+### 5.3 Merge / redeem to recycle capital
+A held complete set (`min(yes_qty, no_qty)`) is **merged** back to collateral
+($1/set) to free locked capital; resolved markets are **redeemed**. Reuse the
+execution crate's redeem/merge path on live; the paper venue simulates it
+(reduce both inventories by the merged amount, credit cash). Merge runs when the
+matched pair exceeds a `merge_threshold` so we don't churn tiny amounts.
+
+### 5.4 Capital & risk
+A YES+NO pair locks ~$1/share until merge/redeem. Phase B therefore (a) counts
+**both** bid legs in the cash budget, (b) caps total pairs by
+`max_gross_inventory_usd`, and (c) merges complete sets (5.3) to recycle capital
+so the gross cap doesn't permanently throttle quoting.
+
+### 5.5 Config (`[reward_farm]` additions, Phase B)
 ```toml
-hedging_enabled  = false   # opt-in; off keeps Spec-1 long-only live behavior
-hedge_threshold_usd = 5.0  # net inventory above which we hedge via the complement
+hedging_enabled    = false  # opt-in; off keeps Spec-1 single-token behavior
+                            # (required for live two-sided-from-flat)
+merge_threshold_usd = 5.0   # merge a complete YES+NO set once the matched pair
+                            # exceeds this (recycles locked collateral)
 ```
 
 ## 6. Testing
@@ -153,11 +173,17 @@ hedge_threshold_usd = 5.0  # net inventory above which we hedge via the compleme
   reward vs Spec 1 on the same feed.
 
 **Phase B:**
-- hedge sizing: a long beyond `hedge_threshold` produces a complement buy that
-  neutralizes delta within caps; NegRisk path covered.
-- live two-sided-from-flat: with `hedging_enabled`, a flat MM quotes both sides;
-  an ask fill is covered by a complement buy (no naked-short reject).
-- capital: complement leg counts against the budget; gross cap respected.
+- complement-pair quoting: with `hedging_enabled`, a flat MM quotes a bid on YES
+  AND a bid on NO (both buys, no naked-short reject); single-token bid+ask
+  remains when hedging is off.
+- pair delta-neutral sizing: long YES ⇒ smaller YES-bid / larger NO-bid (capped
+  by `size_skew_max_ratio`); flat ⇒ balanced.
+- pull mapping: strong UP-on-YES pulls the NO bid (and vice versa).
+- merge/redeem: a held complete set above `merge_threshold` merges back to
+  collateral (paper sim credits cash + reduces both legs); resolved markets
+  redeem.
+- capital: both bid legs count against the budget; total pairs respect the gross
+  cap; merging recycles locked collateral.
 
 ## 7. Out of scope
 - The adaptive/learning layer (Spec 3) — Spec 2 only *logs* the signals for it.
