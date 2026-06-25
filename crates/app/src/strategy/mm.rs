@@ -2933,10 +2933,12 @@ fn apply_redeem(
     let mut book_rows: Vec<(TokenId, Qty, Usdc)> = Vec::with_capacity(target.legs.len());
     let mut recovered_micro: i128 = 0;
     for leg in &target.legs {
-        // Resolved value of the held leg, integer µUSDC, never negative (a price
-        // is in [0, 1]; clamp defensively so a bad mark can't credit a debit).
-        let cash_micro = ((leg.net_micro as f64) * leg.resolved_price).round() as i128;
-        let cash_micro = cash_micro.max(0);
+        // Resolved value of the held leg, integer µUSDC. A resolved price is a
+        // probability in [0, 1]; clamp it BOTH ways defensively so a noisy/buggy
+        // Data-API `curPrice` can neither credit a debit (< 0) nor over-credit
+        // beyond the true $1/share on-chain recovery (> 1).
+        let price = leg.resolved_price.clamp(0.0, 1.0);
+        let cash_micro = (((leg.net_micro as f64) * price).round() as i128).max(0);
         let basis_before = inv.basis(leg.token).0;
         // The shared signed-lot SELL: reduce the long by `net_micro`, credit the
         // recovered cash (winner ≈ $1/share, loser $0) and release basis pro-rata.
