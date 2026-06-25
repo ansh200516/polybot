@@ -282,6 +282,11 @@ pub struct MmStrategy {
     tokens: Vec<TokenId>,
     /// `token → market` for [`PositionBook::apply`] (from the registry).
     token_market: HashMap<TokenId, MarketId>,
+    /// Spec-2 Phase B (§5.1): yes↔no complement map for the quoted markets,
+    /// populated by main ONLY under reward-farm hedging (empty otherwise). Lets
+    /// the quote loop / estimator pair a market's two complement bids; threaded
+    /// here and consumed by B3/B4 (set via [`with_complement`](Self::with_complement)).
+    complement: HashMap<TokenId, TokenId>,
     params: MmParams,
     inv_cfg: InventoryConfig,
     capital: Usdc,
@@ -334,6 +339,7 @@ impl MmStrategy {
             id: StrategyId("mm"),
             tokens,
             token_market,
+            complement: HashMap::new(),
             params,
             inv_cfg,
             capital,
@@ -342,6 +348,17 @@ impl MmStrategy {
             start_paused: false,
             store_path: None,
         }
+    }
+
+    /// Spec-2 Phase B (§5.1): attach the yes↔no complement map for the quoted
+    /// markets so the reward-farm hedging path can pair a market's two complement
+    /// bids. main builds it (yes→no and no→yes for each quoted market) ONLY when
+    /// reward-farm hedging is on; the default is empty, so non-hedging / paper /
+    /// test paths behave exactly as before. A builder (like [`with_seed`](Self::with_seed))
+    /// keeps [`new`](Self::new)'s signature stable.
+    pub fn with_complement(mut self, complement: HashMap<TokenId, TokenId>) -> Self {
+        self.complement = complement;
+        self
     }
 
     /// Attach a live venue (Task 4.5 / 4.6), switching `run` from the paper maker
@@ -400,6 +417,7 @@ impl Strategy for MmStrategy {
                 id: _,
                 tokens,
                 token_market,
+                complement,
                 params,
                 inv_cfg,
                 capital,
@@ -434,15 +452,15 @@ impl Strategy for MmStrategy {
             match live_venue {
                 Some(MmLive::Rest(live)) => {
                     run_mm_loop(
-                        live, qm, inv, positions, ctx, params, tokens, token_market, capital, true,
-                        start_paused, store_path,
+                        live, qm, inv, positions, ctx, params, tokens, token_market, complement,
+                        capital, true, start_paused, store_path,
                     )
                     .await;
                 }
                 Some(MmLive::Ws(split)) => {
                     run_mm_loop(
-                        split, qm, inv, positions, ctx, params, tokens, token_market, capital, true,
-                        start_paused, store_path,
+                        split, qm, inv, positions, ctx, params, tokens, token_market, complement,
+                        capital, true, start_paused, store_path,
                     )
                     .await;
                 }
@@ -452,8 +470,8 @@ impl Strategy for MmStrategy {
                     let venue = PaperMakerVenue::new(ctx.fetcher.clone())
                         .with_taker_fill_pct(params.paper_taker_fill_pct);
                     run_mm_loop(
-                        venue, qm, inv, positions, ctx, params, tokens, token_market, capital, false,
-                        start_paused, store_path,
+                        venue, qm, inv, positions, ctx, params, tokens, token_market, complement,
+                        capital, false, start_paused, store_path,
                     )
                     .await;
                 }
@@ -831,6 +849,14 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     params: MmParams,
     tokens: Vec<TokenId>,
     token_market: HashMap<TokenId, MarketId>,
+    /// Spec-2 Phase B (§5.1): yes↔no complement map for the quoted markets,
+    /// populated by main ONLY under reward-farm hedging (empty otherwise). The
+    /// hedging quote path is BID-ONLY per token (no naked short); this map lets
+    /// the loop / estimator pair a market's two complement bids. THREADED in B2;
+    /// READ by B3 (pair-aware estimator/budget) and B4 (delta-neutral sizing +
+    /// pull mapping), so it is intentionally not yet read on this (B2) path.
+    #[allow(dead_code)]
+    complement: HashMap<TokenId, TokenId>,
     /// Quote policy (Task 5): which quote-computation path [`quote`](Self::quote)
     /// takes — [`Policy::SpreadCapture`] (the UNCHANGED spread path) or
     /// [`Policy::RewardFarm`] (tight two-sided reward quoting). Set from
@@ -1129,7 +1155,7 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                     // capped by `size_skew_max_ratio` (spec §8.3) — prices stay tight.
                     let (min_size_shares, max_spread_cents, _daily_rate) =
                         self.reward_by_token.get(&token).copied().unwrap_or((0.0, 0.0, 0.0));
-                    reward_compute_quotes(
+                    let (bid, ask) = reward_compute_quotes(
                         &book,
                         token,
                         self.notional_micro,
@@ -1138,7 +1164,19 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                         max_inventory_micro,
                         self.params.size_skew_max_ratio,
                         min_size_shares,
-                    )
+                    );
+                    // Spec-2 Phase B (§5.1, closes M3): complement-pair HEDGING is
+                    // BID-ONLY per token. A flat MM cannot place an ask (Polymarket
+                    // has no naked short), and the ask is the WRONG leg for the pair
+                    // — the second side comes from the complement BID on the OTHER
+                    // token of the market (the reward formula's `m`/`m'` books). So
+                    // DROP the ask leg entirely; the bid still flows through the SAME
+                    // pull / veto / no-naked-short / inventory / sticky gating below.
+                    // Gated on `hedging_enabled` WITHIN this `RewardFarm` arm, so
+                    // non-hedging RewardFarm (ask kept) and SpreadCapture stay
+                    // byte-for-byte.
+                    let ask = if self.params.hedging_enabled { None } else { ask };
+                    (bid, ask)
                 }
             };
             // Phase-A ADVERSE-SELECTION QUOTE-PULL (spec §4; RewardFarm ONLY).
@@ -1956,6 +1994,7 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
     params: MmParams,
     tokens: Vec<TokenId>,
     token_market: HashMap<TokenId, MarketId>,
+    complement: HashMap<TokenId, TokenId>,
     capital: Usdc,
     no_naked_shorts: bool,
     start_paused: bool,
@@ -2001,6 +2040,7 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
         params,
         tokens,
         token_market,
+        complement,
         policy: params.policy,
         reward_by_token,
         notional_micro,
@@ -2261,6 +2301,7 @@ mod tests {
             params,
             tokens,
             token_market,
+            complement: HashMap::new(),
             policy: params.policy,
             reward_by_token: HashMap::new(),
             notional_micro,
@@ -3037,6 +3078,89 @@ mod tests {
             mm.qm.tracked().get(&(TokenId(1), Side::Ask)).cloned(),
             Some(ask_id0),
             "in-band ask must NOT be re-quoted on an unchanged book (sticky)"
+        );
+    }
+
+    // ── RewardFarm Phase-B complement-pair bid quoting (Task B2, spec §5.1) ─────
+
+    /// Spec-2 Phase B (§5.1, closes M3): with `hedging_enabled`, a FLAT RewardFarm
+    /// MM quotes the COMPLEMENT PAIR — a BID on YES and a BID on NO (both buys) —
+    /// and NO ask on either. A flat MM has no inventory to sell and Polymarket has
+    /// no naked short, so the ask leg is dropped; the second side the reward score
+    /// reads is the complement BID (the `m`/`m'` books). The complement map is set
+    /// exactly as main builds it under hedging (B3/B4 pair the two bids).
+    #[tokio::test]
+    async fn rewardfarm_hedging_quotes_bid_on_both_complement_tokens() {
+        let yes = TokenId(1);
+        let no = TokenId(2);
+        let tokens = vec![yes, no];
+        // Both outcomes have a valid two-sided book at mid 0.50 (a YES at
+        // 0.48/0.52 ⇒ its NO complement is also 0.48/0.52), each quoted on its own.
+        let (fetcher, _shared) = controllable_fetcher(
+            &tokens,
+            HashMap::from([(yes, (mid50_book(), true)), (no, (mid50_book(), true))]),
+        );
+        let mut params = mk_params(200, 5.0);
+        params.policy = Policy::RewardFarm;
+        params.hedging_enabled = true;
+        let (mut mm, _store_rx, _status_rx) =
+            build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+        // Both outcomes are funded, reward-eligible (min_size 1 sh, 3¢, $100/day).
+        mm.reward_by_token.insert(yes, (1.0, 3.0, 100.0));
+        mm.reward_by_token.insert(no, (1.0, 3.0, 100.0));
+        // The yes↔no complement map main wires under hedging (consumed by B3/B4).
+        mm.complement.insert(yes, no);
+        mm.complement.insert(no, yes);
+
+        mm.quote().await;
+
+        // A BID rests on BOTH complement tokens (two-sided-from-flat for the score).
+        assert!(
+            mm.qm.tracked().contains_key(&(yes, Side::Bid)),
+            "a BID is placed on YES (complement pair)"
+        );
+        assert!(
+            mm.qm.tracked().contains_key(&(no, Side::Bid)),
+            "a BID is placed on NO (complement pair)"
+        );
+        // NO ask on either token — the ask leg is dropped under hedging (no naked
+        // short; the complement bid is the second side).
+        assert!(
+            !mm.qm.tracked().contains_key(&(yes, Side::Ask)),
+            "NO ask on YES under hedging (bid-only)"
+        );
+        assert!(
+            !mm.qm.tracked().contains_key(&(no, Side::Ask)),
+            "NO ask on NO under hedging (bid-only)"
+        );
+    }
+
+    /// Converse / isolation LOCK: with `hedging_enabled = false`, RewardFarm keeps
+    /// the Spec-1 single-token TWO-SIDED quote (bid + ask) on the one token — the
+    /// Phase-B bid-only drop is gated strictly on `hedging_enabled`, so the default
+    /// reward-farm path is byte-for-byte unchanged.
+    #[tokio::test]
+    async fn rewardfarm_non_hedging_keeps_single_token_bid_and_ask() {
+        let yes = TokenId(1);
+        let tokens = vec![yes];
+        let (fetcher, _shared) =
+            controllable_fetcher(&tokens, HashMap::from([(yes, (mid50_book(), true))]));
+        let mut params = mk_params(200, 5.0);
+        params.policy = Policy::RewardFarm;
+        params.hedging_enabled = false; // Spec-1 single-token bid+ask
+        let (mut mm, _store_rx, _status_rx) =
+            build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+        mm.reward_by_token.insert(yes, (1.0, 3.0, 100.0));
+
+        mm.quote().await;
+
+        assert!(
+            mm.qm.tracked().contains_key(&(yes, Side::Bid)),
+            "non-hedging RewardFarm still places the bid"
+        );
+        assert!(
+            mm.qm.tracked().contains_key(&(yes, Side::Ask)),
+            "non-hedging RewardFarm still places the ASK (Spec-1 single-token two-sided)"
         );
     }
 
@@ -4167,6 +4291,7 @@ mod tests {
             mk_params(200, 5.0),
             tokens,
             token_market,
+            HashMap::new(),
             Usdc(1_000_000_000),
             false,
             false,
@@ -4430,6 +4555,7 @@ mod tests {
             params,
             tokens,
             token_market,
+            complement: HashMap::new(),
             policy: params.policy,
             reward_by_token: HashMap::new(),
             notional_micro,
@@ -4512,6 +4638,7 @@ mod tests {
             params: mk_params(200, 5.0),
             tokens: vec![yes, no],
             token_market: HashMap::from([(yes, MarketId(0)), (no, MarketId(0))]),
+            complement: HashMap::new(),
             policy: Policy::SpreadCapture,
             reward_by_token: HashMap::new(),
             notional_micro: 5_000_000,
@@ -4710,6 +4837,7 @@ mod tests {
             mk_params(200, 5.0),
             tokens,
             token_market,
+            HashMap::new(),
             Usdc(1_000_000_000),
             false,
             false,

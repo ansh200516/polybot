@@ -1510,8 +1510,16 @@ async fn main() {
         let mm_market_by_id: HashMap<pm_core::instrument::MarketId, pm_core::instrument::Market> =
             reg.markets().iter().map(|m| (m.id, *m)).collect();
 
+        // Spec-2 Phase B (§5.1): complement-pair HEDGING — only meaningful in
+        // reward-farm mode. When on, the MM quotes the BID PAIR (YES + NO) per
+        // market for two-sided-from-flat reward farming with no naked short.
+        let mm_hedging = reward_farm_mode && config.reward_farm.hedging_enabled;
         let mut mm_tokens = Vec::new();
         let mut mm_token_market = HashMap::new();
+        // Spec-2 Phase B: yes↔no per quoted market (populated only under hedging),
+        // threaded into the MM so the loop/estimator (B3/B4) can pair the two bids.
+        let mut mm_complement: HashMap<pm_core::instrument::TokenId, pm_core::instrument::TokenId> =
+            HashMap::new();
         // Task 4.6 user-WS inputs (live only): the markets' condition_ids to
         // subscribe to, and the asset_id→(TokenId, TickSize) map the WS fills
         // source resolves each trade's `asset_id` against (the SAME shape the
@@ -1537,7 +1545,16 @@ async fn main() {
             if mm_live && let Some(cid) = reg.market_condition(m.id) {
                 mm_condition_ids.push(cid.to_string());
             }
-            let quote_toks = mm_quote_tokens(&reg, &m, &favored_venue_ids, reward_farm_mode);
+            let quote_toks =
+                mm_quote_tokens(&reg, &m, &favored_venue_ids, reward_farm_mode, mm_hedging);
+            // Spec-2 Phase B (§5.1): under hedging the MM quotes BOTH outcomes as a
+            // bid pair, so record this market's yes↔no complement (both directions)
+            // for the markets we actually quote — B3/B4 use it to pair the two bids
+            // and score them as the `m`/`m'` books. Empty off the hedging path.
+            if mm_hedging {
+                mm_complement.insert(m.yes, m.no);
+                mm_complement.insert(m.no, m.yes);
+            }
             for tok in [m.yes, m.no] {
                 if let Some(vid) = reg.token_venue_id(tok) {
                     if mm_live {
@@ -1639,6 +1656,10 @@ async fn main() {
         }
         let mut mm = MmStrategy::new(mm_tokens, mm_token_market, mm_params, mm_inv_cfg, mm_capital)
             .with_seed(mm_seed)
+            // Spec-2 Phase B (§5.1): the yes↔no complement map for the quoted
+            // markets — empty unless reward-farm hedging is on — so the quote loop
+            // and estimator can pair the two complement bids (consumed by B3/B4).
+            .with_complement(mm_complement)
             // Task 9 — PERSISTENT UTC-day loss cap: thread the store path so the
             // loop reads today's persisted "mm" P&L at startup and refuses to quote
             // when the day is already at/under the daily-loss cap, making the cap

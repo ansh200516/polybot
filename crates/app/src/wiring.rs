@@ -366,15 +366,22 @@ pub fn directional_quote_tokens(
 
 /// The token(s) the MARKET MAKER quotes for `market`, by policy:
 ///
-/// * `reward_farm_mode` ⇒ a SINGLE token — the `yes` outcome. Spec §9 scopes
-///   Spec 1 to **single-token two-sided quoting** (bid + ask on ONE token);
-///   quoting the complement (`no`) is a Spec-2 hedging concern. This keeps the
-///   selection's `per_market_cost` (2 orders on the one quoted token) honest and
-///   stops the per-token reward estimator from double-counting a market's single
-///   reward pool across both of its tokens.
+/// * `reward_farm_mode` + `hedging` ⇒ the COMPLEMENT PAIR — BOTH outcome tokens
+///   (`yes` and `no`). Spec-2 Phase B (§5.1, closes M3): a flat MM cannot place
+///   an ask (Polymarket has no naked short), so it bids YES and bids NO — and a
+///   bid on each outcome IS the two-sided structure the reward formula scores
+///   (the `m`/YES book and the `m'`/NO book). This is the LIVE two-sided-from-flat
+///   path; it refines I1 below.
+/// * `reward_farm_mode` only (no hedging) ⇒ a SINGLE token — the `yes` outcome
+///   (Spec-1 I1). Spec §9 scopes Spec 1 to **single-token two-sided quoting**
+///   (bid + ask on ONE token); quoting the complement is the Spec-2 hedging
+///   concern above. This keeps the selection's `per_market_cost` (2 orders on the
+///   one quoted token) honest and stops the per-token reward estimator from
+///   double-counting a market's single reward pool across both of its tokens.
 /// * otherwise ⇒ [`directional_quote_tokens`] unchanged — the confluence-favored
 ///   side, or BOTH sides when confluence is off (the normal spread-capture
-///   universe).
+///   universe). `hedging` is IGNORED off the reward-farm path (it is a
+///   reward-farm-only concern), so SpreadCapture stays byte-for-byte.
 ///
 /// Either way the caller still REGISTERS both outcome tokens on the venue so a
 /// stray fill on the unquoted side resolves to a known token; this governs only
@@ -384,8 +391,11 @@ pub fn mm_quote_tokens(
     market: &Market,
     favored_venue_ids: &HashSet<String>,
     reward_farm_mode: bool,
+    hedging: bool,
 ) -> Vec<TokenId> {
-    if reward_farm_mode {
+    if reward_farm_mode && hedging {
+        vec![market.yes, market.no]
+    } else if reward_farm_mode {
         vec![market.yes]
     } else {
         directional_quote_tokens(reg, market, favored_venue_ids)
@@ -968,14 +978,14 @@ mod tests {
         // `yes` outcome — EVEN with confluence off (empty favored set). The
         // complement `no` is NOT quoted (it would 2× the budget and double-count
         // the reward pool in the per-token estimator).
-        let rf = mm_quote_tokens(&r, m, &HashSet::new(), true);
+        let rf = mm_quote_tokens(&r, m, &HashSet::new(), true, false);
         assert_eq!(rf, vec![m.yes], "reward_farm quotes a single (yes) token");
         assert!(!rf.contains(&m.no), "reward_farm must NOT quote the complement");
 
         // SPREAD-CAPTURE (reward_farm_mode = false), confluence off → BOTH sides,
         // identical to `directional_quote_tokens` (the path is unchanged).
         assert_eq!(
-            mm_quote_tokens(&r, m, &HashSet::new(), false),
+            mm_quote_tokens(&r, m, &HashSet::new(), false, false),
             vec![m.yes, m.no],
             "spread_capture still maps both outcome tokens"
         );
@@ -983,7 +993,39 @@ mod tests {
         // SPREAD-CAPTURE with a favored side still delegates to directional → the
         // favored token only (confluence lean preserved).
         let fav_yes: HashSet<String> = ["ya".to_string()].into_iter().collect();
-        assert_eq!(mm_quote_tokens(&r, m, &fav_yes, false), vec![m.yes]);
+        assert_eq!(mm_quote_tokens(&r, m, &fav_yes, false, false), vec![m.yes]);
+    }
+
+    #[test]
+    fn mm_quote_tokens_hedging_returns_complement_pair() {
+        let r = reg();
+        let m = r.market_by_condition("0xa").unwrap();
+        let empty = HashSet::new();
+
+        // REWARD-FARM + HEDGING (Spec-2 Phase B §5.1, closes M3): the
+        // complement PAIR — a BID on YES and a BID on NO — so the MM is
+        // two-sided-from-flat for the liquidity-reward score with NO naked short.
+        let toks = mm_quote_tokens(&r, m, &empty, true, true);
+        assert!(
+            toks.contains(&m.yes) && toks.contains(&m.no),
+            "reward_farm + hedging quotes BOTH outcome tokens (complement pair)"
+        );
+
+        // REWARD-FARM, NO hedging (Spec-1 I1): the SINGLE `yes` token only
+        // (single-token two-sided bid+ask) — the default Spec-1 behavior.
+        assert_eq!(
+            mm_quote_tokens(&r, m, &empty, true, false),
+            vec![m.yes],
+            "reward_farm without hedging stays single-token (Spec-1 I1)"
+        );
+
+        // SPREAD-CAPTURE is unaffected by `hedging` — it delegates to
+        // `directional_quote_tokens` regardless (confluence off → both sides).
+        assert_eq!(
+            mm_quote_tokens(&r, m, &empty, false, true),
+            vec![m.yes, m.no],
+            "spread_capture ignores hedging (delegates to directional)"
+        );
     }
 
     #[test]
