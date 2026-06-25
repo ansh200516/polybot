@@ -872,11 +872,9 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     token_market: HashMap<TokenId, MarketId>,
     /// Spec-2 Phase B (§5.1): yes↔no complement map for the quoted markets,
     /// populated by main ONLY under reward-farm hedging (empty otherwise). The
-    /// hedging quote path is BID-ONLY per token (no naked short); this map lets
-    /// the loop / estimator pair a market's two complement bids. THREADED in B2;
-    /// READ by B3 (pair-aware estimator/budget) and B4 (delta-neutral sizing +
-    /// pull mapping), so it is intentionally not yet read on this (B2) path.
-    #[allow(dead_code)]
+    /// hedging quote path is BID-ONLY per token (no naked short); this map pairs
+    /// a market's two complement bids for the pair-aware estimator/budget (B3),
+    /// the delta-neutral sizing + pull mapping (B4), and the set merge (B5).
     complement: HashMap<TokenId, TokenId>,
     /// Quote policy (Task 5): which quote-computation path [`quote`](Self::quote)
     /// takes — [`Policy::SpreadCapture`] (the UNCHANGED spread path) or
