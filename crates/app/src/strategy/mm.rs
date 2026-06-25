@@ -3875,6 +3875,199 @@ mod tests {
         assert_eq!(spread.positions.cash(), Usdc(0));
     }
 
+    // ── RewardFarm Phase-B integration (Task B6, spec §5.1) ─────────────────────
+
+    /// Spec-2 Phase B (Task B6) END-TO-END: a RewardFarm + `hedging_enabled` loop
+    /// over a complement market with BOTH books and the paper taker-fill sim ON,
+    /// driven for several cycles, ties the whole reward-farm hedging story
+    /// together:
+    ///   (1) FROM FLAT it bids the complement PAIR (buy YES + buy NO) and places
+    ///       NO ask on either — two-sided-from-flat with no naked short (closes M3).
+    ///   (2) as the taker sim lifts both bids, inventory accumulates toward a
+    ///       DELTA-NEUTRAL pair: `|yes_net − no_net|` stays bounded (the mirror
+    ///       books + pair-symmetric sizing hold it at exactly 0 here, so the pair
+    ///       never runs away one-sided; the size-skew that rebalances an ALREADY
+    ///       unbalanced pair is locked by `rewardfarm_hedging_skews_bids_by_net_delta`).
+    ///   (3) once a complete set clears `merge_threshold_usd`, `maybe_merge_sets`
+    ///       (the SAME step `quote()` runs each cycle) recycles it — BOTH legs drop
+    ///       by the matched count and the recovered `matched × $1` collateral is
+    ///       credited as cash (gross inventory falls). The end-to-end tail then
+    ///       shows the loop's OWN `quote()` auto-merging a re-accumulated set.
+    ///   (4) the published `RewardFarmStatus` is two-sided: `q_min > 0`, and the
+    ///       PAIRED score strictly exceeds the single-sided/penalized sum a
+    ///       per-token (bid-only) scoring would yield.
+    ///
+    /// Determinism note: the bids land at the 0.50 mid on both legs (a complete
+    /// set costs exactly $1 and merges to exactly $1), so the merge is BREAK-EVEN
+    /// (realized ≈ 0) — the capital-recycling benefit shows as the inventory drop
+    /// + recovered collateral, NOT a realized profit. The exact merge cash/realized
+    /// accounting (incl. a below-$1 set booking a profit) is locked by
+    /// `merge_recycles_complete_set_in_paper` (B5); here we assert the integration
+    /// fact that a set ACCUMULATED BY REAL FILLS is merged and drops inventory.
+    #[tokio::test]
+    async fn reward_farm_hedging_two_sided_from_flat_and_merges() {
+        let yes = TokenId(1);
+        let no = TokenId(2);
+        let tokens = vec![yes, no];
+        // Both outcomes: an identical mirror book at mid 0.50 (a YES 0.48/0.52 ⇒
+        // its NO complement is also 0.48/0.52), each two-sided + reward-eligible.
+        let (fetcher, _shared) = controllable_fetcher(
+            &tokens,
+            HashMap::from([(yes, (mid50_book(), true)), (no, (mid50_book(), true))]),
+        );
+        let mut params = mk_params(200, 5.0); // $5/side notional ⇒ a 10-share base bid at 0.50
+        params.policy = Policy::RewardFarm;
+        params.hedging_enabled = true;
+        params.merge_threshold_usd = 5.0; // a complete set above $5 is recycled
+        // Steady taker flow lifts ~25% of each resting bid per poll, so BOTH legs
+        // accumulate long toward a complete set over several cycles.
+        params.paper_taker_fill_pct = 25;
+        let merge_threshold_usd = params.merge_threshold_usd;
+        // `build_loop_tally` wires `paper_taker_fill_pct` into the PaperMakerVenue
+        // (no_naked_shorts = false, so the paper merge path is live) and hands back
+        // a tally of every venue-produced fill so we can prove fills actually land.
+        let (mut mm, _store_rx, produced) =
+            build_loop_tally(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+        mm.reward_by_token.insert(yes, (1.0, 3.0, 100.0));
+        mm.reward_by_token.insert(no, (1.0, 3.0, 100.0));
+        // The yes↔no complement map main wires under hedging (pairs the two bids
+        // for the estimator + delta-neutral sizing + the merge).
+        mm.complement.insert(yes, no);
+        mm.complement.insert(no, yes);
+
+        // ── (1) TWO-SIDED FROM FLAT (no naked short) ───────────────────────────
+        mm.quote().await;
+        assert!(
+            mm.qm.tracked().contains_key(&(yes, Side::Bid)),
+            "from flat: a BID rests on YES (complement pair)"
+        );
+        assert!(
+            mm.qm.tracked().contains_key(&(no, Side::Bid)),
+            "from flat: a BID rests on NO (complement pair)"
+        );
+        assert!(
+            !mm.qm.tracked().contains_key(&(yes, Side::Ask)),
+            "from flat: NO ask on YES (no naked short — the complement bid is the second side)"
+        );
+        assert!(
+            !mm.qm.tracked().contains_key(&(no, Side::Ask)),
+            "from flat: NO ask on NO (no naked short)"
+        );
+
+        // ── (4) THE PUBLISHED q_min IS TWO-SIDED (PAIRED, not single-sided) ────
+        // Per-leg score from the SAME primitives the estimator uses, against each
+        // bid's own mid (both bids rest at the 0.50 mid, full size, pre-fill).
+        let v = 3.0_f64;
+        let adj_mid = reward_fair_value(&mid50_book(), TickSize::Cent, 1.0).expect("two-sided mid");
+        let (mut q_yes, mut q_no) = (0.0_f64, 0.0_f64);
+        for (_, o) in mm.qm.resting_orders() {
+            let price = o.price.microusdc(TickSize::Cent) as f64 / 1_000_000.0;
+            let shares = o.size.0 as f64 / 1_000_000.0;
+            let s = order_score(v, (price - adj_mid).abs() * 100.0) * shares;
+            if o.token == yes {
+                q_yes += s;
+            } else if o.token == no {
+                q_no += s;
+            }
+        }
+        assert!(q_yes > 0.0 && q_no > 0.0, "both complement bids rest and score in-band");
+        // PAIRED: the YES bid (Q1) + NO bid (Q2) combine into ONE market q_min.
+        let expected_paired = q_min(q_yes, q_no, adj_mid);
+        // SINGLE-SIDED (the per-token path): each bid-only token collapses to the
+        // 1/C floor, so the sum is strictly smaller.
+        let single_sided = q_min(q_yes, 0.0, adj_mid) + q_min(0.0, q_no, adj_mid);
+        let st = mm.sample_reward_estimate().await;
+        assert!(st.q_min > 0.0, "two-sided q_min > 0 from flat, got {}", st.q_min);
+        assert!(st.in_band, "two-sided in-band this sample");
+        assert!(
+            (st.q_min - expected_paired).abs() < 1e-9,
+            "published q_min {} is the PAIRED two-sided score {}",
+            st.q_min,
+            expected_paired
+        );
+        assert!(
+            st.q_min > single_sided + 1e-9,
+            "paired q_min {} EXCEEDS the single-sided/penalized sum {} (paired, not per-token)",
+            st.q_min,
+            single_sided
+        );
+
+        // ── (2) FILLS ACCUMULATE TOWARD A DELTA-NEUTRAL PAIR ───────────────────
+        // Drive cycles until a complete set first clears the merge floor. The
+        // mirror books + symmetric bids fill both legs in lock-step, so the pair
+        // stays delta-neutral as it grows (here exactly 0 — it never runs away
+        // one-sided). The loop's own quote() has NOT yet auto-merged the set (that
+        // runs at the START of the NEXT cycle, off the PREVIOUS cycle's inventory).
+        const DELTA_BOUND: i128 = SH as i128; // 1 share; the symmetric run holds it at 0
+        let mut cycles = 0;
+        loop {
+            mm.tick().await;
+            cycles += 1;
+            let (yn, nn) = (mm.inv.net(yes), mm.inv.net(no));
+            assert!(
+                (yn - nn).abs() <= DELTA_BOUND,
+                "pair stays delta-neutral as it accumulates: |{yn} − {nn}| within {DELTA_BOUND}"
+            );
+            if (yn.min(nn)) as f64 / 1_000_000.0 > merge_threshold_usd {
+                break;
+            }
+            assert!(cycles < 50, "fills must accumulate a mergeable set within a few cycles");
+        }
+        assert!(cycles >= 2, "the set is built over SEVERAL cycles, not one fill (got {cycles})");
+        assert!(!produced.lock().unwrap().is_empty(), "the paper taker sim actually produced fills");
+
+        // ── (3) MERGE RECYCLES THE COMPLETE SET (legs drop, collateral credited) ─
+        let (yes_pre, no_pre) = (mm.inv.net(yes), mm.inv.net(no));
+        let matched = yes_pre.min(no_pre); // the matched complete-set count (µshares)
+        let gross_pre = yes_pre.abs() + no_pre.abs();
+        let cash_pre = mm.positions.cash();
+        assert!(matched > 0, "a complete YES+NO set is held");
+
+        mm.maybe_merge_sets().await;
+
+        assert_eq!(mm.inv.net(yes), yes_pre - matched, "YES leg reduced by the matched set count");
+        assert_eq!(mm.inv.net(no), no_pre - matched, "NO leg reduced by the matched set count");
+        let gross_post = mm.inv.net(yes).abs() + mm.inv.net(no).abs();
+        assert!(
+            gross_post < gross_pre,
+            "merge recycles the set ⇒ gross inventory falls ({gross_pre} → {gross_post} µshares)"
+        );
+        // Recovered collateral = matched × $1 (a complete set redeems to exactly
+        // $1), credited as cash. For a $1 set the µUSDC recovered equals the
+        // matched µshares numerically, so the cash delta == `matched`.
+        assert_eq!(
+            mm.positions.cash().0 - cash_pre.0,
+            matched,
+            "recovered matched × $1 collateral credited as cash"
+        );
+
+        // ── (3, end-to-end) the loop's OWN quote() auto-merges a re-accumulated set ─
+        // Bids-only means gross long inventory can ONLY fall via a merge, so an
+        // observed drop across cycles proves quote()'s maybe_merge_sets fired in
+        // the loop (and the pair stays delta-neutral throughout).
+        let mut gross_seq = Vec::new();
+        for _ in 0..8 {
+            mm.tick().await;
+            assert!(
+                (mm.inv.net(yes) - mm.inv.net(no)).abs() <= DELTA_BOUND,
+                "pair stays delta-neutral across the auto-merge cycles"
+            );
+            gross_seq.push(mm.inv.net(yes).abs() + mm.inv.net(no).abs());
+        }
+        assert!(
+            gross_seq.windows(2).any(|w| w[1] < w[0]),
+            "quote()'s own merge step recycles a re-accumulated set (gross long inventory falls): {gross_seq:?}"
+        );
+
+        // ── (4, published) the loop's published reward telemetry is two-sided ──
+        let published = mm.reward_status.expect("RewardFarm publishes a reward estimate");
+        assert!(
+            published.q_min > 0.0,
+            "published RewardFarmStatus stays two-sided (q_min > 0), got {}",
+            published.q_min
+        );
+    }
+
     /// PRIORITY-4 (light) A/B (spec §15): run BOTH policies over the SAME
     /// synthetic mid-0.50 book with identical simulated taker flow and surface
     /// each one's estimated reward + realized P&L so the difference is VISIBLE.
