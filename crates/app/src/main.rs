@@ -939,7 +939,7 @@ async fn main() {
         // `secrets.api` is moved out by the match below (so `&secrets` is still a
         // whole borrow). Only attempted when MM is cleared for live;
         // `RelayerClient::new` itself returns `None` unless the relayer is enabled
-        // AND builder creds + deposit wallet + a valid EOA key are present (OFF by
+        // AND relayer creds + deposit wallet + a valid EOA key are present (OFF by
         // default, staging-first), so arb-only / non-relayer live stay no-op.
         if config.strategies.mm.enabled && mm_use_live(args.live, config.strategies.mm.live) {
             let relayer_http = reqwest::Client::builder()
@@ -959,7 +959,7 @@ async fn main() {
             } else if config.live.relayer_enabled {
                 warn!(
                     "live.relayer_enabled = true but the relayer could NOT be constructed \
-                     (missing builder creds / deposit wallet / unparseable key) — live merge \
+                     (missing relayer creds / deposit wallet / unparseable key) — live merge \
                      stays the hold-to-resolution no-op"
                 );
             }

@@ -3,10 +3,11 @@
 //! docs/superpowers/specs/2026-06-25-m6-deposit-wallet-relayer-design.md
 //!
 //! Build order (per the M6 plan): M6-1 the Polygon-137 contract constants +
-//! builder credentials; M6-2 the golden-vector-validated EIP-712 `Batch`
+//! relayer credentials; M6-2 the golden-vector-validated EIP-712 `Batch`
 //! signing; M6-3 the merge/redeem calldata + deposit-wallet derivation; M6-4
-//! (this task) the relayer I/O — builder-auth headers (reusing the CLOB L2 HMAC
-//! in `auth.rs`), the WALLET request body, `POST /submit`, and the
+//! (this task) the relayer I/O — the two static Relayer-API-key headers
+//! (`RELAYER_API_KEY` + `RELAYER_API_KEY_ADDRESS`), the WALLET request body,
+//! `POST /submit`, and the
 //! `/transaction` state-machine poll to `STATE_CONFIRMED`. The live round-trip
 //! is validated only at the operator's first FUNDED STAGING run (design §5/§8);
 //! everything here is unit-tested offline (body shape, header shape, state
@@ -21,8 +22,7 @@ use alloy_sol_types::{SolCall, SolStruct, eip712_domain, sol};
 use pm_config::Live;
 use serde_json::json;
 
-use crate::auth::l2_signature;
-use crate::secrets::{BuilderCreds, LiveSecrets};
+use crate::secrets::{LiveSecrets, RelayerCreds};
 
 // ---------------------------------------------------------------------------
 // Polygon-137 contracts
@@ -117,9 +117,6 @@ pub enum RelayerError {
     BadKey(String),
     /// The local signer failed to produce a signature.
     Sign(String),
-    /// Builder-auth HMAC could not be computed (e.g. the builder secret was not
-    /// valid base64url). Wraps the underlying `auth::AuthError`.
-    Auth(String),
     /// HTTP transport failed, or the relayer returned a non-success status.
     Http(String),
     /// The relayer response was unparseable or missing a required field
@@ -138,7 +135,6 @@ impl std::fmt::Display for RelayerError {
         match self {
             RelayerError::BadKey(e) => write!(f, "invalid signer key: {e}"),
             RelayerError::Sign(e) => write!(f, "batch signing error: {e}"),
-            RelayerError::Auth(e) => write!(f, "builder auth error: {e}"),
             RelayerError::Http(e) => write!(f, "relayer http error: {e}"),
             RelayerError::Response(e) => write!(f, "relayer response error: {e}"),
             RelayerError::Failed(e) => write!(f, "relayer batch failed: {e}"),
@@ -334,7 +330,7 @@ pub fn derive_deposit_wallet(owner: Address, factory: Address, implementation: A
 }
 
 // ---------------------------------------------------------------------------
-// (C) Relayer I/O (M6-4): builder-auth headers, WALLET request body,
+// (C) Relayer I/O (M6-4): static Relayer-API-key headers, WALLET request body,
 //     POST /submit, and the /transaction state-machine poll (design §2.2/§6).
 // ---------------------------------------------------------------------------
 
@@ -396,32 +392,15 @@ impl RelayerState {
     }
 }
 
-/// Builder-auth headers for a relayer request. The builder auth uses the SAME
-/// HMAC scheme as the CLOB L2 auth — `base64url(HMAC-SHA256(base64url-decode(
-/// secret), ts + METHOD + path + body))` — so we REUSE [`auth::l2_signature`]
-/// rather than reimplementing it; only the header NAMES and the secret differ
-/// (`POLY_BUILDER_*` + the builder secret instead of `POLY_*` + the CLOB
-/// secret). Mirrors `auth.rs::l2_headers`.
-///
-/// For a GET, `path` MUST exclude the query string (same rule as the CLOB L2
-/// HMAC); `body` is the EXACT serialized request string for a POST, or `None`.
-/// Header ORDER is not significant to the relayer (HTTP header names are
-/// unordered); we emit key/timestamp/passphrase/signature for a stable test.
-pub fn builder_headers(
-    creds: &BuilderCreds,
-    ts: &str,
-    method: &str,
-    path: &str,
-    body: Option<&str>,
-) -> Result<Vec<(&'static str, String)>, RelayerError> {
-    let signature = l2_signature(creds.secret.expose(), ts, method, path, body)
-        .map_err(|e| RelayerError::Auth(e.to_string()))?;
-    Ok(vec![
-        ("POLY_BUILDER_API_KEY", creds.key.clone()),
-        ("POLY_BUILDER_TIMESTAMP", ts.to_string()),
-        ("POLY_BUILDER_PASSPHRASE", creds.passphrase.expose().to_string()),
-        ("POLY_BUILDER_SIGNATURE", signature),
-    ])
+/// The two static Relayer-API-key headers Polymarket's current relayer expects
+/// (settings → Relayer API keys). No HMAC/timestamp/passphrase — the wallet
+/// action is authorized by the EIP-712 Batch signature; these authenticate the
+/// submitter to the relayer service. Same on every method/path.
+pub fn relayer_headers(creds: &RelayerCreds) -> Vec<(&'static str, String)> {
+    vec![
+        ("RELAYER_API_KEY", creds.api_key.clone()),
+        ("RELAYER_API_KEY_ADDRESS", creds.api_key_address.clone()),
+    ]
 }
 
 /// Build the relayer WALLET-batch request body (design §2.2; matches the py
@@ -497,8 +476,7 @@ fn parse_transaction_response(v: &serde_json::Value) -> (RelayerState, Option<St
     (state, hash)
 }
 
-/// Unix time in whole seconds. Backs the builder-auth timestamp (stringified
-/// via [`unix_seconds_string`]) AND the typed batch `deadline`. Mirrors
+/// Unix time in whole seconds. Backs the typed batch `deadline`. Mirrors
 /// `live.rs::unix_seconds_string`.
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -507,31 +485,25 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Unix seconds as a decimal string (the builder-auth timestamp).
-fn unix_seconds_string() -> String {
-    now_secs().to_string()
-}
-
-/// Submit a signed WALLET batch: `POST {relayer_url}/submit` with builder-auth
-/// headers + the JSON `body`, returning the relayer `transactionID`.
+/// Submit a signed WALLET batch: `POST {relayer_url}/submit` with the static
+/// Relayer-API-key headers + the JSON `body`, returning the relayer
+/// `transactionID`.
 ///
-/// The body is serialized ONCE to a canonical string; that EXACT string is both
-/// HMAC'd (`builder_headers(.., "POST", "/submit", Some(&body_str))`) and sent
-/// as the request body — they must be byte-identical (same invariant as the
-/// CLOB POST in `live.rs`). Every failure maps to a [`RelayerError`]; this never
-/// panics.
+/// The body is serialized ONCE to a canonical string and sent as the request
+/// body; the wallet action is authorized by the EIP-712 `Batch` signature inside
+/// it, while [`relayer_headers`] authenticate the submitter. Every failure maps
+/// to a [`RelayerError`]; this never panics.
 pub async fn submit_wallet_batch(
     http: &reqwest::Client,
     relayer_url: &str,
-    creds: &BuilderCreds,
+    creds: &RelayerCreds,
     body: &serde_json::Value,
 ) -> Result<String, RelayerError> {
     let base = relayer_url.trim_end_matches('/');
     let path = "/submit";
     let body_str = serde_json::to_string(body)
         .map_err(|e| RelayerError::Response(format!("serialize WALLET body: {e}")))?;
-    let ts = unix_seconds_string();
-    let headers = builder_headers(creds, &ts, "POST", path, Some(&body_str))?;
+    let headers = relayer_headers(creds);
 
     let url = format!("{base}{path}");
     let mut req = http
@@ -566,23 +538,21 @@ pub async fn submit_wallet_batch(
 /// between polls. `STATE_MINED` is intentionally NOT accepted — the design
 /// requires `STATE_CONFIRMED`.
 ///
-/// The HMAC path is the query-LESS `/transaction` (same GET rule as the CLOB L2
-/// HMAC); builder auth is included even though the read may not require it
-/// ("include it to be safe"). Every failure maps to a [`RelayerError`]; this
-/// never panics.
+/// The static Relayer-API-key headers are included even though the read may not
+/// require them ("include them to be safe"). Every failure maps to a
+/// [`RelayerError`]; this never panics.
 pub async fn poll_until_confirmed(
     http: &reqwest::Client,
     relayer_url: &str,
-    creds: &BuilderCreds,
+    creds: &RelayerCreds,
     tx_id: &str,
     timeout: Duration,
 ) -> Result<String, RelayerError> {
     let base = relayer_url.trim_end_matches('/');
     let path = "/transaction";
     let deadline = Instant::now() + timeout;
+    let headers = relayer_headers(creds);
     loop {
-        let ts = unix_seconds_string();
-        let headers = builder_headers(creds, &ts, "GET", path, None)?;
         let url = format!("{base}{path}?id={tx_id}");
         let mut req = http.get(&url);
         for (k, v) in &headers {
@@ -660,23 +630,21 @@ fn parse_nonce(v: &serde_json::Value) -> Result<u64, RelayerError> {
 /// and drops the RPC round-trip (the `RPC_URL` secret is now unused by the merge/
 /// redeem path).
 ///
-/// The builder-auth HMAC signs the query-LESS path `/nonce` (same GET rule as the
-/// CLOB L2 HMAC and the `/transaction` poll); the `address`/`type` query is
-/// appended after. `owner` renders EIP-55 checksummed (alloy `Address` Display)
-/// — the exact accepted address form is a staging-confirmation item, but the
-/// relayer keys the nonce off the recovered owner regardless. Accepts a number
-/// OR string nonce (see [`parse_nonce`]). Every failure maps to a
-/// [`RelayerError`]; this never panics.
+/// The static Relayer-API-key headers authenticate the read; the `address`/`type`
+/// query selects the WALLET nonce. `owner` renders EIP-55 checksummed (alloy
+/// `Address` Display) — the exact accepted address form is a staging-confirmation
+/// item, but the relayer keys the nonce off the recovered owner regardless.
+/// Accepts a number OR string nonce (see [`parse_nonce`]). Every failure maps to
+/// a [`RelayerError`]; this never panics.
 pub async fn fetch_wallet_nonce(
     http: &reqwest::Client,
     relayer_url: &str,
-    creds: &BuilderCreds,
+    creds: &RelayerCreds,
     owner: Address,
 ) -> Result<u64, RelayerError> {
     let base = relayer_url.trim_end_matches('/');
     let path = "/nonce";
-    let ts = unix_seconds_string();
-    let headers = builder_headers(creds, &ts, "GET", path, None)?;
+    let headers = relayer_headers(creds);
     let url = format!("{base}{path}?address={owner}&type=WALLET");
     let mut req = http.get(&url);
     for (k, v) in &headers {
@@ -730,7 +698,7 @@ const DEADLINE_SECS: u64 = 600;
 /// MM (M6-7) holds an `Option<RelayerClient>` and calls `merge`/`redeem`
 /// directly off the quote hot path.
 ///
-/// Constructed ONLY when the relayer is enabled AND builder creds + the deposit
+/// Constructed ONLY when the relayer is enabled AND relayer creds + the deposit
 /// wallet + a valid EOA key are present (see [`RelayerClient::new`]); otherwise
 /// live merge/redeem stays the hold-to-resolution no-op (design §7). OFF by
 /// default + staging-first.
@@ -740,9 +708,9 @@ pub struct RelayerClient {
     /// Staging or prod base URL, from config (no trailing slash assumed; the I/O
     /// helpers trim it). Override > `relayer_staging` ? staging : prod.
     relayer_url: String,
-    /// Builder/relayer HMAC credentials (the relayer rejects unauthenticated
-    /// WALLET batches, design §1).
-    creds: BuilderCreds,
+    /// Relayer API-key credentials — the two static headers that authenticate
+    /// the submitter to the relayer service (design §1).
+    creds: RelayerCreds,
     /// The owner EOA private key (0x-stripped hex, the `expose_key_hex` form the
     /// rest of the app feeds `PrivateKeySigner`). Signs the EIP-712 `Batch` AND
     /// is the WALLET request `from`/owner. Validated to parse in `new`.
@@ -770,7 +738,7 @@ impl RelayerClient {
     /// `None` when the relayer must NOT be constructed. Returns `Some` ONLY when
     /// ALL of:
     /// - `live_cfg.relayer_enabled` is true (the master switch, default OFF),
-    /// - builder creds are present (`BUILDER_*`, all-or-none from the env loader),
+    /// - relayer creds are present (`RELAYER_API_*`, both-or-none from the env loader),
     /// - the deposit wallet is present AND parses to an `Address`, and
     /// - the EOA key parses to a `PrivateKeySigner` (validated up-front so
     ///   `owner`/`sign_batch` never surprise the sweep at submit time).
@@ -784,8 +752,8 @@ impl RelayerClient {
         if !live_cfg.relayer_enabled {
             return None;
         }
-        // Gate 2: builder creds (all-or-none; absent → relayer not configured).
-        let creds = secrets.builder.clone()?;
+        // Gate 2: relayer creds (both-or-none; absent → relayer not configured).
+        let creds = secrets.relayer.clone()?;
         // Gate 3: the deposit wallet must be present AND a valid address.
         let wallet: Address = secrets.deposit_wallet.as_deref()?.parse().ok()?;
         // Gate 4: the EOA key must parse to a signer. Store the 0x-stripped hex
@@ -1088,61 +1056,26 @@ mod tests {
 
     // -- (C) Relayer I/O (M6-4) --------------------------------------------
 
-    /// `builder_headers` mirrors `auth.rs::l2_headers_carry_all_five`: the four
-    /// `POLY_BUILDER_*` names in order, key/timestamp/passphrase passthrough,
-    /// and — crucially — the signature REUSES the CLOB L2 HMAC scheme. We feed
-    /// the SAME inputs as the pinned L2 vector (`auth_vectors.json` l2[0]:
-    /// secret `QQ==`, POST `/order`, body `{"hello":"world"}`) and assert the
-    /// builder signature is byte-identical to that vector — proving we did not
-    /// reimplement (or drift from) `l2_signature`.
+    /// `relayer_headers` emits exactly the two static Relayer-API-key headers
+    /// Polymarket's current relayer expects — `RELAYER_API_KEY` +
+    /// `RELAYER_API_KEY_ADDRESS` — with the key and bound owner/signer address
+    /// passed through verbatim (no HMAC/timestamp/passphrase; the wallet action
+    /// is authorized by the EIP-712 Batch signature, not these headers).
     #[test]
-    fn builder_headers_carry_all_four_and_reuse_l2_hmac() {
-        let creds = BuilderCreds {
-            key: "703629aa-builder-key".into(),
-            secret: crate::secrets::Secret::new("QQ==".into()),
-            passphrase: crate::secrets::Secret::new("builder-pass".into()),
+    fn relayer_headers_carry_the_two_static_headers() {
+        let creds = RelayerCreds {
+            api_key: "703629aa-relayer-key".into(),
+            api_key_address: "0x35199219DB86C963f0E8379C62cDd139ECd6986e".into(),
         };
-        let h = builder_headers(
-            &creds,
-            "1750000000",
-            "POST",
-            "/order",
-            Some("{\"hello\":\"world\"}"),
-        )
-        .unwrap();
+        let h = relayer_headers(&creds);
 
         let names: Vec<&str> = h.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["RELAYER_API_KEY", "RELAYER_API_KEY_ADDRESS"]);
+        assert_eq!(h[0].1, "703629aa-relayer-key", "API key passthrough");
         assert_eq!(
-            names,
-            vec![
-                "POLY_BUILDER_API_KEY",
-                "POLY_BUILDER_TIMESTAMP",
-                "POLY_BUILDER_PASSPHRASE",
-                "POLY_BUILDER_SIGNATURE",
-            ]
+            h[1].1, "0x35199219DB86C963f0E8379C62cDd139ECd6986e",
+            "owner/signer address passthrough"
         );
-        assert_eq!(h[0].1, "703629aa-builder-key", "API key passthrough");
-        assert_eq!(h[1].1, "1750000000", "timestamp passthrough");
-        assert_eq!(h[2].1, "builder-pass", "passphrase passthrough");
-        // Same HMAC as the CLOB L2 (auth_vectors.json l2[0]) — REUSE, not reimpl.
-        assert_eq!(
-            h[3].1, "rL5wbSueMIhsnLDR0rvOx2jaeW5-YHxY5zfKwMrZtQY=",
-            "builder signature must equal the pinned L2 HMAC for identical inputs"
-        );
-    }
-
-    /// An invalid (non-base64url) builder secret surfaces as `RelayerError::Auth`
-    /// (mapped from `auth::AuthError`), never a panic.
-    #[test]
-    fn builder_headers_bad_secret_is_auth_error() {
-        let creds = BuilderCreds {
-            key: "k".into(),
-            // '!' is not a valid base64url char → l2_signature's decode fails.
-            secret: crate::secrets::Secret::new("not valid base64!!".into()),
-            passphrase: crate::secrets::Secret::new("p".into()),
-        };
-        let err = builder_headers(&creds, "1", "POST", "/submit", Some("{}")).unwrap_err();
-        assert!(matches!(err, RelayerError::Auth(_)), "got {err:?}");
     }
 
     /// `build_wallet_request` matches the py client `to_dict()` shape (design
@@ -1361,16 +1294,17 @@ mod tests {
     const TEST_WALLET: &str = "0xa2927E7834648F1C03b4961CeeA4597292e3c025";
 
     /// Build `LiveSecrets` through the REAL env loader, toggling whether the
-    /// builder creds / deposit wallet are present so the gating paths are
+    /// relayer creds / deposit wallet are present so the gating paths are
     /// exercised end-to-end (`PM_PRIVATE_KEY` is always present — the loader
     /// requires it).
-    fn test_secrets(builder: bool, deposit_wallet: bool) -> LiveSecrets {
+    fn test_secrets(relayer: bool, deposit_wallet: bool) -> LiveSecrets {
         LiveSecrets::from_lookup(|k| match k {
             "PM_PRIVATE_KEY" => Some(TEST_PK.to_string()),
             "PM_DEPOSIT_WALLET" if deposit_wallet => Some(TEST_WALLET.to_string()),
-            "BUILDER_API_KEY" if builder => Some("703629aa-builder-key".to_string()),
-            "BUILDER_SECRET" if builder => Some("QQ==".to_string()),
-            "BUILDER_PASS_PHRASE" if builder => Some("builder-pass".to_string()),
+            "RELAYER_API_KEY" if relayer => Some("703629aa-relayer-key".to_string()),
+            "RELAYER_API_KEY_ADDRESS" if relayer => {
+                Some("0x35199219DB86C963f0E8379C62cDd139ECd6986e".to_string())
+            }
             _ => None,
         })
         .unwrap()
@@ -1387,7 +1321,7 @@ mod tests {
         }
     }
 
-    /// Gating: `None` unless enabled AND builder creds AND deposit wallet present;
+    /// Gating: `None` unless enabled AND relayer creds AND deposit wallet present;
     /// when `Some`, the URL follows the override > staging-vs-prod rule and the
     /// factory/adapter/collateral/chain defaults are the pinned consts. No HTTP
     /// (constructing a `reqwest::Client` needs no runtime).
@@ -1401,11 +1335,11 @@ mod tests {
                 .is_none(),
             "relayer must not be constructed when disabled"
         );
-        // Enabled but builder creds absent → None.
+        // Enabled but relayer creds absent → None.
         assert!(
             RelayerClient::new(&live_cfg(true, true, None), &test_secrets(false, true), http.clone())
                 .is_none(),
-            "no builder creds → None"
+            "no relayer creds → None"
         );
         // Enabled + creds but deposit wallet absent → None.
         assert!(

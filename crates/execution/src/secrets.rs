@@ -46,18 +46,16 @@ pub struct ApiCreds {
     pub passphrase: Secret,
 }
 
-/// Polymarket BUILDER/relayer credentials for the M6 deposit-wallet relayer
-/// (`BUILDER_API_KEY` / `BUILDER_SECRET` / `BUILDER_PASS_PHRASE`). Separate from
-/// the CLOB `ApiCreds` — the relayer rejects unauthenticated WALLET batches
-/// (spec 2026-06-25 §1) — but deliberately the SAME shape: a plaintext `key`
-/// (UUID, sent in the builder-auth headers) plus a redacted `secret` and
-/// `passphrase` (HMAC-SHA256 material that must never reach logs). All three or
-/// none (see `LiveSecrets::from_lookup`).
+/// Polymarket Relayer API-key credentials for the M6 deposit-wallet relayer
+/// (current scheme — the "Relayer API keys" settings page). Two STATIC headers,
+/// no HMAC/secret: `RELAYER_API_KEY` (the key) + `RELAYER_API_KEY_ADDRESS` (the
+/// owner/signer address the key is bound to). Sent verbatim on every relayer
+/// request; the wallet ACTION is authorized by the EIP-712 Batch signature, so
+/// these only authenticate the submitter to the relayer service.
 #[derive(Debug, Clone)]
-pub struct BuilderCreds {
-    pub key: String,
-    pub secret: Secret,
-    pub passphrase: Secret,
+pub struct RelayerCreds {
+    pub api_key: String,
+    pub api_key_address: String,
 }
 
 /// Everything live mode reads from the environment.
@@ -76,11 +74,12 @@ pub struct LiveSecrets {
     pub deposit_wallet: Option<String>,
     /// When present, API-key derivation is skipped.
     pub api: Option<ApiCreds>,
-    /// Polymarket builder/relayer credentials for the M6 deposit-wallet relayer
-    /// (`BUILDER_API_KEY`/`BUILDER_SECRET`/`BUILDER_PASS_PHRASE`). All three or
-    /// none (mirrors `api`). Absent → the relayer is not configured and live
-    /// merge/redeem stays the hold-to-resolution no-op (spec 2026-06-25 §7).
-    pub builder: Option<BuilderCreds>,
+    /// Polymarket Relayer API-key credentials for the M6 deposit-wallet relayer
+    /// (`RELAYER_API_KEY` + `RELAYER_API_KEY_ADDRESS`, the current "Relayer API
+    /// keys" settings scheme). Both or none. Absent → the relayer is not
+    /// configured and live merge/redeem stays the hold-to-resolution no-op
+    /// (spec 2026-06-25 §7).
+    pub relayer: Option<RelayerCreds>,
     /// Polygon JSON-RPC URL (`RPC_URL`), used to read the deposit-wallet batch
     /// nonce (M6-5). Absent → relayer not configured.
     pub rpc_url: Option<String>,
@@ -120,30 +119,23 @@ impl LiveSecrets {
                 return Err(format!("partial PM_API_* credentials; missing: {}", missing.join(", ")));
             }
         };
-        // Builder/relayer creds (M6): all-or-none, same shape as PM_API_*.
-        let builder = match (
-            lookup("BUILDER_API_KEY"),
-            lookup("BUILDER_SECRET"),
-            lookup("BUILDER_PASS_PHRASE"),
-        ) {
-            (None, None, None) => None,
-            (Some(key), Some(secret), Some(pass)) => Some(BuilderCreds {
-                key,
-                secret: Secret::new(secret),
-                passphrase: Secret::new(pass),
+        // Relayer API-key creds (M6, current scheme): two STATIC headers,
+        // both-or-none (no HMAC secret/passphrase).
+        let relayer = match (lookup("RELAYER_API_KEY"), lookup("RELAYER_API_KEY_ADDRESS")) {
+            (None, None) => None,
+            (Some(api_key), Some(api_key_address)) => Some(RelayerCreds {
+                api_key,
+                api_key_address,
             }),
-            (k, s, p) => {
+            (k, a) => {
                 let mut missing = Vec::new();
                 if k.is_none() {
-                    missing.push("BUILDER_API_KEY");
+                    missing.push("RELAYER_API_KEY");
                 }
-                if s.is_none() {
-                    missing.push("BUILDER_SECRET");
+                if a.is_none() {
+                    missing.push("RELAYER_API_KEY_ADDRESS");
                 }
-                if p.is_none() {
-                    missing.push("BUILDER_PASS_PHRASE");
-                }
-                return Err(format!("partial BUILDER_* credentials; missing: {}", missing.join(", ")));
+                return Err(format!("partial RELAYER_API_* credentials; missing: {}", missing.join(", ")));
             }
         };
         let rpc_url = lookup("RPC_URL");
@@ -152,7 +144,7 @@ impl LiveSecrets {
             proxy_address,
             deposit_wallet,
             api,
-            builder,
+            relayer,
             rpc_url,
         })
     }
@@ -198,7 +190,7 @@ mod tests {
             "PM_DEPOSIT_WALLET is read (V2 deposit-wallet maker)"
         );
         assert!(s.api.is_none(), "no PM_API_* given → derive at startup");
-        assert!(s.builder.is_none(), "no BUILDER_* given → relayer not configured");
+        assert!(s.relayer.is_none(), "no RELAYER_API_* given → relayer not configured");
         assert!(s.rpc_url.is_none(), "no RPC_URL given → relayer not configured");
 
         let none = |_: &str| None::<String>;
@@ -223,24 +215,21 @@ mod tests {
     }
 
     #[test]
-    fn builder_creds_and_rpc_load_from_env() {
-        // Mirror PM_API_*: all three BUILDER_* present → Some(BuilderCreds), with
-        // the secret/passphrase redacted (Secret), and RPC_URL loaded alongside.
+    fn relayer_creds_load_from_env() {
+        // Both RELAYER_API_* present → Some(RelayerCreds) with the key + bound
+        // owner/signer address passed through verbatim; RPC_URL loaded alongside
+        // (kept for compatibility, now unused by the relayer path).
         let lookup = |k: &str| match k {
             "PM_PRIVATE_KEY" => Some("0x".to_string() + &"cd".repeat(32)),
-            "BUILDER_API_KEY" => Some("703629aa-builder-key".to_string()),
-            "BUILDER_SECRET" => Some("YnVpbGRlci1zZWNyZXQ=".to_string()),
-            "BUILDER_PASS_PHRASE" => Some("builder-pass-phrase".to_string()),
+            "RELAYER_API_KEY" => Some("703629aa-relayer-key".to_string()),
+            "RELAYER_API_KEY_ADDRESS" => Some("0x".to_string() + &"33".repeat(20)),
             "RPC_URL" => Some("https://polygon-bor-rpc.publicnode.com".to_string()),
             _ => None,
         };
         let s = LiveSecrets::from_lookup(lookup).unwrap();
-        let b = s.builder.unwrap();
-        assert_eq!(b.key, "703629aa-builder-key");
-        assert_eq!(b.secret.expose(), "YnVpbGRlci1zZWNyZXQ=");
-        assert_eq!(b.passphrase.expose(), "builder-pass-phrase");
-        // Secret stays redacted in Debug — the builder secret must never log.
-        assert_eq!(format!("{:?}", b.secret), "Secret(<redacted>)");
+        let r = s.relayer.unwrap();
+        assert_eq!(r.api_key, "703629aa-relayer-key");
+        assert_eq!(r.api_key_address, format!("0x{}", "33".repeat(20)));
         assert_eq!(
             s.rpc_url.as_deref(),
             Some("https://polygon-bor-rpc.publicnode.com")
@@ -248,19 +237,18 @@ mod tests {
     }
 
     #[test]
-    fn builder_creds_require_all_three() {
-        // Partial BUILDER_* (key only) → error naming the two missing vars,
+    fn relayer_creds_require_both() {
+        // Partial RELAYER_API_* (key only) → error naming the missing address,
         // mirroring the PM_API_* all-or-none contract.
         let partial = |k: &str| match k {
             "PM_PRIVATE_KEY" => Some("ab".repeat(32)),
-            "BUILDER_API_KEY" => Some("bkey".into()),
+            "RELAYER_API_KEY" => Some("rkey".into()),
             _ => None,
         };
         let err = LiveSecrets::from_lookup(partial).unwrap_err();
-        assert!(err.contains("BUILDER_SECRET"), "{err}");
         assert!(
-            err.contains("BUILDER_PASS_PHRASE"),
-            "both missing vars are named: {err}"
+            err.contains("RELAYER_API_KEY_ADDRESS"),
+            "the missing var is named: {err}"
         );
     }
 }

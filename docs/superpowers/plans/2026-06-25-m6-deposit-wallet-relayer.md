@@ -4,9 +4,9 @@
 
 **Goal:** Live on-chain `merge`/`redeem` for the V2 deposit wallet via Polymarket's relayer `WALLET` batch — recycle locked YES+NO pairs and claim resolved winners on live — replacing the `NotSupportedLive` stubs.
 
-**Architecture:** New `crates/execution/src/relayer.rs` `RelayerClient`: EIP-712 `Batch` sign (alloy `sol!`, golden-vector-validated) → builder-auth headers → POST to relayer → poll `STATE_CONFIRMED`; `merge`/`redeem` calldata for the `CtfCollateralAdapter`. The live MM holds an optional `RelayerClient`; merge/redeem run as a rate-limited periodic sweep (never inline). Gated (`relayer_enabled` off by default; staging-first). Paper untouched.
+**Architecture:** New `crates/execution/src/relayer.rs` `RelayerClient`: EIP-712 `Batch` sign (alloy `sol!`, golden-vector-validated) → the two static Relayer-API-key headers (`RELAYER_API_KEY` + `RELAYER_API_KEY_ADDRESS`) → POST to relayer → poll `STATE_CONFIRMED`; `merge`/`redeem` calldata for the `CtfCollateralAdapter`. The live MM holds an optional `RelayerClient`; merge/redeem run as a rate-limited periodic sweep (never inline). Gated (`relayer_enabled` off by default; staging-first). Paper untouched.
 
-**Tech Stack:** Rust, `alloy` (`sol!` EIP-712 + provider for the nonce read — already a dep for signing), `reqwest`, the existing `auth.rs` `l2_headers` (likely reusable for builder auth), `pm-execution`/`pm-app`.
+**Tech Stack:** Rust, `alloy` (`sol!` EIP-712 + provider for the nonce read — already a dep for signing), `reqwest`, the two static Relayer-API-key headers (current "Relayer API keys" scheme — no HMAC), `pm-execution`/`pm-app`.
 
 **Spec:** `docs/superpowers/specs/2026-06-25-m6-deposit-wallet-relayer-design.md`. **Reference:** Polymarket `py-builder-relayer-client@e7108cd` (deposit-wallet support).
 
@@ -16,13 +16,13 @@
 
 ## Task M6-1: Contracts + config + secrets
 
-**Files:** `crates/execution/src/relayer.rs` (new, contracts const + `BuilderCreds`); `crates/config/src/lib.rs` (`[live]` relayer knobs); `crates/execution/src/secrets.rs` (`BUILDER_API_*`, `RPC_URL`).
+**Files:** `crates/execution/src/relayer.rs` (new, contracts const + `RelayerCreds`); `crates/config/src/lib.rs` (`[live]` relayer knobs); `crates/execution/src/secrets.rs` (`RELAYER_API_KEY`, `RELAYER_API_KEY_ADDRESS`).
 
 - [ ] **Step 1** Add `crates/execution/src/relayer.rs` with the Polygon-137 contract constants (typed `Address`): `DEPOSIT_WALLET_FACTORY = 0x894Ee6B254f251518206f709E9B115f214ebDf17`, `DEPOSIT_WALLET_IMPL = 0x55913A0bdecCbB77b7Af781A48300e6394B5EEAE`. Add a `CTF_COLLATERAL_ADAPTER` const (RESEARCH the 137 address — Unknown B; leave a clearly-marked `// TODO(M6-B): confirm adapter address` + a unit test asserting it's set before live use). Declare `pub mod relayer;` in `lib.rs`.
-- [ ] **Step 2** `secrets.rs`: load `BUILDER_API_KEY`, `BUILDER_SECRET`, `BUILDER_PASS_PHRASE`, `RPC_URL` (same `.env`/env pattern as `PM_API_*`). Add a `BuilderCreds { key, secret, passphrase }` (mirror the CLOB `ApiCreds`). Test the loader.
+- [ ] **Step 2** `secrets.rs`: load `RELAYER_API_KEY`, `RELAYER_API_KEY_ADDRESS` (same `.env`/env pattern as `PM_API_*`; both-or-none). Add a `RelayerCreds { api_key, api_key_address }` (two static header values — current "Relayer API keys" scheme). Test the loader.
 - [ ] **Step 3** `config.rs`: `[live]` gains `relayer_enabled: bool` (default false), `relayer_staging: bool` (default true), `relayer_url: Option<String>` (default None → derive from staging flag). Validate. Test parse + default.
 - [ ] **Step 4** `cargo test -p pm-execution -p pm-config && cargo clippy -p pm-execution -p pm-config --all-targets -- -D warnings` (use `CARGO_TARGET_DIR=/Users/ansh.singh/test/target` if the sandbox libsqlite3-sys bindgen error appears).
-- [ ] **Step 5** Commit: `feat(execution,config): M6 relayer contracts + builder creds + [live] relayer config`
+- [ ] **Step 5** Commit: `feat(execution,config): M6 relayer contracts + relayer creds + [live] relayer config`
 
 ---
 
@@ -85,7 +85,7 @@ sol! {
 
 **Files:** `crates/execution/src/relayer.rs` + tests. **Research Unknowns A + C.**
 
-- [ ] **Step 1 — RESEARCH the builder-auth header scheme** (`py-builder-signing-sdk`): determine the headers the relayer requires. Compare to the existing `auth.rs::l2_headers` (POLY-* HMAC-SHA256 over `ts+method+path+body`). If identical, REUSE `l2_headers` with the builder creds; if different, implement the SDK's scheme. Document the finding. Also confirm the **submit endpoint path** + the **poll endpoint + state JSON** (Unknown C).
+- [ ] **Step 1 — relayer auth header scheme** (RESOLVED): the operator's account uses Polymarket's CURRENT "Relayer API keys" scheme — two STATIC headers `RELAYER_API_KEY` + `RELAYER_API_KEY_ADDRESS` (no HMAC/timestamp/passphrase). The wallet action is authorized by the EIP-712 Batch signature; these headers only authenticate the submitter. (The earlier builder-HMAC guess from the stale `py-builder-relayer-client@e7108cd` reference was wrong for this account.) Also confirm the **submit endpoint path** + the **poll endpoint + state JSON** (Unknown C).
 - [ ] **Step 2 — failing test:** the WALLET request body serializes to the py `to_dict()` shape:
 ```json
 { "type":"WALLET", "from":<eoa>, "to":<factory>, "nonce":<n>, "signature":"0x…",
@@ -93,7 +93,7 @@ sol! {
     "calls":[{"target":<adapter>,"value":"0","data":"0x…"}] } }
 ```
 (unit test the serializer against a fixed fixture; mirror `test_client_deposit_wallet.py`'s assertions.)
-- [ ] **Step 3 — implement:** `build_wallet_request(from, factory, nonce, deadline, wallet, calls, sig) -> serde_json::Value`; `execute_wallet_batch(...)` = sign (M6-2) + build body + builder-auth headers + `reqwest` POST to `<relayer_url>/<submit_path>` → return `transaction_id`; `poll_until_confirmed(tx_id)` polls the state endpoint until `STATE_CONFIRMED` (timeout + the intermediate states). Errors → `VenueError::Live(...)` (never panic).
+- [ ] **Step 3 — implement:** `build_wallet_request(from, factory, nonce, deadline, wallet, calls, sig) -> serde_json::Value`; `execute_wallet_batch(...)` = sign (M6-2) + build body + the static Relayer-API-key headers + `reqwest` POST to `<relayer_url>/<submit_path>` → return `transaction_id`; `poll_until_confirmed(tx_id)` polls the state endpoint until `STATE_CONFIRMED` (timeout + the intermediate states). Errors → `VenueError::Live(...)` (never panic).
 - [ ] **Step 4** `cargo test -p pm-execution && cargo clippy …` → green. (No live call in tests — the POST/poll are exercised at the user's funded staging run.)
 - [ ] **Step 5** Commit: `feat(execution): relayer WALLET request + builder auth + STATE_CONFIRMED poll`
 
@@ -113,7 +113,7 @@ sol! {
 
 **Files:** `crates/execution/src/relayer.rs`, `crates/execution/src/live.rs`.
 
-- [ ] **Step 1** `RelayerClient { http, relayer_url, chain_id, signer, builder_creds, rpc_url, adapter, factory, wallet }`; `RelayerClient::new(...)` from config+secrets (Some only when `relayer_enabled` + creds + RPC present; staging flag picks the URL). `merge(condition_id, amount) -> Result<Usdc>` = nonce → `merge_call` → `execute_wallet_batch` → `poll_until_confirmed` → return recovered collateral (`amount × $1`). `redeem(condition_id) -> Result<Usdc>`.
+- [ ] **Step 1** `RelayerClient { http, relayer_url, chain_id, signer, relayer_creds, adapter, factory, wallet }`; `RelayerClient::new(...)` from config+secrets (Some only when `relayer_enabled` + creds + RPC present; staging flag picks the URL). `merge(condition_id, amount) -> Result<Usdc>` = nonce → `merge_call` → `execute_wallet_batch` → `poll_until_confirmed` → return recovered collateral (`amount × $1`). `redeem(condition_id) -> Result<Usdc>`.
 - [ ] **Step 2** `LiveVenue`: replace the `merge` `NotSupportedLive` stub to delegate to a held `Option<RelayerClient>` (return `NotSupportedLive` only when the relayer isn't configured). Add `redeem`. Keep `split` `NotSupportedLive` (out of scope).
 - [ ] **Step 3** Tests: `RelayerClient` constructed-only-when-enabled; merge/redeem call the (mocked) batch path; disabled → `NotSupportedLive`. `cargo test -p pm-execution && cargo clippy …` green.
 - [ ] **Step 4** Commit: `feat(execution): RelayerClient + LiveVenue merge/redeem via relayer (gated)`
@@ -138,11 +138,11 @@ sol! {
 - [ ] **Step 2** `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings` (pinned target) → green/clean.
 - [ ] **Step 3** Commit: `test(execution,app): M6 relayer merge/redeem integration`
 - [ ] **Step 4** Final whole-M6 review subagent: golden-vector signing, calldata correctness, gating (relayer only when enabled+creds), staging-first, non-blocking sweep, no panics on relayer failure, money integer.
-- [ ] **Step 5 (operator)** First funded validation: set `BUILDER_API_*` + `RPC_URL`, `relayer_enabled=true`, `relayer_staging=true` → run a tiny set merge on staging, confirm `STATE_CONFIRMED`; then prod.
+- [ ] **Step 5 (operator)** First funded validation: set `RELAYER_API_KEY` + `RELAYER_API_KEY_ADDRESS`, `relayer_enabled=true`, `relayer_staging=true` → run a tiny set merge on staging, confirm `STATE_CONFIRMED`; then prod.
 
 ## Notes for the implementer
 - **The golden-vector test (M6-2) is the gate** — do not build the relayer I/O on top of an unvalidated signer.
 - Relayer is OFF by default + constructed only with creds+RPC; paper/non-relayer paths byte-for-byte unchanged.
 - On-chain ops NEVER block the quote loop (spawned/periodic) and NEVER panic on failure (log + retry).
-- Reuse `auth.rs` `l2_headers` for builder auth IF the scheme matches (confirm in M6-4).
+- Relayer auth is the two static Relayer-API-key headers (`RELAYER_API_KEY` + `RELAYER_API_KEY_ADDRESS`) — no HMAC; the wallet action is authorized by the EIP-712 Batch signature.
 - A merged set = exactly $1/set (matches the paper sim + the inventory math).

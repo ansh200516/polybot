@@ -401,8 +401,9 @@ pub struct Live {
     pub confirm_phrase: String,
     /// M6 deposit-wallet relayer (live on-chain merge/redeem) master switch.
     /// `false` (default) → no relayer is constructed and live merge/redeem stays
-    /// the hold-to-resolution no-op; the relayer also requires builder creds +
-    /// `RPC_URL` from env (spec 2026-06-25 §7). Opt in deliberately.
+    /// the hold-to-resolution no-op; the relayer also requires relayer creds
+    /// (`RELAYER_API_KEY` + `RELAYER_API_KEY_ADDRESS`) from env (spec 2026-06-25
+    /// §7). Opt in deliberately.
     pub relayer_enabled: bool,
     /// Staging-first: `true` (default) targets Polymarket's relayer STAGING
     /// environment so the first funded batch is off prod. The live MM constructor
@@ -918,7 +919,7 @@ impl Config {
         }
         // M6 relayer knobs (spec 2026-06-25 §7). `relayer_enabled`/`relayer_staging`
         // are plain booleans (default OFF / staging-first) and need no check; the
-        // relayer is additionally gated at runtime on builder creds + RPC_URL. A
+        // relayer is additionally gated at runtime on relayer creds. A
         // `relayer_url` OVERRIDE, if set, must be non-empty — an empty string is a
         // silent misconfig (the URL is what reaches the relayer).
         if self.live.relayer_url.as_deref().is_some_and(str::is_empty) {

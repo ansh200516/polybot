@@ -16,9 +16,12 @@ direct EOA/execTransaction path. Today `LiveVenue::merge`/`split` return
 throttles. M6 implements the relayer `WALLET` batch in Rust (no Rust client
 exists; ported from Polymarket's `py-builder-relayer-client`).
 
-**Hard dependency:** Polymarket **builder credentials** (`BUILDER_API_KEY/SECRET/
-PASSPHRASE`), separate from the CLOB `PM_API_*` keys. The relayer rejects
-unauthenticated batches. (User confirmed they have/will get these.)
+**Hard dependency:** Polymarket **Relayer API keys** — the current scheme from
+the "Relayer API keys" settings page: two STATIC headers `RELAYER_API_KEY` +
+`RELAYER_API_KEY_ADDRESS` (no HMAC/secret/passphrase), separate from the CLOB
+`PM_API_*` keys. The relayer rejects unauthenticated batches; the wallet action
+itself is authorized by the EIP-712 Batch signature. (User confirmed they have
+these.)
 
 ## 2. The protocol (from py-builder-relayer-client@e7108cd)
 
@@ -42,8 +45,9 @@ unauthenticated batches. (User confirmed they have/will get these.)
   "depositWalletParams": { "depositWallet": "<wallet>", "deadline": "<ts>",
     "calls": [ { "target": "<adapter>", "value": "0", "data": "0x…" } ] } }
 ```
-+ **builder-auth headers** (HMAC from the builder creds — see §6 Unknown A) and
-poll the transaction id until `STATE_CONFIRMED` (`STATE_MINED` is insufficient).
++ the two **static Relayer-API-key headers** (`RELAYER_API_KEY` +
+`RELAYER_API_KEY_ADDRESS` — see §6 Unknown A) and poll the transaction id until
+`STATE_CONFIRMED` (`STATE_MINED` is insufficient).
 
 ### 2.3 Contracts (Polygon 137)
 - deposit_wallet_factory `0x894Ee6B254f251518206f709E9B115f214ebDf17`
@@ -56,11 +60,11 @@ poll the transaction id until `STATE_CONFIRMED` (`STATE_MINED` is insufficient).
 
 ## 3. Architecture
 New module `crates/execution/src/relayer.rs`:
-- `RelayerClient { http, relayer_url, chain_id, signer, builder_creds, contracts }`.
+- `RelayerClient { http, relayer_url, chain_id, signer, relayer_creds, contracts }`.
 - `sign_batch(wallet, nonce, deadline, calls) -> sig` — EIP-712 `Batch` via
   alloy `sol!` (same pattern as `auth.rs`/`sign.rs`), pinned to the golden vector.
 - `execute_wallet_batch(calls, wallet, nonce, deadline) -> tx_id` — build request
-  + builder-auth headers + POST + return tx id.
+  + the static Relayer-API-key headers + POST + return tx id.
 - `poll_until_confirmed(tx_id)`.
 - Calldata builders: `merge_call(adapter, collateral, condition_id, amount)`,
   `redeem_call(adapter, collateral, condition_id)` (alloy `sol!` ABI encode).
@@ -71,13 +75,13 @@ Wiring:
 - `LiveVenue::merge` (and a new `redeem`) call `RelayerClient` instead of
   `NotSupportedLive`. The `MakerVenue` trait stays CLOB-only; the relayer is a
   SEPARATE capability the live MM holds (a `Option<RelayerClient>`), so paper is
-  untouched and the relayer is only constructed when builder creds + RPC are set.
+  untouched and the relayer is only constructed when relayer creds are set.
 - MM `maybe_merge_sets` (B5): on live, instead of the no-op, enqueue a relayer
   merge for the matched set (and redeem on resolution). **Decision:** do this as
   a PERIODIC sweep (e.g. once per quote cycle, rate-limited), NOT inline in the
   hot path — an on-chain batch is slow + must not block quoting.
-- Config `[reward_farm]`/`[live]`: `relayer_url`, builder creds + RPC from env
-  (`BUILDER_API_KEY/SECRET/PASSPHRASE`, `RPC_URL`); a `relayer_enabled` gate
+- Config `[reward_farm]`/`[live]`: `relayer_url`, relayer creds from env
+  (`RELAYER_API_KEY`, `RELAYER_API_KEY_ADDRESS`); a `relayer_enabled` gate
   (default off) and a `staging` flag (use `relayer-v2-staging.polymarket.dev`).
 
 ## 4. Scope (this spec)
@@ -98,10 +102,12 @@ Wiring:
   user's first funded run (staging first) — documented; everything else is unit-tested.
 
 ## 6. Unknowns to resolve during the build (research tasks)
-- **A — builder-auth header scheme** (`py-builder-signing-sdk`): the HMAC headers
-  the relayer requires. Likely the same L2 scheme as the CLOB (`l2_headers` in
-  `auth.rs` — POLY-* HMAC-SHA256 over ts+method+path+body). Confirm against the
-  signing SDK; reuse `l2_headers` if identical.
+- **A — relayer auth header scheme** (RESOLVED): the operator's account uses
+  Polymarket's CURRENT "Relayer API keys" scheme — two STATIC headers
+  `RELAYER_API_KEY` + `RELAYER_API_KEY_ADDRESS` (no HMAC/timestamp/passphrase).
+  The earlier builder-HMAC guess (the stale `py-builder-relayer-client@e7108cd`
+  reference) is NOT what this account uses; the wallet action is authorized by
+  the EIP-712 Batch signature, so these headers only authenticate the submitter.
 - **B — `CtfCollateralAdapter` address** (137) + exact `mergePositions`/
   `redeemPositions` signatures on the adapter (pUSD-native). From the inventory
   docs / on-chain.
@@ -110,7 +116,7 @@ Wiring:
 - **D — deposit-wallet nonce source**: read on-chain (RPC) vs relayer-provided.
 
 ## 7. Safety
-- `relayer_enabled` default OFF; constructed only with builder creds + RPC.
+- `relayer_enabled` default OFF; constructed only with relayer creds.
 - **Staging-first**: a `staging` flag points at `relayer-v2-staging` so the first
   real batch is on testnet/staging.
 - Merge/redeem amounts derive from REAL held inventory (`min(yes,no)` for merge;
