@@ -974,6 +974,12 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     /// cycle PULLED any side. Folded into [`RewardFarmStatus::pulled`] for the
     /// dashboard's "rew" PULL indicator. `false` under SpreadCapture.
     last_pulled: bool,
+    /// RewardFarm Phase-B (Task B5) one-shot log latch: set the FIRST time
+    /// [`maybe_merge_sets`](Self::maybe_merge_sets) finds a mergeable complete set
+    /// on a LIVE venue (`no_naked_shorts`), where the on-chain merge is deferred
+    /// to M6 and the pair is held. Prevents the "complete set held" warning from
+    /// spamming every cycle a set sits above the threshold. Never set on paper.
+    merge_live_warned: bool,
 }
 
 /// Read BOTH arms of the persistent UTC-day loss gate for `"mm"` on `utc_day`,
@@ -1095,6 +1101,14 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         if self.day_loss_halted {
             return;
         }
+        // Spec-2 Phase B (Task B5): recycle locked capital by merging any complete
+        // YES+NO set back to collateral BEFORE re-quoting, so this cycle's sizing
+        // leans off the post-merge (more balanced, less capital-locked) inventory.
+        // Cheap and a guaranteed no-op outside RewardFarm+hedging, so SpreadCapture
+        // and non-hedging RewardFarm are byte-for-byte unchanged. Paper-only
+        // effect; on a live venue it is a logged no-op (NO live merge is called —
+        // the on-chain op is deferred to M6, and the gross cap is the control).
+        self.maybe_merge_sets().await;
         let tokens = self.tokens.clone();
         // Per-market inventory cap (µUSDC) the skew normalizes against — read
         // once; the skew is otherwise a pure function of the per-token net.
@@ -1480,6 +1494,143 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             tracing::warn!(error = %e, desired = desired.len(), "mm quote: reconcile failed (venue rejected an order)");
         }
         self.record_placed(&desired).await;
+    }
+
+    /// Spec-2 Phase B (Task B5): merge any complete YES+NO set back to collateral
+    /// to RECYCLE the capital locked in a hedged pair. Called once per
+    /// [`quote`](Self::quote) cycle (cheap); GATED on `RewardFarm` +
+    /// `hedging_enabled`, so SpreadCapture and non-hedging RewardFarm never enter
+    /// — their inventory / cash / store rows are untouched (byte-for-byte
+    /// unchanged).
+    ///
+    /// For each complement market-pair (the `complement` map carries yes→no AND
+    /// no→yes; each unordered pair is processed ONCE, in token-id order), the
+    /// mergeable set is `matched = min(net(a).max(0), net(b).max(0))` µshares — the
+    /// matched LONG depth on both legs (a short on either leg is not part of a
+    /// set). A complete set ALWAYS redeems to EXACTLY $1, so recycling `matched`
+    /// sets returns `recovered = matched_shares × $1` collateral; in µUSDC that is
+    /// `matched_micro µshares × $1 µUSDC/share-pair ÷ 1e6 µshares/share` (which for
+    /// a $1 set equals `matched_micro` numerically). The pair is skipped when
+    /// `recovered ≤ merge_threshold_usd` (the per-pair "worth the merge" floor).
+    ///
+    /// VENUE SPLIT — the live/paper discriminator is `no_naked_shorts`:
+    /// - LIVE (`no_naked_shorts == true`): the on-chain merge is UNSUPPORTED
+    ///   (`LiveVenue::merge` → `NotSupportedLive`, deferred to M6). The pair is
+    ///   HELD to resolution and the GROSS inventory cap is the control. We log
+    ///   ONCE (`merge_live_warned`) and change NOTHING — and never call a live
+    ///   merge (merge is not even on the `MakerVenue` trait the loop holds, so the
+    ///   no-op is structural, not just skipped).
+    /// - PAPER (`no_naked_shorts == false`): model the economics directly to
+    ///   validate the capital-recycling. REDUCE both legs' long inventory by
+    ///   `matched` via the tested signed-lot [`InventoryRisk::on_fill`] sell path
+    ///   (a pure reduction — `matched ≤ net` on each leg by construction — which
+    ///   releases each leg's average-cost basis pro-rata and books realized) and
+    ///   CREDIT the recovered `matched × $1` collateral as cash in the reporting
+    ///   [`PositionBook`]. The aggregate realized (`recovered − basis released`)
+    ///   feeds the persistent day-loss ledger exactly like a fill; the recovered
+    ///   cash lands in this same tick's `PnlSnapshot` (`publish_status`).
+    async fn maybe_merge_sets(&mut self) {
+        // GATE: RewardFarm + hedging only — the only mode that holds BOTH legs of
+        // a complement pair. Everything below is then provably inert elsewhere.
+        if self.policy != Policy::RewardFarm || !self.params.hedging_enabled {
+            return;
+        }
+        // A complete set redeems to EXACTLY $1 = 1e6 µUSDC per YES+NO share-pair.
+        const SET_VALUE_MICRO: i128 = 1_000_000;
+        // Dedup the bidirectional complement map down to each unordered
+        // market-pair, processed in a deterministic (token-id) order.
+        let mut keys: Vec<TokenId> = self.complement.keys().copied().collect();
+        keys.sort_by_key(|t| t.0);
+        let mut seen: HashSet<TokenId> = HashSet::new();
+        let mut pairs: Vec<(TokenId, TokenId)> = Vec::new();
+        for a in keys {
+            if seen.contains(&a) {
+                continue;
+            }
+            if let Some(&b) = self.complement.get(&a) {
+                seen.insert(a);
+                seen.insert(b);
+                pairs.push((a, b));
+            }
+        }
+        for (a, b) in pairs {
+            // Mergeable complete set = the matched LONG depth on both legs.
+            let matched_micro = self.inv.net(a).max(0).min(self.inv.net(b).max(0));
+            if matched_micro <= 0 {
+                continue;
+            }
+            // Recovered collateral (µUSDC): matched_micro µshares × $1/share-pair
+            // ÷ 1e6 µshares/share. (For a $1 set this equals matched_micro.)
+            let recovered_micro = matched_micro * SET_VALUE_MICRO / 1_000_000;
+            // Per-pair "worth the merge" floor (USD). A coarse gate only — the
+            // money movement below stays in integer µUSDC.
+            let recovered_usd = recovered_micro as f64 / 1_000_000.0;
+            if recovered_usd <= self.params.merge_threshold_usd {
+                continue;
+            }
+            if self.no_naked_shorts {
+                // LIVE: on-chain merge deferred to M6 — HOLD the pair (gross cap
+                // is the control). Log ONCE (don't spam every cycle the set sits
+                // above the threshold); never call a live merge.
+                if !self.merge_live_warned {
+                    tracing::warn!(
+                        "reward-farm: complete set held (live merge unsupported, deferred to M6); \
+                         gross cap is the control"
+                    );
+                    self.merge_live_warned = true;
+                }
+                continue;
+            }
+            // ── PAPER recycle ─────────────────────────────────────────────────
+            // Snapshot realized BEFORE so the merge's realized delta can feed the
+            // persistent day-loss ledger (mirrors `consume_fills`).
+            let realized_before = self.inv.realized(a).0 + self.inv.realized(b).0;
+            let basis_before_a = self.inv.basis(a).0;
+            let basis_before_b = self.inv.basis(b).0;
+            // REDUCE both legs by `matched` via the tested signed-lot sell path.
+            // The basis released is SHARE-based (independent of the cash supplied),
+            // so the per-leg cash split is purely a realized-ATTRIBUTION choice —
+            // the AGGREGATE realized (recovered − basis released) is invariant to
+            // it. Split the recovered $1/set evenly across the two legs; the
+            // economically meaningful figure is the aggregate (matching how the
+            // arb `Ledger`/store treat a merge as one set-level event).
+            let cash_a = recovered_micro / 2;
+            let cash_b = recovered_micro - cash_a;
+            self.inv.on_fill(a, -matched_micro, Usdc(cash_a));
+            self.inv.on_fill(b, -matched_micro, Usdc(cash_b));
+            // Mirror into the reporting `PositionBook` in lock-step (as
+            // `consume_fills` does): credit the recovered collateral as cash and
+            // release each leg's basis. Qty 0 — the append-only book derives
+            // position VALUE from `inv.net`-based marks, so a REDUCTION must not
+            // grow phantom qty here; only cash + basis move.
+            let cost_delta_a = Usdc(self.inv.basis(a).0 - basis_before_a);
+            let cost_delta_b = Usdc(self.inv.basis(b).0 - basis_before_b);
+            self.positions.apply(
+                &[(a, Qty(0), cost_delta_a), (b, Qty(0), cost_delta_b)],
+                Usdc(recovered_micro),
+                &self.token_market,
+            );
+            // Persist the realized delta to the cumulative UTC-day ledger so the
+            // PERSISTENT loss cap accounts for merge P&L just like a fill's
+            // (fire-and-forget; a closed/full channel drops it, never blocks).
+            let realized_delta =
+                (self.inv.realized(a).0 + self.inv.realized(b).0) - realized_before;
+            if realized_delta != 0 {
+                let _ = self.store_tx.try_send(StoreMsg::DayRealized {
+                    utc_day: utc_day_from_ms(now_ms()),
+                    strategy: "mm".into(),
+                    delta_micro: realized_delta,
+                });
+            }
+            tracing::debug!(
+                market_a = a.0,
+                market_b = b.0,
+                matched_micro = matched_micro as i64,
+                recovered_micro = recovered_micro as i64,
+                realized_delta = realized_delta as i64,
+                "mm: merged complete YES+NO set (paper) — recycled locked collateral"
+            );
+        }
     }
 
     /// Record every newly-tracked resting order into `placed` (so a later fill
@@ -2249,6 +2400,7 @@ pub(crate) async fn run_mm_loop<V: MakerVenue + UserFillSource>(
         pulled_until: HashMap::new(),
         last_signal: 0.0,
         last_pulled: false,
+        merge_live_warned: false,
     };
     if start_paused {
         tracing::info!("mm: live held — quoting PAUSED until release (press `l`)");
@@ -2508,6 +2660,7 @@ mod tests {
             pulled_until: HashMap::new(),
             last_signal: 0.0,
             last_pulled: false,
+            merge_live_warned: false,
         };
         (mm, store_rx, status_rx)
     }
@@ -3556,6 +3709,170 @@ mod tests {
         let (yes_bid, no_bid) = run(yes_down()).await;
         assert!(!yes_bid, "strong DOWN on YES PULLS the YES bid");
         assert!(no_bid, "strong DOWN on YES keeps the (safe) NO bid");
+    }
+
+    // ── RewardFarm Phase-B complete-set merge (Task B5, spec §5.1) ──────────────
+
+    /// Spec-2 Phase B (Task B5): under hedging the MM accumulates long YES AND
+    /// long NO; a COMPLETE set `min(yes, no)` can be MERGED back to collateral —
+    /// a set always redeems to exactly $1 — to RECYCLE the locked capital. On the
+    /// PAPER venue (`no_naked_shorts = false`) the economics are modeled directly:
+    /// both legs drop by the matched set count, the recovered `matched × $1`
+    /// collateral is credited as cash, and gross inventory falls. On a LIVE venue
+    /// (`no_naked_shorts = true`) the on-chain merge is unsupported (deferred to
+    /// M6), so the step is a NO-OP — the pair is HELD (the gross cap is the
+    /// control) and NO live merge is ever attempted. This locks BOTH behaviors.
+    #[tokio::test]
+    async fn merge_recycles_complete_set_in_paper() {
+        // A RewardFarm+hedging loop over a YES/NO pair, seeded LONG on BOTH legs:
+        // 100 YES @ $0.50 ($50 basis) + 80 NO @ $0.45 ($36 basis). The matched
+        // set is min(100, 80) = 80; avg set cost $0.95 < $1 ⇒ recycling 80 sets
+        // returns $80 collateral and books a small +$4 realized profit.
+        fn seeded_pair(no_naked_shorts: bool) -> MmLoop<PaperMakerVenue<BookFetcher>> {
+            let yes = TokenId(1);
+            let no = TokenId(2);
+            let tokens = vec![yes, no];
+            let (fetcher, _shared) = controllable_fetcher(
+                &tokens,
+                HashMap::from([(yes, (mid50_book(), true)), (no, (mid50_book(), true))]),
+            );
+            let mut params = mk_params(200, 5.0);
+            params.policy = Policy::RewardFarm;
+            params.hedging_enabled = true;
+            params.merge_threshold_usd = 5.0; // $5 floor; $80 matched clears it
+            let (mut mm, _store_rx, _status_rx) =
+                build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+            mm.complement.insert(yes, no);
+            mm.complement.insert(no, yes);
+            mm.no_naked_shorts = no_naked_shorts;
+            mm.inv.seed(yes, 100 * SH as i128, Usdc(50_000_000));
+            mm.inv.seed(no, 80 * SH as i128, Usdc(36_000_000));
+            mm
+        }
+
+        let yes = TokenId(1);
+        let no = TokenId(2);
+        let matched = 80 * SH as i128; // min(100, 80) = 80 complete sets
+
+        // ── PAPER (no_naked_shorts = false): the complete set is recycled ───────
+        let mut paper = seeded_pair(false);
+        let gross_before = paper.inv.net(yes).abs() + paper.inv.net(no).abs();
+        paper.maybe_merge_sets().await;
+        // Both legs drop by the matched set count (NO goes flat; YES keeps its
+        // unmatched 20-share surplus).
+        assert_eq!(
+            paper.inv.net(yes),
+            100 * SH as i128 - matched,
+            "YES leg reduced by the matched set count"
+        );
+        assert_eq!(
+            paper.inv.net(no),
+            80 * SH as i128 - matched,
+            "NO leg reduced by the matched set count (to flat)"
+        );
+        // Recovered collateral = matched × $1 (a complete set redeems to exactly
+        // $1): 80 shares × $1 = $80 = 80_000_000 µUSDC, credited as cash.
+        assert_eq!(
+            paper.positions.cash(),
+            Usdc(80_000_000),
+            "recovered matched × $1 collateral credited as cash"
+        );
+        // Aggregate realized = recovered − basis released = $80 − ($40 YES + $36
+        // NO) = +$4 (the avg set cost was $0.95 < $1).
+        let realized = paper.inv.realized(yes).0 + paper.inv.realized(no).0;
+        assert_eq!(realized, 4_000_000, "merge books recovered − basis released = +$4");
+        // Gross inventory FALLS — the locked capital is recycled.
+        let gross_after = paper.inv.net(yes).abs() + paper.inv.net(no).abs();
+        assert!(gross_after < gross_before, "gross inventory falls after the merge");
+        assert_eq!(
+            gross_after,
+            20 * SH as i128,
+            "only the unmatched 20-share YES surplus remains"
+        );
+
+        // ── LIVE (no_naked_shorts = true): NO-OP — the pair is HELD (M6) ────────
+        let mut live = seeded_pair(true);
+        live.maybe_merge_sets().await;
+        assert_eq!(
+            live.inv.net(yes),
+            100 * SH as i128,
+            "live: YES leg UNCHANGED (on-chain merge deferred to M6)"
+        );
+        assert_eq!(
+            live.inv.net(no),
+            80 * SH as i128,
+            "live: NO leg UNCHANGED (pair held; gross cap is the control)"
+        );
+        assert_eq!(
+            live.positions.cash(),
+            Usdc(0),
+            "live: NO collateral recovered (logged no-op)"
+        );
+        assert_eq!(
+            live.inv.realized(yes).0 + live.inv.realized(no).0,
+            0,
+            "live: NO realized booked"
+        );
+    }
+
+    /// Task B5 gates: the merge step skips below `merge_threshold_usd`, and is
+    /// inert OUTSIDE RewardFarm+hedging — so SpreadCapture and non-hedging
+    /// RewardFarm never recycle a set (their paths stay byte-for-byte unchanged).
+    #[tokio::test]
+    async fn merge_skips_below_threshold_and_outside_hedging() {
+        fn loop_with(
+            policy: Policy,
+            hedging: bool,
+            threshold_usd: f64,
+            shares: i128,
+        ) -> MmLoop<PaperMakerVenue<BookFetcher>> {
+            let yes = TokenId(1);
+            let no = TokenId(2);
+            let tokens = vec![yes, no];
+            let (fetcher, _shared) = controllable_fetcher(
+                &tokens,
+                HashMap::from([(yes, (mid50_book(), true)), (no, (mid50_book(), true))]),
+            );
+            let mut params = mk_params(200, 5.0);
+            params.policy = policy;
+            params.hedging_enabled = hedging;
+            params.merge_threshold_usd = threshold_usd;
+            let (mut mm, _store_rx, _status_rx) =
+                build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+            mm.complement.insert(yes, no);
+            mm.complement.insert(no, yes);
+            mm.inv.seed(yes, shares * SH as i128, Usdc(0));
+            mm.inv.seed(no, shares * SH as i128, Usdc(0));
+            mm
+        }
+
+        let yes = TokenId(1);
+
+        // Below threshold: 3 matched sets × $1 = $3 ≤ $5 floor → skip.
+        let mut below = loop_with(Policy::RewardFarm, true, 5.0, 3);
+        below.maybe_merge_sets().await;
+        assert_eq!(below.inv.net(yes), 3 * SH as i128, "below threshold → no merge");
+        assert_eq!(below.positions.cash(), Usdc(0), "below threshold → no cash recycled");
+
+        // Non-hedging RewardFarm: inert even with a mergeable $50 set.
+        let mut non_hedging = loop_with(Policy::RewardFarm, false, 5.0, 50);
+        non_hedging.maybe_merge_sets().await;
+        assert_eq!(
+            non_hedging.inv.net(yes),
+            50 * SH as i128,
+            "non-hedging RewardFarm → merge step inert"
+        );
+        assert_eq!(non_hedging.positions.cash(), Usdc(0));
+
+        // SpreadCapture: inert (the merge step belongs to RewardFarm hedging only).
+        let mut spread = loop_with(Policy::SpreadCapture, true, 5.0, 50);
+        spread.maybe_merge_sets().await;
+        assert_eq!(
+            spread.inv.net(yes),
+            50 * SH as i128,
+            "SpreadCapture → merge step inert"
+        );
+        assert_eq!(spread.positions.cash(), Usdc(0));
     }
 
     /// PRIORITY-4 (light) A/B (spec §15): run BOTH policies over the SAME
@@ -4970,6 +5287,7 @@ mod tests {
             pulled_until: HashMap::new(),
             last_signal: 0.0,
             last_pulled: false,
+            merge_live_warned: false,
         };
         (mm, store_rx, produced)
     }
@@ -5053,6 +5371,7 @@ mod tests {
             pulled_until: HashMap::new(),
             last_signal: 0.0,
             last_pulled: false,
+            merge_live_warned: false,
         };
         // We placed this order on YES (an Ask). The fill must follow THIS token.
         mm.placed.insert(
