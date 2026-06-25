@@ -1176,12 +1176,35 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                     // capped by `size_skew_max_ratio` (spec §8.3) — prices stay tight.
                     let (min_size_shares, max_spread_cents, _daily_rate) =
                         self.reward_by_token.get(&token).copied().unwrap_or((0.0, 0.0, 0.0));
+                    // Spec-2 Phase B (Task B4): under hedging the quoting UNIT is
+                    // the complement PAIR (bid-YES + bid-NO), so the bid SIZE lean
+                    // is driven by the PAIR's net delta, NOT this token's net
+                    // alone. `pair_net = net(self) − net(complement)` (µshares):
+                    // long THIS token vs its complement (>0) SHRINKS this leg's
+                    // bid via skewed_sizes' BID return (`base/lean`) and — because
+                    // the complement token's pair_net is the exact negation — the
+                    // complement leg symmetrically GROWS its bid (`base·lean`) when
+                    // it is processed, so the heavy leg bids LESS and the light leg
+                    // MORE, rebalancing the pair toward delta-neutral. The
+                    // grown:shrunk ratio is `max_ratio^(|pair_net|/cap) ≤
+                    // size_skew_max_ratio`. (Equivalent to ONE
+                    // `skewed_sizes(base, pair_net = yes−no, …)` call mapping its
+                    // returned `(bid, ask)` to `(YES bid, NO bid)`.)
+                    // reward_compute_quotes uses the net ONLY for skewed_sizes and
+                    // the ask leg it returns is dropped just below, so feeding the
+                    // pair delta here re-leans exactly the surviving bid. Non-hedging
+                    // keeps this token's own net (bid-vs-ask lean) — byte-for-byte.
+                    let sizing_net = if self.params.hedging_enabled {
+                        net_micro - self.complement.get(&token).map_or(0, |c| self.inv.net(*c))
+                    } else {
+                        net_micro
+                    };
                     let (bid, ask) = reward_compute_quotes(
                         &book,
                         token,
                         self.notional_micro,
                         max_spread_cents,
-                        net_micro,
+                        sizing_net,
                         max_inventory_micro,
                         self.params.size_skew_max_ratio,
                         min_size_shares,
@@ -1239,6 +1262,29 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                     ladder_depth(&book.asks, self.params.microprice_levels),
                 );
                 sig_blend = combined_signal(sig_imb, sig_mom);
+                // Spec-2 Phase B (Task B4): the COMPLEMENT leg's blended signal,
+                // used ONLY under hedging to make the bid pull PAIR-aware (below).
+                // The pair quotes bid-YES + bid-NO, so a leg's bid is endangered
+                // when its OWN book runs DOWN *or* its COMPLEMENT book runs UP (the
+                // complement rising ⇒ this token = 1 − complement falling ⇒ buying
+                // it is adverse). Read off the complement's OWN book (imbalance) +
+                // its rolling momentum, mirroring the own-leg signal; a missing /
+                // one-sided complement book leaves it 0 (no complement-driven pull).
+                // This realizes "the YES book drives the pair, the NO book is the
+                // mirror": up-YES pulls the NO bid, down-YES pulls the YES bid —
+                // and it still fires when the two real books haven't re-mirrored.
+                let mut sig_complement = 0.0_f64;
+                if self.params.hedging_enabled
+                    && let Some(&comp) = self.complement.get(&token)
+                    && let Some((comp_book, true)) = self.fetcher.fetch(comp).await
+                {
+                    let comp_imb = imbalance(
+                        ladder_depth(&comp_book.bids, self.params.microprice_levels),
+                        ladder_depth(&comp_book.asks, self.params.microprice_levels),
+                    );
+                    let comp_mom = self.signals.get(&comp).map_or(0.0, |s| s.momentum(now));
+                    sig_complement = combined_signal(comp_imb, comp_mom);
+                }
                 // Per side: pull when the live signal endangers it OR a prior
                 // pull's cooldown is still running. An active pull (re)arms the
                 // cooldown deadline; once it lapses AND the signal has eased the
@@ -1246,7 +1292,16 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 let thresh = self.params.pull_threshold;
                 let cooldown_ms = self.params.pull_cooldown_ms as i64;
                 for side in [Side::Bid, Side::Ask] {
-                    let active = should_pull(side, sig_blend, thresh);
+                    // Live signal endangers this side. Under HEDGING only the BID
+                    // exists per leg and the quoting unit is the complement PAIR,
+                    // so the bid is ALSO pulled when the COMPLEMENT book signals
+                    // strong UP (Ask semantics on `sig_complement`): up-complement
+                    // ≡ down-self, i.e. up-YES pulls the NO bid and down-YES pulls
+                    // the YES bid. Cooldown stays keyed by `(token, Side::Bid)`.
+                    let active = should_pull(side, sig_blend, thresh)
+                        || (self.params.hedging_enabled
+                            && side == Side::Bid
+                            && should_pull(Side::Ask, sig_complement, thresh));
                     if active {
                         self.pulled_until.insert((token, side), now + cooldown_ms);
                     }
@@ -3368,6 +3423,139 @@ mod tests {
             st.q_min,
             single_sided
         );
+    }
+
+    /// Spec-2 Phase B (Task B4): under hedging the quoting unit is the complement
+    /// PAIR (bid-YES + bid-NO), so the two bid SIZES are leaned by the PAIR's net
+    /// delta to drive it back toward delta-neutral — NOT by each token's own net
+    /// in isolation. Net LONG YES (yes inventory > no) ⇒ the YES bid is sized
+    /// SMALLER and the NO bid LARGER (bid LESS of the heavy leg, MORE of the light
+    /// leg), the grown:shrunk ratio capped at `size_skew_max_ratio`; a FLAT pair
+    /// quotes balanced bids. We compare a seeded run against a flat baseline: the
+    /// per-token Spec-1 lean would leave the NO bid at the balanced base
+    /// (net(no)=0 ⇒ no skew), so asserting the NO bid GROWS above the flat base is
+    /// what pins the PAIR-aware sizing (and fails the per-token path).
+    #[tokio::test]
+    async fn rewardfarm_hedging_skews_bids_by_net_delta() {
+        // Run one hedging cycle over a YES/NO pair (both at mid 0.50) seeded with
+        // `seed_yes_shares` of LONG YES inventory; return the placed (YES bid, NO
+        // bid) sizes in µshares.
+        async fn pair_bid_sizes(seed_yes_shares: i128) -> (u64, u64) {
+            let yes = TokenId(1);
+            let no = TokenId(2);
+            let tokens = vec![yes, no];
+            let (fetcher, _shared) = controllable_fetcher(
+                &tokens,
+                HashMap::from([(yes, (mid50_book(), true)), (no, (mid50_book(), true))]),
+            );
+            let mut params = mk_params(200, 5.0);
+            params.policy = Policy::RewardFarm;
+            params.hedging_enabled = true;
+            params.size_skew_max_ratio = 2.0;
+            let (mut mm, _store_rx, _status_rx) =
+                build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+            mm.reward_by_token.insert(yes, (1.0, 3.0, 100.0));
+            mm.reward_by_token.insert(no, (1.0, 3.0, 100.0));
+            mm.complement.insert(yes, no);
+            mm.complement.insert(no, yes);
+            // generous_inv(): $1000 per-market cap ⇒ a 2000-share cap at the 0.50
+            // mid, so 1000 sh of long YES is r 0.5 and the YES bid buy still fits.
+            if seed_yes_shares != 0 {
+                mm.inv.seed(yes, seed_yes_shares * SH as i128, Usdc(0));
+            }
+            mm.quote().await;
+            let resting = mm.qm.resting_orders();
+            let bid_of = |tok: TokenId| {
+                resting
+                    .iter()
+                    .find(|(_, o)| o.token == tok && o.side == Side::Bid)
+                    .map(|(_, o)| o.size.0)
+            };
+            (bid_of(yes).expect("YES bid placed"), bid_of(no).expect("NO bid placed"))
+        }
+
+        // FLAT pair ⇒ the two bids are balanced (equal base size).
+        let (yb_flat, nb_flat) = pair_bid_sizes(0).await;
+        assert_eq!(yb_flat, nb_flat, "flat pair ⇒ balanced YES/NO bids");
+
+        // LONG YES (1000 sh, half the 2000-sh cap) ⇒ smaller YES bid, larger NO
+        // bid, both vs the flat base, ratio within the 2:1 cap.
+        let (yb, nb) = pair_bid_sizes(1000).await;
+        assert!(yb < nb, "long YES ⇒ YES bid SMALLER than NO bid (rebalance)");
+        assert!(yb < yb_flat, "long YES SHRINKS the YES bid below the flat base");
+        assert!(
+            nb > nb_flat,
+            "long YES GROWS the NO bid above the flat base (PAIR-delta-neutral, not \
+             the per-token lean that leaves net(no)=0 at base)"
+        );
+        let ratio = nb as f64 / yb as f64;
+        assert!(
+            ratio <= 2.0 + 1e-9,
+            "grown:shrunk bid ratio {ratio} must stay within size_skew_max_ratio (2:1)"
+        );
+    }
+
+    /// Spec-2 Phase B (Task B4): under hedging the quoting unit is the complement
+    /// PAIR (bid-YES + bid-NO), so the adverse-selection quote-pull is PAIR-aware.
+    /// The signal drives the pair off the YES book (the NO book is its mirror): a
+    /// strong UP on YES (≡ DOWN on NO) endangers the NO bid (you'd buy NO right
+    /// before it falls) ⇒ pull the NO bid, keep the YES bid; a strong DOWN on YES
+    /// endangers the YES bid ⇒ pull the YES bid, keep the NO bid. Each leg's bid
+    /// is pulled when its COMPLEMENT book is running UP, so a NEUTRAL own-book leg
+    /// is STILL pulled (which the per-token Spec-1 pull — reading only the leg's
+    /// OWN book — would miss; that is what this locks).
+    #[tokio::test]
+    async fn rewardfarm_hedging_pull_maps_up_yes_to_no_bid() {
+        // Strong UP on YES: balanced TOP (clean 0.50 microprice ⇒ momentum 0) with
+        // heavy bid DEPTH behind the touch ⇒ summed top-3 imbalance ~0.9 ⇒ blended
+        // signal ~0.45. Its NO complement book is left NEUTRAL (mid 0.50), so ONLY
+        // the PAIR-aware (complement-driven) pull can endanger the NO bid.
+        fn yes_up() -> Book {
+            cent_book(&[(48, 100 * SH), (47, 1000 * SH), (46, 1000 * SH)], &[(52, 100 * SH)])
+        }
+        // Strong DOWN on YES: the mirror — heavy ASK depth behind a balanced touch.
+        fn yes_down() -> Book {
+            cent_book(&[(48, 100 * SH)], &[(52, 100 * SH), (53, 1000 * SH), (54, 1000 * SH)])
+        }
+
+        // Build a fresh hedging loop over the pair with the given YES book and a
+        // NEUTRAL NO book; run one cycle. Returns (yes_bid_quoting, no_bid_quoting).
+        async fn run(yes_book: Book) -> (bool, bool) {
+            let yes = TokenId(1);
+            let no = TokenId(2);
+            let tokens = vec![yes, no];
+            let (fetcher, _shared) = controllable_fetcher(
+                &tokens,
+                HashMap::from([(yes, (yes_book, true)), (no, (mid50_book(), true))]),
+            );
+            let mut params = mk_params(200, 5.0);
+            params.policy = Policy::RewardFarm;
+            params.hedging_enabled = true;
+            // imbalance/2 (~0.45) clears 0.3; the default 0.6 is unreachable on
+            // imbalance alone (the blend halves it), per the Phase-A convention.
+            params.pull_threshold = 0.3;
+            let (mut mm, _store_rx, _status_rx) =
+                build_loop(fetcher, generous_inv(), params, tokens, Usdc(1_000_000_000));
+            mm.reward_by_token.insert(yes, (1.0, 3.0, 100.0));
+            mm.reward_by_token.insert(no, (1.0, 3.0, 100.0));
+            mm.complement.insert(yes, no);
+            mm.complement.insert(no, yes);
+            mm.quote().await;
+            (
+                mm.qm.tracked().contains_key(&(yes, Side::Bid)),
+                mm.qm.tracked().contains_key(&(no, Side::Bid)),
+            )
+        }
+
+        // Strong UP on YES ⇒ NO bid PULLED (endangered), YES bid stays.
+        let (yes_bid, no_bid) = run(yes_up()).await;
+        assert!(yes_bid, "strong UP on YES keeps the (safe) YES bid");
+        assert!(!no_bid, "strong UP on YES PULLS the NO bid (buying NO right before it falls)");
+
+        // Strong DOWN on YES ⇒ YES bid PULLED, NO bid stays.
+        let (yes_bid, no_bid) = run(yes_down()).await;
+        assert!(!yes_bid, "strong DOWN on YES PULLS the YES bid");
+        assert!(no_bid, "strong DOWN on YES keeps the (safe) NO bid");
     }
 
     /// PRIORITY-4 (light) A/B (spec §15): run BOTH policies over the SAME
