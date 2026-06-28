@@ -3,7 +3,7 @@ resolver = "3"
 members = [
     "crates/core", "crates/engine", "crates/config", "crates/registry",
     "crates/ingestion", "crates/store", "crates/risk", "crates/execution", "crates/app",
-    "crates/tui",
+    "crates/tui", "crates/backtest",
 ]
 
 [workspace.package]

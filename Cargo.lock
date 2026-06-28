@@ -2674,6 +2674,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pm-backtest"
+version = "0.1.0"
+dependencies = [
+ "pm-ingestion",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pm-config"
 version = "0.1.0"
 dependencies = [

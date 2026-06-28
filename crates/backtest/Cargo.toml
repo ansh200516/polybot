@@ -1,0 +1,21 @@
+[package]
+name = "pm-backtest"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pm-ingestion = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lib]
+name = "pm_backtest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "backtest"
+path = "src/main.rs"

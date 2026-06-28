@@ -17,7 +17,7 @@
 //! - `GET /closed-positions?user=<w>` → resolved track record (like `/positions`
 //!   plus realized `avgPrice`/`cashPnl`; `curPrice ≈ 1/0` ⇒ won/lost).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::IngestError;
 
@@ -67,7 +67,7 @@ impl TimePeriod {
 
 /// One leaderboard row. Only the fields the confluence uses are kept; the rest
 /// of the response (rank, xUsername, profileImage, …) is ignored.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LeaderboardEntry {
     /// The trader's on-chain Polymarket address (the funder/proxy wallet) — the
     /// key for `positions(user=…)`.
@@ -144,10 +144,24 @@ impl<'de> Deserialize<'de> for TradeSide {
     }
 }
 
+impl Serialize for TradeSide {
+    /// Emits the wire form (`"BUY"`/`"SELL"`) so cached `/trades` JSON round-trips
+    /// through the lenient [`Deserialize`] above (used by the backtest cache).
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(match self {
+            TradeSide::Buy => "BUY",
+            TradeSide::Sell => "SELL",
+        })
+    }
+}
+
 /// One timestamped fill from `GET /trades`. Only the fields the backtest reads
 /// are kept; the rest (transactionHash, pseudonym, bio, profileImage, …) is
 /// ignored.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Trade {
     /// The trader's proxy wallet (the `user` key for `/trades?user=`).
     #[serde(rename = "proxyWallet")]
@@ -181,7 +195,7 @@ pub struct Trade {
 
 /// One resolved/closed position from `GET /closed-positions` — the shape of
 /// `/positions` plus realized fields. Source for the track-record ranking.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClosedPos {
     #[serde(rename = "conditionId")]
     pub condition_id: String,
