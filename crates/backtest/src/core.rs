@@ -21,6 +21,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::Serialize;
+
 use pm_ingestion::data_api::{ClosedPos, LeaderboardEntry, Trade, TradeSide};
 
 // ---------------------------------------------------------------------------
@@ -37,6 +39,17 @@ pub enum Ranking {
     TrackRecord,
     /// Rank by realized edge vs. entry price (`won − avg_price`) per bet.
     EdgePerBet,
+}
+
+impl Ranking {
+    /// Stable string label (used as a grid-result key and in the report JSON).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Ranking::RawLeaderboard => "RawLeaderboard",
+            Ranking::TrackRecord => "TrackRecord",
+            Ranking::EdgePerBet => "EdgePerBet",
+        }
+    }
 }
 
 /// Return the WHITELIST of wallets to follow under `ranking`, given the trader
@@ -253,6 +266,16 @@ pub enum ExitMode {
     FollowExit,
 }
 
+impl ExitMode {
+    /// Stable string label (used as a grid-result key and in the report JSON).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExitMode::Resolution => "Resolution",
+            ExitMode::FollowExit => "FollowExit",
+        }
+    }
+}
+
 /// Copy-trade execution parameters.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SimParams {
@@ -379,7 +402,7 @@ fn earliest_follow_sell(
 // ---------------------------------------------------------------------------
 
 /// Aggregate statistics over a batch of simulated trades.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Metrics {
     /// Number of FILLED trades (the basis of every return statistic below).
     pub n: usize,

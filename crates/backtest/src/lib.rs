@@ -37,6 +37,11 @@ use pm_ingestion::data_api::{
     ClosedPos, DataApiClient, LeaderboardEntry, OrderBy, TimePeriod, Trade, TradeSide, TradesFilter,
 };
 
+use crate::core::{
+    ExitMode, Metrics, Ranking, SimParams, SimResult, metrics, rank_wallets, signals,
+    simulate_signal,
+};
+
 /// Default size of the leaderboard pull, per `(orderBy, timePeriod)` slice.
 pub const DEFAULT_TRADERS: usize = 30;
 /// Default cap on the per-trader `/trades?user=` history.
@@ -383,6 +388,165 @@ pub async fn fetch_all(
     Ok(data)
 }
 
+// ---------------------------------------------------------------------------
+// BT-4: the parameter-grid runner (pure, I/O-free, unit-tested)
+// ---------------------------------------------------------------------------
+
+/// One row of the BT-4 result grid: the [`Metrics`] for a single
+/// `(ranking, k, lag, exit)` cell under one `scope`.
+#[derive(Debug, Clone, Serialize)]
+pub struct GridResult {
+    /// Ranking label ([`Ranking::as_str`]).
+    pub ranking: String,
+    /// Convergence threshold K (distinct whitelisted wallets).
+    pub k: usize,
+    /// Detection/execution lag in MINUTES.
+    pub lag_min: i64,
+    /// Exit-rule label ([`ExitMode::as_str`]).
+    pub exit: String,
+    /// `"all"` | `"sports"` | `"nonsports"`.
+    pub scope: String,
+    /// Aggregate statistics for this cell + scope.
+    pub metrics: Metrics,
+}
+
+/// The parameter grid swept by [`run_grid`]. [`Default`] is the BT-4 spec grid:
+/// rankings × Ks × lags × exits = 3 × 3 × 4 × 2 = 72 cells.
+#[derive(Debug, Clone)]
+pub struct GridConfig {
+    /// Wallet-selection rankings to sweep.
+    pub rankings: Vec<Ranking>,
+    /// Convergence thresholds K.
+    pub ks: Vec<usize>,
+    /// Detection/execution lags, in MINUTES (converted to seconds internally).
+    pub lags_min: Vec<i64>,
+    /// Exit rules.
+    pub exits: Vec<ExitMode>,
+    /// Whitelist size cap (per ranking).
+    pub top_n: usize,
+    /// Minimum resolved-position sample for the skill rankings.
+    pub min_bets: usize,
+    /// Convergence window for [`signals`], in seconds (default 24h).
+    pub window_secs: i64,
+    /// Round-trip fee/slippage fraction subtracted from each gross return.
+    pub fee_frac: f64,
+}
+
+impl Default for GridConfig {
+    fn default() -> Self {
+        Self {
+            rankings: vec![Ranking::RawLeaderboard, Ranking::TrackRecord, Ranking::EdgePerBet],
+            ks: vec![1, 2, 3],
+            lags_min: vec![1, 5, 30, 60],
+            exits: vec![ExitMode::Resolution, ExitMode::FollowExit],
+            top_n: 30,
+            min_bets: 20,
+            window_secs: 86_400,
+            fee_frac: 0.0,
+        }
+    }
+}
+
+/// Run the entire parameter grid over `data`, returning every [`GridResult`].
+///
+/// Pure and deterministic. For each `(ranking, k, lag, exit)` cell it emits THREE
+/// rows — scope `"all"`, `"sports"`, `"nonsports"`, in that order — so the output
+/// length is exactly `rankings × ks × lags_min × exits × 3` and the order is the
+/// grid order (rankings → ks → lags → exits, each followed by the 3 scopes).
+///
+/// Per cell:
+/// 1. `whitelist = rank_wallets(ranking, …)` (depends only on the ranking).
+/// 2. `sigs = signals(whitelist, k, window)`; re-sorted ascending by signal
+///    timestamp so [`metrics`]' max-drawdown sees true time order.
+/// 3. Each signal with a known resolution AND a tape is simulated with
+///    `SimParams { lag_secs: lag_min*60, fee_frac, exit }`, in signal-time order.
+/// 4. Scope split: `"all"` gets every result (so `Skipped` are counted there);
+///    `"sports"`/`"nonsports"` get only the `Filled` results, partitioned by
+///    their `sports` flag (preserving time order within each partition).
+pub fn run_grid(data: &FetchedData, cfg: &GridConfig) -> Vec<GridResult> {
+    let mut out: Vec<GridResult> = Vec::new();
+
+    for &ranking in &cfg.rankings {
+        // The whitelist depends only on the ranking (+ top_n/min_bets).
+        let whitelist = rank_wallets(
+            ranking,
+            &data.traders,
+            &data.closed_by_wallet,
+            cfg.top_n,
+            cfg.min_bets,
+        );
+
+        for &k in &cfg.ks {
+            // Signals depend on (whitelist, k, window). `signals` already returns
+            // them sorted by (timestamp, …); re-sort by timestamp defensively so
+            // the cumulative-equity / max-drawdown always sees true time order.
+            let mut sigs = signals(&whitelist, &data.trades_by_wallet, k, cfg.window_secs);
+            sigs.sort_by_key(|s| s.timestamp);
+
+            for &lag_min in &cfg.lags_min {
+                for &exit in &cfg.exits {
+                    let p = SimParams {
+                        lag_secs: lag_min * 60,
+                        fee_frac: cfg.fee_frac,
+                        exit,
+                    };
+
+                    // Simulate each signal that has BOTH a resolution and a tape,
+                    // in signal-timestamp order; partition Filled by sports.
+                    let mut all: Vec<SimResult> = Vec::with_capacity(sigs.len());
+                    let mut sports: Vec<SimResult> = Vec::new();
+                    let mut nonsports: Vec<SimResult> = Vec::new();
+
+                    for sig in &sigs {
+                        let (Some(&winning_outcome), Some(tape)) = (
+                            data.resolutions.get(&sig.condition_id),
+                            data.tape_by_market.get(&sig.condition_id),
+                        ) else {
+                            continue;
+                        };
+                        let title = data
+                            .titles
+                            .get(&sig.condition_id)
+                            .map_or("", String::as_str);
+                        let result = simulate_signal(
+                            sig,
+                            tape,
+                            winning_outcome,
+                            &data.trades_by_wallet,
+                            &p,
+                            title,
+                        );
+                        if let SimResult::Filled { sports: is_sports, .. } = &result {
+                            if *is_sports {
+                                sports.push(result.clone());
+                            } else {
+                                nonsports.push(result.clone());
+                            }
+                        }
+                        all.push(result);
+                    }
+
+                    // Emit the 3 scope rows, in a fixed order, for this cell.
+                    let scopes: [(&str, &[SimResult]); 3] =
+                        [("all", &all), ("sports", &sports), ("nonsports", &nonsports)];
+                    for (scope, results) in scopes {
+                        out.push(GridResult {
+                            ranking: ranking.as_str().to_string(),
+                            k,
+                            lag_min,
+                            exit: exit.as_str().to_string(),
+                            scope: scope.to_string(),
+                            metrics: metrics(results),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -556,5 +720,173 @@ mod tests {
         );
         // Defensive folding of stray characters.
         assert_eq!(cache_file_name("closed", "a/b c"), "closed-a_b_c.json");
+    }
+
+    // ===================== run_grid (BT-4) =====================
+
+    fn lb_entry(wallet: &str) -> LeaderboardEntry {
+        LeaderboardEntry {
+            proxy_wallet: wallet.to_string(),
+            user_name: String::new(),
+            pnl: 0.0,
+            vol: 0.0,
+        }
+    }
+
+    fn buy(wallet: &str, cid: &str, price: f64, ts: i64) -> Trade {
+        Trade {
+            proxy_wallet: wallet.to_string(),
+            condition_id: cid.to_string(),
+            asset: String::new(),
+            side: TradeSide::Buy,
+            size: 10.0,
+            price,
+            timestamp: ts,
+            outcome_index: 0,
+            title: String::new(),
+            slug: String::new(),
+        }
+    }
+
+    fn won_pos(cid: &str) -> ClosedPos {
+        ClosedPos {
+            condition_id: cid.to_string(),
+            asset: String::new(),
+            avg_price: 0.4,
+            outcome_index: 0,
+            cur_price: 1.0,
+            cash_pnl: 1.0,
+            size: 100.0,
+            title: String::new(),
+        }
+    }
+
+    /// Locate one grid cell + scope (helper for the hand-computed assertions).
+    fn cell<'a>(
+        results: &'a [GridResult],
+        ranking: &str,
+        k: usize,
+        lag_min: i64,
+        exit: &str,
+        scope: &str,
+    ) -> &'a GridResult {
+        results
+            .iter()
+            .find(|r| {
+                r.ranking == ranking
+                    && r.k == k
+                    && r.lag_min == lag_min
+                    && r.exit == exit
+                    && r.scope == scope
+            })
+            .expect("grid cell present")
+    }
+
+    /// `run_grid` over a small synthetic `FetchedData`: assert the grid
+    /// cardinality (rankings×ks×lags×exits×3 scopes) AND a hand-computable cell.
+    #[test]
+    fn run_grid_cardinality_and_known_cell() {
+        use crate::core::{ExitMode, Ranking};
+
+        // Two whitelisted wallets, both BUY two resolved markets (winner = #0):
+        //   0xM1 — non-sports ("Will the Fed cut rates?")
+        //   0xM2 — sports     ("Lakers vs Celtics tonight")
+        let traders = vec![lb_entry("0xA"), lb_entry("0xB")];
+
+        let mut trades_by_wallet: HashMap<String, Vec<Trade>> = HashMap::new();
+        trades_by_wallet.insert(
+            "0xA".to_string(),
+            vec![buy("0xA", "0xM1", 0.45, 1000), buy("0xA", "0xM2", 0.35, 2000)],
+        );
+        trades_by_wallet.insert(
+            "0xB".to_string(),
+            vec![buy("0xB", "0xM1", 0.46, 1100), buy("0xB", "0xM2", 0.36, 2100)],
+        );
+
+        // Track records ≥ min_bets so the skill rankings also select both.
+        let mut closed_by_wallet: HashMap<String, Vec<ClosedPos>> = HashMap::new();
+        closed_by_wallet.insert("0xA".to_string(), vec![won_pos("0xH1"), won_pos("0xH2")]);
+        closed_by_wallet.insert("0xB".to_string(), vec![won_pos("0xH3"), won_pos("0xH4")]);
+
+        let mut resolutions: HashMap<String, i64> = HashMap::new();
+        resolutions.insert("0xM1".to_string(), 0);
+        resolutions.insert("0xM2".to_string(), 0);
+
+        // Tapes: first trade at/after the lag-1min entry (t+60) is the entry px.
+        let mut tape_by_market: HashMap<String, Vec<Trade>> = HashMap::new();
+        tape_by_market.insert(
+            "0xM1".to_string(),
+            vec![buy("0xMM", "0xM1", 0.45, 1000), buy("0xMM", "0xM1", 0.50, 1060), buy("0xMM", "0xM1", 0.55, 1200)],
+        );
+        tape_by_market.insert(
+            "0xM2".to_string(),
+            vec![buy("0xMM", "0xM2", 0.30, 2000), buy("0xMM", "0xM2", 0.40, 2060), buy("0xMM", "0xM2", 0.50, 2200)],
+        );
+
+        let mut titles: HashMap<String, String> = HashMap::new();
+        titles.insert("0xM1".to_string(), "Will the Fed cut rates?".to_string());
+        titles.insert("0xM2".to_string(), "Lakers vs Celtics tonight".to_string());
+
+        let data = FetchedData {
+            traders,
+            trades_by_wallet,
+            closed_by_wallet,
+            resolutions,
+            tape_by_market,
+            titles,
+        };
+
+        let cfg = GridConfig {
+            rankings: vec![Ranking::RawLeaderboard, Ranking::TrackRecord, Ranking::EdgePerBet],
+            ks: vec![1, 2],
+            lags_min: vec![1, 5],
+            exits: vec![ExitMode::Resolution, ExitMode::FollowExit],
+            top_n: 10,
+            min_bets: 1,
+            window_secs: 86_400,
+            fee_frac: 0.0,
+        };
+
+        let results = run_grid(&data, &cfg);
+
+        // ---- cardinality: rankings × ks × lags × exits × 3 scopes ----
+        let expected =
+            cfg.rankings.len() * cfg.ks.len() * cfg.lags_min.len() * cfg.exits.len() * 3;
+        assert_eq!(results.len(), expected);
+        assert_eq!(expected, 3 * 2 * 2 * 2 * 3);
+
+        // Each cell emits exactly 3 scope rows in all→sports→nonsports order.
+        for chunk in results.chunks(3) {
+            assert_eq!(chunk[0].scope, "all");
+            assert_eq!(chunk[1].scope, "sports");
+            assert_eq!(chunk[2].scope, "nonsports");
+        }
+
+        // ---- hand-computed cell: RawLeaderboard, k=1, lag=1min, Resolution ----
+        // k=1 → first whitelisted BUY per (market,#0): M1@1000, M2@2000.
+        // lag 60s → entries M1@1060 px=0.50, M2@2060 px=0.40; winner #0 → exit 1.0.
+        //   ret(M1) = (1.0-0.50)/0.50 = 1.0  (non-sports)
+        //   ret(M2) = (1.0-0.40)/0.40 = 1.5  (sports)
+        // all = [1.0, 1.5] (time order): mean 1.25, total 2.5, hit 1.0,
+        //   stdev 0.25 → sharpe 5.0, cumsum monotically up → maxDD 0.
+        let all = cell(&results, "RawLeaderboard", 1, 1, "Resolution", "all");
+        assert_eq!(all.metrics.n, 2);
+        assert_eq!(all.metrics.skipped, 0);
+        assert!((all.metrics.mean_ret - 1.25).abs() < 1e-12);
+        assert!((all.metrics.median_ret - 1.25).abs() < 1e-12);
+        assert!((all.metrics.total_ret - 2.5).abs() < 1e-12);
+        assert!((all.metrics.hit_rate - 1.0).abs() < 1e-12);
+        assert!((all.metrics.sharpe - 5.0).abs() < 1e-9);
+        assert!((all.metrics.max_drawdown - 0.0).abs() < 1e-12);
+
+        let sports = cell(&results, "RawLeaderboard", 1, 1, "Resolution", "sports");
+        assert_eq!(sports.metrics.n, 1);
+        assert_eq!(sports.metrics.skipped, 0);
+        assert!((sports.metrics.total_ret - 1.5).abs() < 1e-12);
+
+        let nonsports = cell(&results, "RawLeaderboard", 1, 1, "Resolution", "nonsports");
+        assert_eq!(nonsports.metrics.n, 1);
+        assert_eq!(nonsports.metrics.skipped, 0);
+        assert!((nonsports.metrics.total_ret - 1.0).abs() < 1e-12);
     }
 }
