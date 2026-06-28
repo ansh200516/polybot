@@ -43,8 +43,8 @@ use pm_ingestion::data_api::{
 use pm_registry::gamma::GammaMarket;
 
 use crate::core::{
-    ExitMode, Metrics, Ranking, SimParams, SimResult, metrics, rank_wallets, signals,
-    simulate_signal,
+    ExitMode, Metrics, PRICE_BUCKETS, Ranking, SimParams, SimResult, metrics, price_bucket,
+    rank_wallets_oos, signals_after, simulate_signal, trader_records,
 };
 
 /// Default size of the leaderboard pull, per `(orderBy, timePeriod)` slice.
@@ -562,7 +562,7 @@ pub async fn fetch_all(
 // ---------------------------------------------------------------------------
 
 /// One row of the BT-4 result grid: the [`Metrics`] for a single
-/// `(ranking, k, lag, exit)` cell under one `scope`.
+/// `(ranking, k, lag, exit, freshness)` cell under one `scope`.
 #[derive(Debug, Clone, Serialize)]
 pub struct GridResult {
     /// Ranking label ([`Ranking::as_str`]).
@@ -573,14 +573,18 @@ pub struct GridResult {
     pub lag_min: i64,
     /// Exit-rule label ([`ExitMode::as_str`]).
     pub exit: String,
-    /// `"all"` | `"sports"` | `"nonsports"`.
+    /// FRESHNESS filter: max tolerated entry-vs-trigger price drift, or `null`
+    /// (no filter). Serialized as a number or null ([`SimParams::max_drift`]).
+    pub max_drift: Option<f64>,
+    /// `"all"` | `"sports"` | `"nonsports"` | `"px:<bucket>"` (see
+    /// [`crate::core::PRICE_BUCKETS`]).
     pub scope: String,
     /// Aggregate statistics for this cell + scope.
     pub metrics: Metrics,
 }
 
-/// The parameter grid swept by [`run_grid`]. [`Default`] is the BT-4 spec grid:
-/// rankings × Ks × lags × exits = 3 × 3 × 4 × 2 = 72 cells.
+/// The parameter grid swept by [`run_grid`]. [`Default`] is the FIX-B spec grid:
+/// rankings × Ks × lags × exits × freshness = 3 × 3 × 4 × 2 × 3 = 216 cells.
 #[derive(Debug, Clone)]
 pub struct GridConfig {
     /// Wallet-selection rankings to sweep.
@@ -591,14 +595,23 @@ pub struct GridConfig {
     pub lags_min: Vec<i64>,
     /// Exit rules.
     pub exits: Vec<ExitMode>,
+    /// FRESHNESS thresholds to sweep: `None` (no filter) and the fractional
+    /// entry-vs-trigger drift caps ([`SimParams::max_drift`]).
+    pub freshness: Vec<Option<f64>>,
     /// Whitelist size cap (per ranking).
     pub top_n: usize,
-    /// Minimum resolved-position sample for the skill rankings.
+    /// Minimum PRE-cutoff resolved-bet sample for the skill rankings
+    /// ([`trader_records`]).
     pub min_bets: usize,
-    /// Convergence window for [`signals`], in seconds (default 24h).
+    /// Convergence window for [`signals_after`], in seconds (default 24h).
     pub window_secs: i64,
     /// Round-trip fee/slippage fraction subtracted from each gross return.
     pub fee_frac: f64,
+    /// OUT-OF-SAMPLE split point (epoch seconds). BUYS strictly BEFORE it build
+    /// the trader records that SELECT wallets; BUYS at/after it are the COPY-TEST
+    /// signals. Callers MUST set this (e.g. `now − 90 days`); [`Default`] leaves
+    /// it at `0` (epoch), which makes the whole history the test set.
+    pub cutoff_ts: i64,
 }
 
 impl Default for GridConfig {
@@ -608,105 +621,90 @@ impl Default for GridConfig {
             ks: vec![1, 2, 3],
             lags_min: vec![1, 5, 30, 60],
             exits: vec![ExitMode::Resolution, ExitMode::FollowExit],
+            freshness: vec![None, Some(0.35), Some(0.15)],
             top_n: 30,
-            min_bets: 20,
+            min_bets: 10,
             window_secs: 86_400,
             fee_frac: 0.0,
+            cutoff_ts: 0,
         }
     }
 }
 
 /// Run the entire parameter grid over `data`, returning every [`GridResult`].
 ///
-/// Pure and deterministic. For each `(ranking, k, lag, exit)` cell it emits THREE
-/// rows — scope `"all"`, `"sports"`, `"nonsports"`, in that order — so the output
-/// length is exactly `rankings × ks × lags_min × exits × 3` and the order is the
-/// grid order (rankings → ks → lags → exits, each followed by the 3 scopes).
+/// Pure and deterministic. This is the FIX-B (OUT-OF-SAMPLE) pipeline: trader
+/// SELECTION uses only PRE-`cutoff_ts` history and the COPY TEST uses only
+/// POST-`cutoff_ts` signals, so the two are DISJOINT (no survivorship bias).
+///
+/// For each `(ranking, k, lag, exit, freshness)` cell it emits one row per scope:
+/// `"all"`, `"sports"`, `"nonsports"`, then one `"px:<bucket>"` per
+/// [`PRICE_BUCKETS`] entry — `3 + PRICE_BUCKETS.len()` rows in a fixed order. The
+/// total length is `rankings × ks × lags_min × exits × freshness × (3 + buckets)`
+/// in grid order.
 ///
 /// Per cell:
-/// 1. `whitelist = rank_wallets(ranking, …)` (depends only on the ranking).
-/// 2. `sigs = signals(whitelist, k, window)`; re-sorted ascending by signal
-///    timestamp so [`metrics`]' max-drawdown sees true time order.
+/// 1. `records = trader_records(trades, resolutions, cutoff_ts)` (computed once);
+///    `whitelist = rank_wallets_oos(ranking, traders, records, …)`.
+/// 2. `sigs = signals_after(whitelist, k, window, cutoff_ts)`; re-sorted ascending
+///    by timestamp so [`metrics`]' max-drawdown sees true time order.
 /// 3. Each signal with a known resolution AND a tape is simulated with
-///    `SimParams { lag_secs: lag_min*60, fee_frac, exit }`, in signal-time order.
+///    `SimParams { lag_secs: lag_min*60, fee_frac, exit, max_drift }`, in
+///    signal-time order (the freshness filter may turn a copy into `Skipped`).
 /// 4. Scope split: `"all"` gets every result (so `Skipped` are counted there);
-///    `"sports"`/`"nonsports"` get only the `Filled` results, partitioned by
-///    their `sports` flag (preserving time order within each partition).
+///    `"sports"`/`"nonsports"`/`"px:<bucket>"` get only the `Filled` results,
+///    partitioned by the sports flag / entry-price bucket (time order preserved).
 pub fn run_grid(data: &FetchedData, cfg: &GridConfig) -> Vec<GridResult> {
     let mut out: Vec<GridResult> = Vec::new();
 
+    // PRE-cutoff records (the OUT-OF-SAMPLE selection set) — computed once.
+    let records = trader_records(&data.trades_by_wallet, &data.resolutions, cfg.cutoff_ts);
+
     for &ranking in &cfg.rankings {
-        // The whitelist depends only on the ranking (+ top_n/min_bets).
-        let whitelist = rank_wallets(
-            ranking,
-            &data.traders,
-            &data.closed_by_wallet,
-            cfg.top_n,
-            cfg.min_bets,
-        );
+        // Selection ranks on PRE-cutoff records only (never the test trades).
+        let whitelist = rank_wallets_oos(ranking, &data.traders, &records, cfg.top_n, cfg.min_bets);
 
         for &k in &cfg.ks {
-            // Signals depend on (whitelist, k, window). `signals` already returns
+            // POST-cutoff signals only (the copy-test set). `signals_after` returns
             // them sorted by (timestamp, …); re-sort by timestamp defensively so
             // the cumulative-equity / max-drawdown always sees true time order.
-            let mut sigs = signals(&whitelist, &data.trades_by_wallet, k, cfg.window_secs);
+            let mut sigs =
+                signals_after(&whitelist, &data.trades_by_wallet, k, cfg.window_secs, cfg.cutoff_ts);
             sigs.sort_by_key(|s| s.timestamp);
 
             for &lag_min in &cfg.lags_min {
                 for &exit in &cfg.exits {
-                    let p = SimParams {
-                        lag_secs: lag_min * 60,
-                        fee_frac: cfg.fee_frac,
-                        exit,
-                    };
-
-                    // Simulate each signal that has BOTH a resolution and a tape,
-                    // in signal-timestamp order; partition Filled by sports.
-                    let mut all: Vec<SimResult> = Vec::with_capacity(sigs.len());
-                    let mut sports: Vec<SimResult> = Vec::new();
-                    let mut nonsports: Vec<SimResult> = Vec::new();
-
-                    for sig in &sigs {
-                        let (Some(&winning_outcome), Some(tape)) = (
-                            data.resolutions.get(&sig.condition_id),
-                            data.tape_by_market.get(&sig.condition_id),
-                        ) else {
-                            continue;
+                    for &max_drift in &cfg.freshness {
+                        let p = SimParams {
+                            lag_secs: lag_min * 60,
+                            fee_frac: cfg.fee_frac,
+                            exit,
+                            max_drift,
                         };
-                        let title = data
-                            .titles
-                            .get(&sig.condition_id)
-                            .map_or("", String::as_str);
-                        let result = simulate_signal(
-                            sig,
-                            tape,
-                            winning_outcome,
-                            &data.trades_by_wallet,
-                            &p,
-                            title,
-                        );
-                        if let SimResult::Filled { sports: is_sports, .. } = &result {
-                            if *is_sports {
-                                sports.push(result.clone());
-                            } else {
-                                nonsports.push(result.clone());
-                            }
-                        }
-                        all.push(result);
-                    }
 
-                    // Emit the 3 scope rows, in a fixed order, for this cell.
-                    let scopes: [(&str, &[SimResult]); 3] =
-                        [("all", &all), ("sports", &sports), ("nonsports", &nonsports)];
-                    for (scope, results) in scopes {
-                        out.push(GridResult {
-                            ranking: ranking.as_str().to_string(),
-                            k,
-                            lag_min,
-                            exit: exit.as_str().to_string(),
-                            scope: scope.to_string(),
-                            metrics: metrics(results),
-                        });
+                        // Simulate each signal that has BOTH a resolution and a
+                        // tape, in signal-timestamp order.
+                        let mut all: Vec<SimResult> = Vec::with_capacity(sigs.len());
+                        for sig in &sigs {
+                            let (Some(&winning_outcome), Some(tape)) = (
+                                data.resolutions.get(&sig.condition_id),
+                                data.tape_by_market.get(&sig.condition_id),
+                            ) else {
+                                continue;
+                            };
+                            let title =
+                                data.titles.get(&sig.condition_id).map_or("", String::as_str);
+                            all.push(simulate_signal(
+                                sig,
+                                tape,
+                                winning_outcome,
+                                &data.trades_by_wallet,
+                                &p,
+                                title,
+                            ));
+                        }
+
+                        emit_scopes(&mut out, ranking, k, lag_min, exit, max_drift, &all);
                     }
                 }
             }
@@ -714,6 +712,60 @@ pub fn run_grid(data: &FetchedData, cfg: &GridConfig) -> Vec<GridResult> {
     }
 
     out
+}
+
+/// Partition one cell's `Filled` results by sports flag and entry-price bucket,
+/// and push the `"all"` + `"sports"` + `"nonsports"` + `"px:<bucket>"` scope rows
+/// (in that fixed order) for the `(ranking, k, lag, exit, max_drift)` cell. Time
+/// order is preserved within every partition.
+fn emit_scopes(
+    out: &mut Vec<GridResult>,
+    ranking: Ranking,
+    k: usize,
+    lag_min: i64,
+    exit: ExitMode,
+    max_drift: Option<f64>,
+    all: &[SimResult],
+) {
+    let mut sports: Vec<SimResult> = Vec::new();
+    let mut nonsports: Vec<SimResult> = Vec::new();
+    let mut buckets: Vec<(&'static str, Vec<SimResult>)> =
+        PRICE_BUCKETS.iter().map(|&b| (b, Vec::new())).collect();
+
+    for r in all {
+        if let SimResult::Filled { sports: is_sp, entry_px, .. } = r {
+            if *is_sp {
+                sports.push(r.clone());
+            } else {
+                nonsports.push(r.clone());
+            }
+            // `price_bucket` always returns a `PRICE_BUCKETS` member, so the
+            // lookup never misses (no unwrap/panic).
+            let label = price_bucket(*entry_px);
+            if let Some(slot) = buckets.iter_mut().find(|(b, _)| *b == label) {
+                slot.1.push(r.clone());
+            }
+        }
+    }
+
+    let push = |out: &mut Vec<GridResult>, scope: String, results: &[SimResult]| {
+        out.push(GridResult {
+            ranking: ranking.as_str().to_string(),
+            k,
+            lag_min,
+            exit: exit.as_str().to_string(),
+            max_drift,
+            scope,
+            metrics: metrics(results),
+        });
+    };
+
+    push(out, "all".to_string(), all);
+    push(out, "sports".to_string(), &sports);
+    push(out, "nonsports".to_string(), &nonsports);
+    for (label, results) in &buckets {
+        push(out, format!("px:{label}"), results);
+    }
 }
 
 #[cfg(test)]
@@ -1006,19 +1058,6 @@ mod tests {
         }
     }
 
-    fn won_pos(cid: &str) -> ClosedPos {
-        ClosedPos {
-            condition_id: cid.to_string(),
-            asset: String::new(),
-            avg_price: 0.4,
-            outcome_index: 0,
-            cur_price: 1.0,
-            cash_pnl: 1.0,
-            size: 100.0,
-            title: String::new(),
-        }
-    }
-
     /// Locate one grid cell + scope (helper for the hand-computed assertions).
     fn cell<'a>(
         results: &'a [GridResult],
@@ -1026,6 +1065,7 @@ mod tests {
         k: usize,
         lag_min: i64,
         exit: &str,
+        max_drift: Option<f64>,
         scope: &str,
     ) -> &'a GridResult {
         results
@@ -1035,50 +1075,74 @@ mod tests {
                     && r.k == k
                     && r.lag_min == lag_min
                     && r.exit == exit
+                    && r.max_drift == max_drift
                     && r.scope == scope
             })
             .expect("grid cell present")
     }
 
-    /// `run_grid` over a small synthetic `FetchedData`: assert the grid
-    /// cardinality (rankings×ks×lags×exits×3 scopes) AND a hand-computable cell.
+    /// `run_grid` over a small synthetic `FetchedData` with an OUT-OF-SAMPLE
+    /// cutoff: assert the grid cardinality (incl. the freshness dimension and the
+    /// 3 + price-bucket scopes), that PRE-cutoff BUYS do NOT become signals (the
+    /// trust fix), a hand-computable cell, and that the freshness filter skips a
+    /// chased copy.
     #[test]
-    fn run_grid_cardinality_and_known_cell() {
-        use crate::core::{ExitMode, Ranking};
+    fn run_grid_oos_split_freshness_and_known_cell() {
+        use crate::core::{ExitMode, PRICE_BUCKETS, Ranking};
 
-        // Two whitelisted wallets, both BUY two resolved markets (winner = #0):
-        //   0xM1 — non-sports ("Will the Fed cut rates?")
-        //   0xM2 — sports     ("Lakers vs Celtics tonight")
+        const CUTOFF: i64 = 1_000_000;
+
         let traders = vec![lb_entry("0xA"), lb_entry("0xB")];
 
+        // PRE-cutoff SELECTION buys (resolved winners) so the skill rankings pick
+        // both wallets; plus a PRE-cutoff buy in 0xM1 that MUST be excluded from
+        // the POST-cutoff signal set. POST-cutoff buys in 0xM1/0xM2 are the test.
         let mut trades_by_wallet: HashMap<String, Vec<Trade>> = HashMap::new();
         trades_by_wallet.insert(
             "0xA".to_string(),
-            vec![buy("0xA", "0xM1", 0.45, 1000), buy("0xA", "0xM2", 0.35, 2000)],
+            vec![
+                buy("0xA", "0xH1", 0.4, 100),
+                buy("0xA", "0xH2", 0.4, 200),
+                buy("0xA", "0xM1", 0.20, 500), // PRE-cutoff M1 buy -> excluded from signals
+                buy("0xA", "0xM1", 0.45, CUTOFF), // POST (>= cutoff): triggers M1
+                buy("0xA", "0xM2", 0.35, 1_001_000), // POST: triggers M2
+            ],
         );
         trades_by_wallet.insert(
             "0xB".to_string(),
-            vec![buy("0xB", "0xM1", 0.46, 1100), buy("0xB", "0xM2", 0.36, 2100)],
+            vec![
+                buy("0xB", "0xH3", 0.4, 100),
+                buy("0xB", "0xH4", 0.4, 200),
+                buy("0xB", "0xM1", 0.46, 1_000_100), // POST
+                buy("0xB", "0xM2", 0.36, 1_001_100), // POST
+            ],
         );
 
-        // Track records ≥ min_bets so the skill rankings also select both.
-        let mut closed_by_wallet: HashMap<String, Vec<ClosedPos>> = HashMap::new();
-        closed_by_wallet.insert("0xA".to_string(), vec![won_pos("0xH1"), won_pos("0xH2")]);
-        closed_by_wallet.insert("0xB".to_string(), vec![won_pos("0xH3"), won_pos("0xH4")]);
+        // closed positions are no longer consulted by run_grid (OOS uses trades).
+        let closed_by_wallet: HashMap<String, Vec<ClosedPos>> = HashMap::new();
 
         let mut resolutions: HashMap<String, i64> = HashMap::new();
-        resolutions.insert("0xM1".to_string(), 0);
-        resolutions.insert("0xM2".to_string(), 0);
+        for cid in ["0xH1", "0xH2", "0xH3", "0xH4", "0xM1", "0xM2"] {
+            resolutions.insert(cid.to_string(), 0); // every market resolves to #0
+        }
 
         // Tapes: first trade at/after the lag-1min entry (t+60) is the entry px.
         let mut tape_by_market: HashMap<String, Vec<Trade>> = HashMap::new();
         tape_by_market.insert(
             "0xM1".to_string(),
-            vec![buy("0xMM", "0xM1", 0.45, 1000), buy("0xMM", "0xM1", 0.50, 1060), buy("0xMM", "0xM1", 0.55, 1200)],
+            vec![
+                buy("0xMM", "0xM1", 0.45, CUTOFF),
+                buy("0xMM", "0xM1", 0.50, CUTOFF + 60),
+                buy("0xMM", "0xM1", 0.55, CUTOFF + 200),
+            ],
         );
         tape_by_market.insert(
             "0xM2".to_string(),
-            vec![buy("0xMM", "0xM2", 0.30, 2000), buy("0xMM", "0xM2", 0.40, 2060), buy("0xMM", "0xM2", 0.50, 2200)],
+            vec![
+                buy("0xMM", "0xM2", 0.30, 1_001_000),
+                buy("0xMM", "0xM2", 0.40, 1_001_060),
+                buy("0xMM", "0xM2", 0.50, 1_001_200),
+            ],
         );
 
         let mut titles: HashMap<String, String> = HashMap::new();
@@ -1099,52 +1163,77 @@ mod tests {
             ks: vec![1, 2],
             lags_min: vec![1, 5],
             exits: vec![ExitMode::Resolution, ExitMode::FollowExit],
+            freshness: vec![None, Some(0.13)],
             top_n: 10,
-            min_bets: 1,
+            min_bets: 2,
             window_secs: 86_400,
             fee_frac: 0.0,
+            cutoff_ts: CUTOFF,
         };
 
         let results = run_grid(&data, &cfg);
 
-        // ---- cardinality: rankings × ks × lags × exits × 3 scopes ----
-        let expected =
-            cfg.rankings.len() * cfg.ks.len() * cfg.lags_min.len() * cfg.exits.len() * 3;
+        // ---- cardinality: rankings × ks × lags × exits × freshness × scopes ----
+        let n_scopes = 3 + PRICE_BUCKETS.len();
+        let expected = cfg.rankings.len()
+            * cfg.ks.len()
+            * cfg.lags_min.len()
+            * cfg.exits.len()
+            * cfg.freshness.len()
+            * n_scopes;
         assert_eq!(results.len(), expected);
-        assert_eq!(expected, 3 * 2 * 2 * 2 * 3);
+        assert_eq!(expected, 3 * 2 * 2 * 2 * 2 * 8);
 
-        // Each cell emits exactly 3 scope rows in all→sports→nonsports order.
-        for chunk in results.chunks(3) {
+        // Each cell emits its scope rows in a fixed all→sports→nonsports→px order.
+        for chunk in results.chunks(n_scopes) {
             assert_eq!(chunk[0].scope, "all");
             assert_eq!(chunk[1].scope, "sports");
             assert_eq!(chunk[2].scope, "nonsports");
+            for (i, b) in PRICE_BUCKETS.iter().enumerate() {
+                assert_eq!(chunk[3 + i].scope, format!("px:{b}"));
+            }
         }
 
-        // ---- hand-computed cell: RawLeaderboard, k=1, lag=1min, Resolution ----
-        // k=1 → first whitelisted BUY per (market,#0): M1@1000, M2@2000.
-        // lag 60s → entries M1@1060 px=0.50, M2@2060 px=0.40; winner #0 → exit 1.0.
-        //   ret(M1) = (1.0-0.50)/0.50 = 1.0  (non-sports)
-        //   ret(M2) = (1.0-0.40)/0.40 = 1.5  (sports)
-        // all = [1.0, 1.5] (time order): mean 1.25, total 2.5, hit 1.0,
-        //   stdev 0.25 → sharpe 5.0, cumsum monotically up → maxDD 0.
-        let all = cell(&results, "RawLeaderboard", 1, 1, "Resolution", "all");
-        assert_eq!(all.metrics.n, 2);
+        // ---- hand-computed cell: RawLeaderboard, k=1, lag=1min, Resolution, NO
+        //      freshness. POST-cutoff k=1 signals: M1 @CUTOFF (trigger 0.45),
+        //      M2 @1_001_000 (trigger 0.35). The PRE-cutoff M1 buy @500 is NOT a
+        //      signal (the OOS trust fix) — else M1's entry/return would differ.
+        //      lag 60s → entries M1=0.50, M2=0.40; winner #0 → exit 1.0:
+        //        ret(M1) = (1-0.50)/0.50 = 1.0  (non-sports)
+        //        ret(M2) = (1-0.40)/0.40 = 1.5  (sports)
+        //      all = [1.0, 1.5]: mean 1.25, total 2.5, hit 1.0, sharpe 5.0, DD 0.
+        let all = cell(&results, "RawLeaderboard", 1, 1, "Resolution", None, "all");
+        assert_eq!(all.metrics.n, 2, "exactly the two POST-cutoff signals filled");
         assert_eq!(all.metrics.skipped, 0);
         assert!((all.metrics.mean_ret - 1.25).abs() < 1e-12);
-        assert!((all.metrics.median_ret - 1.25).abs() < 1e-12);
         assert!((all.metrics.total_ret - 2.5).abs() < 1e-12);
         assert!((all.metrics.hit_rate - 1.0).abs() < 1e-12);
         assert!((all.metrics.sharpe - 5.0).abs() < 1e-9);
         assert!((all.metrics.max_drawdown - 0.0).abs() < 1e-12);
 
-        let sports = cell(&results, "RawLeaderboard", 1, 1, "Resolution", "sports");
+        let sports = cell(&results, "RawLeaderboard", 1, 1, "Resolution", None, "sports");
         assert_eq!(sports.metrics.n, 1);
-        assert_eq!(sports.metrics.skipped, 0);
         assert!((sports.metrics.total_ret - 1.5).abs() < 1e-12);
-
-        let nonsports = cell(&results, "RawLeaderboard", 1, 1, "Resolution", "nonsports");
+        let nonsports = cell(&results, "RawLeaderboard", 1, 1, "Resolution", None, "nonsports");
         assert_eq!(nonsports.metrics.n, 1);
-        assert_eq!(nonsports.metrics.skipped, 0);
         assert!((nonsports.metrics.total_ret - 1.0).abs() < 1e-12);
+
+        // ---- price-bucket scope: both entries (0.50, 0.40) fall in 30-70. ----
+        let px = cell(&results, "RawLeaderboard", 1, 1, "Resolution", None, "px:30-70");
+        assert_eq!(px.metrics.n, 2);
+        assert!((px.metrics.total_ret - 2.5).abs() < 1e-12);
+        let px_low = cell(&results, "RawLeaderboard", 1, 1, "Resolution", None, "px:lt10");
+        assert_eq!(px_low.metrics.n, 0);
+
+        // ---- freshness cell: max_drift=0.13. M1 drift |0.50-0.45|/0.45=0.111 OK;
+        //      M2 drift |0.40-0.35|/0.35=0.143 > 0.13 -> chased -> Skipped. ----
+        let fresh = cell(&results, "RawLeaderboard", 1, 1, "Resolution", Some(0.13), "all");
+        assert_eq!(fresh.metrics.n, 1, "M2 skipped as too far chased");
+        assert_eq!(fresh.metrics.skipped, 1);
+        assert!((fresh.metrics.total_ret - 1.0).abs() < 1e-12);
+        let fresh_ns = cell(&results, "RawLeaderboard", 1, 1, "Resolution", Some(0.13), "nonsports");
+        assert_eq!(fresh_ns.metrics.n, 1); // only M1 (non-sports) survives
+        let fresh_sp = cell(&results, "RawLeaderboard", 1, 1, "Resolution", Some(0.13), "sports");
+        assert_eq!(fresh_sp.metrics.n, 0);
     }
 }

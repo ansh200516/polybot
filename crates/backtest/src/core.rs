@@ -161,45 +161,239 @@ fn wilson_lower_bound(wins: usize, total: usize) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. Out-of-sample trader records (FIX-B — the trust fix)
+// ---------------------------------------------------------------------------
+
+/// A trader's OUT-OF-SAMPLE record, built from their own PRE-cutoff resolved
+/// BUYS (the SELECTION set). This is the trades-based replacement for the
+/// shallow closed-positions track record: it is computed from `/trades` BUYS
+/// scored against the INDEPENDENT Gamma `resolutions`, and it is deliberately
+/// blind to anything at/after `cutoff_ts` — so trader SELECTION and the COPY
+/// TEST run on DISJOINT trades and the leaderboard can no longer be ranked on
+/// the same history it is tested on (the survivorship bias FIX-B removes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraderRecord {
+    /// The trader's proxy wallet.
+    pub wallet: String,
+    /// Number of qualifying PRE-cutoff resolved BUYS (each BUY counts once).
+    pub n_bets: usize,
+    /// Fraction of those bets that WON (`resolutions[cond] == outcome_index`).
+    pub hit_rate: f64,
+    /// Mean realized edge per bet: `mean((won ? 1 : 0) − entry_price)`.
+    pub mean_edge: f64,
+    /// Wilson 95% lower bound of the hit rate (sample-size aware, see
+    /// [`wilson_lower_bound`]).
+    pub wilson: f64,
+}
+
+/// Build every trader's PRE-cutoff resolved-bet record (the OUT-OF-SAMPLE
+/// SELECTION set) from their own BUYS.
+///
+/// For each BUY with `timestamp < cutoff_ts` in a market with a known Gamma
+/// resolution, the bet WON iff `resolutions[condition_id] == outcome_index` and
+/// its realized edge is `(won ? 1 : 0) − price`. These are aggregated per wallet
+/// into a [`TraderRecord`] (`n_bets`, `hit_rate`, `mean_edge`, and the
+/// [`wilson_lower_bound`] of the hit rate).
+///
+/// BUYS at/after `cutoff_ts` (the COPY-TEST set) and BUYS in markets Gamma did
+/// not resolve are ignored. A wallet with zero qualifying bets is omitted, so no
+/// record ever carries a NaN. Pure and deterministic (the output map is keyed by
+/// wallet, independent of iteration order).
+pub fn trader_records(
+    trades_by_wallet: &HashMap<String, Vec<Trade>>,
+    resolutions: &HashMap<String, i64>,
+    cutoff_ts: i64,
+) -> HashMap<String, TraderRecord> {
+    let mut out: HashMap<String, TraderRecord> = HashMap::new();
+    for (wallet, trades) in trades_by_wallet {
+        let mut n_bets = 0usize;
+        let mut wins = 0usize;
+        let mut edge_sum = 0.0_f64;
+        for t in trades {
+            // SELECTION set only: pre-cutoff BUYS in Gamma-resolved markets.
+            if t.side != TradeSide::Buy || t.timestamp >= cutoff_ts {
+                continue;
+            }
+            let Some(&winner) = resolutions.get(&t.condition_id) else {
+                continue;
+            };
+            let won = winner == t.outcome_index;
+            n_bets += 1;
+            if won {
+                wins += 1;
+            }
+            edge_sum += if won { 1.0 } else { 0.0 } - t.price;
+        }
+        if n_bets == 0 {
+            continue;
+        }
+        let nf = n_bets as f64;
+        out.insert(
+            wallet.clone(),
+            TraderRecord {
+                wallet: wallet.clone(),
+                n_bets,
+                hit_rate: wins as f64 / nf,
+                mean_edge: edge_sum / nf,
+                wilson: wilson_lower_bound(wins, n_bets),
+            },
+        );
+    }
+    out
+}
+
+/// Return the WHITELIST of wallets to follow under `ranking`, selected purely
+/// from PRE-cutoff [`TraderRecord`]s (OUT-OF-SAMPLE), so selection never peeks
+/// at the post-cutoff trades the copy test scores. This is the FIX-B replacement
+/// for [`rank_wallets`] (which scored on the same closed positions it tested).
+///
+/// - [`Ranking::RawLeaderboard`]: `traders` (already PnL-sorted) truncated to
+///   `top_n`. `records`/`min_bets` are ignored — the size-driven baseline.
+/// - [`Ranking::TrackRecord`]: keep wallets with `n_bets ≥ min_bets`, rank by
+///   the Wilson lower bound (then `mean_edge`, then wallet), take `top_n`.
+/// - [`Ranking::EdgePerBet`]: keep wallets with `n_bets ≥ min_bets` AND a
+///   strictly positive `mean_edge`, rank by `mean_edge` (then wallet), take
+///   `top_n`.
+///
+/// Only wallets present in `traders` are considered (de-duped, first occurrence
+/// wins) so the universe stays stable and deterministic.
+pub fn rank_wallets_oos(
+    ranking: Ranking,
+    traders: &[LeaderboardEntry],
+    records: &HashMap<String, TraderRecord>,
+    top_n: usize,
+    min_bets: usize,
+) -> Vec<String> {
+    match ranking {
+        Ranking::RawLeaderboard => {
+            let mut seen: HashSet<&str> = HashSet::new();
+            traders
+                .iter()
+                .filter(|t| seen.insert(t.proxy_wallet.as_str()))
+                .map(|t| t.proxy_wallet.clone())
+                .take(top_n)
+                .collect()
+        }
+        Ranking::TrackRecord => {
+            let mut scored = eligible_records(traders, records, min_bets, |_| true);
+            scored.sort_by(|a, b| {
+                b.wilson
+                    .total_cmp(&a.wilson)
+                    .then(b.mean_edge.total_cmp(&a.mean_edge))
+                    .then_with(|| a.wallet.cmp(&b.wallet))
+            });
+            scored
+                .into_iter()
+                .take(top_n)
+                .map(|r| r.wallet.clone())
+                .collect()
+        }
+        Ranking::EdgePerBet => {
+            let mut scored = eligible_records(traders, records, min_bets, |r| r.mean_edge > 0.0);
+            scored.sort_by(|a, b| {
+                b.mean_edge
+                    .total_cmp(&a.mean_edge)
+                    .then_with(|| a.wallet.cmp(&b.wallet))
+            });
+            scored
+                .into_iter()
+                .take(top_n)
+                .map(|r| r.wallet.clone())
+                .collect()
+        }
+    }
+}
+
+/// The de-duped, `min_bets`-filtered records of the wallets in `traders` that
+/// also pass `keep`. Shared by the two skill rankings in [`rank_wallets_oos`].
+fn eligible_records<'a>(
+    traders: &[LeaderboardEntry],
+    records: &'a HashMap<String, TraderRecord>,
+    min_bets: usize,
+    keep: impl Fn(&TraderRecord) -> bool,
+) -> Vec<&'a TraderRecord> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut scored: Vec<&TraderRecord> = Vec::new();
+    for t in traders {
+        if !seen.insert(t.proxy_wallet.as_str()) {
+            continue;
+        }
+        let Some(rec) = records.get(&t.proxy_wallet) else {
+            continue;
+        };
+        if rec.n_bets >= min_bets && keep(rec) {
+            scored.push(rec);
+        }
+    }
+    scored
+}
+
+// ---------------------------------------------------------------------------
 // 2. Signals + convergence
 // ---------------------------------------------------------------------------
 
 /// A copy signal: ≥K whitelisted wallets BOUGHT `(condition_id, outcome_index)`
 /// within the window. `timestamp` is the moment convergence was first met (the
 /// Kth distinct wallet's BUY time); `wallets` are the convergent wallets (in
-/// convergence order — ascending by their BUY time, then wallet).
+/// convergence order — ascending by their BUY time, then wallet);
+/// `trigger_price` is the price of that triggering BUY — the smart trader's
+/// entry, against which the freshness filter measures how far WE'd be chasing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FollowSignal {
     pub condition_id: String,
     pub outcome_index: i64,
     pub timestamp: i64,
     pub wallets: Vec<String>,
+    /// Price of the triggering (Kth-convergence) BUY of `outcome_index`. Because
+    /// the group is keyed by `outcome_index`, this is already the price of OUR
+    /// side — directly comparable to a binary-normalized entry price.
+    pub trigger_price: f64,
 }
+
+/// One eligible BUY in [`signals_after`]'s per-`(market, outcome)` grouping:
+/// `(timestamp, wallet, price)`. Aliased to keep the grouping map's type simple.
+type BuyEvent = (i64, String, f64);
 
 /// From the whitelisted wallets' BUY trades, emit ONE signal per
 /// `(market, outcome)` at the moment `k` DISTINCT whitelisted wallets have
-/// BOUGHT it within `window_secs` (inclusive). Output is sorted by `(timestamp,
-/// condition_id, outcome_index)`. `k = 1` ⇒ a signal at the first whitelisted
-/// BUY of each `(market, outcome)`. Only BUY trades count; a wallet buying the
-/// same side repeatedly counts once.
+/// BOUGHT it within `window_secs` (inclusive). Convenience wrapper over
+/// [`signals_after`] with NO cutoff (every BUY is eligible).
 pub fn signals(
     whitelist: &[String],
     trades_by_wallet: &HashMap<String, Vec<Trade>>,
     k: usize,
     window_secs: i64,
 ) -> Vec<FollowSignal> {
-    // Group whitelisted BUY trades by (market, outcome): list of (ts, wallet).
-    let mut groups: HashMap<(String, i64), Vec<(i64, String)>> = HashMap::new();
+    signals_after(whitelist, trades_by_wallet, k, window_secs, i64::MIN)
+}
+
+/// Like [`signals`], but only BUYS with `timestamp >= cutoff_ts` are eligible —
+/// the OUT-OF-SAMPLE COPY-TEST set (FIX-B). Pre-cutoff BUYS (the SELECTION set
+/// used to build [`trader_records`]) are excluded, so the trades that PICK the
+/// traders and the trades that TEST copying them are disjoint.
+///
+/// Output is sorted by `(timestamp, condition_id, outcome_index)`. `k = 1` ⇒ a
+/// signal at the first eligible whitelisted BUY of each `(market, outcome)`.
+/// Only BUY trades count; a wallet buying the same side repeatedly counts once.
+pub fn signals_after(
+    whitelist: &[String],
+    trades_by_wallet: &HashMap<String, Vec<Trade>>,
+    k: usize,
+    window_secs: i64,
+    cutoff_ts: i64,
+) -> Vec<FollowSignal> {
+    // Group eligible whitelisted BUYS by (market, outcome): (ts, wallet, price).
+    let mut groups: HashMap<(String, i64), Vec<BuyEvent>> = HashMap::new();
     for wallet in whitelist {
         let Some(trades) = trades_by_wallet.get(wallet) else {
             continue;
         };
         for t in trades {
-            if t.side == TradeSide::Buy {
+            if t.side == TradeSide::Buy && t.timestamp >= cutoff_ts {
                 groups
                     .entry((t.condition_id.clone(), t.outcome_index))
                     .or_default()
-                    .push((t.timestamp, wallet.clone()));
+                    .push((t.timestamp, wallet.clone(), t.price));
             }
         }
     }
@@ -207,12 +401,13 @@ pub fn signals(
     let mut out: Vec<FollowSignal> = Vec::new();
     for ((condition_id, outcome_index), mut buys) in groups {
         buys.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        if let Some((timestamp, wallets)) = first_convergence(&buys, k, window_secs) {
+        if let Some((timestamp, wallets, trigger_price)) = first_convergence(&buys, k, window_secs) {
             out.push(FollowSignal {
                 condition_id,
                 outcome_index,
                 timestamp,
                 wallets,
+                trigger_price,
             });
         }
     }
@@ -228,24 +423,25 @@ pub fn signals(
 
 /// The earliest BUY time `t` such that `k` DISTINCT wallets have a BUY in the
 /// trailing window `[t - window_secs, t]`, paired with those distinct wallets
-/// (in convergence order). `buys` must be sorted ascending by timestamp. Uses
-/// no information after `t` (no look-ahead). `None` if `k` is never reached.
+/// (in convergence order) and the price of the triggering BUY at `t`. `buys`
+/// must be sorted ascending by `(timestamp, wallet)`. Uses no information after
+/// `t` (no look-ahead). `None` if `k` is never reached.
 fn first_convergence(
-    buys: &[(i64, String)],
+    buys: &[BuyEvent],
     k: usize,
     window_secs: i64,
-) -> Option<(i64, Vec<String>)> {
-    for &(t, _) in buys {
+) -> Option<(i64, Vec<String>, f64)> {
+    for (t, _w, price) in buys {
         let lo = t - window_secs;
         let mut seen: HashSet<&str> = HashSet::new();
         let mut distinct: Vec<String> = Vec::new();
-        for (ts, wallet) in buys {
-            if *ts >= lo && *ts <= t && seen.insert(wallet.as_str()) {
+        for (ts, wallet, _p) in buys {
+            if *ts >= lo && *ts <= *t && seen.insert(wallet.as_str()) {
                 distinct.push(wallet.clone());
             }
         }
         if distinct.len() >= k {
-            return Some((t, distinct));
+            return Some((*t, distinct, *price));
         }
     }
     None
@@ -285,6 +481,13 @@ pub struct SimParams {
     pub fee_frac: f64,
     /// Exit rule.
     pub exit: ExitMode,
+    /// FRESHNESS filter (alpha): the max fractional drift of OUR entry price from
+    /// the triggering trader's price ([`FollowSignal::trigger_price`]) we will
+    /// tolerate. `Some(d)` ⇒ skip the copy when
+    /// `|entry_px − trigger_price| / trigger_price > d` (we'd be chasing a runner
+    /// and the smart-money edge — being in near their price — is gone). `None`
+    /// disables the filter (copy at any drift).
+    pub max_drift: Option<f64>,
 }
 
 /// The outcome of simulating one [`FollowSignal`].
@@ -324,6 +527,18 @@ pub fn simulate_signal(
     // Degenerate entry (a 0/1 mark means no real two-sided market) — cannot copy.
     if entry_px <= 0.0 || entry_px >= 1.0 {
         return SimResult::Skipped;
+    }
+
+    // FRESHNESS filter (alpha): if OUR entry has drifted too far from the smart
+    // trader's triggering price, we'd be chasing — skip rather than copy late.
+    // `entry_px > 0` is guaranteed above, so `drift` is finite for any real BUY
+    // (and `+inf > max_drift`, i.e. a skip, in the degenerate `trigger_price == 0`
+    // case) — never NaN, so a plain `>` is safe.
+    if let Some(max_drift) = p.max_drift {
+        let drift = (entry_px - sig.trigger_price).abs() / sig.trigger_price;
+        if drift > max_drift {
+            return SimResult::Skipped;
+        }
     }
 
     let resolution = resolution_px(winning_outcome, sig.outcome_index);
@@ -549,6 +764,33 @@ pub fn is_sports(title: &str) -> bool {
         .any(|tok| WORDS.contains(&tok))
 }
 
+// ---------------------------------------------------------------------------
+// 5. Price-bucket scope (alpha) — WHERE the edge lives
+// ---------------------------------------------------------------------------
+
+/// The entry-price buckets, in ascending order. Used as `run_grid` scopes
+/// (`"px:<bucket>"`) so the edge can be read by where on the `[0, 1]` price
+/// curve the copy was filled (cheap longshots vs. near-certainties behave very
+/// differently).
+pub const PRICE_BUCKETS: [&str; 5] = ["lt10", "10-30", "30-70", "70-90", "gt90"];
+
+/// Classify a (binary-normalized) entry price into one of [`PRICE_BUCKETS`].
+/// Half-open intervals `[lo, hi)`: `lt10 = [0, .10)`, `10-30 = [.10, .30)`,
+/// `30-70 = [.30, .70)`, `70-90 = [.70, .90)`, `gt90 = [.90, 1]`.
+pub fn price_bucket(entry_px: f64) -> &'static str {
+    if entry_px < 0.10 {
+        "lt10"
+    } else if entry_px < 0.30 {
+        "10-30"
+    } else if entry_px < 0.70 {
+        "30-70"
+    } else if entry_px < 0.90 {
+        "70-90"
+    } else {
+        "gt90"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -612,17 +854,40 @@ mod tests {
         m
     }
 
+    fn res_map(entries: &[(&str, i64)]) -> HashMap<String, i64> {
+        entries.iter().map(|(c, w)| ((*c).to_string(), *w)).collect()
+    }
+
+    fn rec(wallet: &str, n_bets: usize, hit_rate: f64, mean_edge: f64, wilson: f64) -> TraderRecord {
+        TraderRecord {
+            wallet: wallet.to_string(),
+            n_bets,
+            hit_rate,
+            mean_edge,
+            wilson,
+        }
+    }
+
+    fn rec_map(records: Vec<TraderRecord>) -> HashMap<String, TraderRecord> {
+        records.into_iter().map(|r| (r.wallet.clone(), r)).collect()
+    }
+
     fn find<'a>(sigs: &'a [FollowSignal], cid: &str, oi: i64) -> Option<&'a FollowSignal> {
         sigs.iter()
             .find(|s| s.condition_id == cid && s.outcome_index == oi)
     }
 
     fn sig(cid: &str, oi: i64, ts: i64, wallets: &[&str]) -> FollowSignal {
+        sig_tp(cid, oi, ts, wallets, 0.0)
+    }
+
+    fn sig_tp(cid: &str, oi: i64, ts: i64, wallets: &[&str], trigger_price: f64) -> FollowSignal {
         FollowSignal {
             condition_id: cid.to_string(),
             outcome_index: oi,
             timestamp: ts,
             wallets: wl(wallets),
+            trigger_price,
         }
     }
 
@@ -841,7 +1106,7 @@ mod tests {
     fn sim_entry_picks_first_trade_at_lag_boundary_and_resolution_winner() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1000, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
         let r = simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "Will the Fed cut rates?");
         assert_filled(&r, 0.45, 1.0, (1.0 - 0.45) / 0.45, false);
     }
@@ -850,7 +1115,7 @@ mod tests {
     fn sim_resolution_loser_and_fee() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1000, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.02, exit: ExitMode::Resolution };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.02, exit: ExitMode::Resolution, max_drift: None };
         let r = simulate_signal(&s, &tape, 1, &HashMap::new(), &p, "Market");
         assert_filled(&r, 0.45, 0.0, (0.0 - 0.45) / 0.45 - 0.02, false);
     }
@@ -859,7 +1124,7 @@ mod tests {
     fn sim_binary_normalization_buy_outcome1() {
         let tape = fixture_tape();
         let s = sig("0xM", 1, 1000, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
         // Entry trade @1010 is an OUTCOME 0 trade @0.45 -> price of outcome 1 = 0.55.
         let r = simulate_signal(&s, &tape, 1, &HashMap::new(), &p, "Market");
         assert_filled(&r, 0.55, 1.0, (1.0 - 0.55) / 0.55, false);
@@ -869,7 +1134,7 @@ mod tests {
     fn sim_binary_normalization_entry_on_opposite_outcome_trade() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1010, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
         // Entry_time = 1020 -> the OUTCOME 1 trade @0.70 -> price of outcome 0 = 0.30.
         let r = simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "Market");
         assert_filled(&r, 0.30, 1.0, (1.0 - 0.30) / 0.30, false);
@@ -879,7 +1144,7 @@ mod tests {
     fn sim_skips_when_no_tape_after_lag() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1100, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
         assert_eq!(
             simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "Market"),
             SimResult::Skipped
@@ -889,7 +1154,7 @@ mod tests {
     #[test]
     fn sim_skips_on_empty_tape() {
         let s = sig("0xM", 0, 1000, &["0xA"]);
-        let p = SimParams { lag_secs: 0, fee_frac: 0.0, exit: ExitMode::Resolution };
+        let p = SimParams { lag_secs: 0, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
         assert_eq!(
             simulate_signal(&s, &[], 0, &HashMap::new(), &p, "Market"),
             SimResult::Skipped
@@ -900,7 +1165,7 @@ mod tests {
     fn sim_skips_on_degenerate_entry_price() {
         let tape = vec![trade("0xMM", "0xM", 0, TradeSide::Buy, 1.0, 2000)];
         let s = sig("0xM", 0, 1990, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
         assert_eq!(
             simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "Market"),
             SimResult::Skipped
@@ -911,7 +1176,7 @@ mod tests {
     fn sim_follow_exit_picks_earliest_valid_sell() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1000, &["0xA", "0xB"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::FollowExit };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::FollowExit, max_drift: None };
         let follows = tmap(vec![
             trade("0xA", "0xM", 1, TradeSide::Sell, 0.5, 1005), // wrong outcome
             trade("0xB", "0xM", 0, TradeSide::Sell, 0.5, 999),  // before signal ts
@@ -928,7 +1193,7 @@ mod tests {
     fn sim_follow_exit_falls_back_to_resolution_without_sell() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1000, &["0xA", "0xB"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::FollowExit };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::FollowExit, max_drift: None };
         let r = simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "Market");
         assert_filled(&r, 0.45, 1.0, (1.0 - 0.45) / 0.45, false);
     }
@@ -937,7 +1202,7 @@ mod tests {
     fn sim_follow_exit_falls_back_when_no_tape_after_exit() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1000, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::FollowExit };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::FollowExit, max_drift: None };
         // Sell @1095 -> exit_time = 1105 > last tape (1100) -> fall back to resolution (loser -> 0.0).
         let follows = tmap(vec![trade("0xA", "0xM", 0, TradeSide::Sell, 0.5, 1095)]);
         let r = simulate_signal(&s, &tape, 1, &follows, &p, "Market");
@@ -948,7 +1213,7 @@ mod tests {
     fn sim_sets_sports_flag_from_title() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1000, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
         let r = simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "France vs Brazil: who wins?");
         match r {
             SimResult::Filled { sports, .. } => assert!(sports),
@@ -1011,5 +1276,207 @@ mod tests {
         assert!(!is_sports("Will the Fed cut rates in July?"));
         assert!(!is_sports("Will Bitcoin reach $100k in 2026?"));
         assert!(!is_sports("Will Trump win the 2024 election?"));
+    }
+
+    // ===================== trader_records (OOS, FIX-B) =====================
+    #[test]
+    fn trader_records_pre_cutoff_only_scored_with_edges() {
+        let cutoff = 1000;
+        let trades = tmap(vec![
+            trade("0xS", "m1", 0, TradeSide::Buy, 0.4, 100), // res 0 -> WON,  edge  0.6
+            trade("0xS", "m2", 0, TradeSide::Buy, 0.5, 200), // res 1 -> LOST, edge -0.5
+            trade("0xS", "m3", 0, TradeSide::Buy, 0.3, 300), // res 0 -> WON,  edge  0.7
+            trade("0xS", "m4", 1, TradeSide::Buy, 0.6, 400), // res 1 -> WON,  edge  0.4
+            trade("0xS", "m5", 0, TradeSide::Buy, 0.9, 2000), // post-cutoff -> EXCLUDED
+            trade("0xS", "m6", 0, TradeSide::Buy, 0.5, 500),  // unresolved  -> EXCLUDED
+            trade("0xS", "m1", 0, TradeSide::Sell, 0.4, 150),  // a SELL      -> EXCLUDED
+        ]);
+        let res = res_map(&[("m1", 0), ("m2", 1), ("m3", 0), ("m4", 1), ("m5", 1)]);
+        let recs = trader_records(&trades, &res, cutoff);
+        let r = recs.get("0xS").expect("0xS has a record");
+        assert_eq!(r.n_bets, 4, "post-cutoff + unresolved + sells excluded");
+        assert!((r.hit_rate - 0.75).abs() < 1e-12);
+        assert!((r.mean_edge - 0.3).abs() < 1e-12); // (0.6 - 0.5 + 0.7 + 0.4)/4
+        assert_eq!(r.wilson, wilson_lower_bound(3, 4));
+        assert_eq!(r.wallet, "0xS");
+    }
+
+    #[test]
+    fn trader_records_omits_wallet_with_no_qualifying_bets() {
+        let cutoff = 1000;
+        let trades = tmap(vec![
+            trade("0xEmpty", "m1", 0, TradeSide::Buy, 0.4, 2000), // post-cutoff
+            trade("0xEmpty", "m2", 0, TradeSide::Buy, 0.4, 100),  // unresolved
+        ]);
+        let res = res_map(&[("m1", 0)]); // m1 resolved but is post-cutoff
+        let recs = trader_records(&trades, &res, cutoff);
+        assert!(!recs.contains_key("0xEmpty"));
+        assert!(recs.is_empty());
+    }
+
+    // ===================== rank_wallets_oos (OOS, FIX-B) =====================
+    #[test]
+    fn rank_wallets_oos_raw_leaderboard_is_pnl_order_truncated() {
+        let traders = vec![lb("0xA", 100.0), lb("0xB", 90.0), lb("0xC", 80.0)];
+        let records = HashMap::new(); // ignored by RawLeaderboard
+        let out = rank_wallets_oos(Ranking::RawLeaderboard, &traders, &records, 2, 10);
+        assert_eq!(out, wl(&["0xA", "0xB"]));
+    }
+
+    #[test]
+    fn rank_wallets_oos_track_record_ranks_by_wilson_and_filters() {
+        let traders = vec![lb("0xLucky", 1.0), lb("0xSkilled", 1.0), lb("0xMediocre", 1.0)];
+        let records = rec_map(vec![
+            rec("0xLucky", 2, 1.0, 0.5, 0.90),     // n_bets < min_bets -> filtered
+            rec("0xSkilled", 10, 0.8, 0.3, 0.60),  // highest wilson among eligible
+            rec("0xMediocre", 10, 0.5, 0.1, 0.40),
+        ]);
+        let top1 = rank_wallets_oos(Ranking::TrackRecord, &traders, &records, 1, 5);
+        assert_eq!(top1, wl(&["0xSkilled"]));
+        let top2 = rank_wallets_oos(Ranking::TrackRecord, &traders, &records, 2, 5);
+        assert_eq!(top2, wl(&["0xSkilled", "0xMediocre"]));
+        assert!(!top2.contains(&"0xLucky".to_string()));
+    }
+
+    #[test]
+    fn rank_wallets_oos_edge_per_bet_drops_negative_and_low_sample() {
+        let traders = vec![lb("0xPos", 1.0), lb("0xPos2", 1.0), lb("0xNeg", 1.0), lb("0xLow", 1.0)];
+        let records = rec_map(vec![
+            rec("0xPos", 5, 0.6, 0.24, 0.30),
+            rec("0xPos2", 5, 1.0, 0.40, 0.50), // ranks above 0xPos by mean_edge
+            rec("0xNeg", 5, 0.2, -0.36, 0.05), // mean_edge <= 0 -> dropped
+            rec("0xLow", 2, 1.0, 0.50, 0.40),  // n_bets < min_bets -> dropped
+        ]);
+        let out = rank_wallets_oos(Ranking::EdgePerBet, &traders, &records, 10, 5);
+        assert_eq!(out, wl(&["0xPos2", "0xPos"]));
+    }
+
+    /// The TRUST FIX: selection ranks on PRE-cutoff records only. A trader whose
+    /// post-cutoff trades are terrible still ranks on their pre-cutoff edge, and
+    /// post-cutoff trades NEVER leak into the record.
+    #[test]
+    fn rank_wallets_oos_uses_pre_cutoff_record_not_post_cutoff() {
+        let cutoff = 1000;
+        let mut trades_vec: Vec<Trade> = Vec::new();
+        let mut resolutions: HashMap<String, i64> = HashMap::new();
+        // 0xStrong: 5 winning PRE-cutoff buys @0.3 -> edge 0.7 each.
+        for i in 0..5i64 {
+            let cid = format!("s{i}");
+            trades_vec.push(trade("0xStrong", &cid, 0, TradeSide::Buy, 0.3, 100 + i));
+            resolutions.insert(cid, 0);
+        }
+        // 0xOk: 5 winning PRE-cutoff buys @0.8 -> edge 0.2 each.
+        for i in 0..5i64 {
+            let cid = format!("o{i}");
+            trades_vec.push(trade("0xOk", &cid, 0, TradeSide::Buy, 0.8, 100 + i));
+            resolutions.insert(cid, 0);
+        }
+        // 0xStrong's POST-cutoff disasters (10 losses @0.95). If selection peeked
+        // here, 0xStrong's edge would go NEGATIVE and it would drop out entirely.
+        for i in 0..10i64 {
+            let cid = format!("p{i}");
+            trades_vec.push(trade("0xStrong", &cid, 0, TradeSide::Buy, 0.95, 2000 + i));
+            resolutions.insert(cid, 1);
+        }
+        let trades = tmap(trades_vec);
+
+        let records = trader_records(&trades, &resolutions, cutoff);
+        let strong = records.get("0xStrong").expect("0xStrong has a record");
+        assert_eq!(strong.n_bets, 5, "post-cutoff trades excluded from record");
+        assert!((strong.mean_edge - 0.7).abs() < 1e-12);
+
+        let traders = vec![lb("0xStrong", 1.0), lb("0xOk", 1.0)];
+        let out = rank_wallets_oos(Ranking::EdgePerBet, &traders, &records, 10, 5);
+        assert_eq!(out, wl(&["0xStrong", "0xOk"]));
+    }
+
+    // ===================== signals_after + trigger_price =====================
+    #[test]
+    fn signals_after_excludes_pre_cutoff_and_keeps_post() {
+        let cutoff = 1000;
+        let trades = tmap(vec![
+            trade("0xA", "m1", 0, TradeSide::Buy, 0.20, 500),  // pre-cutoff -> EXCLUDED
+            trade("0xA", "m1", 0, TradeSide::Buy, 0.45, 1500), // post
+            trade("0xB", "m1", 0, TradeSide::Buy, 0.46, 1600), // post
+            trade("0xA", "m2", 0, TradeSide::Buy, 0.50, 200),  // m2 only pre-cutoff
+            trade("0xB", "m2", 0, TradeSide::Buy, 0.50, 300),
+        ]);
+        let k1 = signals_after(&wl(&["0xA", "0xB"]), &trades, 1, 86_400, cutoff);
+        assert_eq!(k1.len(), 1);
+        assert_eq!(k1[0].condition_id, "m1");
+        assert_eq!(k1[0].timestamp, 1500); // NOT the pre-cutoff 500
+        assert!((k1[0].trigger_price - 0.45).abs() < 1e-12);
+        assert!(find(&k1, "m2", 0).is_none());
+
+        let k2 = signals_after(&wl(&["0xA", "0xB"]), &trades, 2, 86_400, cutoff);
+        assert_eq!(k2.len(), 1);
+        let m = find(&k2, "m1", 0).expect("m1 converges post-cutoff");
+        assert_eq!(m.timestamp, 1600);
+        assert_eq!(m.wallets, wl(&["0xA", "0xB"]));
+        assert!((m.trigger_price - 0.46).abs() < 1e-12);
+    }
+
+    #[test]
+    fn signals_trigger_price_is_triggering_buy() {
+        let trades = tmap(vec![
+            trade("0xA", "m", 0, TradeSide::Buy, 0.40, 100),
+            trade("0xB", "m", 0, TradeSide::Buy, 0.55, 150),
+        ]);
+        let k1 = signals(&wl(&["0xA", "0xB"]), &trades, 1, 100);
+        assert_eq!(k1.len(), 1);
+        assert!((k1[0].trigger_price - 0.40).abs() < 1e-12); // first buy
+        let k2 = signals(&wl(&["0xA", "0xB"]), &trades, 2, 100);
+        assert_eq!(k2.len(), 1);
+        assert_eq!(k2[0].timestamp, 150);
+        assert!((k2[0].trigger_price - 0.55).abs() < 1e-12); // Kth (convergence) buy
+    }
+
+    // ===================== freshness filter (alpha) =====================
+    #[test]
+    fn sim_freshness_skips_chased_entry() {
+        // Entry @0.60 while the smart trader's trigger was @0.40 -> 50% drift.
+        let tape = vec![trade("0xMM", "m", 0, TradeSide::Buy, 0.60, 1000)];
+        let s = sig_tp("m", 0, 1000, &["0xA"], 0.40);
+
+        let none = SimParams { lag_secs: 0, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
+        assert_filled(
+            &simulate_signal(&s, &tape, 0, &HashMap::new(), &none, "Market"),
+            0.60,
+            1.0,
+            (1.0 - 0.60) / 0.60,
+            false,
+        );
+
+        let tight = SimParams { lag_secs: 0, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: Some(0.2) };
+        assert_eq!(
+            simulate_signal(&s, &tape, 0, &HashMap::new(), &tight, "Market"),
+            SimResult::Skipped,
+            "0.5 drift > 0.2 max_drift -> chasing -> skip"
+        );
+
+        let loose = SimParams { lag_secs: 0, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: Some(0.6) };
+        match simulate_signal(&s, &tape, 0, &HashMap::new(), &loose, "Market") {
+            SimResult::Filled { entry_px, .. } => assert!((entry_px - 0.60).abs() < 1e-12),
+            SimResult::Skipped => panic!("0.5 drift <= 0.6 max_drift -> allowed"),
+        }
+    }
+
+    // ===================== price_bucket (alpha) =====================
+    #[test]
+    fn price_bucket_classifies_half_open_intervals() {
+        assert_eq!(price_bucket(0.05), "lt10");
+        assert_eq!(price_bucket(0.0999), "lt10");
+        assert_eq!(price_bucket(0.10), "10-30");
+        assert_eq!(price_bucket(0.29), "10-30");
+        assert_eq!(price_bucket(0.30), "30-70");
+        assert_eq!(price_bucket(0.50), "30-70");
+        assert_eq!(price_bucket(0.699), "30-70");
+        assert_eq!(price_bucket(0.70), "70-90");
+        assert_eq!(price_bucket(0.89), "70-90");
+        assert_eq!(price_bucket(0.90), "gt90");
+        assert_eq!(price_bucket(0.99), "gt90");
+        for px in [0.05, 0.2, 0.5, 0.8, 0.95] {
+            assert!(PRICE_BUCKETS.contains(&price_bucket(px)));
+        }
     }
 }
