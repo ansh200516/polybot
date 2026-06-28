@@ -17,6 +17,11 @@
 //! read instead of re-fetching (unless [`FetchParams::refresh`]), so a BT-4 run
 //! is reproducible and re-runs entirely offline. The assembled bundle is also
 //! written to `fetched.json`.
+//!
+//! BT-3 adds the pure analytical core (ranking, signals, simulation, metrics)
+//! in [`core`]; BT-4 wires it to the fetched data.
+
+pub mod core;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
