@@ -5,10 +5,11 @@
 //!
 //! This is an OFFLINE analysis tool. It is read-only and places **NO orders**.
 //!
-//! Usage: `backtest [--n <traders>] [--refresh] [--cache-dir <path>]`
-//! - `--n <traders>`   leaderboard depth per slice (default 30)
-//! - `--refresh`       bypass the cache and re-fetch every request
-//! - `--cache-dir <p>` cache directory (default `./bt-cache`)
+//! Usage: `backtest [--n <traders>] [--refresh] [--cache-dir <path>] [--gamma-base <url>]`
+//! - `--n <traders>`    leaderboard depth per slice (default 30)
+//! - `--refresh`        bypass the cache and re-fetch every request
+//! - `--cache-dir <p>`  cache directory (default `./bt-cache`)
+//! - `--gamma-base <u>` Gamma API base for resolutions (default the public host)
 //!
 //! The single run produces `./bt-results.json` next to the working directory.
 
@@ -18,7 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pm_backtest::core::signals;
 use pm_backtest::{
-    DEFAULT_CACHE_DIR, FetchParams, GridConfig, GridResult, candidate_markets, fetch_all, run_grid,
+    DEFAULT_CACHE_DIR, FetchParams, GridConfig, GridResult, bought_condition_ids,
+    candidate_markets, fetch_all, run_grid,
 };
 use pm_ingestion::data_api::DataApiClient;
 
@@ -33,6 +35,7 @@ struct Args {
     n_traders: Option<usize>,
     refresh: bool,
     cache_dir: PathBuf,
+    gamma_base: Option<String>,
 }
 
 impl Args {
@@ -40,6 +43,7 @@ impl Args {
         let mut n_traders: Option<usize> = None;
         let mut refresh = false;
         let mut cache_dir = PathBuf::from(DEFAULT_CACHE_DIR);
+        let mut gamma_base: Option<String> = None;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -55,6 +59,12 @@ impl Args {
                         .ok_or_else(|| "--cache-dir requires a value".to_string())?;
                     cache_dir = PathBuf::from(v);
                 }
+                "--gamma-base" => {
+                    let v = args
+                        .next()
+                        .ok_or_else(|| "--gamma-base requires a value".to_string())?;
+                    gamma_base = Some(v);
+                }
                 "-h" | "--help" => return Err("help".to_string()),
                 other => return Err(format!("unknown argument: {other}")),
             }
@@ -64,11 +74,13 @@ impl Args {
             n_traders,
             refresh,
             cache_dir,
+            gamma_base,
         })
     }
 }
 
-const USAGE: &str = "usage: backtest [--n <traders>] [--refresh] [--cache-dir <path>]";
+const USAGE: &str =
+    "usage: backtest [--n <traders>] [--refresh] [--cache-dir <path>] [--gamma-base <url>]";
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
@@ -92,6 +104,9 @@ async fn main() -> ExitCode {
         params.n_traders = n;
     }
     params.refresh = args.refresh;
+    if let Some(ref g) = args.gamma_base {
+        params.gamma_base = g.clone();
+    }
 
     let client = match DataApiClient::new(None) {
         Ok(c) => c,
@@ -102,10 +117,11 @@ async fn main() -> ExitCode {
     };
 
     println!(
-        "backtest: assembling universe (n={}, cache_dir={}, refresh={}) — OFFLINE, no trading",
+        "backtest: assembling universe (n={}, cache_dir={}, refresh={}, gamma_base={}) — OFFLINE, no trading",
         params.n_traders,
         args.cache_dir.display(),
-        params.refresh
+        params.refresh,
+        params.gamma_base,
     );
 
     let data = match fetch_all(&client, &params, &args.cache_dir).await {
@@ -121,7 +137,17 @@ async fn main() -> ExitCode {
     let results = run_grid(&data, &cfg);
 
     // Universe descriptors for the report header.
+    let bought = bought_condition_ids(&data.trades_by_wallet);
     let candidates = candidate_markets(&data.trades_by_wallet, &data.resolutions);
+    // FIX-A coverage check: what FRACTION of the markets our traders BOUGHT did
+    // the INDEPENDENT Gamma source resolve decisively? The old circular
+    // closed-position source scored only ~71/657; the independent Gamma source
+    // should recover far more of the bought-market population.
+    let resolved_fraction = if bought.is_empty() {
+        0.0
+    } else {
+        candidates.len() as f64 / bought.len() as f64
+    };
     let universe_wallets: Vec<String> =
         data.traders.iter().map(|t| t.proxy_wallet.clone()).collect();
     // k=1 over the FULL universe = total raw (market,outcome) follow signals
@@ -147,8 +173,10 @@ async fn main() -> ExitCode {
         },
         "universe": {
             "traders": data.traders.len(),
+            "bought_markets": bought.len(),
             "resolved_markets": data.resolutions.len(),
             "candidate_markets": candidates.len(),
+            "resolved_fraction": resolved_fraction,
             "total_signals_k1": total_signals_k1,
         },
         "results": &results,
@@ -167,10 +195,14 @@ async fn main() -> ExitCode {
     }
 
     println!(
-        "backtest: universe traders={}, resolved_markets={}, candidate_markets={}, tapes={}, total_signals_k1={}",
+        "backtest: universe traders={}, bought_markets={}, resolved_markets={} (Gamma), candidate_markets={}, coverage={:.1}% ({}/{}), tapes={}, total_signals_k1={}",
         data.traders.len(),
+        bought.len(),
         data.resolutions.len(),
         candidates.len(),
+        resolved_fraction * 100.0,
+        candidates.len(),
+        bought.len(),
         data.tape_by_market.len(),
         total_signals_k1,
     );

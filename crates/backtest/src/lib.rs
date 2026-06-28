@@ -6,12 +6,16 @@
 //!
 //! - the trader **universe** (top PnL leaderboard, month ∪ all-time),
 //! - each trader's own **trades** and **closed positions**,
-//! - market **resolutions** derived *purely from the traders' own closed
-//!   positions* (no Gamma): for a binary market a single [`ClosedPos`] reveals
-//!   the winner, so we fold the union of everyone's closed positions into a
-//!   `conditionId → winning_outcome_index` map,
+//! - market **resolutions** taken from an INDEPENDENT source — Polymarket
+//!   Gamma's resolved `outcomePrices` (FIX-A) — fetched for EVERY market a
+//!   trader bought (wins AND losses), yielding a `conditionId →
+//!   winning_outcome_index` map. This replaces the earlier circular source
+//!   (the copied traders' OWN closed positions): we picked traders by their
+//!   wins, so scoring them against their own wins was both biased and
+//!   low-coverage. Gamma is independent of any trader and covers far more of
+//!   the bought-market population. See [`gamma_resolutions`].
 //! - the full trade **tape** for every *candidate* market (a market a trader
-//!   BOUGHT into that we also have a resolution for).
+//!   BOUGHT into that Gamma also resolved decisively).
 //!
 //! Every raw request is cached to a directory as JSON; a present cache file is
 //! read instead of re-fetching (unless [`FetchParams::refresh`]), so a BT-4 run
@@ -36,6 +40,7 @@ use pm_ingestion::IngestError;
 use pm_ingestion::data_api::{
     ClosedPos, DataApiClient, LeaderboardEntry, OrderBy, TimePeriod, Trade, TradeSide, TradesFilter,
 };
+use pm_registry::gamma::GammaMarket;
 
 use crate::core::{
     ExitMode, Metrics, Ranking, SimParams, SimResult, metrics, rank_wallets, signals,
@@ -52,6 +57,13 @@ pub const DEFAULT_TAPE_LIMIT: usize = 2000;
 pub const DEFAULT_THROTTLE_MS: u64 = 200;
 /// Default cache directory.
 pub const DEFAULT_CACHE_DIR: &str = "./bt-cache";
+/// Default Gamma API base. Source of the INDEPENDENT market resolutions
+/// (`outcomePrices`) that replace the circular closed-position source (FIX-A).
+pub const DEFAULT_GAMMA_BASE: &str = "https://gamma-api.polymarket.com";
+/// Gamma `/markets?condition_ids=` ids per request. Kept small so the query
+/// string stays well under Gamma's length cap and each response is light
+/// (mirrors the `pm-ingestion` confluence fetcher).
+const GAMMA_BATCH: usize = 20;
 
 /// Tuning knobs for [`fetch_all`].
 #[derive(Debug, Clone)]
@@ -66,6 +78,9 @@ pub struct FetchParams {
     pub throttle: Duration,
     /// Bypass the cache: always re-fetch and overwrite the cache files.
     pub refresh: bool,
+    /// Gamma API base used for the INDEPENDENT `outcomePrices` resolutions.
+    /// Defaults to [`DEFAULT_GAMMA_BASE`].
+    pub gamma_base: String,
 }
 
 impl Default for FetchParams {
@@ -76,6 +91,7 @@ impl Default for FetchParams {
             tape_limit: DEFAULT_TAPE_LIMIT,
             throttle: Duration::from_millis(DEFAULT_THROTTLE_MS),
             refresh: false,
+            gamma_base: DEFAULT_GAMMA_BASE.to_string(),
         }
     }
 }
@@ -88,10 +104,13 @@ pub struct FetchedData {
     pub traders: Vec<LeaderboardEntry>,
     /// Each trader's own fills, keyed by `proxyWallet`.
     pub trades_by_wallet: HashMap<String, Vec<Trade>>,
-    /// Each trader's resolved/closed positions, keyed by `proxyWallet`.
+    /// Each trader's resolved/closed positions, keyed by `proxyWallet`. Still
+    /// fetched and retained (FIX-B builds track records from them), but NO
+    /// LONGER the resolution source.
     pub closed_by_wallet: HashMap<String, Vec<ClosedPos>>,
-    /// `conditionId → winning_outcome_index`, derived from closed positions.
-    /// A market absent here is UNRESOLVED among our traders → excluded.
+    /// `conditionId → winning_outcome_index`, from the INDEPENDENT Gamma
+    /// `outcomePrices` source (FIX-A), fetched over every bought market. A
+    /// market absent here was not decisively resolved by Gamma → excluded.
     pub resolutions: HashMap<String, i64>,
     /// Full ascending-by-`timestamp` trade tape per candidate market.
     pub tape_by_market: HashMap<String, Vec<Trade>>,
@@ -164,9 +183,55 @@ pub fn fold_resolutions<'a>(
     resolutions
 }
 
+/// Parse a Gamma `/markets` response body (a JSON array of [`GammaMarket`]) into
+/// a `conditionId → winning_outcome_index` map, keeping ONLY markets that Gamma
+/// resolved DECISIVELY ([`GammaMarket::resolved_winner`] is `Some`) and that
+/// carry a non-empty condition id.
+///
+/// Pure (no I/O) so the batch fetch logic is unit-testable without HTTP. A body
+/// that does not parse as a `GammaMarket` array yields an EMPTY map rather than
+/// an error — a single malformed/HTML batch response must not poison the run;
+/// the markets in that batch are simply treated as unresolved (best-effort,
+/// safe direction).
+pub fn parse_gamma_resolutions(body: &str) -> HashMap<String, i64> {
+    let markets: Vec<GammaMarket> = match serde_json::from_str(body) {
+        Ok(m) => m,
+        Err(_) => return HashMap::new(),
+    };
+    let mut out: HashMap<String, i64> = HashMap::new();
+    for market in markets {
+        if market.condition_id.is_empty() {
+            continue;
+        }
+        if let Some(winner) = market.resolved_winner() {
+            out.insert(market.condition_id.clone(), winner);
+        }
+    }
+    out
+}
+
+/// The candidate market UNIVERSE before resolution filtering: every
+/// `condition_id` that appears as a BUY in ANY trader's own trades (empty ids
+/// dropped). Returned sorted (a [`BTreeSet`]) so the Gamma resolution batches
+/// are deterministic and the per-batch cache files are stable across runs.
+///
+/// This is the full set we ask Gamma to resolve (wins AND losses) — the source
+/// of FIX-A's much higher coverage versus the old closed-position resolutions.
+pub fn bought_condition_ids(trades_by_wallet: &HashMap<String, Vec<Trade>>) -> BTreeSet<String> {
+    let mut bought: BTreeSet<String> = BTreeSet::new();
+    for trades in trades_by_wallet.values() {
+        for trade in trades {
+            if trade.side == TradeSide::Buy && !trade.condition_id.is_empty() {
+                bought.insert(trade.condition_id.clone());
+            }
+        }
+    }
+    bought
+}
+
 /// The set of markets worth simulating: those that (a) appear as a BUY in some
-/// trader's own trades AND (b) we have a resolution for. Returned sorted (a
-/// [`BTreeSet`]) so the heavy tape-fetch loop is deterministic.
+/// trader's own trades AND (b) Gamma resolved (present in `resolutions`).
+/// Returned sorted (a [`BTreeSet`]) so the heavy tape-fetch loop is deterministic.
 pub fn candidate_markets(
     trades_by_wallet: &HashMap<String, Vec<Trade>>,
     resolutions: &HashMap<String, i64>,
@@ -276,6 +341,97 @@ where
     Ok((value, true))
 }
 
+// ---------------------------------------------------------------------------
+// Gamma resolutions (INDEPENDENT source — FIX-A)
+// ---------------------------------------------------------------------------
+
+/// GET a Gamma URL, returning the raw response body. Transport/status errors
+/// are funnelled through [`IngestError::Http`] so they share the existing
+/// [`BacktestError::Ingest`] channel (no new error variant needed).
+async fn gamma_get(http: &reqwest::Client, url: &str) -> Result<String, BacktestError> {
+    let body = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| BacktestError::Ingest(IngestError::Http(e.to_string())))?
+        .error_for_status()
+        .map_err(|e| BacktestError::Ingest(IngestError::Http(e.to_string())))?
+        .text()
+        .await
+        .map_err(|e| BacktestError::Ingest(IngestError::Http(e.to_string())))?;
+    Ok(body)
+}
+
+/// Deterministic content hash of a batch's condition ids, used as the cache-file
+/// key so a batch's cache is keyed by its CONTENT (not a positional index that
+/// would go stale the moment the trader set or ordering changes).
+fn batch_cache_key(ids: &[String]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    ids.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Fetch INDEPENDENT market resolutions from Gamma's `outcomePrices`.
+///
+/// Batches `condition_ids` (≤ [`GAMMA_BATCH`] per request) into
+/// `GET {gamma_base}/markets?limit=100&condition_ids=<c>&condition_ids=<c>…`
+/// with NO `active`/`closed` filter — we specifically WANT resolved (closed)
+/// markets back, the opposite of the live-universe confluence fetcher. Each
+/// batch's raw response is parsed via [`parse_gamma_resolutions`] and the
+/// decisive winners are merged into one `conditionId → winning_outcome_index`
+/// map.
+///
+/// Each batch response is cached as a readable JSON file under `cache_dir`
+/// (`gamma-markets-<content-hash>.json`); a present cache file is read instead
+/// of re-fetching unless `refresh`. Only real network requests are throttled
+/// (cache hits are free), mirroring [`cached`]. Read-only — places NO orders.
+pub async fn gamma_resolutions(
+    http: &reqwest::Client,
+    gamma_base: &str,
+    condition_ids: &[String],
+    cache_dir: &Path,
+    refresh: bool,
+) -> Result<HashMap<String, i64>, BacktestError> {
+    let base = gamma_base.trim_end_matches('/');
+    let mut resolutions: HashMap<String, i64> = HashMap::new();
+
+    for chunk in condition_ids.chunks(GAMMA_BATCH) {
+        // Repeated `&condition_ids=` params; NO active/closed filter so resolved
+        // (closed) markets ARE returned. ≤20 ids ⇒ ≤20 markets, well under limit.
+        let params: String = chunk
+            .iter()
+            .map(|c| format!("&condition_ids={c}"))
+            .collect();
+        let url = format!("{base}/markets?limit=100{params}");
+
+        let file_name = cache_file_name("gamma-markets", &batch_cache_key(chunk));
+        let path = cache_dir.join(&file_name);
+
+        // Read-before-fetch (like `cached`), but the cache file is the raw Gamma
+        // response array so it stays human-readable and re-derivable.
+        let (body, hit_network) = if !refresh && path.exists() {
+            (std::fs::read_to_string(&path)?, false)
+        } else {
+            let body = gamma_get(http, &url).await?;
+            std::fs::create_dir_all(cache_dir)?;
+            std::fs::write(&path, &body)?;
+            (body, true)
+        };
+
+        for (condition_id, winner) in parse_gamma_resolutions(&body) {
+            resolutions.insert(condition_id, winner);
+        }
+
+        // Throttle politely only on real network requests.
+        if hit_network {
+            sleep(Duration::from_millis(DEFAULT_THROTTLE_MS)).await;
+        }
+    }
+
+    Ok(resolutions)
+}
+
 /// Fetch (or load from cache) everything the simulator needs and assemble it
 /// into a [`FetchedData`], also written to `cache_dir/fetched.json`.
 ///
@@ -345,10 +501,23 @@ pub async fn fetch_all(
         closed_by_wallet.insert(wallet.to_string(), closed);
     }
 
-    // 3. Resolutions from the union of all closed positions (no Gamma).
-    let resolutions = fold_resolutions(closed_by_wallet.values().flatten());
+    // 3. Resolutions from the INDEPENDENT Gamma `outcomePrices` source (FIX-A),
+    //    fetched over EVERY market a trader BOUGHT (wins AND losses) — not the
+    //    circular, low-coverage closed-position source. Closed positions are
+    //    still fetched/retained above (FIX-B uses them) but no longer decide
+    //    winners. A dedicated keyless HTTP client is built here because the Data
+    //    API client's reqwest client is private (and points at a different host).
+    let bought: Vec<String> = bought_condition_ids(&trades_by_wallet).into_iter().collect();
+    let gamma_http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent("pm-arb-bot/1.0")
+        .build()
+        .map_err(|e| BacktestError::Ingest(IngestError::Http(e.to_string())))?;
+    let resolutions =
+        gamma_resolutions(&gamma_http, &params.gamma_base, &bought, cache_dir, params.refresh)
+            .await?;
 
-    // 4. Candidate markets: BUY-by-a-trader ∩ resolved.
+    // 4. Candidate markets: BUY-by-a-trader ∩ Gamma-resolved.
     let candidates = candidate_markets(&trades_by_wallet, &resolutions);
 
     // 5. Tapes: the full ascending trade history of each candidate market.
@@ -628,6 +797,95 @@ mod tests {
         assert!(!candidates.contains("0xSELL_ONLY"));
         assert!(!candidates.contains("0xUNRESOLVED"));
         assert!(!candidates.contains("0xRESOLVED_UNTRADED"));
+    }
+
+    /// The candidate universe (pre-resolution) is the DISTINCT set of markets a
+    /// trader BOUGHT — SELL-only markets and empty ids are excluded, duplicates
+    /// collapse, and the result is sorted (deterministic Gamma batch order).
+    #[test]
+    fn bought_condition_ids_collects_distinct_buys_only() {
+        let trades = parse_trades(
+            r#"[
+                {"proxyWallet":"0xW","side":"BUY","asset":"a","conditionId":"0xB2",
+                 "size":10.0,"price":0.5,"timestamp":100,"outcomeIndex":0,"title":"T","slug":"s"},
+                {"proxyWallet":"0xW","side":"BUY","asset":"a","conditionId":"0xB2",
+                 "size":5.0,"price":0.5,"timestamp":150,"outcomeIndex":0,"title":"T","slug":"s"},
+                {"proxyWallet":"0xW","side":"SELL","asset":"b","conditionId":"0xSELL",
+                 "size":10.0,"price":0.5,"timestamp":200,"outcomeIndex":0,"title":"T","slug":"s"},
+                {"proxyWallet":"0xW","side":"BUY","asset":"c","conditionId":"0xB1",
+                 "size":10.0,"price":0.5,"timestamp":300,"outcomeIndex":0,"title":"T","slug":"s"},
+                {"proxyWallet":"0xW","side":"BUY","asset":"d","conditionId":"",
+                 "size":10.0,"price":0.5,"timestamp":400,"outcomeIndex":0,"title":"T","slug":"s"}
+            ]"#,
+        )
+        .unwrap();
+        let mut trades_by_wallet: HashMap<String, Vec<Trade>> = HashMap::new();
+        trades_by_wallet.insert("0xW".to_string(), trades);
+
+        let bought = bought_condition_ids(&trades_by_wallet);
+        let v: Vec<&str> = bought.iter().map(String::as_str).collect();
+        // Sorted, distinct, BUY-only, no empty id.
+        assert_eq!(v, vec!["0xB1", "0xB2"]);
+    }
+
+    /// FIX-A parse: a Gamma `/markets` body → only the DECISIVELY resolved
+    /// winners. An unresolved (`closed=false`) market, an ambiguous 0.5/0.5
+    /// split, and an empty condition id are all dropped; outcome-0 and outcome-1
+    /// winners map to the right index.
+    #[test]
+    fn parse_gamma_resolutions_keeps_only_decisive() {
+        let body = r#"[
+            {"conditionId":"0xWIN0","closed":true,"outcomePrices":"[\"1\", \"0\"]"},
+            {"conditionId":"0xWIN1","closed":true,"outcomePrices":"[\"0\", \"1\"]"},
+            {"conditionId":"0xLIVE","closed":false,"outcomePrices":"[\"1\", \"0\"]"},
+            {"conditionId":"0xAMB","closed":true,"outcomePrices":"[\"0.5\", \"0.5\"]"},
+            {"conditionId":"","closed":true,"outcomePrices":"[\"1\", \"0\"]"}
+        ]"#;
+        let res = parse_gamma_resolutions(body);
+        assert_eq!(res.len(), 2);
+        assert_eq!(res.get("0xWIN0"), Some(&0));
+        assert_eq!(res.get("0xWIN1"), Some(&1));
+        assert!(!res.contains_key("0xLIVE"));
+        assert!(!res.contains_key("0xAMB"));
+        assert!(!res.contains_key(""));
+    }
+
+    /// A non-array / error / empty body must never panic — it just resolves
+    /// nothing (best-effort: a poisoned batch leaves its markets unresolved).
+    #[test]
+    fn parse_gamma_resolutions_tolerates_malformed_body() {
+        assert!(parse_gamma_resolutions("not json").is_empty());
+        assert!(parse_gamma_resolutions(r#"{"error":"rate limited"}"#).is_empty());
+        assert!(parse_gamma_resolutions("[]").is_empty());
+    }
+
+    /// `gamma_resolutions` reads a pre-seeded per-batch cache file entirely from
+    /// disk (no network): it proves the content-addressed cache-file name
+    /// derivation AND that the cached body flows through `parse_gamma_resolutions`
+    /// — only the decisive winner survives.
+    #[tokio::test]
+    async fn gamma_resolutions_reads_cache_without_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = vec!["0xWIN0".to_string(), "0xAMB".to_string()];
+
+        // Pre-seed the EXACT cache file the fetcher will look for (one batch).
+        let body = r#"[
+            {"conditionId":"0xWIN0","closed":true,"outcomePrices":"[\"0\", \"1\"]"},
+            {"conditionId":"0xAMB","closed":true,"outcomePrices":"[\"0.5\", \"0.5\"]"}
+        ]"#;
+        let file_name = cache_file_name("gamma-markets", &batch_cache_key(&ids));
+        std::fs::write(dir.path().join(&file_name), body).unwrap();
+
+        // The client is required by the signature but must NOT be hit; the base
+        // is unroutable so any accidental network attempt would error loudly.
+        let http = reqwest::Client::new();
+        let res = gamma_resolutions(&http, "http://127.0.0.1:0", &ids, dir.path(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(res.len(), 1, "only the decisive market resolves");
+        assert_eq!(res.get("0xWIN0"), Some(&1));
+        assert!(!res.contains_key("0xAMB"));
     }
 
     #[test]

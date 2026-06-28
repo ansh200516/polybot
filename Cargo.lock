@@ -2678,8 +2678,11 @@ name = "pm-backtest"
 version = "0.1.0"
 dependencies = [
  "pm-ingestion",
+ "pm-registry",
+ "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

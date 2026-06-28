@@ -106,6 +106,16 @@ pub struct GammaMarket {
     pub active: bool,
     #[serde(default)]
     pub closed: bool,
+    /// Resolved (or, for an unresolved market, LIVE) outcome prices as a
+    /// STRINGIFIED JSON array of stringified floats, e.g. `"[\"1\", \"0\"]"`
+    /// (outcome 0 won) or `"[\"0\", \"1\"]"` (outcome 1 won). For an unresolved
+    /// market this carries the live prices, which are NOT a decisive settlement.
+    /// Private: read it through [`GammaMarket::resolved_winner`], which only
+    /// returns a winner for a DECISIVE binary resolution on a `closed` market.
+    /// This is the INDEPENDENT resolution source (it does not depend on any
+    /// trader's own positions).
+    #[serde(default, rename = "outcomePrices")]
+    outcome_prices: Option<String>,
     #[serde(default)]
     pub question: Option<String>,
     /// Protocol fee in basis points (Gamma reports 1000 = 100 bps for most markets).
@@ -150,6 +160,56 @@ impl GammaMarket {
             .as_deref()
             .ok_or(GammaError::MissingTokenIds)?;
         serde_json::from_str(raw).map_err(|_| GammaError::MalformedTokenIds)
+    }
+
+    /// The INDEPENDENT winning outcome index from Gamma's `outcomePrices`, or
+    /// `None`.
+    ///
+    /// Returns `Some(index)` ONLY for a DECISIVE binary resolution: the market
+    /// must be `closed` AND the parsed price array must have exactly two entries
+    /// with one ≈ 1.0 (`≥ 0.99`) and the other ≈ 0.0 (`≤ 0.01`). Every other
+    /// case yields `None` — an unresolved market (`closed == false`, so the
+    /// prices are live), an ambiguous/near-even split (e.g. `0.5/0.5`), a
+    /// refund-shaped settlement, a non-binary array, an absent field, or a
+    /// malformed string.
+    ///
+    /// Unlike a resolution inferred from a trader's own closed position, this is
+    /// independent of any trader, so using it to score the traders is not
+    /// circular.
+    pub fn resolved_winner(&self) -> Option<i64> {
+        // Only a settled market is decisive; otherwise `outcomePrices` is live.
+        if !self.closed {
+            return None;
+        }
+        let raw = self.outcome_prices.as_deref()?;
+        let values: Vec<serde_json::Value> = serde_json::from_str(raw).ok()?;
+        // Binary markets only: exactly two outcome prices.
+        let [a, b] = values.as_slice() else {
+            return None;
+        };
+        let p0 = parse_outcome_price(a)?;
+        let p1 = parse_outcome_price(b)?;
+        // Decisive band: one side ≈ 1.0, the other ≈ 0.0.
+        const WON: f64 = 0.99;
+        const LOST: f64 = 0.01;
+        if p0 >= WON && p1 <= LOST {
+            Some(0)
+        } else if p1 >= WON && p0 <= LOST {
+            Some(1)
+        } else {
+            None
+        }
+    }
+}
+
+/// Parse one `outcomePrices` element. Gamma sends these as stringified floats
+/// (e.g. `"1"`), but a bare JSON number is tolerated defensively. Anything else
+/// (or an unparseable string) yields `None`.
+fn parse_outcome_price(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        serde_json::Value::Number(n) => n.as_f64(),
+        _ => None,
     }
 }
 
@@ -580,5 +640,87 @@ mod tests {
     fn missing_active_defaults_to_excluded() {
         let m: GammaMarket = serde_json::from_str(r#"{"conditionId":"0xa"}"#).unwrap();
         assert!(!m.active);
+    }
+
+    // ---- resolved_winner: independent Gamma resolution (FIX-A) ---------------
+
+    /// A DECISIVE binary resolution on a CLOSED market yields the winning index:
+    /// `["1","0"]` → outcome 0 won, `["0","1"]` → outcome 1 won.
+    #[test]
+    fn resolved_winner_decisive_binary() {
+        let won0: GammaMarket = serde_json::from_str(
+            r#"{"conditionId":"0xa","closed":true,"outcomePrices":"[\"1\", \"0\"]"}"#,
+        )
+        .unwrap();
+        assert_eq!(won0.resolved_winner(), Some(0));
+
+        let won1: GammaMarket = serde_json::from_str(
+            r#"{"conditionId":"0xa","closed":true,"outcomePrices":"[\"0\", \"1\"]"}"#,
+        )
+        .unwrap();
+        assert_eq!(won1.resolved_winner(), Some(1));
+    }
+
+    /// Everything that is NOT a decisive binary resolution → `None`: an ambiguous
+    /// 0.5/0.5 split, a market that is not `closed` (even with decisive-looking
+    /// prices — those are LIVE prices), malformed JSON, and an absent field.
+    #[test]
+    fn resolved_winner_non_decisive_is_none() {
+        let ambiguous: GammaMarket = serde_json::from_str(
+            r#"{"conditionId":"0xa","closed":true,"outcomePrices":"[\"0.5\", \"0.5\"]"}"#,
+        )
+        .unwrap();
+        assert_eq!(ambiguous.resolved_winner(), None);
+
+        // closed=false → unresolved; the prices are live, not a settlement.
+        let live: GammaMarket = serde_json::from_str(
+            r#"{"conditionId":"0xa","closed":false,"outcomePrices":"[\"1\", \"0\"]"}"#,
+        )
+        .unwrap();
+        assert_eq!(live.resolved_winner(), None);
+
+        let malformed: GammaMarket = serde_json::from_str(
+            r#"{"conditionId":"0xa","closed":true,"outcomePrices":"not json"}"#,
+        )
+        .unwrap();
+        assert_eq!(malformed.resolved_winner(), None);
+
+        let absent: GammaMarket =
+            serde_json::from_str(r#"{"conditionId":"0xa","closed":true}"#).unwrap();
+        assert_eq!(absent.resolved_winner(), None);
+    }
+
+    /// The decisive band is `[≥0.99, ≤0.01]`: 0.99/0.01 resolves, 0.98/0.02 is
+    /// ambiguous (None), and a non-binary array (≠2 entries) is never decisive.
+    #[test]
+    fn resolved_winner_threshold_and_arity() {
+        let edge: GammaMarket = serde_json::from_str(
+            r#"{"conditionId":"0xa","closed":true,"outcomePrices":"[\"0.99\", \"0.01\"]"}"#,
+        )
+        .unwrap();
+        assert_eq!(edge.resolved_winner(), Some(0));
+
+        let near: GammaMarket = serde_json::from_str(
+            r#"{"conditionId":"0xa","closed":true,"outcomePrices":"[\"0.98\", \"0.02\"]"}"#,
+        )
+        .unwrap();
+        assert_eq!(near.resolved_winner(), None);
+
+        let three: GammaMarket = serde_json::from_str(
+            r#"{"conditionId":"0xa","closed":true,"outcomePrices":"[\"1\", \"0\", \"0\"]"}"#,
+        )
+        .unwrap();
+        assert_eq!(three.resolved_winner(), None);
+    }
+
+    /// Defensive: although Gamma sends stringified floats, a bare-number array
+    /// (`[1, 0]`) inside the stringified field still resolves correctly.
+    #[test]
+    fn resolved_winner_tolerates_numeric_prices() {
+        let numeric: GammaMarket = serde_json::from_str(
+            r#"{"conditionId":"0xa","closed":true,"outcomePrices":"[1, 0]"}"#,
+        )
+        .unwrap();
+        assert_eq!(numeric.resolved_winner(), Some(0));
     }
 }
