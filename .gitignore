@@ -12,3 +12,7 @@
 *_out.txt
 *output*.txt
 .worktrees/
+
+# backtest runtime artifacts
+bt-cache/
+bt-results.json
