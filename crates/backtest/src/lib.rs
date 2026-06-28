@@ -325,7 +325,7 @@ async fn cached<T, Fut, F>(
 ) -> Result<(T, bool), BacktestError>
 where
     T: Serialize + DeserializeOwned,
-    F: FnOnce() -> Fut,
+    F: Fn() -> Fut,
     Fut: Future<Output = Result<T, IngestError>>,
 {
     let path = cache_dir.join(file_name);
@@ -334,7 +334,23 @@ where
         let value: T = serde_json::from_str(&body)?;
         return Ok((value, false));
     }
-    let value = fetch().await?;
+    // Retry transient network errors with linear backoff. Over a multi-hour
+    // fetch a single dropped connection is near-certain; without retries it
+    // would abort the whole run (the caller can resume from cache, but a
+    // persistently-flaky page would still wedge it). Up to 4 attempts.
+    let mut attempt: u32 = 0;
+    let value = loop {
+        match fetch().await {
+            Ok(v) => break v,
+            Err(e) => {
+                attempt += 1;
+                if attempt >= 4 {
+                    return Err(e.into());
+                }
+                sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+            }
+        }
+    };
     std::fs::create_dir_all(cache_dir)?;
     let body = serde_json::to_string_pretty(&value)?;
     std::fs::write(&path, body)?;
@@ -349,17 +365,34 @@ where
 /// are funnelled through [`IngestError::Http`] so they share the existing
 /// [`BacktestError::Ingest`] channel (no new error variant needed).
 async fn gamma_get(http: &reqwest::Client, url: &str) -> Result<String, BacktestError> {
-    let body = http
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| BacktestError::Ingest(IngestError::Http(e.to_string())))?
-        .error_for_status()
-        .map_err(|e| BacktestError::Ingest(IngestError::Http(e.to_string())))?
-        .text()
-        .await
-        .map_err(|e| BacktestError::Ingest(IngestError::Http(e.to_string())))?;
-    Ok(body)
+    let mut attempt: u32 = 0;
+    loop {
+        let result = async {
+            let body = http
+                .get(url)
+                .send()
+                .await
+                .map_err(|e| BacktestError::Ingest(IngestError::Http(e.to_string())))?
+                .error_for_status()
+                .map_err(|e| BacktestError::Ingest(IngestError::Http(e.to_string())))?
+                .text()
+                .await
+                .map_err(|e| BacktestError::Ingest(IngestError::Http(e.to_string())))?;
+            Ok::<String, BacktestError>(body)
+        }
+        .await;
+        match result {
+            Ok(body) => return Ok(body),
+            // Retry transient blips with backoff (same rationale as `cached`).
+            Err(e) => {
+                attempt += 1;
+                if attempt >= 4 {
+                    return Err(e);
+                }
+                sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+            }
+        }
+    }
 }
 
 /// Deterministic content hash of a batch's condition ids, used as the cache-file
@@ -375,9 +408,10 @@ fn batch_cache_key(ids: &[String]) -> String {
 /// Fetch INDEPENDENT market resolutions from Gamma's `outcomePrices`.
 ///
 /// Batches `condition_ids` (≤ [`GAMMA_BATCH`] per request) into
-/// `GET {gamma_base}/markets?limit=100&condition_ids=<c>&condition_ids=<c>…`
-/// with NO `active`/`closed` filter — we specifically WANT resolved (closed)
-/// markets back, the opposite of the live-universe confluence fetcher. Each
+/// `GET {gamma_base}/markets?closed=true&limit=100&condition_ids=<c>…` — the
+/// explicit `closed=true` is REQUIRED (Gamma's `/markets` defaults to active-only
+/// and returns 0 resolved markets without it; RECON-verified). We specifically
+/// WANT resolved (closed) markets, the opposite of the live-universe fetcher. Each
 /// batch's raw response is parsed via [`parse_gamma_resolutions`] and the
 /// decisive winners are merged into one `conditionId → winning_outcome_index`
 /// map.
@@ -397,13 +431,15 @@ pub async fn gamma_resolutions(
     let mut resolutions: HashMap<String, i64> = HashMap::new();
 
     for chunk in condition_ids.chunks(GAMMA_BATCH) {
-        // Repeated `&condition_ids=` params; NO active/closed filter so resolved
-        // (closed) markets ARE returned. ≤20 ids ⇒ ≤20 markets, well under limit.
+        // Repeated `&condition_ids=` params with EXPLICIT `closed=true`: Gamma's
+        // `/markets` defaults to ACTIVE-only, so an unfiltered query returns 0
+        // resolved markets (RECON-verified live). `closed=true` is what returns the
+        // resolved markets + their settled `outcomePrices`. ≤20 ids ⇒ ≤20 markets.
         let params: String = chunk
             .iter()
             .map(|c| format!("&condition_ids={c}"))
             .collect();
-        let url = format!("{base}/markets?limit=100{params}");
+        let url = format!("{base}/markets?closed=true&limit=100{params}");
 
         let file_name = cache_file_name("gamma-markets", &batch_cache_key(chunk));
         let path = cache_dir.join(&file_name);
@@ -525,13 +561,23 @@ pub async fn fetch_all(
     let mut tape_by_market: HashMap<String, Vec<Trade>> = HashMap::new();
     for condition_id in &candidates {
         let market: &str = condition_id;
-        let (mut tape, tape_net) = cached(
+        // A tape that ultimately fails (after cached's retries) is SKIPPED, not
+        // fatal: one flaky market must not abort a long fetch. The market simply
+        // drops out of the candidate set (its signals can't be scored) — logged.
+        let (mut tape, tape_net) = match cached(
             cache_dir,
             &cache_file_name("trades-market", market),
             params.refresh,
             || client.trades(TradesFilter::Market(market), params.tape_limit),
         )
-        .await?;
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("backtest: tape fetch for {market} failed after retries ({e}); SKIPPING this market");
+                continue;
+            }
+        };
         tape.sort_by_key(|trade| trade.timestamp);
         tape_by_market.insert(condition_id.clone(), tape);
         if tape_net {
