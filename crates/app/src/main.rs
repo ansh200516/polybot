@@ -2449,6 +2449,8 @@ mod tests {
             outcome: String::new(),
             outcome_index: 0,
             cur_price: 0.0,
+            avg_price: 0.0,
+            cash_pnl: 0.0,
             redeemable,
         };
 
