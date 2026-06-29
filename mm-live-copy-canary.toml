@@ -1,0 +1,97 @@
+# mm-live-copy-canary.toml — REAL-MONEY smart-money COPY-TRADING canary.
+#
+# Runs ONLY the CopyStrategy (arb neutered, MM disabled): it ranks the top
+# leaderboard traders by EdgePerBet (entries that beat outcomes), watches their
+# FRESH buys, and — when our entry price is within `max_drift` of their fill —
+# places a tiny taker BUY, exiting on follow (they sell), stop-loss, or
+# resolution (redeem via the M6 relayer). This is the platform's FIRST
+# DIRECTIONAL strategy.
+#
+# WHAT THIS PROVES (the canary's job):
+#   * the live copy path runs clean (whitelist refresh, fresh-signal detection,
+#     freshness gate, taker entry, follow/stop/redeem exits),
+#   * the out-of-sample-validated edge (EdgePerBet + freshness ≤0.15 + ~30-min
+#     reaction; backtest: 68.7% hit, +25.6%/bet, Sharpe 0.30 @ n=150) shows up
+#     on live fills — watch realized P&L over a week+ of resolved copies.
+#
+# BLAST RADIUS (DIRECTIONAL — read this):
+#   * A copy is a one-sided bet: if the market resolves AGAINST us, the whole
+#     position is lost. The controls are HARD and small:
+#       - per_position_usd ($5) × max_concurrent_positions (3) ⇒ ≤ ~$15 at risk
+#         at once; max_gross_usd ($20) is the ceiling.
+#       - stop_loss_pct (0.25) cuts a losing copy at -25% before resolution.
+#       - inventory_stop_loss / daily_loss / live.session_loss latch a halt.
+#   * COVERAGE NOTE: the bot can only copy a signal in a market it has SYNCED
+#     (it needs the token + live book). Smart-money buys in UN-synced markets are
+#     skipped — so a larger [universe] = more overlap = more copies. (On-demand
+#     syncing of signal markets is a future enhancement.)
+#
+# RUN (with the TUI so you can watch the copy line; `l` releases live, `k` kill,
+# `q` quit). Keys load from .env (PM_PRIVATE_KEY / PM_PROXY_ADDRESS /
+# PM_DEPOSIT_WALLET + RELAYER_API_KEY / RELAYER_API_KEY_ADDRESS):
+#
+#   echo "I understand this trades real money" | cargo run --release --bin arb -- \
+#     --live --config mm-live-copy-canary.toml --db /tmp/copy-canary.sqlite
+
+[capital]
+bankroll_usd = 30.0   # Σ strategy capital ≤ this; copy carves $25, leaving a buffer
+
+[strategies.copy]
+enabled     = true
+live        = true
+capital_usd = 25.0    # MUST be <= your deposit-wallet USDC and <= bankroll
+
+[copy]
+per_position_usd        = 5.0    # per-copy notional (≥5 shares clears the venue min)
+max_concurrent_positions = 3     # at most 3 open copies → ≤ ~$15 directional at once
+max_gross_usd           = 20.0   # hard ceiling on total open copy exposure
+stop_loss_pct           = 0.25   # cut a losing copy at -25%
+max_drift               = 0.15   # FRESHNESS: skip if our entry is >15% off the trader's fill
+reaction_window_secs    = 1800   # only copy a buy seen within 30 min
+min_bets                = 10     # min resolved bets to rank a trader (EdgePerBet)
+top_n                   = 30     # whitelist size
+whitelist_refresh_secs  = 21600  # re-rank the skilled set every 6h
+signal_poll_secs        = 90     # poll whitelisted traders' fresh buys every 90s
+follow_exit             = true   # sell when the copied trader sells
+
+# Disable the MM — only the copy strategy trades this canary.
+[strategies.mm]
+enabled = false
+
+# Neuter arb so nothing else trades.
+[edges]
+min_edge_class12_bps = 9000
+min_edge_class3_bps  = 9000
+max_edge_bps         = 9500
+
+# Inventory / loss latches (copy books into InventoryRisk; keep small for a canary).
+[inventory]
+max_inventory_usd       = 20.0
+max_gross_inventory_usd = 25.0
+inventory_stop_loss_usd = 8.0
+daily_loss_usd          = 8.0
+vol_pull_ticks          = 6
+vol_window_ms           = 2500
+
+[live]
+session_loss_usd = 8.0
+basket_cap_usd   = 1.0   # moot (arb neutered) but must be > 0
+# M6 relayer: needed to REDEEM resolved winners. Auth validated via --relayer-check.
+relayer_enabled  = true
+relayer_staging  = false
+
+# Sync a sizeable universe so more smart-money signals fall in tradeable markets.
+[universe]
+max_markets             = 400
+prioritize_by_liquidity = true
+candidate_pool          = 500
+auto_restart_secs       = 1800
+
+[segments]
+liquid_stable_min_volume    = 50000.0
+liquid_stable_min_liquidity = 10000.0
+liquid_min_volume           = 2000.0
+liquid_min_liquidity        = 1000.0
+
+[confluence]
+enabled = false

@@ -18,8 +18,8 @@ use pm_core::num::{Qty, sell_proceeds};
 use pm_registry::Registry;
 use pm_store::read::ReadStore;
 use pm_tui::state::{
-    AppState, FillLine, Health, OpenOrderLine, OppLine, OrderLine, PositionLine, RewardLine,
-    StrategyLine,
+    AppState, CopyLine, FillLine, Health, OpenOrderLine, OppLine, OrderLine, PositionLine,
+    RewardLine, StrategyLine,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -101,6 +101,11 @@ pub fn strategy_lines(view: &[(StrategyId, StrategyStatus)]) -> Vec<StrategyLine
                 // Phase-A (spec §4) adverse-selection signal + pull indicator.
                 signal: r.signal,
                 pulled: r.pulled,
+            }),
+            // Smart-money COPY summary (Task C5): the follow-whitelist size,
+            // `Some` only for the copy strategy. Display-only.
+            copy: s.copy.map(|c| CopyLine {
+                whitelist: c.whitelist,
             }),
         })
         .collect()
@@ -995,6 +1000,36 @@ mod tests {
         assert!((r.cumulative_est - 3.0).abs() < 1e-9);
         assert!((r.signal - 0.45).abs() < 1e-9, "Phase-A signal carried up");
         assert!(r.pulled, "Phase-A pull flag carried up");
+    }
+
+    /// Task C5: `strategy_lines` carries the per-strategy `CopyStatus` up into the
+    /// display `StrategyLine.copy` — `Some` only when the status has it (the copy
+    /// strategy), `None` for everything else; the whitelist size is preserved.
+    #[test]
+    fn strategy_lines_carries_copy_whitelist() {
+        let view: Vec<(StrategyId, StrategyStatus)> = vec![
+            (
+                StrategyId("arb"),
+                StrategyStatus { copy: None, ..Default::default() },
+            ),
+            (
+                StrategyId("copy"),
+                StrategyStatus {
+                    realized_micro: -500_000,
+                    open_positions: 2,
+                    copy: Some(crate::strategy::CopyStatus { whitelist: 30 }),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let lines = strategy_lines(&view);
+        let arb = lines.iter().find(|l| l.id == "arb").unwrap();
+        assert!(arb.copy.is_none(), "arb has no copy summary");
+        let copy = lines.iter().find(|l| l.id == "copy").unwrap();
+        let c = copy.copy.unwrap();
+        assert_eq!(c.whitelist, 30, "follow-whitelist size carried up");
+        assert_eq!(copy.open_positions, 2, "open copied-position count carried up");
+        assert!((copy.realized_usd + 0.5).abs() < 1e-9, "copy realized P&L carried up");
     }
 
     /// Task 1.7: fed the host's aggregated per-strategy view, the publisher

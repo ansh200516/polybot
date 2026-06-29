@@ -261,6 +261,8 @@ fn coord_status_to_strategy(cs: &CoordStatus) -> StrategyStatus {
         resting_orders: Vec::new(),
         // Arb earns no liquidity reward — the estimate is RewardFarm-MM-specific.
         reward_farm: None,
+        // Smart-money COPY telemetry (Task C5) is copy-strategy-only.
+        copy: None,
     }
 }
 

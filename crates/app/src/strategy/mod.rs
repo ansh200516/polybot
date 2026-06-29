@@ -104,6 +104,26 @@ pub struct StrategyStatus {
     /// into the money fields above — the true payout needs the epoch-wide maker
     /// totals only Polymarket has (spec §9/§17).
     pub reward_farm: Option<RewardFarmStatus>,
+    /// Smart-money COPY telemetry (Task C5). `Some` ONLY for the copy strategy
+    /// ([`CopyStrategy`](crate::strategy::copy::CopyStrategy)); `None` for arb /
+    /// MM / the heartbeat. Carries the live follow-whitelist size so the
+    /// dashboard shows how many traders the executor is currently mirroring; the
+    /// open-position COUNT is `open_positions`, realized P&L is `realized_micro`,
+    /// and each open copied position's line (market / outcome / qty / entry /
+    /// mark / uPnL) reaches the TUI via the store-driven Positions panel (every
+    /// copy fill is `"copy"`-tagged), exactly as the MM's positions are surfaced.
+    pub copy: Option<CopyStatus>,
+}
+
+/// Smart-money COPY telemetry (Task C5) for the dashboard's per-strategy line —
+/// the copy analogue of [`RewardFarmStatus`]. Display-only: surfaced on the
+/// dashboard, never fed back into accounting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CopyStatus {
+    /// Size of the current follow-whitelist (the top-ranked traders the executor
+    /// is mirroring this cycle). `0` before the first whitelist refresh, or after
+    /// a refresh that found nobody clearing the `EdgePerBet` bar.
+    pub whitelist: usize,
 }
 
 /// RewardFarm liquidity-reward ESTIMATE telemetry (Task 11, spec §9), computed

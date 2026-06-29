@@ -499,20 +499,19 @@ impl LiveVenue {
         self.data_rows("trades", "").await
     }
 
-    /// Fetch the public order book for a registered `token` and return its best
-    /// (lowest) ask as a tick `Px`, or `None` if the ask side is empty/
-    /// unparseable. Public read — no auth, no limiter. Used by `--probe-order`
-    /// to find a cheap, fillable level to exercise the signed-order path.
-    pub async fn best_ask(
-        &self,
-        token: TokenId,
-        ts: TickSize,
-    ) -> Result<Option<Px>, VenueError> {
+    /// Fetch + parse the public order book JSON for a registered `token`. Public
+    /// read — no auth, no limiter. Shared by [`best_ask`](Self::best_ask) and
+    /// [`best_bid`](Self::best_bid). Takes `&mut self` (not `&self`) so the
+    /// returned future holds `&mut LiveVenue` rather than `&LiveVenue`: the venue
+    /// is `Send` but NOT `Sync` (it owns a `Box<dyn FnMut + Send>` salt source),
+    /// so only the exclusive borrow keeps the read future `Send` (required by the
+    /// copy executor's `CopyVenue: Send` bound).
+    async fn book_json(&mut self, token: TokenId) -> Result<serde_json::Value, VenueError> {
         let (venue_token, _neg, _ts) = self
             .tokens
             .get(&token)
             .cloned()
-            .ok_or_else(|| VenueError::Live(format!("probe: token {} not registered", token.0)))?;
+            .ok_or_else(|| VenueError::Live(format!("book: token {} not registered", token.0)))?;
         let url = format!("{}/book?token_id={}", self.cfg.base, venue_token);
         let resp = self
             .http
@@ -525,8 +524,20 @@ impl LiveVenue {
         if !status.is_success() {
             return Err(VenueError::Live(format!("book {status}: {body}")));
         }
-        let book: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| VenueError::Live(e.to_string()))?;
+        serde_json::from_str(&body).map_err(|e| VenueError::Live(e.to_string()))
+    }
+
+    /// Fetch the public order book for a registered `token` and return its best
+    /// (lowest) ask as a tick `Px`, or `None` if the ask side is empty/
+    /// unparseable. Public read — no auth, no limiter. Used by `--probe-order`
+    /// to find a cheap, fillable level to exercise the signed-order path AND by
+    /// the copy executor's freshness/entry reference (`CopyVenue::best_ask`).
+    pub async fn best_ask(
+        &mut self,
+        token: TokenId,
+        ts: TickSize,
+    ) -> Result<Option<Px>, VenueError> {
+        let book = self.book_json(token).await?;
         let asks = match book.get("asks").and_then(|a| a.as_array()) {
             Some(a) => a,
             None => return Ok(None),
@@ -537,6 +548,31 @@ impl LiveVenue {
             .filter_map(|lvl| lvl.get("price").and_then(|p| p.as_str()))
             .filter_map(|p| px_from_decimal(p, ts))
             .min_by_key(|px| px.get());
+        Ok(best)
+    }
+
+    /// Fetch the public order book for a registered `token` and return its best
+    /// (highest) bid as a tick `Px`, or `None` if the bid side is empty/
+    /// unparseable. The symmetric counterpart of [`best_ask`](Self::best_ask):
+    /// the copy executor (`CopyVenue::best_bid`) reads it as the marketable SELL
+    /// price for a follow-exit / stop-loss AND as the long's mark-to-market.
+    /// Public read — no auth, no limiter.
+    pub async fn best_bid(
+        &mut self,
+        token: TokenId,
+        ts: TickSize,
+    ) -> Result<Option<Px>, VenueError> {
+        let book = self.book_json(token).await?;
+        let bids = match book.get("bids").and_then(|b| b.as_array()) {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        // Highest bid across all levels — don't assume the venue's sort order.
+        let best = bids
+            .iter()
+            .filter_map(|lvl| lvl.get("price").and_then(|p| p.as_str()))
+            .filter_map(|p| px_from_decimal(p, ts))
+            .max_by_key(|px| px.get());
         Ok(best)
     }
 }

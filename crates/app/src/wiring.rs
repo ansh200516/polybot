@@ -76,87 +76,125 @@ pub fn inventory_config(cfg: &Config) -> Result<pm_risk::inventory::InventoryCon
 }
 
 /// The platform's per-strategy capital envelopes plus the RiskConfig arb's
-/// `RiskEngine` enforces — the pure capital carve-out (Task 4.4b), factored out
-/// of `main`'s host-build block so it is unit-testable.
+/// `RiskEngine` enforces — the pure capital carve-out (Task 4.4b; Task C5 adds
+/// the copy strategy), factored out of `main`'s host-build block so it is
+/// unit-testable.
 ///
-/// `mm` is `Some` only when `[strategies.mm] enabled`. The risk field on each
-/// envelope is allocator/record metadata (the host only sums `capital`); MM's
-/// real risk enforcement is its [`InventoryConfig`](pm_risk::inventory::InventoryConfig),
-/// not `mm`'s envelope `RiskConfig`.
+/// `mm` is `Some` only when `[strategies.mm] enabled`; `copy` is `Some` only
+/// when `[strategies.copy] enabled`. The risk field on each envelope is
+/// allocator/record metadata (the host only sums `capital`); each strategy's
+/// real risk enforcement is its own (the MM's / copy's
+/// [`InventoryConfig`](pm_risk::inventory::InventoryConfig), arb's `RiskEngine`),
+/// not the envelope `RiskConfig`.
 pub struct PlatformEnvelopes {
-    /// Arb's envelope: the WHOLE bankroll when MM is off, else `bankroll −
-    /// mm_capital`. Its `risk` is [`arb_risk`](Self::arb_risk).
+    /// Arb's envelope: the WHOLE bankroll when both MM and copy are off, else
+    /// `bankroll − mm_capital − copy_capital`. Its `risk` is
+    /// [`arb_risk`](Self::arb_risk).
     pub arb: StrategyEnvelope,
     /// The heartbeat's envelope: always zero capital (it takes no risk).
     pub heartbeat: StrategyEnvelope,
     /// The MM's envelope — `Some` only when the MM is enabled.
     pub mm: Option<StrategyEnvelope>,
+    /// The copy strategy's envelope — `Some` only when copy is enabled (Task
+    /// C5). Carved out of the bankroll exactly like the MM's, so all three
+    /// trading strategies SHARE the bankroll safely (Σ capital == bankroll).
+    pub copy: Option<StrategyEnvelope>,
     /// The RiskConfig arb's `RiskEngine` enforces. Byte-identical to the input
-    /// `risk_cfg` when MM is off; when MM is on its `bankroll` is REDUCED to
-    /// arb's slice so arb genuinely trades within its reduced capital (the crux
-    /// of sharing real funds without overlap).
+    /// `risk_cfg` when MM and copy are off; when either is on its `bankroll` is
+    /// REDUCED to arb's slice (`bankroll − mm − copy`) so arb genuinely trades
+    /// within its reduced capital (the crux of sharing real funds without
+    /// overlap).
     pub arb_risk: RiskConfig,
 }
 
-/// Carve the platform `bankroll` into per-strategy envelopes (Task 4.4b). Pure
-/// (no I/O), so it is unit-tested directly.
+/// Carve the platform `bankroll` into per-strategy envelopes (Task 4.4b; Task
+/// C5 adds the copy strategy). Pure (no I/O), so it is unit-tested directly.
 ///
-/// * **MM disabled (default):** byte-identical to pre-4.4b — arb claims the
-///   WHOLE bankroll (its `RiskEngine` cap stays `risk_cfg.bankroll`), the
-///   heartbeat claims zero, and there is no MM envelope. Σ capital == bankroll.
-/// * **MM enabled:** `mm_capital = usd→µUSDC(mm.capital_usd)` is carved OUT, so
-///   `arb_capital = bankroll − mm_capital`. Arb's enforced `RiskConfig.bankroll`
-///   is reduced to `arb_capital` ([`arb_risk`](PlatformEnvelopes::arb_risk)) so
-///   the two strategies SHARE the bankroll without overlapping real funds. Σ
-///   capital (arb + mm + heartbeat 0) == bankroll, so the startup allocator
-///   passes exactly.
+/// * **MM + copy both disabled (default):** byte-identical to pre-4.4b — arb
+///   claims the WHOLE bankroll (its `RiskEngine` cap stays `risk_cfg.bankroll`),
+///   the heartbeat claims zero, and there is no MM/copy envelope. Σ ==
+///   bankroll.
+/// * **MM and/or copy enabled:** each enabled strategy's `capital_usd` is carved
+///   OUT (`mm_capital`, `copy_capital`), so `arb_capital = bankroll −
+///   mm_capital − copy_capital`. Arb's enforced `RiskConfig.bankroll` is reduced
+///   to `arb_capital` ([`arb_risk`](PlatformEnvelopes::arb_risk)) so ALL the
+///   trading strategies SHARE the bankroll without overlapping real funds. Σ
+///   capital (arb + mm + copy + heartbeat 0) == bankroll, so the startup
+///   allocator passes exactly.
 ///
 /// `bankroll` is the platform bankroll the host validates against (the caller
-/// passes `risk_cfg.bankroll`). Errors if `mm.capital_usd` is unconvertible or
-/// (when enabled) exceeds the bankroll — the latter is also rejected at config
-/// validation, but guarded here too since this fn is the real-money carve.
+/// passes `risk_cfg.bankroll`). Errors if a `capital_usd` is unconvertible or
+/// the enabled strategies' COMBINED slice exceeds the bankroll — the per-
+/// strategy bound is also rejected at config validation, but the combined carve
+/// is guarded here (this fn is the real-money carve), so a copy + MM that each
+/// fit but together exceed the bankroll fails startup like the others.
 pub fn strategy_envelopes(
     config: &Config,
     risk_cfg: &RiskConfig,
     bankroll: Usdc,
 ) -> Result<PlatformEnvelopes, ConfigError> {
     let mm = &config.strategies.mm;
+    let copy = &config.strategies.copy;
     // The heartbeat always claims zero capital; its risk is record-only.
     let heartbeat = StrategyEnvelope::new(StrategyId("heartbeat"), Usdc(0), risk_cfg.clone());
 
-    if !mm.enabled {
-        // DEFAULT path — change NOTHING: arb claims the whole bankroll and its
-        // enforced risk cap is the unmodified `risk_cfg`.
-        return Ok(PlatformEnvelopes {
-            arb: StrategyEnvelope::new(StrategyId("arb"), bankroll, risk_cfg.clone()),
-            heartbeat,
-            mm: None,
-            arb_risk: risk_cfg.clone(),
-        });
-    }
+    // Each enabled trading strategy's slice (0 µUSDC when disabled — inert, so it
+    // claims nothing). Convertibility is validated even when disabled is cheap.
+    let mm_capital = if mm.enabled {
+        Usdc(usd_to_microusdc(mm.capital_usd)?)
+    } else {
+        Usdc(0)
+    };
+    let copy_capital = if copy.enabled {
+        Usdc(usd_to_microusdc(copy.capital_usd)?)
+    } else {
+        Usdc(0)
+    };
 
-    // MM ON: carve its slice out of the bankroll (real funds — no overlap).
-    let mm_capital = Usdc(usd_to_microusdc(mm.capital_usd)?);
-    if mm_capital.0 > bankroll.0 {
+    // The COMBINED carve must fit the bankroll — a copy + MM that each fit but
+    // together exceed it fails startup (sharing funds that don't exist is the
+    // one thing the carve must never allow).
+    let carved = mm_capital.0 + copy_capital.0;
+    if carved > bankroll.0 {
         return Err(ConfigError::BadMoney(
-            "strategies.mm.capital_usd exceeds the platform bankroll",
+            "strategies capital (mm + copy) exceeds the platform bankroll",
         ));
     }
-    let arb_capital = Usdc(bankroll.0 - mm_capital.0);
-    // Arb's RiskEngine cap shrinks to its slice so it trades within it.
+    let arb_capital = Usdc(bankroll.0 - carved);
+    // Arb's RiskEngine cap shrinks to its slice so it trades within it. When both
+    // MM and copy are off, `carved == 0` ⇒ `arb_capital == bankroll` and this is
+    // byte-identical to the unmodified `risk_cfg` (the default path is unchanged).
     let arb_risk = RiskConfig {
         bankroll: arb_capital,
         ..risk_cfg.clone()
     };
-    // MM's envelope risk records its slice; MM enforces via InventoryConfig.
-    let mm_risk = RiskConfig {
-        bankroll: mm_capital,
-        ..risk_cfg.clone()
-    };
+    // Each enabled strategy's envelope risk records its slice; the strategy
+    // enforces via its own InventoryConfig (the host only sums `capital`).
+    let mm_env = mm.enabled.then(|| {
+        StrategyEnvelope::new(
+            StrategyId("mm"),
+            mm_capital,
+            RiskConfig {
+                bankroll: mm_capital,
+                ..risk_cfg.clone()
+            },
+        )
+    });
+    let copy_env = copy.enabled.then(|| {
+        StrategyEnvelope::new(
+            StrategyId("copy"),
+            copy_capital,
+            RiskConfig {
+                bankroll: copy_capital,
+                ..risk_cfg.clone()
+            },
+        )
+    });
     Ok(PlatformEnvelopes {
         arb: StrategyEnvelope::new(StrategyId("arb"), arb_capital, arb_risk.clone()),
         heartbeat,
-        mm: Some(StrategyEnvelope::new(StrategyId("mm"), mm_capital, mm_risk)),
+        mm: mm_env,
+        copy: copy_env,
         arb_risk,
     })
 }

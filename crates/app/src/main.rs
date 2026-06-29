@@ -28,6 +28,7 @@ use pm_app::coordinator::{CoordinatorSummary, CtlCommand, LiveParams, now_ms, ru
 use pm_app::kill::spawn_kill_watch;
 use pm_app::stats::AppStats;
 use pm_app::strategy::arb::{ArbStrategy, ExecTaskBuilder};
+use pm_app::strategy::copy::{AppCopyVenue, CopyParams, CopyStrategy, PaperCopyVenue, TradeTokenInfo};
 use pm_app::strategy::host::{HostShared, StrategyHost};
 use pm_app::strategy::mm::{MmFillsSource, MmLive, MmParams, MmStrategy};
 use pm_app::strategy::stub::HeartbeatStrategy;
@@ -313,6 +314,59 @@ struct MmLiveInputs {
     proxy: alloy_primitives::Address,
     deposit_wallet: alloy_primitives::Address,
     auth_address: alloy_primitives::Address,
+}
+
+/// Build the copy executor's `(condition_id, outcome_index) →` [`TradeTokenInfo`]
+/// resolver (Task C5) from the registry: for every SYNCED-universe market, map
+/// outcome 0 → the YES token and outcome 1 → the NO token (the Data-API outcome
+/// convention the copy signals carry), each with the venue tick grid + the
+/// on-chain condition id (the relayer redeem key). A market whose condition id
+/// does not parse as a `B256` is skipped (it can't be redeemed and is almost
+/// never a real market).
+///
+/// COVERAGE LIMITATION (canary, documented): the copy executor can only TRADE
+/// markets present in this map, i.e. the SYNCED universe — a smart-money signal
+/// in an UNSYNCED market resolves to no tradeable token and is skipped without an
+/// order. A future enhancement is on-demand syncing of a signal's market (à la
+/// confluence's `fetch_gamma_markets_by_condition`); until then, widen
+/// `[universe]` coverage to raise the hit rate.
+fn build_copy_tradeable(reg: &pm_registry::Registry) -> HashMap<(String, i64), TradeTokenInfo> {
+    let mut map: HashMap<(String, i64), TradeTokenInfo> = HashMap::new();
+    let mut skipped = 0usize;
+    for m in reg.markets() {
+        let Some(cond_str) = reg.market_condition(m.id) else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(condition) = cond_str.parse::<alloy_primitives::B256>() else {
+            skipped += 1;
+            continue;
+        };
+        // outcome 0 → YES token, outcome 1 → NO token.
+        map.insert(
+            (cond_str.to_string(), 0),
+            TradeTokenInfo {
+                token: m.yes,
+                ts: m.tick,
+                condition,
+            },
+        );
+        map.insert(
+            (cond_str.to_string(), 1),
+            TradeTokenInfo {
+                token: m.no,
+                ts: m.tick,
+                condition,
+            },
+        );
+    }
+    if skipped > 0 {
+        warn!(
+            skipped,
+            "copy: markets without a parseable condition_id are not tradeable by the copy executor"
+        );
+    }
+    map
 }
 
 // ---------------------------------------------------------------------------
@@ -990,11 +1044,18 @@ async fn main() {
     // MM is wired — so MM's LiveVenue is identical to arb's with NO second key
     // derivation. Stays `None` on the paper arm (and whenever MM is paper).
     let mut mm_live_inputs: Option<MmLiveInputs> = None;
-    // M6-7: the LIVE on-chain MERGE relayer for the reward-farm MM, built in the
-    // live arm below (only when MM is cleared for live) and threaded into the MM.
-    // `None` on paper / arb / non-relayer live — the MM then keeps the hold-to-
-    // resolution no-op, so those paths are byte-for-byte unchanged. `Arc` so each
-    // spawned, non-blocking merge-sweep task shares the one client.
+    // Task C5: the copy executor's live inputs — a CLONE of arb's resolved
+    // creds/signer (NO second API key derivation), stashed in the live arm below
+    // iff copy is cleared for live. Parallel to `mm_live_inputs`; copy can be
+    // live with MM OFF (the copy canary does exactly that), so it has its OWN
+    // stash. `None` on paper / arb / whenever copy is paper.
+    let mut copy_live_inputs: Option<MmLiveInputs> = None;
+    // M6-7: the LIVE on-chain relayer (deposit-wallet redeem / merge), built in
+    // the live arm below when EITHER the reward-farm MM OR the copy executor is
+    // cleared for live, and SHARED (same wallet/account) by whichever holds it.
+    // `None` on paper / arb / non-relayer live — both strategies then keep the
+    // hold-to-resolution no-op, so those paths are byte-for-byte unchanged. `Arc`
+    // so each spawned, non-blocking sweep task shares the one client.
     let mut mm_merger: Option<std::sync::Arc<pm_execution::relayer::RelayerClient>> = None;
     // Capture the deposit-wallet address BEFORE `live_rt` is consumed below — the
     // MM's live seed reconcile (further down) reads its on-chain holdings. `Some`
@@ -1004,13 +1065,20 @@ async fn main() {
     let exec_builder: ExecTaskBuilder = if let Some((secrets, signer, proxy, deposit_wallet)) =
         live_rt
     {
-        // M6-7: build the LIVE on-chain MERGE relayer for the reward-farm MM BEFORE
-        // `secrets.api` is moved out by the match below (so `&secrets` is still a
-        // whole borrow). Only attempted when MM is cleared for live;
-        // `RelayerClient::new` itself returns `None` unless the relayer is enabled
-        // AND relayer creds + deposit wallet + a valid EOA key are present (OFF by
-        // default, staging-first), so arb-only / non-relayer live stay no-op.
-        if config.strategies.mm.enabled && mm_use_live(args.live, config.strategies.mm.live) {
+        // M6-7: build the LIVE on-chain relayer BEFORE `secrets.api` is moved out
+        // by the match below (so `&secrets` is still a whole borrow). Attempted
+        // when EITHER the reward-farm MM OR the copy executor is cleared for live
+        // — it is the SAME deposit-wallet account either way, so one client is
+        // built and SHARED. `RelayerClient::new` itself returns `None` unless the
+        // relayer is enabled AND relayer creds + deposit wallet + a valid EOA key
+        // are present (OFF by default, staging-first), so arb-only / non-relayer
+        // live stay no-op. The copy executor uses it to redeem resolved winners;
+        // without it, copy holds resolved positions for the next reconcile.
+        let mm_live_cleared =
+            config.strategies.mm.enabled && mm_use_live(args.live, config.strategies.mm.live);
+        let copy_live_cleared =
+            config.strategies.copy.enabled && mm_use_live(args.live, config.strategies.copy.live);
+        if mm_live_cleared || copy_live_cleared {
             let relayer_http = reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -1100,6 +1168,22 @@ async fn main() {
             && mm_use_live(args.live, config.strategies.mm.live)
         {
             mm_live_inputs = Some(MmLiveInputs {
+                base: config.endpoints.clob_base.clone(),
+                creds: creds.clone(),
+                signer: signer.clone(),
+                proxy,
+                deposit_wallet,
+                auth_address,
+            });
+        }
+        // Task C5: likewise stash a CLONE for the COPY executor when it is
+        // cleared for live (independent of MM — copy can be live with MM off, as
+        // the copy canary is). Same account/creds/signer/deposit_wallet as arb,
+        // so the copy `LiveVenue` is byte-identical with NO second key derivation.
+        if config.strategies.copy.enabled
+            && mm_use_live(args.live, config.strategies.copy.live)
+        {
+            copy_live_inputs = Some(MmLiveInputs {
                 base: config.endpoints.clob_base.clone(),
                 creds: creds.clone(),
                 signer: signer.clone(),
@@ -1342,6 +1426,7 @@ async fn main() {
         arb: arb_envelope,
         heartbeat: hb_envelope,
         mm: mm_envelope,
+        copy: copy_envelope,
         arb_risk,
     } = strategy_envelopes(&config, &risk_cfg, bankroll)
         .unwrap_or_else(|e| fatal(format!("strategy capital carve-out: {e}")));
@@ -1841,8 +1926,10 @@ async fn main() {
             // a reward-farm live run RECYCLES a complete YES+NO set on-chain via a
             // periodic, non-blocking sweep. `merger` is `None` (and the map empty)
             // off relayer-enabled reward-farm live, keeping every other path
-            // (paper / arb / non-relayer live) byte-for-byte unchanged.
-            .with_merger(mm_merger)
+            // (paper / arb / non-relayer live) byte-for-byte unchanged. CLONE (not
+            // move) the shared Arc so the copy executor (below) can share the SAME
+            // relayer (same wallet/account) when it too is live.
+            .with_merger(mm_merger.clone())
             .with_conditions(mm_cond_by_token)
             // R2 (auto-redeem): the resolved-winner feed — token→asset map + Data-API
             // positions client + lowercased deposit wallet. All empty/None unless a
@@ -1951,6 +2038,143 @@ async fn main() {
             live = mm_live,
             shadow = args.shadow,
             "market maker enabled: bankroll carved between arb and MM"
+        );
+    }
+
+    // ---- copy executor (#4): DEFAULT-OFF, behind [strategies.copy] enabled --
+    // Present only when the carve produced a `copy_envelope` (copy enabled). When
+    // disabled this whole block is skipped — the strategy is never constructed,
+    // so it is fully DORMANT (no feed, no venue, no orders), and arb/MM/paper are
+    // byte-for-byte unaffected.
+    //
+    // LIVE GATING (same as the MM): copy trades REAL taker orders ONLY when
+    // `mm_use_live(args.live, copy.live)` clears — the PROCESS is --live (which
+    // forced the typed confirmation at startup) AND `[strategies.copy].live`.
+    // EVERY other combination uses the PAPER taker venue.
+    //
+    // COVERAGE LIMITATION (canary, documented in `build_copy_tradeable`): copy can
+    // only trade SYNCED-universe markets; a smart-money signal in an UNSYNCED
+    // market is skipped (no tradeable token). A future enhancement is on-demand
+    // syncing of signal markets.
+    if let Some(copy_envelope) = copy_envelope {
+        let copy_capital = copy_envelope.capital;
+        let copy_live = mm_use_live(args.live, config.strategies.copy.live);
+        let copy_params = CopyParams::from_config(&config.strategies.copy, &config.copy_params)
+            .unwrap_or_else(|e| fatal(format!("CopyParams::from_config: {e}")));
+
+        // Signal/whitelist feed: the keyless Data API (the SAME client the MM
+        // redeem path + confluence use; no key). A build failure leaves the
+        // strategy an inert heartbeat (no whitelist, no orders) rather than
+        // aborting startup.
+        let copy_feed = match DataApiClient::new(None) {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                warn!(error = %e, "copy: Data-API client build failed — copy strategy inert this run");
+                None
+            }
+        };
+
+        // Tradeable map: (condition_id, outcome_index) → venue token/tick/condition
+        // for every SYNCED market (outcome 0 → yes, 1 → no). Empty markets without
+        // a parseable condition id are skipped (see `build_copy_tradeable`).
+        let copy_tradeable = build_copy_tradeable(&reg);
+        let copy_tradeable_markets = copy_tradeable.len();
+
+        // Venue: a LIVE taker venue for THIS account when cleared (reusing the
+        // SAME creds/signer/deposit-wallet arb resolved — NO second API key), else
+        // the PAPER taker venue over the shared book fetcher.
+        let copy_venue: Option<AppCopyVenue> = if copy_live {
+            let inputs = copy_live_inputs.take().unwrap_or_else(|| {
+                fatal("internal: copy cleared for live but live inputs were not stashed")
+            });
+            let mut v = pm_execution::live::LiveVenue::new(pm_execution::live::LiveVenueCfg {
+                base: inputs.base,
+                creds: inputs.creds,
+                signer: inputs.signer,
+                proxy: inputs.proxy,
+                deposit_wallet: inputs.deposit_wallet,
+                auth_address: inputs.auth_address,
+                fill_window: Duration::from_millis(config.execution.fill_window_ms),
+                rate_per_sec: config.ingestion.rest_rate_per_sec,
+                rate_capacity: config.ingestion.rest_rate_capacity,
+                shadow: args.shadow,
+            })
+            .unwrap_or_else(|e| fatal(format!("copy LiveVenue: {e}")));
+            // Register every synced-universe token so a taker FAK for any tradeable
+            // token is accepted (an unregistered token is rejected before any I/O).
+            // SHARED-ACCOUNT RATE BUDGET: this is a THIRD LiveVenue (after arb +
+            // MM), each with its OWN REST limiter against the one account budget —
+            // acceptable for a tiny canary; keep `ingestion.rest_rate_*`
+            // conservative (a shared limiter is future work).
+            for m in reg.markets() {
+                for tok in [m.yes, m.no] {
+                    if let Some(vid) = reg.token_venue_id(tok) {
+                        v.register_token(tok, vid.to_owned(), m.neg_risk, m.tick);
+                    }
+                }
+            }
+            Some(AppCopyVenue::Live(v))
+        } else {
+            Some(AppCopyVenue::Paper(PaperCopyVenue::new(
+                fetcher.clone(),
+                Duration::from_millis(config.execution.paper_latency_ms),
+                params.gas,
+            )))
+        };
+
+        // Relayer: SHARE the one `mm_merger` Arc if it was built (same wallet /
+        // account); else `None` → copy holds resolved winners for the next
+        // session's reconcile (the documented no-relayer behavior).
+        let copy_relayer = mm_merger.clone();
+        let copy_has_relayer = copy_relayer.is_some();
+
+        let copy = CopyStrategy::new(copy_params)
+            .with_feed(copy_feed)
+            .with_venue(copy_venue)
+            .with_relayer(copy_relayer)
+            .with_tradeable(copy_tradeable)
+            // Same live gate as arb/MM: when live is HELD (TUI before `l`), copy
+            // starts PAUSED and only trades once the operator releases.
+            .with_start_paused(copy_live && !released_at_start);
+
+        host.add(Box::new(copy), copy_envelope);
+
+        if copy_live {
+            // Surface the DIRECTIONAL canary LOUDLY. Unlike the (delta-neutral-ish)
+            // MM, a copied buy is an outright directional bet — a wrong copy can
+            // lose the WHOLE position. The CONTROLS are the capital carve + the
+            // per-position / gross / concurrency caps + the stop-loss + the drift
+            // (freshness) gate + the startup confirmation.
+            warn!(
+                capital_usd = config.strategies.copy.capital_usd,
+                per_position_usd = config.copy_params.per_position_usd,
+                max_concurrent_positions = config.copy_params.max_concurrent_positions,
+                max_gross_usd = config.copy_params.max_gross_usd,
+                stop_loss_pct = config.copy_params.stop_loss_pct,
+                max_drift = config.copy_params.max_drift,
+                tradeable_markets = copy_tradeable_markets,
+                relayer = copy_has_relayer,
+                shadow = args.shadow,
+                "LIVE COPY ENABLED — DIRECTIONAL real taker orders (canary): a wrong copy can lose \
+                 the whole position; controls = capital carve + per-position/gross/concurrency caps \
+                 + stop-loss + drift gate + confirmation; SHARED account rate budget with arb"
+            );
+        } else if config.strategies.copy.live {
+            // `copy.live` set but the PROCESS is not --live → cannot trade real
+            // money (no confirmation, no live secrets); fall back to PAPER.
+            warn!(
+                "strategies.copy.live set but process not --live; using the PAPER taker venue \
+                 (restart with --live to trade real copy orders)"
+            );
+        }
+        info!(
+            copy_capital_usd = config.strategies.copy.capital_usd,
+            copy_capital_micro = copy_capital.0,
+            tradeable_markets = copy_tradeable_markets,
+            live = copy_live,
+            relayer = copy_has_relayer,
+            shadow = args.shadow,
+            "copy executor enabled: bankroll carved for the smart-money copy strategy"
         );
     }
 
@@ -2143,6 +2367,9 @@ async fn main() {
                     // harmless no-op.
                     let _ = running.pause(StrategyId("arb"), p).await;
                     let _ = running.pause(StrategyId("mm"), p).await;
+                    // The copy executor is also a real-money trading strategy:
+                    // pausing it stops its entry/exit poll cycle (no orders).
+                    let _ = running.pause(StrategyId("copy"), p).await;
                 }
                 pm_tui::state::TuiCommand::Kill => kill.store(true, Ordering::Release),
                 pm_tui::state::TuiCommand::GoLive => {
@@ -2153,6 +2380,10 @@ async fn main() {
                         // never places a real order.
                         let _ = live_release_sender.send(CtlCommand::ReleaseLive).await;
                         let _ = running.pause(StrategyId("mm"), false).await;
+                        // Release the copy executor too: it starts PAUSED under a
+                        // held live latch (see `with_start_paused`), so until this
+                        // fires it never places a real copy order.
+                        let _ = running.pause(StrategyId("copy"), false).await;
                         // Remember the release so a periodic auto-restart resumes
                         // live (carries PM_RESUME_LIVE) instead of re-holding.
                         live_released = true;

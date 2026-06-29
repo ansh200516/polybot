@@ -394,6 +394,13 @@ fn draw_health(f: &mut Frame, s: &AppState, area: Rect) {
                 if r.pulled { " PULL" } else { "" },
             ));
         }
+        // Smart-money COPY (Task C5): a compact segment for the copy strategy —
+        // the follow-whitelist size. The open copied positions themselves render
+        // in the Positions panel (tagged "copy"), with realized P&L / pos count /
+        // paused-halt already on the line above. Absent for non-copy strategies.
+        if let Some(c) = &line.copy {
+            text.push_str(&format!("\n  copy whitelist {}", c.whitelist));
+        }
     }
     let block = Block::default().borders(Borders::ALL).title(" Health ");
     let para = Paragraph::new(text).block(block);
@@ -1020,6 +1027,7 @@ mod tests {
                 halted: None,
                 // arb earns no liquidity reward → no reward segment.
                 reward: None,
+                copy: None,
             },
             crate::state::StrategyLine {
                 id: "mm".into(),
@@ -1031,6 +1039,7 @@ mod tests {
                 paused: false,
                 halted: Some("DailyDrawdown".into()),
                 reward: None,
+                copy: None,
             },
         ];
         let text = render_to_text(&s, &UiState::default(), 200, 60);
@@ -1082,6 +1091,7 @@ mod tests {
                 signal: 0.45,
                 pulled: true,
             }),
+            copy: None,
         }];
         // Wide so the reward segment is not clipped by the Health panel width.
         let text = render_to_text(&s, &UiState::default(), 200, 60);
@@ -1106,9 +1116,56 @@ mod tests {
             paused: false,
             halted: None,
             reward: None,
+            copy: None,
         }];
         let bare_text = render_to_text(&bare, &UiState::default(), 200, 60);
         assert!(!bare_text.contains("rew est"), "no reward segment without reward:\n{bare_text}");
+    }
+
+    /// Task C5: a copy strategy line carrying a [`CopyLine`](crate::state::CopyLine)
+    /// renders a compact "copy whitelist N" segment; a strategy with no copy
+    /// summary (`copy: None`) renders no such segment.
+    #[test]
+    fn health_panel_shows_copy_whitelist() {
+        let mut s = sample_state();
+        s.per_strategy = vec![crate::state::StrategyLine {
+            id: "copy".into(),
+            equity_usd: 0.00,
+            cash_usd: 0.00,
+            realized_usd: -0.50,
+            unrealized_usd: 0.00,
+            open_positions: 2,
+            paused: false,
+            halted: None,
+            reward: None,
+            copy: Some(crate::state::CopyLine { whitelist: 30 }),
+        }];
+        let text = render_to_text(&s, &UiState::default(), 200, 60);
+        // The compact copy segment surfaces the follow-whitelist size; the open
+        // count + realized are on the line above (pos 2 / rlzd -0.50).
+        assert!(text.contains("copy whitelist 30"), "copy whitelist segment missing:\n{text}");
+        assert!(text.contains("pos 2"), "copy open-position count missing:\n{text}");
+        assert!(text.contains("rlzd -0.50"), "copy realized P&L missing:\n{text}");
+
+        // A non-copy strategy renders no "copy whitelist" segment.
+        let mut bare = sample_state();
+        bare.per_strategy = vec![crate::state::StrategyLine {
+            id: "arb".into(),
+            equity_usd: 1.00,
+            cash_usd: 1.00,
+            realized_usd: 0.00,
+            unrealized_usd: 0.00,
+            open_positions: 0,
+            paused: false,
+            halted: None,
+            reward: None,
+            copy: None,
+        }];
+        let bare_text = render_to_text(&bare, &UiState::default(), 200, 60);
+        assert!(
+            !bare_text.contains("copy whitelist"),
+            "no copy segment without a copy summary:\n{bare_text}"
+        );
     }
 
     #[test]

@@ -40,10 +40,10 @@ use std::time::Duration;
 use alloy_primitives::B256;
 use pm_core::instrument::TokenId;
 use pm_core::num::{Bps, ONE_USDC_MICRO, Px, Qty, TickSize, Usdc};
-use pm_engine::Action;
+use pm_engine::{Action, GasTable};
 use pm_execution::Order;
 use pm_execution::relayer::RelayerClient;
-use pm_execution::venue::{SubmitOutcome, VenueError};
+use pm_execution::venue::{BookSource, ExecutionVenue, PaperVenue, SubmitOutcome, VenueError};
 use pm_ingestion::data_api::{
     ClosedPos, DataApiClient, LeaderboardEntry, OrderBy, TimePeriod, Trade, TradeSide, TradesFilter,
 };
@@ -57,7 +57,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::coordinator::now_ms;
 
-use super::{Strategy, StrategyCommand, StrategyCtx, StrategyId, StrategyStatus};
+use super::{CopyStatus, Strategy, StrategyCommand, StrategyCtx, StrategyId, StrategyStatus};
 
 /// Max fills pulled from each whitelisted wallet's `/trades?user=` history when
 /// RANKING (the 6-hourly whitelist refresh). Matches the backtest's
@@ -527,6 +527,125 @@ pub struct TradeTokenInfo {
     pub condition: B256,
 }
 
+// ---------------------------------------------------------------------------
+// Concrete CopyVenue impls (C5): the LIVE taker venue + a PAPER taker venue,
+// plus the app-level enum main wires into CopyStrategy.
+// ---------------------------------------------------------------------------
+
+/// The live CLOB venue IS a [`CopyVenue`]: it already exposes the public-book
+/// `best_ask` + the taker `submit_fak`, and C5 added the symmetric `best_bid`.
+/// The public book reads return `Result<Option<Px>, _>`; the copy loop only
+/// needs "a price or not", so a transport/parse error degrades to `None` (skip
+/// this cycle, retry next) — the same best-effort posture the loop's other I/O
+/// takes — rather than aborting the loop. `submit_fak` is the
+/// [`ExecutionVenue`] taker FAK (signed deposit-wallet sigType-3 order); a
+/// `--shadow` venue signs but returns a zero-fill, so a shadow copy run places
+/// no real orders. main builds this venue from the SAME live inputs the MM
+/// reuses (no second API key).
+impl CopyVenue for pm_execution::live::LiveVenue {
+    async fn best_ask(&mut self, token: TokenId, ts: TickSize) -> Option<Px> {
+        // A transport/parse error is not actionable here — treat "no price"
+        // (None) and "errored" identically (skip), matching the loop's posture.
+        pm_execution::live::LiveVenue::best_ask(self, token, ts)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn best_bid(&mut self, token: TokenId, ts: TickSize) -> Option<Px> {
+        pm_execution::live::LiveVenue::best_bid(self, token, ts)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn submit_fak(&mut self, order: &Order) -> Result<SubmitOutcome, VenueError> {
+        <pm_execution::live::LiveVenue as ExecutionVenue>::submit_fak(self, order).await
+    }
+}
+
+/// A PAPER taker [`CopyVenue`]: honest fills against the LIVE book (re-read at
+/// fill time — no midpoints, no infinite depth) via the SAME [`PaperVenue`] the
+/// arb taker uses, with NO live calls. `best_ask` / `best_bid` read the current
+/// book off the same [`BookFetcher`] (the freshness gate + the long's mark).
+/// `BookFetcher` is cheaply `Clone` (an `Arc` inside), so it holds two handles:
+/// one inside [`PaperVenue`] (the fill path) and one for the book reads
+/// (`BookSource::book` needs `&mut self`, so the read path owns its own).
+pub struct PaperCopyVenue {
+    /// The honest fill-at-book taker (reused, not re-implemented).
+    venue: PaperVenue<crate::wiring::BookFetcher>,
+    /// A second handle to the SAME books for the best-ask/bid reads.
+    books: crate::wiring::BookFetcher,
+}
+
+impl PaperCopyVenue {
+    /// Build a paper copy venue over `books`, with the same `latency` / `gas`
+    /// the arb paper venue uses.
+    pub fn new(books: crate::wiring::BookFetcher, latency: Duration, gas: GasTable) -> Self {
+        PaperCopyVenue {
+            venue: PaperVenue::new(books.clone(), latency, gas),
+            books,
+        }
+    }
+}
+
+impl CopyVenue for PaperCopyVenue {
+    async fn best_ask(&mut self, token: TokenId, _ts: TickSize) -> Option<Px> {
+        // The book carries its own tick grid (== the market's, == `_ts`); read
+        // the best ask straight off it.
+        self.books.book(token).await.and_then(|b| b.asks.best())
+    }
+
+    async fn best_bid(&mut self, token: TokenId, _ts: TickSize) -> Option<Px> {
+        self.books.book(token).await.and_then(|b| b.bids.best())
+    }
+
+    async fn submit_fak(&mut self, order: &Order) -> Result<SubmitOutcome, VenueError> {
+        self.venue.submit_fak(order).await
+    }
+}
+
+/// The app's concrete [`CopyVenue`] — the single monomorphic type main wires
+/// into [`CopyStrategy`] so the SAME `CopyStrategy<AppCopyVenue>` covers both a
+/// live run (a `LiveVenue` for THIS account — the SAME creds/signer the MM
+/// reuses, NO second API key) and a paper run (a [`PaperCopyVenue`] over the
+/// live `BookFetcher`). Mirrors the MM's `MmLive` enum: the strategy stays
+/// monomorphic, the variant just chooses live-vs-paper.
+// `Live` is the operative variant on a live run; boxing it would add a heap
+// indirection on every taker order for no real benefit (one instance per
+// process, chosen once at startup). The size difference is intentional.
+#[allow(clippy::large_enum_variant)]
+pub enum AppCopyVenue {
+    /// LIVE: real taker FAK orders for this account (book reads via the public
+    /// `/book` REST). Built only when the copy strategy is cleared for live.
+    Live(pm_execution::live::LiveVenue),
+    /// PAPER: honest fills at the live book, NO live calls (the default).
+    Paper(PaperCopyVenue),
+}
+
+impl CopyVenue for AppCopyVenue {
+    async fn best_ask(&mut self, token: TokenId, ts: TickSize) -> Option<Px> {
+        match self {
+            AppCopyVenue::Live(v) => CopyVenue::best_ask(v, token, ts).await,
+            AppCopyVenue::Paper(v) => v.best_ask(token, ts).await,
+        }
+    }
+
+    async fn best_bid(&mut self, token: TokenId, ts: TickSize) -> Option<Px> {
+        match self {
+            AppCopyVenue::Live(v) => CopyVenue::best_bid(v, token, ts).await,
+            AppCopyVenue::Paper(v) => v.best_bid(token, ts).await,
+        }
+    }
+
+    async fn submit_fak(&mut self, order: &Order) -> Result<SubmitOutcome, VenueError> {
+        match self {
+            AppCopyVenue::Live(v) => CopyVenue::submit_fak(v, order).await,
+            AppCopyVenue::Paper(v) => v.submit_fak(order).await,
+        }
+    }
+}
+
 /// One OPEN copied position (keyed in `open` by `(condition_id, outcome_index)`).
 /// Long-only: `qty_micro > 0`, `cost_micro > 0`.
 #[derive(Debug, Clone)]
@@ -618,13 +737,18 @@ impl<V: CopyVenue> CopyLoop<V> {
         self.open.values().map(|p| p.cost_micro).sum()
     }
 
-    /// View for the per-strategy dashboard. C4 surfaces the open-position count
-    /// and running realized P&L; C5 enriches with marked equity / unrealized.
-    fn status(&self, paused: bool) -> StrategyStatus {
+    /// View for the per-strategy dashboard. Surfaces the open-position count,
+    /// running realized P&L, and (C5) the copy-specific telemetry — the
+    /// follow-whitelist size — in a [`CopyStatus`] (mirroring how the MM
+    /// surfaces its `RewardFarmStatus`). The per-position lines (market / qty /
+    /// entry / mark / uPnL) reach the TUI's Positions panel via the durable
+    /// store (every fill is `"copy"`-tagged), exactly as the MM's do.
+    fn status(&self, paused: bool, whitelist: usize) -> StrategyStatus {
         StrategyStatus {
             paused,
             open_positions: self.open.len(),
             realized_micro: i64::try_from(self.realized_micro).unwrap_or(0),
+            copy: Some(CopyStatus { whitelist }),
             ..Default::default()
         }
     }
@@ -1234,7 +1358,7 @@ async fn run_copy_loop<V: CopyVenue>(
         // and publish a final status out-of-band before returning. Open positions
         // are intentionally LEFT for the next session's reconcile (no fire sale).
         if kill.load(Ordering::Relaxed) {
-            let _ = status_tx.send(state.status(paused));
+            let _ = status_tx.send(state.status(paused, whitelist.len()));
             return;
         }
         tokio::select! {
@@ -1273,8 +1397,8 @@ async fn run_copy_loop<V: CopyVenue>(
                 None => return,
             },
         }
-        // Publish the live paused/positions/realized view after each event.
-        let _ = status_tx.send(state.status(paused));
+        // Publish the live paused/positions/realized/whitelist view each event.
+        let _ = status_tx.send(state.status(paused, whitelist.len()));
     }
 }
 
@@ -2069,5 +2193,224 @@ mod tests {
             .await
             .expect("copy loop did not exit after control channel closed")
             .expect("copy run task panicked");
+    }
+
+    // ===================== C5: paper venue + end-to-end lifecycle =====================
+
+    /// A zero-gas table for the paper-venue test (the copy taker pays venue fees
+    /// via `fee_bps`, not gas; gas only matters for split/merge which copy never
+    /// does).
+    fn gas() -> GasTable {
+        GasTable {
+            split: 0,
+            merge: 0,
+            redeem: 0,
+            negrisk_convert: 0,
+        }
+    }
+
+    /// A book responder for one token: answers every `BookSnapshot` with a
+    /// single (bid, ask) Cent book. The test analogue of a live feed behind a
+    /// [`BookFetcher`] (mirrors the publisher tests' `spawn_book`).
+    fn spawn_paper_book(
+        bid_tick: u16,
+        ask_tick: u16,
+    ) -> mpsc::Sender<pm_ingestion::supervisor::SupervisorCommand> {
+        let (tx, mut rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            use pm_core::book::{Book, Side};
+            while let Some(pm_ingestion::supervisor::SupervisorCommand::BookSnapshot {
+                reply,
+                ..
+            }) = rx.recv().await
+            {
+                let mut b = Book::new(TickSize::Cent);
+                b.apply(
+                    Side::Bid,
+                    Px::new(bid_tick, TickSize::Cent).unwrap(),
+                    Qty(200_000_000),
+                );
+                b.apply(
+                    Side::Ask,
+                    Px::new(ask_tick, TickSize::Cent).unwrap(),
+                    Qty(200_000_000),
+                );
+                let _ = reply.send(Some((b, true)));
+            }
+        });
+        tx
+    }
+
+    /// The PAPER taker [`CopyVenue`] (C5): `best_ask` / `best_bid` read the live
+    /// book off the `BookFetcher`, and `submit_fak` fills HONESTLY at that book
+    /// (no midpoints, no infinite depth) — with NO live calls. An unknown token
+    /// degrades to `None` (no price), never a panic.
+    #[tokio::test]
+    async fn paper_copy_venue_reads_book_and_fills_at_book() {
+        let token = TokenId(7);
+        let fetcher = BookFetcher::new(HashMap::from([(token, spawn_paper_book(40, 50))]));
+        let mut v = PaperCopyVenue::new(fetcher, Duration::ZERO, gas());
+
+        // best_ask / best_bid read the current book.
+        assert_eq!(
+            CopyVenue::best_ask(&mut v, token, TickSize::Cent).await,
+            Some(cent(50)),
+            "best ask is the live $0.50 ask"
+        );
+        assert_eq!(
+            CopyVenue::best_bid(&mut v, token, TickSize::Cent).await,
+            Some(cent(40)),
+            "best bid is the live $0.40 bid"
+        );
+        // submit_fak fills honestly at the book: buy 5 sh @ $0.50 → −$2.50 cost.
+        let order = Order::new(
+            "copy:m:0".into(),
+            token,
+            Action::Buy,
+            TickSize::Cent,
+            cent(50),
+            Qty(5_000_000),
+            Bps(0),
+        );
+        let out = CopyVenue::submit_fak(&mut v, &order).await.unwrap();
+        assert_eq!(out.filled, Qty(5_000_000), "the FAK fully fills against depth");
+        assert_eq!(out.fills[0].cash.0, -2_500_000, "5 sh × $0.50 = $2.50 paid");
+        // An unknown token has no book → no price (None), no panic.
+        assert_eq!(
+            CopyVenue::best_ask(&mut v, TokenId(999), TickSize::Cent).await,
+            None
+        );
+    }
+
+    /// PAPER/mocked END-TO-END (Task C5; mirrors the MM's `paper_end_to_end_*`):
+    /// ONE `CopyLoop`, backed by a REAL in-memory store + writer, driven through
+    /// the full lifecycle on a single shared inventory/cap/store ledger —
+    ///   (1) a whitelisted trader's FRESH buy within drift → a copy ENTRY is
+    ///       booked and the capital/gross caps are consumed;
+    ///   (2) that trader SELLS → the FOLLOW-EXIT sells our copy out;
+    ///   (3) a separate marked-down position → the STOP-LOSS sells it; and
+    ///   (4) the DORMANT case (no venue — the `strategies.copy.enabled=false`
+    ///       analogue, where main never even wires a venue) → a fresh candidate
+    ///       books NOTHING.
+    /// Exact-integer assertions throughout (spec §21 style); the recorded order
+    /// sequence proves the whole pipeline ran end-to-end on one ledger.
+    #[tokio::test]
+    async fn copy_paper_end_to_end_lifecycle() {
+        let t1 = TokenId(1); // m1/0 — entry + follow-exit
+        let t2 = TokenId(2); // m2/1 — stop-loss
+        let venue = MockVenue {
+            asks: HashMap::from([(t1, cent(50))]), // entry ask $0.50
+            // m1 exit bid $0.58 (a profit), m2 mark/exit bid $0.37 (past the stop).
+            bids: HashMap::from([(t1, cent(58)), (t2, cent(37))]),
+            orders: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        let orders = Arc::clone(&venue.orders);
+        let mut tradeable = tradeable_of("m1", 0, t1);
+        tradeable.insert(
+            ("m2".to_string(), 1),
+            TradeTokenInfo {
+                token: t2,
+                ts: TickSize::Cent,
+                condition: B256::ZERO,
+            },
+        );
+        let (mut state, writer) = loop_with(venue, tradeable, copy_params());
+
+        // (1) ENTRY — fresh, within drift → buy 10 sh @ $0.50, $5 cost.
+        let mut seen = SeenKeys::default();
+        state
+            .run_entries(&[candidate("m1", 0, "0xA", 0.50, 9_000)], &mut seen)
+            .await;
+        assert_eq!(state.open.len(), 1, "one copy position opened");
+        assert_eq!(
+            state.deployed_micro(),
+            5_000_000,
+            "capital + gross headroom consumed by the $5 cost"
+        );
+        assert!(seen.contains(&("m1".to_string(), 0)), "the entry signal is seen");
+        assert_eq!(state.inv.net(t1), 10_000_000, "10 sh long booked");
+
+        // (2) FOLLOW-EXIT — the SOURCE trader 0xA SELLS m1/0 after our entry.
+        let recent = HashMap::from([(
+            "0xA".to_string(),
+            vec![trade("0xA", "m1", 0, TradeSide::Sell, 0.58, 9_500)],
+        )]);
+        state.run_exit_sweep(&recent, &HashMap::new()).await;
+        assert!(
+            !state.open.contains_key(&("m1".to_string(), 0)),
+            "m1 closed on follow-exit"
+        );
+        assert_eq!(state.inv.net(t1), 0, "flat on m1 after the follow-exit");
+        assert_eq!(
+            state.realized_micro, 800_000,
+            "sold $5.80 vs $5.00 cost → +$0.80 realized"
+        );
+
+        // (3) STOP-LOSS — seed a second long (m2/1, 10 sh @ $0.50); the mark (bid
+        //     $0.37) is below the 25% stop floor ($3.75) → cut it.
+        state.inv.on_fill(t2, 10_000_000, Usdc(-5_000_000));
+        state.open.insert(
+            ("m2".to_string(), 1),
+            CopyPosition {
+                trader: "0xB".into(),
+                entry_ts: 1_000,
+                qty_micro: 10_000_000,
+                cost_micro: 5_000_000,
+                token: t2,
+                ts: TickSize::Cent,
+                condition: B256::ZERO,
+            },
+        );
+        state.run_exit_sweep(&HashMap::new(), &HashMap::new()).await;
+        assert!(state.open.is_empty(), "m2 cut by the stop-loss");
+        assert_eq!(state.inv.net(t2), 0, "flat on m2 after the stop");
+        assert_eq!(
+            state.realized_micro,
+            800_000 - 1_300_000,
+            "sold $3.70 vs $5.00 → −$1.30; cumulative −$0.50"
+        );
+
+        // The venue saw exactly: ENTRY buy, FOLLOW-EXIT sell, STOP-LOSS sell.
+        assert_eq!(
+            orders.lock().unwrap().clone(),
+            vec![
+                (t1, Action::Buy, 50, 10_000_000),
+                (t1, Action::Sell, 58, 10_000_000),
+                (t2, Action::Sell, 37, 10_000_000),
+            ],
+            "the full lifecycle ran on one loop, in order"
+        );
+
+        drop(state);
+        let store = writer.await.unwrap();
+        assert_eq!(
+            store.count_fills().unwrap(),
+            3,
+            "entry + two exits persisted via the OrderInsert→FillSigned FK path"
+        );
+
+        // (4) DORMANT — the `strategies.copy.enabled=false` analogue (main never
+        //     wires a venue): a no-venue loop books NOTHING from a fresh candidate.
+        let (store_tx, _store_rx) = mpsc::channel(16);
+        let params = copy_params();
+        let mut dormant: CopyLoop<MockVenue> = CopyLoop {
+            venue: None,
+            relayer: None,
+            inv: InventoryRisk::new(inv_config(&params)),
+            open: HashMap::new(),
+            tradeable: tradeable_of("m1", 0, t1),
+            store_tx,
+            params,
+            realized_micro: 0,
+        };
+        let mut seen2 = SeenKeys::default();
+        dormant
+            .run_entries(&[candidate("m1", 0, "0xA", 0.50, 9_000)], &mut seen2)
+            .await;
+        assert!(
+            dormant.open.is_empty(),
+            "a disabled / no-venue copy strategy is dormant — no entries"
+        );
     }
 }

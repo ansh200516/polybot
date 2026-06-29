@@ -2642,6 +2642,8 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             // sample's cached telemetry. `Some` ONLY under RewardFarm (the sampler
             // never runs otherwise), so SpreadCapture/arb publish `None` here.
             reward_farm: self.reward_status,
+            // Smart-money COPY telemetry (Task C5) is copy-strategy-only.
+            copy: None,
         });
     }
 

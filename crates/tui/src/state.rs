@@ -88,6 +88,19 @@ pub struct StrategyLine {
     /// the MM in reward-farm mode, `None` otherwise. Display-only — rendered as a
     /// compact "rew" segment on this strategy's Health line.
     pub reward: Option<RewardLine>,
+    /// Smart-money COPY summary (Task C5); `Some` only for the copy strategy,
+    /// `None` otherwise. Display-only — rendered as a compact "copy" segment
+    /// (the follow-whitelist size) on this strategy's Health line. The open
+    /// copied positions themselves render in the Positions panel (tagged "copy").
+    pub copy: Option<CopyLine>,
+}
+
+/// Smart-money COPY summary for a [`StrategyLine`] (Task C5). Display-only,
+/// carried up from the strategy's status; the copy analogue of [`RewardLine`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyLine {
+    /// Size of the current follow-whitelist (traders being mirrored).
+    pub whitelist: usize,
 }
 
 /// RewardFarm liquidity-reward ESTIMATE summary for a [`StrategyLine`] (Task 11,
