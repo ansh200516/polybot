@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, watch};
 use crate::wiring::BookFetcher;
 
 pub mod arb;
+pub mod copy;
 pub mod host;
 pub mod mm;
 pub mod quote_policy;
