@@ -6,6 +6,7 @@ pub mod decimal;
 pub mod livebook;
 pub mod rest;
 pub mod shard;
+pub mod smart_money;
 pub mod stats;
 pub mod supervisor;
 pub mod sync;
