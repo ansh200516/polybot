@@ -2128,11 +2128,22 @@ async fn main() {
         let copy_relayer = mm_merger.clone();
         let copy_has_relayer = copy_relayer.is_some();
 
+        // Cumulative-loss circuit breaker (mirrors the MM): the REAL `[inventory]`
+        // caps so `inv.halted()` (inventory stop-loss / daily-loss) binds, and the
+        // store path so the PERSISTENT `"copy"` day-loss cap arms at startup and
+        // binds across the periodic auto-restart.
+        let copy_inv_cfg = inventory_config(&config)
+            .unwrap_or_else(|e| fatal(format!("inventory_config (copy): {e}")));
         let copy = CopyStrategy::new(copy_params)
             .with_feed(copy_feed)
             .with_venue(copy_venue)
             .with_relayer(copy_relayer)
             .with_tradeable(copy_tradeable)
+            // The REAL `[inventory]` floors the inventory halt keys off + the
+            // store path for the persistent `"copy"` day-loss cap (same file the
+            // MM threads; the cap binds across the auto-restart).
+            .with_inventory_config(copy_inv_cfg)
+            .with_store_path(std::path::PathBuf::from(&config.store.path))
             // Same live gate as arb/MM: when live is HELD (TUI before `l`), copy
             // starts PAUSED and only trades once the operator releases.
             .with_start_paused(copy_live && !released_at_start);

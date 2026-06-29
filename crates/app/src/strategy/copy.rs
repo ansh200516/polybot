@@ -49,7 +49,8 @@ use pm_ingestion::data_api::{
 };
 use pm_ingestion::smart_money::{Ranking, rank_wallets_oos, trader_records, within_drift};
 use pm_ingestion::supervisor::OnApplyFn;
-use pm_risk::inventory::{InventoryConfig, InventoryRisk};
+use pm_risk::inventory::{InventoryConfig, InventoryRisk, Marks};
+use pm_store::read::ReadStore;
 use pm_store::writer::StoreMsg;
 use pm_store::{FillRow, OrderRow, usdc_to_i64, utc_day_from_ms};
 use tokio::sync::mpsc;
@@ -57,6 +58,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::coordinator::now_ms;
 
+use super::mm::read_day_loss;
 use super::{CopyStatus, Strategy, StrategyCommand, StrategyCtx, StrategyId, StrategyStatus};
 
 /// Max fills pulled from each whitelisted wallet's `/trades?user=` history when
@@ -460,12 +462,18 @@ fn order_row(order: &Order, strategy: &str) -> OrderRow {
     }
 }
 
-/// Derive the inventory LEDGER's caps from the copy caps. The load-bearing entry
-/// gate is the pure deciders + the concurrency gate; this config just keeps the
-/// [`InventoryRisk`] accounting ledger's own caps consistent with the envelope
-/// (a portfolio backstop). The volatility hint is off — the copy loop quotes
-/// nothing.
-fn inv_config(params: &CopyParams) -> InventoryConfig {
+/// FALLBACK inventory-ledger config for the INERT / test paths only. Production
+/// threads the REAL `[inventory]` caps (`config.inventory`) into the loop via
+/// [`CopyStrategy::with_inventory_config`], EXACTLY like the MM — so the
+/// cumulative-loss circuit breaker (`inv.halted()` inventory stop-loss + the
+/// persistent day-loss cap) keys off the operator-configured floors rather than
+/// a value derived from the per-trade caps (which made `inv.halted()` meaningless).
+///
+/// This fallback only backs a [`CopyStrategy`] built WITHOUT
+/// `with_inventory_config` (the no-store inert heartbeat + the unit tests that
+/// don't exercise the halt), keeping the accounting ledger's own caps sane
+/// there. The volatility hint is off — the copy loop quotes nothing.
+fn fallback_inv_config(params: &CopyParams) -> InventoryConfig {
     InventoryConfig {
         max_inventory_usd: Usdc(params.per_position_micro),
         max_gross_inventory_usd: Usdc(params.max_gross_micro),
@@ -728,6 +736,30 @@ pub(crate) struct CopyLoop<V: CopyVenue> {
     params: CopyParams,
     /// Running realized P&L, µUSDC (status / telemetry).
     realized_micro: i128,
+    /// Latched once an inventory halt (`inv.halted()` — the inventory stop-loss /
+    /// daily-loss floor crossed on the marked book) fires: NO new entries resume
+    /// this session, mirroring the MM's `halted`. Exits/redeem still run so a held
+    /// position can be flattened. Sticky for the session (cleared only by a
+    /// restart, like the MM's `InvHalt`).
+    halted: bool,
+    /// UTC-day index ([`utc_day_from_ms`]) this loop is accounting against. Set at
+    /// startup and advanced on a day rollover, which releases
+    /// [`day_loss_halted`](Self::day_loss_halted) — a fresh day gets a fresh cap
+    /// (mirrors the MM).
+    day: i64,
+    /// PERSISTENT UTC-day loss-cap latch (mirrors the MM's `day_loss_halted`),
+    /// SEPARATE from [`halted`](Self::halted). Armed at startup from the persisted
+    /// `"copy"` P&L (so the cap BINDS across the periodic auto-restart instead of
+    /// resetting every session), re-checked each cycle, and RELEASED on a UTC-day
+    /// rollover. Stops NEW entries exactly like `halted`; exits still run.
+    day_loss_halted: bool,
+    /// Read-only store handle for the persistent day-loss gate, opened ONCE at
+    /// startup from the threaded store path. [`arm_day_loss_gate`](Self::arm_day_loss_gate)
+    /// latches from it at startup, and [`refresh_day_loss_gate`](Self::refresh_day_loss_gate)
+    /// re-reads it each cycle so the cap ALSO binds MID-session (the cumulative
+    /// `"copy"` day-realized ledger crossing the cap). `None` on paper/test paths
+    /// with no store → the gate stays inert (a fresh run is never day-loss halted).
+    day_loss_read: Option<ReadStore>,
 }
 
 impl<V: CopyVenue> CopyLoop<V> {
@@ -737,15 +769,28 @@ impl<V: CopyVenue> CopyLoop<V> {
         self.open.values().map(|p| p.cost_micro).sum()
     }
 
-    /// View for the per-strategy dashboard. Surfaces the open-position count,
-    /// running realized P&L, and (C5) the copy-specific telemetry — the
-    /// follow-whitelist size — in a [`CopyStatus`] (mirroring how the MM
-    /// surfaces its `RewardFarmStatus`). The per-position lines (market / qty /
-    /// entry / mark / uPnL) reach the TUI's Positions panel via the durable
-    /// store (every fill is `"copy"`-tagged), exactly as the MM's do.
+    /// View for the per-strategy dashboard. Surfaces the latched HALT reason, the
+    /// open-position count, running realized P&L, and (C5) the copy-specific
+    /// telemetry — the follow-whitelist size — in a [`CopyStatus`] (mirroring how
+    /// the MM surfaces its halt + `RewardFarmStatus`). The per-position lines
+    /// (market / qty / entry / mark / uPnL) reach the TUI's Positions panel via
+    /// the durable store (every fill is `"copy"`-tagged), exactly as the MM's do.
     fn status(&self, paused: bool, whitelist: usize) -> StrategyStatus {
+        // Surface BOTH halt sources to the dashboard (mirrors the MM): the
+        // in-session inventory halt reason (StopLoss/DailyLoss) takes precedence
+        // as the more specific cause; otherwise, when only the PERSISTENT UTC-day
+        // loss cap is latched, show `DayLossCap` so operators see WHY the copy
+        // executor refuses new entries instead of it appearing un-halted.
+        // `self.halted` mirrors `self.inv.halted().is_some()` (set together in
+        // `mark_and_check`), so reading `inv.halted()` here is equivalent.
+        let halted = self
+            .inv
+            .halted()
+            .map(|h| format!("{h:?}"))
+            .or_else(|| self.day_loss_halted.then(|| "DayLossCap".to_string()));
         StrategyStatus {
             paused,
+            halted,
             open_positions: self.open.len(),
             realized_micro: i64::try_from(self.realized_micro).unwrap_or(0),
             copy: Some(CopyStatus { whitelist }),
@@ -759,6 +804,14 @@ impl<V: CopyVenue> CopyLoop<V> {
     /// the drift gate is consumed (`seen`); a cap-limited candidate is left
     /// un-consumed so a freed slot / capital can still take it while it is fresh.
     async fn run_entries(&mut self, candidates: &[CopyCandidate], seen: &mut SeenKeys) {
+        // Cumulative-loss circuit breaker (mirrors the MM's quote gate): a latched
+        // inventory halt (`inv.halted()` → `self.halted`) or the persistent
+        // UTC-day loss cap stops ALL new entries — only exits run on a bad day so
+        // an open position can still be flattened. Defensive twin of the gate in
+        // `run_poll_cycle`, so a direct caller is gated too.
+        if self.halted || self.day_loss_halted {
+            return;
+        }
         if self.venue.is_none() {
             return; // paper-without-venue → inert
         }
@@ -1103,13 +1156,134 @@ impl<V: CopyVenue> CopyLoop<V> {
         };
         (filled_micro, value)
     }
+
+    /// Mark every open (long-only) copy at the live best BID — the conservative
+    /// liquidation mark, the SAME reference the per-position stop uses — and feed
+    /// it to [`InventoryRisk::mark`], then latch the session
+    /// [`halted`](Self::halted) flag when the inventory stop-loss / daily-loss
+    /// floor crosses (the SAME machinery the MM's `mark_and_check` uses). This is
+    /// what makes `inv.halted()` MEAN something for copy: without a mark the latch
+    /// can never fire. A held position with no live bid is left UNMARKED, which
+    /// (per the `mark` contract) WITHHOLDS the latch that cycle — a transient data
+    /// gap never permanently halts the strategy. Sticky once latched.
+    async fn mark_and_check(&mut self) {
+        if self.halted {
+            return; // already latched (sticky) — nothing more to check.
+        }
+        let mut marks: Marks = HashMap::new();
+        let keys: Vec<(String, i64)> = self.open.keys().cloned().collect();
+        for key in keys {
+            let Some(pos) = self.open.get(&key).cloned() else {
+                continue;
+            };
+            let bid = match self.venue.as_mut() {
+                Some(v) => v.best_bid(pos.token, pos.ts).await,
+                None => return, // no venue → inert (nothing to mark)
+            };
+            // Omitting an unmarkable held token makes `mark` withhold the latch
+            // that cycle (its Marks contract) — a transient gap won't halt.
+            if let Some(bid) = bid {
+                marks.insert(pos.token, bid.microusdc(pos.ts));
+            }
+        }
+        let _ = self.inv.mark(&marks);
+        if let Some(reason) = self.inv.halted() {
+            self.halted = true;
+            tracing::warn!(
+                ?reason,
+                "copy: inventory halt latched (cumulative-loss circuit breaker) — \
+                 no new entries this session; exits still run to flatten"
+            );
+        }
+    }
+
+    /// Arm the PERSISTENT UTC-day loss-cap latch at startup (mirrors the MM's
+    /// `arm_day_loss_gate`). Records the current UTC day and reads BOTH gate arms
+    /// for the `"copy"` strategy for that day via the SHARED [`read_day_loss`]
+    /// helper (NOT reimplemented); if EITHER the cumulative day-realized LEDGER or
+    /// the worst-point snapshot is already at/under the daily-loss cap
+    /// (`InventoryConfig::daily_loss_usd`, the SAME floor the in-session
+    /// `InvHalt::DailyLoss` keys off), latch [`day_loss_halted`](Self::day_loss_halted)
+    /// so the cap BINDS across the periodic auto-restart instead of resetting
+    /// every session. No handle / a read error / no data today → both arms read
+    /// `0` → a fresh run is NEVER halted by default. Called once before the loop
+    /// ticks; [`refresh_day_loss_gate`](Self::refresh_day_loss_gate) re-checks each
+    /// cycle.
+    fn arm_day_loss_gate(&mut self, read: Option<&ReadStore>, now_ms: i64) {
+        let today = utc_day_from_ms(now_ms);
+        self.day = today;
+        let cap_micro = self.inv.config().daily_loss_usd.0;
+        let Some(read) = read else { return };
+        let (realized, snapshot) = read_day_loss(read, "copy", today);
+        if realized <= -cap_micro || snapshot <= -cap_micro {
+            self.day_loss_halted = true;
+            tracing::warn!(
+                utc_day = today,
+                day_realized_micro = realized as i64,
+                day_pnl_micro = snapshot as i64,
+                daily_loss_cap_micro = cap_micro as i64,
+                "copy: daily loss cap ALREADY hit for the UTC day (persisted across \
+                 restart) — refusing NEW entries until the day rolls over"
+            );
+        }
+    }
+
+    /// Per-cycle PERSISTENT day-loss maintenance (mirrors the top of the MM's
+    /// `tick`): (1) on a UTC-day ROLLOVER advance the tracked day and RELEASE the
+    /// cross-restart day-loss latch — a fresh day gets a fresh cap (the in-session
+    /// inventory [`halted`](Self::halted) latch is deliberately left untouched, so
+    /// an inventory halt stays latched for the whole session); (2) otherwise,
+    /// while un-halted, RE-READ both gate arms for `"copy"` so the cap also binds
+    /// MID-session (the cumulative day-realized ledger crossing the cap), not only
+    /// across auto-restarts. Inert when there is no store handle. Takes an
+    /// explicit `now_ms` (like [`arm_day_loss_gate`](Self::arm_day_loss_gate)) so
+    /// the loop passes [`now_ms`] and tests drive the rollover deterministically.
+    fn refresh_day_loss_gate(&mut self, now_ms: i64) {
+        let today = utc_day_from_ms(now_ms);
+        if today > self.day {
+            self.day = today;
+            if self.day_loss_halted {
+                tracing::warn!(
+                    utc_day = today,
+                    "copy: UTC day rolled over — releasing persistent day-loss cap latch"
+                );
+                self.day_loss_halted = false;
+            }
+        }
+        if !self.day_loss_halted {
+            let cap_micro = self.inv.config().daily_loss_usd.0;
+            // The breach is computed under an immutable borrow that ENDS before
+            // the latch is set (mirrors the MM), satisfying the borrow checker.
+            let breach = self.day_loss_read.as_ref().map(|read| {
+                let (realized, snapshot) = read_day_loss(read, "copy", self.day);
+                (
+                    realized,
+                    snapshot,
+                    realized <= -cap_micro || snapshot <= -cap_micro,
+                )
+            });
+            if let Some((realized, snapshot, true)) = breach {
+                self.day_loss_halted = true;
+                tracing::warn!(
+                    utc_day = self.day,
+                    day_realized_micro = realized as i64,
+                    day_pnl_micro = snapshot as i64,
+                    daily_loss_cap_micro = cap_micro as i64,
+                    "copy: daily loss cap crossed MID-session (cumulative ledger / \
+                     worst-point snapshot) — halting NEW entries until the UTC day rolls over"
+                );
+            }
+        }
+    }
 }
 
-/// One poll cycle: fetch the recent tape (whitelist + open-position traders),
-/// build the resolution map for open markets (only when a relayer can redeem),
-/// SWEEP exits, then run fresh ENTRIES. The exit-before-entry order frees caps
-/// for new entries the same cycle. Best-effort I/O: a per-wallet error just
-/// omits that wallet this cycle.
+/// One poll cycle: refresh the PERSISTENT day-loss gate (rollover release /
+/// mid-session re-latch), fetch the recent tape (whitelist + open-position
+/// traders), build the resolution map for open markets (only when a relayer can
+/// redeem), SWEEP exits, MARK the held book + latch the inventory halt, then —
+/// only when the cumulative-loss circuit breaker is clear — run fresh ENTRIES.
+/// The exit-before-entry order frees caps for new entries the same cycle.
+/// Best-effort I/O: a per-wallet error just omits that wallet this cycle.
 async fn run_poll_cycle<V: CopyVenue>(
     state: &mut CopyLoop<V>,
     feed: &Option<Arc<DataApiClient>>,
@@ -1119,7 +1293,12 @@ async fn run_poll_cycle<V: CopyVenue>(
     let Some(client) = feed else {
         return;
     };
-    let now = now_ms() / 1000;
+    let now_ms_val = now_ms();
+    let now = now_ms_val / 1000;
+    // PERSISTENT day-loss maintenance FIRST (mirrors the top of the MM's `tick`):
+    // RELEASE the latch on a UTC-day rollover, else RE-LATCH if the cumulative
+    // `"copy"` ledger (or worst-point snapshot) crossed the cap mid-session.
+    state.refresh_day_loss_gate(now_ms_val);
     let mut recent_by_wallet: HashMap<String, Vec<Trade>> = HashMap::new();
     for wallet in whitelist {
         if let Ok(trades) = client.trades(TradesFilter::User(wallet), POLL_TRADE_LIMIT).await {
@@ -1150,14 +1329,23 @@ async fn run_poll_cycle<V: CopyVenue>(
         fetch_open_resolutions(client, &state.open).await
     };
     state.run_exit_sweep(&recent_by_wallet, &resolutions).await;
-    let candidates = select_signals(
-        &recent_by_wallet,
-        whitelist,
-        seen.set(),
-        now,
-        state.params.reaction_window_secs,
-    );
-    state.run_entries(&candidates, seen).await;
+    // Mark the held book + latch the inventory halt (cumulative-loss circuit
+    // breaker) AFTER the exit sweep — exactly like the MM marks after consuming
+    // fills — so `inv.halted()` actually binds on a bad day.
+    state.mark_and_check().await;
+    // Gate NEW entries on the circuit breaker (exits above ALWAYS run so a bad day
+    // can still be flattened): mirrors the MM's `!halted && !day_loss_halted`
+    // quote gate (the loop already gated `!paused && venue.is_some()`).
+    if !state.halted && !state.day_loss_halted {
+        let candidates = select_signals(
+            &recent_by_wallet,
+            whitelist,
+            seen.set(),
+            now,
+            state.params.reaction_window_secs,
+        );
+        state.run_entries(&candidates, seen).await;
+    }
 }
 
 /// Build `conditionId → winning_outcome` for the markets we currently hold, from
@@ -1215,6 +1403,19 @@ pub struct CopyStrategy<V: CopyVenue> {
     /// Start the loop PAUSED when live is held (the operator releases via the
     /// host's `SetPaused(false)`), mirroring the MM. Gates the live path.
     start_paused: bool,
+    /// Inventory-ledger caps the cumulative-loss circuit breaker keys off — the
+    /// REAL `[inventory]` floors (`inventory_stop_loss_usd` / `daily_loss_usd` /
+    /// gross), threaded by main via
+    /// [`with_inventory_config`](Self::with_inventory_config) EXACTLY like the MM.
+    /// Defaults to [`fallback_inv_config`] (inert/test) so a strategy built
+    /// without it still has sane ledger caps.
+    inv_cfg: InventoryConfig,
+    /// Durable-store path, threaded so the loop arms the PERSISTENT UTC-day loss
+    /// cap at startup from the persisted `"copy"` P&L (and re-checks it each
+    /// cycle) — what makes the cap BIND across the periodic auto-restart. `None`
+    /// (the default) → the day-loss gate is inert (a fresh run reads no prior
+    /// P&L). Set via [`with_store_path`](Self::with_store_path), mirroring the MM.
+    store_path: Option<std::path::PathBuf>,
 }
 
 impl<V: CopyVenue> CopyStrategy<V> {
@@ -1222,6 +1423,7 @@ impl<V: CopyVenue> CopyStrategy<V> {
     /// relayer, and tradeable map are all absent by default (a fully inert
     /// heartbeat — no whitelist, no orders); attach them with the builders.
     pub fn new(params: CopyParams) -> Self {
+        let inv_cfg = fallback_inv_config(&params);
         CopyStrategy {
             id: StrategyId("copy"),
             params,
@@ -1230,6 +1432,8 @@ impl<V: CopyVenue> CopyStrategy<V> {
             relayer: None,
             tradeable: HashMap::new(),
             start_paused: false,
+            inv_cfg,
+            store_path: None,
         }
     }
 
@@ -1265,6 +1469,28 @@ impl<V: CopyVenue> CopyStrategy<V> {
         self.start_paused = start_paused;
         self
     }
+
+    /// Thread the REAL `[inventory]` caps (`config.inventory`) the cumulative-loss
+    /// circuit breaker keys off — the inventory stop-loss / daily-loss / gross
+    /// floors — EXACTLY like the MM's `inv_cfg` constructor arg. main builds it via
+    /// `wiring::inventory_config`. Without it the loop falls back to
+    /// [`fallback_inv_config`] (the inert/test default), so `inv.halted()` would
+    /// not reflect the operator-configured floors.
+    pub fn with_inventory_config(mut self, inv_cfg: InventoryConfig) -> Self {
+        self.inv_cfg = inv_cfg;
+        self
+    }
+
+    /// Thread the durable-store path so the loop arms the PERSISTENT UTC-day loss
+    /// cap at startup from the persisted `"copy"` P&L (and re-checks it each cycle),
+    /// making the daily-loss cap bind across the periodic auto-restart. main
+    /// sources it from `config.store.path`. Without it the day-loss gate is inert
+    /// (a fresh run reads no prior P&L), mirroring
+    /// [`MmStrategy::with_store_path`](super::mm::MmStrategy::with_store_path).
+    pub fn with_store_path(mut self, store_path: std::path::PathBuf) -> Self {
+        self.store_path = Some(store_path);
+        self
+    }
 }
 
 impl<V: CopyVenue + 'static> Strategy for CopyStrategy<V> {
@@ -1288,8 +1514,13 @@ impl<V: CopyVenue + 'static> Strategy for CopyStrategy<V> {
                 relayer,
                 tradeable,
                 start_paused,
+                inv_cfg,
+                store_path,
             } = *self;
-            run_copy_loop(ctx, params, feed, venue, relayer, tradeable, start_paused).await;
+            run_copy_loop(
+                ctx, params, feed, venue, relayer, tradeable, start_paused, inv_cfg, store_path,
+            )
+            .await;
         })
     }
 }
@@ -1318,6 +1549,8 @@ async fn run_copy_loop<V: CopyVenue>(
     relayer: Option<Arc<RelayerClient>>,
     tradeable: HashMap<(String, i64), TradeTokenInfo>,
     start_paused: bool,
+    inv_cfg: InventoryConfig,
+    store_path: Option<std::path::PathBuf>,
 ) {
     let StrategyCtx {
         kill,
@@ -1328,16 +1561,33 @@ async fn run_copy_loop<V: CopyVenue>(
     } = ctx;
 
     // The live trading state the loop owns (the strategy struct is config-only).
+    // `inv` carries the REAL `[inventory]` caps so the cumulative-loss circuit
+    // breaker (`inv.halted()` inventory stop-loss/daily-loss + the persistent
+    // day-loss cap) is meaningful, not a per-trade-derived placeholder.
     let mut state = CopyLoop {
         venue,
         relayer,
-        inv: InventoryRisk::new(inv_config(&params)),
+        inv: InventoryRisk::new(inv_cfg),
         open: HashMap::new(),
         tradeable,
         store_tx,
         params: params.clone(),
         realized_micro: 0,
+        halted: false,
+        day: utc_day_from_ms(now_ms()),
+        day_loss_halted: false,
+        day_loss_read: None,
     };
+    // PERSISTENT UTC-day loss cap (mirrors the MM): before the first tick, read
+    // today's persisted `"copy"` P&L and latch `day_loss_halted` if the day is
+    // already at/under the daily-loss cap, so the cap binds across the periodic
+    // auto-restart. The read-only handle is RETAINED so the per-cycle re-check
+    // (`refresh_day_loss_gate`) also catches a MID-session crossing; a
+    // missing/failed DB → no handle → not halted (fresh run) + an inert re-check.
+    let day_loss_read = store_path.as_deref().and_then(|p| ReadStore::open(p).ok());
+    state.arm_day_loss_gate(day_loss_read.as_ref(), now_ms());
+    state.day_loss_read = day_loss_read;
+
     let mut seen = SeenKeys::default();
     let mut whitelist: Vec<String> = Vec::new();
     let mut paused = start_paused;
@@ -1802,11 +2052,26 @@ mod tests {
     /// Build a [`CopyLoop`] over the mock venue, backed by a REAL in-memory store
     /// and writer (so the `OrderInsert`→`FillSigned` FK path is exercised
     /// end-to-end), returning the loop and the writer join handle (await it after
-    /// dropping the loop to recover the `Store` for assertions).
+    /// dropping the loop to recover the `Store` for assertions). Uses the
+    /// inert/test [`fallback_inv_config`]; the circuit-breaker tests use
+    /// [`loop_with_inv`] to pass TIGHT inventory caps.
     fn loop_with(
         venue: MockVenue,
         tradeable: HashMap<(String, i64), TradeTokenInfo>,
         params: CopyParams,
+    ) -> (CopyLoop<MockVenue>, tokio::task::JoinHandle<Store>) {
+        let inv_cfg = fallback_inv_config(&params);
+        loop_with_inv(venue, tradeable, params, inv_cfg)
+    }
+
+    /// As [`loop_with`], but with an explicit [`InventoryConfig`] so the
+    /// cumulative-loss circuit-breaker tests can exercise `inv.halted()` with a
+    /// TIGHT inventory stop-loss / daily-loss floor.
+    fn loop_with_inv(
+        venue: MockVenue,
+        tradeable: HashMap<(String, i64), TradeTokenInfo>,
+        params: CopyParams,
+        inv_cfg: InventoryConfig,
     ) -> (CopyLoop<MockVenue>, tokio::task::JoinHandle<Store>) {
         let store = Store::open_in_memory().unwrap();
         let (store_tx, store_rx) = mpsc::channel(256);
@@ -1814,12 +2079,16 @@ mod tests {
         let state = CopyLoop {
             venue: Some(venue),
             relayer: None,
-            inv: InventoryRisk::new(inv_config(&params)),
+            inv: InventoryRisk::new(inv_cfg),
             open: HashMap::new(),
             tradeable,
             store_tx,
             params,
             realized_micro: 0,
+            halted: false,
+            day: utc_day_from_ms(now_ms()),
+            day_loss_halted: false,
+            day_loss_read: None,
         };
         (state, writer)
     }
@@ -2083,12 +2352,16 @@ mod tests {
         let mut state: CopyLoop<MockVenue> = CopyLoop {
             venue: None,
             relayer: None,
-            inv: InventoryRisk::new(inv_config(&params)),
+            inv: InventoryRisk::new(fallback_inv_config(&params)),
             open: HashMap::new(),
             tradeable: tradeable_of("m1", 0, TokenId(1)),
             store_tx,
             params,
             realized_micro: 0,
+            halted: false,
+            day: utc_day_from_ms(now_ms()),
+            day_loss_halted: false,
+            day_loss_read: None,
         };
 
         let mut seen = SeenKeys::default();
@@ -2099,6 +2372,289 @@ mod tests {
 
         assert!(state.open.is_empty(), "no venue → no entry");
         assert_eq!(state.inv.net(TokenId(1)), 0, "no venue → nothing booked");
+    }
+
+    // ============ cumulative-loss circuit breaker (mirrors the MM) ============
+
+    /// A generous-elsewhere inventory config with explicit stop-loss / daily-loss
+    /// floors, for the cumulative-loss circuit-breaker tests (`daily ≥ stop`).
+    fn breaker_inv_cfg(stop_loss_micro: i128, daily_loss_micro: i128) -> InventoryConfig {
+        InventoryConfig {
+            max_inventory_usd: Usdc(1_000_000_000),
+            max_gross_inventory_usd: Usdc(1_000_000_000),
+            inventory_stop_loss_usd: Usdc(stop_loss_micro),
+            daily_loss_usd: Usdc(daily_loss_micro),
+            vol_pull_ticks: 0,
+            vol_window: Duration::from_secs(1),
+        }
+    }
+
+    /// INVENTORY HALT: once the marked book pushes a held copy past the inventory
+    /// STOP-LOSS floor, `mark_and_check` latches `halted` (and `inv.halted()` ==
+    /// StopLoss), the halt is SURFACED in the status, and NEW entries are refused
+    /// — while EXITS still run so the position can be flattened. Mirrors the MM's
+    /// `mark_and_check` stop-loss latch.
+    #[tokio::test]
+    async fn inventory_stop_loss_latches_halt_blocks_entries_exits_still_run() {
+        use pm_risk::inventory::InvHalt;
+        let held = TokenId(1); // the bleeding long
+        let entry = TokenId(2); // a fresh candidate's market
+        let venue = MockVenue {
+            asks: HashMap::from([(entry, cent(50))]),
+            bids: HashMap::from([(held, cent(37))]), // marks the long down to $0.37
+            orders: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        let orders = Arc::clone(&venue.orders);
+        // TIGHT inventory caps: $1 unrealized stop ($6 daily ≥ stop).
+        let (mut state, writer) = loop_with_inv(
+            venue,
+            tradeable_of("m2", 0, entry),
+            copy_params(),
+            breaker_inv_cfg(1_000_000, 6_000_000),
+        );
+        // Seed a held long: 10 sh @ $0.50, cost $5.
+        state.inv.on_fill(held, 10_000_000, Usdc(-5_000_000));
+        state.open.insert(
+            ("m1".to_string(), 0),
+            CopyPosition {
+                trader: "0xA".into(),
+                entry_ts: 1_000,
+                qty_micro: 10_000_000,
+                cost_micro: 5_000_000,
+                token: held,
+                ts: TickSize::Cent,
+                condition: B256::ZERO,
+            },
+        );
+
+        // Mark the book: unrealized = $3.70 − $5.00 = −$1.30 ≤ −$1 stop → StopLoss.
+        state.mark_and_check().await;
+        assert!(state.halted, "inventory stop-loss latches the session halt");
+        assert_eq!(state.inv.halted(), Some(InvHalt::StopLoss));
+        assert_eq!(
+            state.status(false, 0).halted.as_deref(),
+            Some("StopLoss"),
+            "the inventory halt is surfaced in StrategyStatus.halted"
+        );
+
+        // A fresh, otherwise-tradeable candidate for a DIFFERENT market is REFUSED.
+        let mut seen = SeenKeys::default();
+        state
+            .run_entries(&[candidate("m2", 0, "0xB", 0.50, 9_000)], &mut seen)
+            .await;
+        assert!(
+            orders.lock().unwrap().is_empty(),
+            "a halted loop places NO new entry"
+        );
+        assert!(
+            !seen.contains(&("m2".to_string(), 0)),
+            "a halt-blocked signal is not consumed"
+        );
+        assert_eq!(state.open.len(), 1, "only the pre-existing held position");
+
+        // EXITS still run while halted: the source sells m1 → flatten it.
+        let recent = HashMap::from([(
+            "0xA".to_string(),
+            vec![trade("0xA", "m1", 0, TradeSide::Sell, 0.37, 2_000)],
+        )]);
+        state.run_exit_sweep(&recent, &HashMap::new()).await;
+        assert!(
+            state.open.is_empty(),
+            "exits still flatten the held position while halted"
+        );
+        assert_eq!(
+            orders.lock().unwrap().clone(),
+            vec![(held, Action::Sell, 37, 10_000_000)],
+            "the only order is the flattening SELL — no entry, but the exit ran"
+        );
+
+        drop(state);
+        let _ = writer.await;
+    }
+
+    /// PERSISTENT day-loss cap: when the persisted `"copy"` day-realized ledger is
+    /// already at/under the daily-loss cap for the UTC day, `arm_day_loss_gate`
+    /// latches `day_loss_halted` at STARTUP (so the cap binds across the periodic
+    /// auto-restart — many sub-cap exits whose realized losses SUM over the cap),
+    /// the halt is surfaced as `DayLossCap`, and new entries are refused. Mirrors
+    /// the MM's `starts_halted_when_day_already_at_loss_cap` /
+    /// `day_loss_latches_on_summed_sub_cap_realized`.
+    #[tokio::test]
+    async fn day_loss_ledger_at_cap_arms_halt_at_startup_and_blocks_entries() {
+        let token = TokenId(1);
+        let venue = MockVenue {
+            asks: HashMap::from([(token, cent(50))]),
+            bids: HashMap::new(),
+            orders: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        let orders = Arc::clone(&venue.orders);
+        let (mut state, writer) = loop_with_inv(
+            venue,
+            tradeable_of("m1", 0, token),
+            copy_params(),
+            breaker_inv_cfg(6_000_000, 6_000_000), // $6 daily cap
+        );
+
+        // A real file-backed store whose "copy" day-realized ledger is past the
+        // cap for UTC day 0 (FOUR sub-cap −$2 exits summing to −$8 > −$6).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copy-daycap.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        let ts = 1_000i64; // within UTC day 0
+        let day = utc_day_from_ms(ts);
+        for _ in 0..4 {
+            s.add_day_realized(day, "copy", -2_000_000).unwrap();
+        }
+        drop(s);
+        let read = ReadStore::open(&path).unwrap();
+        assert_eq!(read.day_realized_micro("copy", day).unwrap(), -8_000_000);
+
+        // Arm exactly as run_copy_loop does at startup, for that ledger's day.
+        state.arm_day_loss_gate(Some(&read), ts);
+        assert!(
+            state.day_loss_halted,
+            "today already past the daily-loss cap → latched at startup"
+        );
+        assert_eq!(
+            state.status(false, 0).halted.as_deref(),
+            Some("DayLossCap"),
+            "the persistent day-loss latch is surfaced in StrategyStatus.halted"
+        );
+
+        // A fresh, otherwise-tradeable candidate is REFUSED.
+        let mut seen = SeenKeys::default();
+        state
+            .run_entries(&[candidate("m1", 0, "0xA", 0.50, 9_000)], &mut seen)
+            .await;
+        assert!(
+            orders.lock().unwrap().is_empty(),
+            "the persistent day-loss latch blocks new entries"
+        );
+        assert!(!seen.contains(&("m1".to_string(), 0)), "blocked → not consumed");
+
+        drop(state);
+        let _ = writer.await;
+    }
+
+    /// PERSISTENT day-loss cap RE-LATCH mid-session: a session that started UNDER
+    /// the cap still halts once the cumulative `"copy"` ledger crosses it — not
+    /// only at the next auto-restart. Mirrors the MM's
+    /// `day_loss_re_latches_mid_session_from_ledger`.
+    #[tokio::test]
+    async fn day_loss_re_latches_mid_session_from_copy_ledger() {
+        let token = TokenId(1);
+        let venue = MockVenue {
+            asks: HashMap::from([(token, cent(50))]),
+            bids: HashMap::new(),
+            orders: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        let orders = Arc::clone(&venue.orders);
+        let (mut state, writer) = loop_with_inv(
+            venue,
+            tradeable_of("m1", 0, token),
+            copy_params(),
+            breaker_inv_cfg(6_000_000, 6_000_000),
+        );
+        assert!(!state.day_loss_halted, "starts un-halted (no handle armed yet)");
+
+        // Seed the LEDGER past the cap for TODAY (the day the loop is accounting
+        // against), then attach the read handle exactly as run_copy_loop retains it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copy-midsession.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        let today = utc_day_from_ms(now_ms());
+        for _ in 0..4 {
+            s.add_day_realized(today, "copy", -2_000_000).unwrap();
+        }
+        drop(s);
+        state.day_loss_read = Some(ReadStore::open(&path).unwrap());
+
+        // One per-cycle refresh must RE-LATCH from the ledger and block entries.
+        state.refresh_day_loss_gate(now_ms());
+        assert!(
+            state.day_loss_halted,
+            "per-cycle re-check latches once the cumulative ledger crosses the cap"
+        );
+        let mut seen = SeenKeys::default();
+        state
+            .run_entries(&[candidate("m1", 0, "0xA", 0.50, 9_000)], &mut seen)
+            .await;
+        assert!(
+            orders.lock().unwrap().is_empty(),
+            "no entry after the mid-session day-loss latch"
+        );
+
+        drop(state);
+        let _ = writer.await;
+    }
+
+    /// UTC-day ROLLOVER release: a `day_loss_halted` latch is RELEASED once the
+    /// UTC day rolls over (a fresh day gets a fresh cap), so entries RESUME.
+    /// Mirrors the MM's rollover release at the top of `tick`.
+    #[tokio::test]
+    async fn day_loss_releases_on_utc_rollover_and_entries_resume() {
+        let token = TokenId(1);
+        let venue = MockVenue {
+            asks: HashMap::from([(token, cent(50))]),
+            bids: HashMap::new(),
+            orders: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        let orders = Arc::clone(&venue.orders);
+        let (mut state, writer) = loop_with_inv(
+            venue,
+            tradeable_of("m1", 0, token),
+            copy_params(),
+            breaker_inv_cfg(6_000_000, 6_000_000),
+        );
+
+        // Ledger past the cap for UTC day 0 → arm halted on day 0.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copy-rollover.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        s.add_day_realized(0, "copy", -8_000_000).unwrap();
+        drop(s);
+        let read = ReadStore::open(&path).unwrap();
+        let day0_ms = 1_000i64; // within UTC day 0
+        state.arm_day_loss_gate(Some(&read), day0_ms);
+        state.day_loss_read = Some(read); // retain for the per-cycle re-check
+        assert!(state.day_loss_halted, "day 0 ledger past the cap → latched");
+
+        // Entries are blocked BEFORE the rollover.
+        let mut seen = SeenKeys::default();
+        state
+            .run_entries(&[candidate("m1", 0, "0xA", 0.50, 9_000)], &mut seen)
+            .await;
+        assert!(
+            orders.lock().unwrap().is_empty(),
+            "day-loss latch blocks entries before the rollover"
+        );
+
+        // UTC day rolls over → the persistent latch RELEASES (the ledger for the
+        // fresh day is 0, so the per-cycle re-check does not re-latch).
+        let day1_ms = day0_ms + 24 * 3_600 * 1_000;
+        state.refresh_day_loss_gate(day1_ms);
+        assert!(
+            !state.day_loss_halted,
+            "rollover releases the persistent day-loss latch"
+        );
+        assert_eq!(state.day, utc_day_from_ms(day1_ms), "now accounting the fresh day");
+
+        // Entries RESUME on the fresh day: the same fresh candidate now enters.
+        state
+            .run_entries(&[candidate("m1", 0, "0xA", 0.50, 9_000)], &mut seen)
+            .await;
+        assert_eq!(
+            orders.lock().unwrap().clone(),
+            vec![(token, Action::Buy, 50, 10_000_000)],
+            "a fresh UTC day re-opens entries"
+        );
+
+        drop(state);
+        let _ = writer.await;
     }
 
     // ===================== loop: kill / pause (network-free, feed = None) =====================
@@ -2397,12 +2953,16 @@ mod tests {
         let mut dormant: CopyLoop<MockVenue> = CopyLoop {
             venue: None,
             relayer: None,
-            inv: InventoryRisk::new(inv_config(&params)),
+            inv: InventoryRisk::new(fallback_inv_config(&params)),
             open: HashMap::new(),
             tradeable: tradeable_of("m1", 0, t1),
             store_tx,
             params,
             realized_micro: 0,
+            halted: false,
+            day: utc_day_from_ms(now_ms()),
+            day_loss_halted: false,
+            day_loss_read: None,
         };
         let mut seen2 = SeenKeys::default();
         dormant

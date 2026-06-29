@@ -1149,12 +1149,12 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
     last_redeem_sweep: Instant,
 }
 
-/// Read BOTH arms of the persistent UTC-day loss gate for `"mm"` on `utc_day`,
-/// in µUSDC: the cumulative day-realized LEDGER ([`ReadStore::day_realized_micro`],
-/// I3) and the worst-point snapshot P&L ([`ReadStore::day_pnl_micro`], Task 9).
-/// A read error on either arm is treated as `0` (logged), so a transient DB
-/// error can never trip the gate. The caller latches the day-loss halt when
-/// EITHER value is at/under the daily-loss cap:
+/// Read BOTH arms of the persistent UTC-day loss gate for `strategy` on
+/// `utc_day`, in µUSDC: the cumulative day-realized LEDGER
+/// ([`ReadStore::day_realized_micro`], I3) and the worst-point snapshot P&L
+/// ([`ReadStore::day_pnl_micro`], Task 9). A read error on either arm is treated
+/// as `0` (logged), so a transient DB error can never trip the gate. The caller
+/// latches the day-loss halt when EITHER value is at/under the daily-loss cap:
 /// - the LEDGER catches MANY sub-cap *realized* sessions whose losses SUM over
 ///   the cap across the day — per-session realized resets each restart, so no
 ///   single snapshot row shows it;
@@ -1162,13 +1162,17 @@ struct MmLoop<V: MakerVenue + UserFillSource> {
 ///   drawdowns.
 ///
 /// Both scope to the same UTC day, so a day rollover resets both to 0 → released.
-fn read_day_loss(read: &ReadStore, utc_day: i64) -> (i128, i128) {
-    let realized = read.day_realized_micro("mm", utc_day).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "mm: day-realized ledger read failed — treating as 0");
+///
+/// `pub(crate)` + strategy-parameterized so the copy executor reuses the SAME
+/// ledger read (keyed `"copy"`) for its own persistent day-loss cap rather than
+/// reimplementing it; the MM passes `"mm"`.
+pub(crate) fn read_day_loss(read: &ReadStore, strategy: &str, utc_day: i64) -> (i128, i128) {
+    let realized = read.day_realized_micro(strategy, utc_day).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, strategy, "day-realized ledger read failed — treating as 0");
         0
     });
-    let snapshot = read.day_pnl_micro("mm", utc_day).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "mm: day-loss snapshot read failed — treating as 0");
+    let snapshot = read.day_pnl_micro(strategy, utc_day).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, strategy, "day-loss snapshot read failed — treating as 0");
         0
     });
     (realized, snapshot)
@@ -1205,7 +1209,7 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         if !self.day_loss_halted {
             let cap_micro = self.inv.config().daily_loss_usd.0;
             let breach = self.day_loss_read.as_ref().map(|read| {
-                let (realized, snapshot) = read_day_loss(read, self.day);
+                let (realized, snapshot) = read_day_loss(read, "mm", self.day);
                 (
                     realized,
                     snapshot,
@@ -2274,7 +2278,7 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
         self.day = today;
         let cap_micro = self.inv.config().daily_loss_usd.0;
         let Some(read) = read else { return };
-        let (realized, snapshot) = read_day_loss(read, today);
+        let (realized, snapshot) = read_day_loss(read, "mm", today);
         if realized <= -cap_micro || snapshot <= -cap_micro {
             self.day_loss_halted = true;
             tracing::warn!(
