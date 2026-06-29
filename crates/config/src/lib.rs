@@ -25,6 +25,11 @@ pub struct Config {
     pub segments: Segments,
     pub confluence: Confluence,
     pub reward_farm: RewardFarm,
+    /// Smart-money copy-trading tuning (`[copy]`, Task C2). Renamed so the TOML
+    /// section is the terse `[copy]` while the Rust field stays `copy_params`
+    /// (and the per-strategy entry is `[strategies.copy]`).
+    #[serde(rename = "copy")]
+    pub copy_params: CopyParamsCfg,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -478,6 +483,43 @@ impl Default for Inventory {
 #[serde(deny_unknown_fields, default)]
 pub struct Strategies {
     pub mm: Mm,
+    pub copy: CopyCfg,
+}
+
+/// Smart-money COPY strategy config (`[strategies.copy]`, Task C2). The copy
+/// executor follows a whitelist of top-ranked traders (see
+/// `pm_ingestion::smart_money`) and mirrors their fresh buys within its capital
+/// envelope; the per-trade sizing / freshness / whitelist knobs live in the
+/// top-level `[copy]` section ([`CopyParamsCfg`]). DEFAULT-OFF and paper-only
+/// until an operator flips both `enabled` and `live`, matching the cross-cutting
+/// safety model (mirrors [`Mm`]). Named `CopyCfg` (not `Copy`) so it never
+/// shadows the `Copy` trait.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CopyCfg {
+    /// Master switch. `false` (default) → the copy strategy never trades; the
+    /// platform behaves exactly as before. Mirrors the established default-off
+    /// flag pattern (`strategies.mm.enabled`).
+    pub enabled: bool,
+    /// Live arm. `false` (default) → paper only; the live arm trades real
+    /// orders. Inert (and unvalidated as a gate here) until the executor wires
+    /// it up.
+    pub live: bool,
+    /// Strategy capital envelope, USD. When `enabled`, this is carved OUT of the
+    /// platform bankroll (mirrors `strategies.mm.capital_usd`): must be finite
+    /// and ≥ 0 always, and ≤ `capital.bankroll_usd` when enabled. Inert while
+    /// disabled.
+    pub capital_usd: f64,
+}
+
+impl Default for CopyCfg {
+    fn default() -> Self {
+        CopyCfg {
+            enabled: false,
+            live: false,
+            capital_usd: 25.0,
+        }
+    }
 }
 
 /// Market-making strategy config (`[strategies.mm]`, spec §7). Maps into the
@@ -730,6 +772,75 @@ impl Default for RewardFarm {
             size_rebalance_pct: 0.25,
             hedging_enabled: false,
             merge_threshold_usd: 5.0,
+        }
+    }
+}
+
+/// Smart-money copy-trading tuning (`[copy]`, Task C2). A TOP-LEVEL section
+/// (sibling of `[reward_farm]` / `[segments]`), inert unless
+/// `[strategies.copy].enabled` selects the copy executor. The sizing/risk knobs
+/// (`per_position_usd`, `max_gross_usd`, `max_concurrent_positions`,
+/// `stop_loss_pct`) bound the copied book; the alpha knobs (`max_drift`,
+/// `reaction_window_secs`, `min_bets`, `top_n`) feed the shared ranking +
+/// freshness math in `pm_ingestion::smart_money` (`rank_wallets_oos`,
+/// `within_drift`). Defaults are deliberately conservative (tiny book, tight
+/// stop) so the strategy is safe to flip on in paper.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CopyParamsCfg {
+    /// Notional opened per copied position, USD.
+    pub per_position_usd: f64,
+    /// Cap on simultaneously-open copied positions.
+    pub max_concurrent_positions: u32,
+    /// Gross exposure cap summed across open copied positions, USD.
+    pub max_gross_usd: f64,
+    /// Cut a copied position at this unrealized-loss fraction (0.25 = −25%).
+    /// A fraction in (0, 1].
+    pub stop_loss_pct: f64,
+    /// FRESHNESS gate: skip the copy if OUR entry price is more than this
+    /// fraction off the trader's fill — i.e. we'd be chasing a runner whose
+    /// edge is gone (see `pm_ingestion::smart_money::within_drift`). A fraction
+    /// in (0, 1]; default 0.15 (15%).
+    pub max_drift: f64,
+    /// Copy a buy only within this many seconds of the trader's fill (the
+    /// reaction window); a stale signal is dropped. Default 1800 (30 min).
+    pub reaction_window_secs: i64,
+    /// Minimum resolved PRE-cutoff bets required to rank a trader at all
+    /// (`pm_ingestion::smart_money::rank_wallets_oos`'s `min_bets`). `0` ranks
+    /// even zero-sample wallets — documented, not bounded.
+    pub min_bets: usize,
+    /// Follow-whitelist size: the top-N ranked traders to copy. Must be ≥ 1
+    /// (an empty whitelist would copy nobody).
+    pub top_n: usize,
+    /// How often to rebuild the follow whitelist, seconds. Default 21600 (6 h).
+    pub whitelist_refresh_secs: u64,
+    /// How often to poll the whitelist's recent trades for new copy signals,
+    /// seconds. Default 90.
+    pub signal_poll_secs: u64,
+    /// Sell our copied position when the copied trader sells out. Default
+    /// `true` (track their exit); `false` holds to our own stop / resolution.
+    pub follow_exit: bool,
+}
+
+impl Default for CopyParamsCfg {
+    fn default() -> Self {
+        CopyParamsCfg {
+            per_position_usd: 5.0,
+            max_concurrent_positions: 3,
+            max_gross_usd: 25.0,
+            // Tight stop / freshness by default — conservative.
+            stop_loss_pct: 0.25,
+            max_drift: 0.15,
+            // Copy a buy only within 30 min of the trader's fill.
+            reaction_window_secs: 1800,
+            // Rank a trader only with a real sample; whitelist the top 30.
+            min_bets: 10,
+            top_n: 30,
+            // Rebuild the whitelist every 6 h; poll for signals every 90 s.
+            whitelist_refresh_secs: 21_600,
+            signal_poll_secs: 90,
+            // Track the trader's exit by default.
+            follow_exit: true,
         }
     }
 }
@@ -1125,6 +1236,66 @@ impl Config {
                 ));
             }
         }
+        // Smart-money COPY strategy (`[strategies.copy]` + `[copy]`, Task C2).
+        // Capital mirrors the MM carve-out: finite + ≥ 0 ALWAYS, and ≤ the
+        // bankroll when ENABLED (it is carved out of the platform bankroll, so
+        // it can never exceed it — disabled is inert, so the bankroll bound is
+        // skipped). The `[copy]` tuning knobs are validated UNCONDITIONALLY
+        // (cheap; the section is inert unless the executor is selected), exactly
+        // as the MM / reward_farm / inventory knobs are.
+        if self.strategies.copy.capital_usd < 0.0 || !self.strategies.copy.capital_usd.is_finite() {
+            return Err(ConfigError::BadMoney(
+                "strategies.copy.capital_usd must be finite and ≥ 0",
+            ));
+        }
+        if self.strategies.copy.enabled
+            && self.strategies.copy.capital_usd > self.capital.bankroll_usd
+        {
+            return Err(ConfigError::BadMoney(
+                "strategies.copy.capital_usd must be ≤ capital.bankroll_usd when enabled",
+            ));
+        }
+        let cp = &self.copy_params;
+        if cp.per_position_usd <= 0.0 || !cp.per_position_usd.is_finite() {
+            return Err(ConfigError::BadMoney("copy.per_position_usd must be > 0"));
+        }
+        if cp.max_gross_usd <= 0.0 || !cp.max_gross_usd.is_finite() {
+            return Err(ConfigError::BadMoney("copy.max_gross_usd must be > 0"));
+        }
+        if cp.max_concurrent_positions < 1 {
+            return Err(ConfigError::BadMoney(
+                "copy.max_concurrent_positions must be ≥ 1",
+            ));
+        }
+        // Both fractions are in (0, 1]: a 0 stop/drift would never trigger a cut
+        // / always reject the copy, and a value > 1 is nonsensical (>100%). The
+        // range check also catches NaN/∞, but keep the explicit `is_finite` for
+        // intent (mirrors `reward_farm.pull_threshold`).
+        if !(cp.stop_loss_pct.is_finite() && cp.stop_loss_pct > 0.0 && cp.stop_loss_pct <= 1.0) {
+            return Err(ConfigError::BadMoney("copy.stop_loss_pct must be in (0, 1]"));
+        }
+        if !(cp.max_drift.is_finite() && cp.max_drift > 0.0 && cp.max_drift <= 1.0) {
+            return Err(ConfigError::BadMoney("copy.max_drift must be in (0, 1]"));
+        }
+        if cp.reaction_window_secs <= 0 {
+            return Err(ConfigError::BadMoney(
+                "copy.reaction_window_secs must be > 0",
+            ));
+        }
+        if cp.signal_poll_secs == 0 {
+            return Err(ConfigError::BadMoney("copy.signal_poll_secs must be > 0"));
+        }
+        if cp.whitelist_refresh_secs == 0 {
+            return Err(ConfigError::BadMoney(
+                "copy.whitelist_refresh_secs must be > 0",
+            ));
+        }
+        if cp.top_n < 1 {
+            return Err(ConfigError::BadMoney("copy.top_n must be ≥ 1"));
+        }
+        // `min_bets` (usize) needs no bound: `0` simply ranks even zero-sample
+        // wallets (degenerate but valid); any usize is accepted. Documented,
+        // not checked — mirrors `strategies.mm.max_markets`.
         Ok(())
     }
 }
@@ -2065,5 +2236,183 @@ mod tests {
         let mut c2 = Config::default();
         c2.reward_farm.merge_threshold_usd = f64::NAN;
         assert!(c2.validate().is_err());
+    }
+
+    // ---- Task C2: smart-money copy executor ([strategies.copy] + [copy]) ----
+
+    #[test]
+    fn copy_strategy_defaults_are_off_and_paper() {
+        let c = Config::default();
+        // [strategies.copy] — default-OFF, paper-only, conservative slice.
+        assert!(!c.strategies.copy.enabled, "copy strategy is OFF by default");
+        assert!(!c.strategies.copy.live, "copy strategy is paper by default");
+        assert!(
+            (c.strategies.copy.capital_usd - 25.0).abs() < 1e-9,
+            "default copy slice $25"
+        );
+        // [copy] — the tuning knobs.
+        assert!((c.copy_params.per_position_usd - 5.0).abs() < 1e-9);
+        assert_eq!(c.copy_params.max_concurrent_positions, 3);
+        assert!((c.copy_params.max_gross_usd - 25.0).abs() < 1e-9);
+        assert!((c.copy_params.stop_loss_pct - 0.25).abs() < 1e-9);
+        assert!((c.copy_params.max_drift - 0.15).abs() < 1e-9);
+        assert_eq!(c.copy_params.reaction_window_secs, 1800);
+        assert_eq!(c.copy_params.min_bets, 10);
+        assert_eq!(c.copy_params.top_n, 30);
+        assert_eq!(c.copy_params.whitelist_refresh_secs, 21_600);
+        assert_eq!(c.copy_params.signal_poll_secs, 90);
+        assert!(c.copy_params.follow_exit, "follow the trader's exit by default");
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn copy_disabled_when_sections_omitted() {
+        // A config with NEITHER section still parses, with copy disabled and the
+        // tuning knobs at their defaults.
+        let c = Config::from_toml_str("[capital]\nbankroll_usd = 5000.0\n").unwrap();
+        assert!(!c.strategies.copy.enabled);
+        assert!(!c.strategies.copy.live);
+        assert!((c.copy_params.per_position_usd - 5.0).abs() < 1e-9);
+        assert_eq!(c.copy_params.top_n, 30);
+        // The empty TOML is all defaults (copy included).
+        assert!(!Config::from_toml_str("").unwrap().strategies.copy.enabled);
+    }
+
+    #[test]
+    fn copy_sections_parse_from_toml() {
+        let c = Config::from_toml_str(
+            "[strategies.copy]\nenabled = true\nlive = false\ncapital_usd = 50.0\n\
+             [copy]\nper_position_usd = 10.0\nmax_concurrent_positions = 5\nmax_gross_usd = 100.0\n\
+             stop_loss_pct = 0.3\nmax_drift = 0.2\nreaction_window_secs = 900\nmin_bets = 20\n\
+             top_n = 15\nwhitelist_refresh_secs = 3600\nsignal_poll_secs = 30\nfollow_exit = false\n",
+        )
+        .unwrap();
+        assert!(c.strategies.copy.enabled);
+        assert!(!c.strategies.copy.live);
+        assert!((c.strategies.copy.capital_usd - 50.0).abs() < 1e-9);
+        assert!((c.copy_params.per_position_usd - 10.0).abs() < 1e-9);
+        assert_eq!(c.copy_params.max_concurrent_positions, 5);
+        assert!((c.copy_params.max_gross_usd - 100.0).abs() < 1e-9);
+        assert!((c.copy_params.stop_loss_pct - 0.3).abs() < 1e-9);
+        assert!((c.copy_params.max_drift - 0.2).abs() < 1e-9);
+        assert_eq!(c.copy_params.reaction_window_secs, 900);
+        assert_eq!(c.copy_params.min_bets, 20);
+        assert_eq!(c.copy_params.top_n, 15);
+        assert_eq!(c.copy_params.whitelist_refresh_secs, 3600);
+        assert_eq!(c.copy_params.signal_poll_secs, 30);
+        assert!(!c.copy_params.follow_exit);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn copy_partial_sections_keep_other_defaults() {
+        // Overriding a single knob in each section leaves the rest at defaults.
+        let c = Config::from_toml_str(
+            "[strategies.copy]\nenabled = true\n[copy]\ntop_n = 50\n",
+        )
+        .unwrap();
+        assert!(c.strategies.copy.enabled);
+        assert!(!c.strategies.copy.live, "untouched field stays default");
+        assert!(
+            (c.strategies.copy.capital_usd - 25.0).abs() < 1e-9,
+            "untouched field stays default"
+        );
+        assert_eq!(c.copy_params.top_n, 50);
+        assert!(
+            (c.copy_params.per_position_usd - 5.0).abs() < 1e-9,
+            "untouched field stays default"
+        );
+        assert!(c.copy_params.follow_exit, "untouched field stays default");
+    }
+
+    #[test]
+    fn copy_unknown_field_is_rejected() {
+        assert!(Config::from_toml_str("[strategies.copy]\nbogus = 1\n").is_err());
+        assert!(Config::from_toml_str("[copy]\nbogus = 1\n").is_err());
+        // The renamed field is NOT addressable under its Rust name.
+        assert!(Config::from_toml_str("[copy_params]\nper_position_usd = 5.0\n").is_err());
+    }
+
+    #[test]
+    fn copy_capital_carve_out_parses_and_validates() {
+        // An enabled copy strategy with a slice within the bankroll round-trips.
+        let c = Config::from_toml_str(
+            "[capital]\nbankroll_usd = 1000.0\n[strategies.copy]\nenabled = true\ncapital_usd = 250.0\n",
+        )
+        .unwrap();
+        assert!(c.strategies.copy.enabled);
+        assert!((c.strategies.copy.capital_usd - 250.0).abs() < 1e-9);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn copy_capital_must_be_finite_and_nonnegative() {
+        // Negative capital is rejected even when disabled.
+        assert!(Config::from_toml_str("[strategies.copy]\ncapital_usd = -1.0\n").is_err());
+        let mut c = Config::default();
+        c.strategies.copy.capital_usd = f64::NAN;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn copy_capital_over_bankroll_rejected_only_when_enabled() {
+        // Disabled: an over-bankroll slice is inert → still parses.
+        let c = Config::from_toml_str(
+            "[capital]\nbankroll_usd = 100.0\nper_market_usd = 50.0\n[strategies.copy]\nenabled = false\ncapital_usd = 500.0\n",
+        )
+        .unwrap();
+        assert!((c.strategies.copy.capital_usd - 500.0).abs() < 1e-9);
+        // Enabled: the same over-bankroll slice can't be carved out → rejected.
+        assert!(
+            Config::from_toml_str(
+                "[capital]\nbankroll_usd = 100.0\nper_market_usd = 50.0\n[strategies.copy]\nenabled = true\ncapital_usd = 500.0\n",
+            )
+            .is_err(),
+            "an enabled copy slice above the bankroll must be rejected"
+        );
+    }
+
+    #[test]
+    fn copy_validation_rejects_bad_bounds() {
+        // stop_loss_pct must be in (0, 1].
+        assert!(Config::from_toml_str("[copy]\nstop_loss_pct = 0.0\n").is_err());
+        assert!(Config::from_toml_str("[copy]\nstop_loss_pct = 1.5\n").is_err());
+        // max_drift must be in (0, 1].
+        assert!(Config::from_toml_str("[copy]\nmax_drift = 0.0\n").is_err());
+        assert!(Config::from_toml_str("[copy]\nmax_drift = 2.0\n").is_err());
+        // per_position_usd / max_gross_usd must be > 0.
+        assert!(Config::from_toml_str("[copy]\nper_position_usd = 0.0\n").is_err());
+        assert!(Config::from_toml_str("[copy]\nmax_gross_usd = 0.0\n").is_err());
+        // max_concurrent_positions must be ≥ 1.
+        assert!(Config::from_toml_str("[copy]\nmax_concurrent_positions = 0\n").is_err());
+        // Time/size knobs must be positive.
+        assert!(Config::from_toml_str("[copy]\nreaction_window_secs = 0\n").is_err());
+        assert!(Config::from_toml_str("[copy]\nsignal_poll_secs = 0\n").is_err());
+        assert!(Config::from_toml_str("[copy]\nwhitelist_refresh_secs = 0\n").is_err());
+        assert!(Config::from_toml_str("[copy]\ntop_n = 0\n").is_err());
+        // The boundary (1.0) is allowed for both fractions.
+        Config::from_toml_str("[copy]\nstop_loss_pct = 1.0\nmax_drift = 1.0\n")
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn copy_floats_must_be_finite() {
+        let mut c = Config::default();
+        c.copy_params.per_position_usd = f64::NAN;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.copy_params.max_gross_usd = f64::INFINITY;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.copy_params.stop_loss_pct = f64::NAN;
+        assert!(c.validate().is_err());
+
+        let mut c = Config::default();
+        c.copy_params.max_drift = f64::INFINITY;
+        assert!(c.validate().is_err());
     }
 }
