@@ -34,7 +34,8 @@
 #     --live --config mm-live-copy-canary.toml --db /tmp/copy-canary.sqlite
 
 [capital]
-bankroll_usd = 30.0   # Σ strategy capital ≤ this; copy carves $25, leaving a buffer
+bankroll_usd   = 30.0   # Σ strategy capital ≤ this; copy carves $25, leaving a buffer
+per_market_usd = 10.0   # arb per-market sizing — MOOT (arb neutered below), but must be ≤ bankroll to pass validation (default 1000 > 30 would fail)
 
 [strategies.copy]
 enabled     = true
