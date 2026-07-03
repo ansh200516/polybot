@@ -448,3 +448,62 @@ the order AND suppresses re-quoting that `(market, side)`** until you press `x`
 again on the (now `VETOED`) row to un-veto it. Selecting and cancelling targets
 exactly one order without disturbing the rest; `p` (pause) still cancels them
 all at once.
+
+## 24/7 deployment (AWS EC2, Amazon Linux)
+
+Run the bot headless on an always-on **US-region** VM (lower latency to
+Polymarket = fewer drift-gate rejections + a stabler book feed than a laptop in
+another region). Artifacts live in [`deploy/`](deploy/):
+
+- `deploy/copybot.service` — systemd unit (auto-restart on crash, starts on boot,
+  logs to journald). On restart the copy strategy **reloads its open positions
+  from the persistent `data/` DB** and resumes managing them — so the `--db` path
+  MUST be on persistent disk (the unit uses `~/copybot/data/`, never `/tmp`).
+- `deploy/setup.sh` — idempotent on-box setup (build deps, swap, Rust, release
+  build, install+enable the service).
+- `deploy/status.sh` — prints open positions, deployed capital, fills, and
+  today's realized P&L from the DB.
+
+### First deploy
+
+```bash
+# 0) NEVER commit secrets. .env and *.pem are git-ignored; keep them out of the repo history.
+
+# 1) Push code to the box (from your laptop, repo root). Excludes secrets + build junk:
+HOST=ec2-user@ec2-54-167-209-122.compute-1.amazonaws.com
+KEY=ansh.pem
+ssh -i "$KEY" "$HOST" 'mkdir -p ~/copybot'
+rsync -az --delete -e "ssh -i $KEY" \
+  --exclude '.git' --exclude 'target' --exclude '.env' --exclude '*.pem' \
+  --exclude 'data' --exclude '*.sqlite*' --exclude '.worktrees' --exclude 'bt-cache' \
+  ./ "$HOST":~/copybot/
+
+# 2) Copy your secrets SEPARATELY (never via the code sync):
+scp -i "$KEY" .env "$HOST":~/copybot/.env
+
+# 3) Build + install the service on the box (5-15 min build on a small instance):
+ssh -i "$KEY" "$HOST" 'cd ~/copybot && bash deploy/setup.sh'
+
+# 4) Start it + watch:
+ssh -i "$KEY" "$HOST" 'sudo systemctl start copybot && journalctl -u copybot -f'
+```
+
+### Day-to-day
+
+```bash
+ssh -i ansh.pem $HOST 'bash ~/copybot/deploy/status.sh'   # positions + P&L
+ssh -i ansh.pem $HOST 'journalctl -u copybot -f'          # live logs
+ssh -i ansh.pem $HOST 'sudo systemctl restart copybot'    # safe: reloads positions
+```
+
+### Updating after code changes
+
+Re-run steps 1 and 3, then `sudo systemctl restart copybot`. The position reload
+makes the restart safe (it resumes managing open copies rather than orphaning
+them). Keep the same `data/` DB across updates.
+
+### Security
+
+SSH **key-only** (disable password auth), a security group allowing only your IP
+on port 22, `~/copybot/.env` at `chmod 600`. The private key on the box can move
+funds — treat the instance as sensitive and keep capital small while validating.

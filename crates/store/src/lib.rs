@@ -154,6 +154,27 @@ pub struct FillRow {
     pub strategy: String,
 }
 
+/// One OPEN copy-strategy position, persisted so a RESTART resumes managing it
+/// (follow-exit / stop-loss / redeem) instead of orphaning it — mirrors the MM's
+/// inventory reload. Keyed by `(condition_id, outcome_index)`. `asset` is the
+/// venue token id (re-registered on the venue at reload so exits can trade it),
+/// `tick_decimals` encodes the [`pm_core::num::TickSize`] (2 = cent, 3 = milli),
+/// `condition_hex` is the on-chain redeem key, and `trader` is the source wallet
+/// a later SELL follow-exits against.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopyPositionRow {
+    pub condition_id: String,
+    pub outcome_index: i64,
+    pub asset: String,
+    pub neg_risk: bool,
+    pub tick_decimals: i64,
+    pub condition_hex: String,
+    pub trader: String,
+    pub entry_ts: i64,
+    pub qty_micro: i64,
+    pub cost_micro: i64,
+}
+
 /// A split or merge (complete-set conversion). `kind` is "split" | "merge".
 #[derive(Debug, Clone)]
 pub struct ConversionRow {
@@ -273,7 +294,12 @@ CREATE TABLE IF NOT EXISTS rf_outcomes (
 CREATE TABLE IF NOT EXISTS day_realized (
   utc_day INTEGER NOT NULL, strategy TEXT NOT NULL,
   realized_micro INTEGER NOT NULL, PRIMARY KEY (utc_day, strategy));
-";
+CREATE TABLE IF NOT EXISTS copy_positions (
+  condition_id TEXT NOT NULL, outcome_index INTEGER NOT NULL,
+  asset TEXT NOT NULL, neg_risk INTEGER NOT NULL, tick_decimals INTEGER NOT NULL,
+  condition_hex TEXT NOT NULL, trader TEXT NOT NULL, entry_ts INTEGER NOT NULL,
+  qty_micro INTEGER NOT NULL, cost_micro INTEGER NOT NULL,
+  PRIMARY KEY (condition_id, outcome_index));";
 
 const TERMINAL_STATES: [&str; 4] = ["Filled", "Cancelled", "Rejected", "Expired"];
 
@@ -749,6 +775,50 @@ impl Store {
             "INSERT INTO day_realized (utc_day, strategy, realized_micro) VALUES (?1, ?2, ?3)
              ON CONFLICT(utc_day, strategy) DO UPDATE SET realized_micro = realized_micro + excluded.realized_micro",
             rusqlite::params![utc_day, strategy, delta_i64],
+        )?;
+        Ok(())
+    }
+
+    /// UPSERT one open copy position (keyed by `(condition_id, outcome_index)`),
+    /// so a restart can reload + resume managing it. Called on entry and on a
+    /// PARTIAL exit (with the reduced `qty_micro`/`cost_micro`).
+    pub fn upsert_copy_position(&mut self, r: &CopyPositionRow) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO copy_positions
+               (condition_id, outcome_index, asset, neg_risk, tick_decimals,
+                condition_hex, trader, entry_ts, qty_micro, cost_micro)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(condition_id, outcome_index) DO UPDATE SET
+               asset=excluded.asset, neg_risk=excluded.neg_risk,
+               tick_decimals=excluded.tick_decimals, condition_hex=excluded.condition_hex,
+               trader=excluded.trader, entry_ts=excluded.entry_ts,
+               qty_micro=excluded.qty_micro, cost_micro=excluded.cost_micro",
+            rusqlite::params![
+                r.condition_id,
+                r.outcome_index,
+                r.asset,
+                r.neg_risk as i64,
+                r.tick_decimals,
+                r.condition_hex,
+                r.trader,
+                r.entry_ts,
+                r.qty_micro,
+                r.cost_micro,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// DELETE the persisted open copy position on a FULL close (follow-exit,
+    /// stop-loss, or resolution redeem), so a restart does not resurrect it.
+    pub fn close_copy_position(
+        &mut self,
+        condition_id: &str,
+        outcome_index: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM copy_positions WHERE condition_id = ?1 AND outcome_index = ?2",
+            rusqlite::params![condition_id, outcome_index],
         )?;
         Ok(())
     }
@@ -2069,6 +2139,50 @@ mod tests {
             r.day_realized_micro("mm", 0).unwrap(),
             i128::from(i64::MIN),
             "an out-of-range negative delta clamps to i64::MIN"
+        );
+    }
+
+    #[test]
+    fn copy_positions_upsert_read_close_round_trip() {
+        // The copy-position durable ledger (restart-safety): UPSERT is keyed by
+        // (condition_id, outcome_index) so a partial-exit re-persist REPLACES the
+        // row (no duplicate); the reader returns it; CLOSE deletes it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copypos.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        let row = CopyPositionRow {
+            condition_id: "0xabc".into(),
+            outcome_index: 1,
+            asset: "12345678901234567890".into(),
+            neg_risk: true,
+            tick_decimals: 3,
+            condition_hex: "0xabc".into(),
+            trader: "0xtrader".into(),
+            entry_ts: 1_000,
+            qty_micro: 12_345_600,
+            cost_micro: 5_000_000,
+        };
+        s.upsert_copy_position(&row).unwrap();
+        // Partial exit → re-upsert with a reduced qty/cost REPLACES the same key.
+        let mut reduced = row.clone();
+        reduced.qty_micro = 6_000_000;
+        reduced.cost_micro = 2_500_000;
+        s.upsert_copy_position(&reduced).unwrap();
+        drop(s);
+
+        let rs = crate::read::ReadStore::open(&path).unwrap();
+        let got = rs.copy_open_positions().unwrap();
+        assert_eq!(got.len(), 1, "UPSERT replaces on the PK — no duplicate row");
+        assert_eq!(got[0], reduced, "reader returns the latest persisted state");
+        drop(rs);
+
+        let mut s = Store::open(&path).unwrap();
+        s.close_copy_position("0xabc", 1).unwrap();
+        drop(s);
+        let rs = crate::read::ReadStore::open(&path).unwrap();
+        assert!(
+            rs.copy_open_positions().unwrap().is_empty(),
+            "CLOSE deletes the row so a restart won't resurrect it"
         );
     }
 }

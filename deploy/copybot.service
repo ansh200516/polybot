@@ -1,0 +1,32 @@
+[Unit]
+Description=Polymarket smart-money copy bot (24/7 live)
+# Only start once the network is really up (the bot fetches CLOB/Data API immediately).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/copybot
+# The bot reads ./.env from WorkingDirectory itself (load_dotenv) — PM_PRIVATE_KEY,
+# PM_PROXY_ADDRESS, PM_DEPOSIT_WALLET, RELAYER_API_KEY(_ADDRESS), PM_API_*.
+# Keep that file chmod 600. (No systemd EnvironmentFile: the bot's own loader
+# handles the .env format, quotes and all.)
+#
+# Headless live has no interactive stdin, so the confirmation phrase is piped in.
+# This is a human-intent gate, NOT a secret (the real secret is PM_PRIVATE_KEY);
+# if you change [live].confirm_phrase in the config, update the echo below.
+ExecStart=/bin/sh -c 'echo "I understand this trades real money" | /home/ec2-user/copybot/arb --live --headless --config /home/ec2-user/copybot/mm-live-copy-canary.toml --db /home/ec2-user/copybot/data/copy-canary.sqlite'
+# Auto-restart on crash. On restart the copy strategy RELOADS its open positions
+# from the persistent DB (data/) and resumes managing them — this is why the
+# --db path must be on persistent disk, not /tmp.
+Restart=always
+RestartSec=15
+# Clean shutdown: SIGINT lets the store flush + the loop exit gracefully.
+KillSignal=SIGINT
+TimeoutStopSec=30
+# Basic hardening.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

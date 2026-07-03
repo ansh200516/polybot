@@ -35,7 +35,7 @@ use crate::auth::l2_headers;
 use crate::fills::{MakerFill, UserFillSource, parse_maker_fills};
 use crate::maker::{MakerOrder, MakerVenue, OpenOrder, OrderId, OrderType};
 use crate::secrets::ApiCreds;
-use crate::sign::{CHAIN_ID, ClobOrder, Side, clob_amounts, sign_order_1271};
+use crate::sign::{CHAIN_ID, ClobOrder, Side, clob_amounts, clob_market_amounts, sign_order_1271};
 use crate::venue::{ExecutionVenue, Fill, SubmitOutcome, VenueError};
 
 // ---------------------------------------------------------------------------
@@ -214,7 +214,20 @@ pub struct LiveVenue {
     /// each maker fill is reported exactly once. Lives on the venue because the
     /// poll reuses the venue's single rate-limit budget + token registry.
     seen_trades: HashSet<String>,
+    /// Next synthetic [`TokenId`] handed out by [`ensure_token`](Self::ensure_token)
+    /// for ON-DEMAND markets (a copy signal in a market the universe sync never
+    /// covered). Starts well above any interned-registry id (which count up from
+    /// 0 over a universe of at most thousands), so these session-local handles
+    /// never collide with `register_token`'d ids; the assignment also re-checks
+    /// `tokens` defensively. Session-local only — the copy executor reloads no
+    /// per-token state across restarts.
+    synth_next: u64,
 }
+
+/// Base for [`LiveVenue::ensure_token`]'s synthetic token ids — far above the
+/// sequential registry-interned ids (a few thousand at most), so on-demand
+/// handles never collide with `register_token`'d tokens.
+const SYNTH_TOKEN_BASE: u64 = 1 << 48;
 
 impl LiveVenue {
     /// Build a live venue. 10 s HTTP timeout (matches `ingestion::ClobRest`).
@@ -237,6 +250,7 @@ impl LiveVenue {
             limiter: RateLimiter::new(rate_capacity, rate_per_sec),
             log_first_order: true,
             seen_trades: HashSet::new(),
+            synth_next: SYNTH_TOKEN_BASE,
         })
     }
 
@@ -253,6 +267,32 @@ impl LiveVenue {
         ts: TickSize,
     ) {
         self.tokens.insert(token, (venue_id, neg_risk, ts));
+    }
+
+    /// Register an UNSYNCED market's outcome token ON-DEMAND and return the
+    /// internal [`TokenId`] to trade it by. Idempotent: if `venue_id` is already
+    /// registered (synced at startup OR a prior on-demand resolve) its existing
+    /// `TokenId` is returned and the args are ignored. Otherwise a fresh
+    /// session-local synthetic id (see [`SYNTH_TOKEN_BASE`]) is assigned and the
+    /// token registered exactly like [`register_token`](Self::register_token), so
+    /// the taker `submit_fak` + the public `best_ask`/`best_bid` book reads work
+    /// for it immediately.
+    ///
+    /// This is what lets the copy executor trade a fresh smart-money signal in a
+    /// market the periodic universe snapshot never covered — without waiting for
+    /// the next snapshot (entry latency is a copy-edge contributor).
+    pub fn ensure_token(&mut self, venue_id: &str, neg_risk: bool, ts: TickSize) -> TokenId {
+        if let Some((tok, _ts)) = self.token_for_venue_id(venue_id) {
+            return tok;
+        }
+        let mut id = self.synth_next;
+        while self.tokens.contains_key(&TokenId(id)) {
+            id += 1;
+        }
+        self.synth_next = id + 1;
+        let tok = TokenId(id);
+        self.tokens.insert(tok, (venue_id.to_string(), neg_risk, ts));
+        tok
     }
 
     /// Reverse-map a venue decimal token id (`asset_id`) back to our interned
@@ -277,6 +317,7 @@ impl LiveVenue {
     /// struct is time-in-force-agnostic: the resting `orderType`/`postOnly` and
     /// the `expiration` are WIRE-ONLY top-level fields (see `order_wire_body`),
     /// so GTC maker orders are signing-identical to the proven taker order.
+    #[allow(clippy::too_many_arguments)]
     fn sign_v2_order(
         &mut self,
         venue_token: &str,
@@ -285,8 +326,17 @@ impl LiveVenue {
         ts: TickSize,
         price: Px,
         qty: Qty,
+        // MARKET (taker FAK/FOK) orders must round the USDC leg to 2 decimals and
+        // the shares leg to 4 (`clob_market_amounts`); resting LIMIT (maker)
+        // orders keep the µ-exact `clob_amounts`. The CLOB rejects a market order
+        // with finer precision ("invalid amounts").
+        market: bool,
     ) -> Result<(ClobOrder, String, &'static str), VenueError> {
-        let (maker_amount, taker_amount) = clob_amounts(action, ts, price, qty);
+        let (maker_amount, taker_amount) = if market {
+            clob_market_amounts(action, ts, price, qty)
+        } else {
+            clob_amounts(action, ts, price, qty)
+        };
         let side = match action {
             Action::Buy => Side::Buy,
             Action::Sell => Side::Sell,
@@ -632,6 +682,7 @@ impl ExecutionVenue for LiveVenue {
             order.ts,
             order.limit_px,
             order.qty,
+            /* market = */ true,
         )?;
 
         // FAK taker wire: orderType "FAK", postOnly false, expiration "0" — the
@@ -735,9 +786,15 @@ impl ExecutionVenue for LiveVenue {
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or_else(|| {
-                        tracing::warn!(
+                        // DEBUG, not WARN: the live MARKET-order "matched" response
+                        // formats this field differently from the maker fixture, so
+                        // it doesn't parse as a raw µ-integer and this fires on every
+                        // taker fill. It is only an EARLY-STOP hint — `poll_fills`
+                        // with target 0 books every fill over the time window
+                        // instead, so accounting is correct (just not early-stopped).
+                        tracing::debug!(
                             field = target_field,
-                            "matched response had unparseable fill target; polling on window only"
+                            "matched response fill target not a raw µ-integer; polling on the window only (fills still book)"
                         );
                         0
                     });
@@ -835,7 +892,7 @@ impl MakerVenue for LiveVenue {
             BookSide::Ask => Action::Sell,
         };
         let (clob_order, signature, side_str) =
-            self.sign_v2_order(&venue_token, neg_risk, action, ts, o.price, o.size)?;
+            self.sign_v2_order(&venue_token, neg_risk, action, ts, o.price, o.size, /* market = */ false)?;
 
         // The three top-level wire fields that distinguish a resting maker order
         // from a FAK taker: orderType, postOnly, expiration. GTC → "0"; GTD →
@@ -1483,6 +1540,33 @@ mod tests {
             other => panic!("expected Live, got {other:?}"),
         }
         assert_eq!(mock.hits.load(Ordering::SeqCst), 0, "no network before token check");
+    }
+
+    #[tokio::test]
+    async fn ensure_token_assigns_synthetic_ids_idempotently() {
+        let mock = spawn_mock(vec![]);
+        let mut v = test_venue(format!("http://{}", mock.addr), false);
+        // Pre-registered venue id (test_venue registered "123456789" → TokenId(7)):
+        // ensure_token must REUSE the existing id, ignoring the passed args.
+        assert_eq!(
+            v.ensure_token("123456789", true, TickSize::Milli),
+            TokenId(7),
+            "already-registered venue id reuses its TokenId"
+        );
+        // A new venue id gets a fresh synthetic id (>= the synth base, so it can
+        // never collide with the sequential registry ids) and is now tradeable.
+        let a = v.ensure_token("999000111", false, TickSize::Cent);
+        assert!(a.0 >= SYNTH_TOKEN_BASE, "synthetic id above the registry range");
+        assert_eq!(
+            v.token_for_venue_id("999000111"),
+            Some((a, TickSize::Cent)),
+            "the on-demand token is registered for book reads + orders"
+        );
+        // Idempotent: the same venue id returns the SAME synthetic id.
+        assert_eq!(v.ensure_token("999000111", false, TickSize::Cent), a);
+        // A different venue id gets a DISTINCT id.
+        let b = v.ensure_token("222000333", false, TickSize::Milli);
+        assert_ne!(a, b, "distinct venue ids get distinct synthetic ids");
     }
 
     // -- maker venue (Task 3.3) --------------------------------------------

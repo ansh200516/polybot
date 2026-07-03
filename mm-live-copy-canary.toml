@@ -21,10 +21,15 @@
 #         at once; max_gross_usd ($20) is the ceiling.
 #       - stop_loss_pct (0.25) cuts a losing copy at -25% before resolution.
 #       - inventory_stop_loss / daily_loss / live.session_loss latch a halt.
-#   * COVERAGE NOTE: the bot can only copy a signal in a market it has SYNCED
-#     (it needs the token + live book). Smart-money buys in UN-synced markets are
-#     skipped — so a larger [universe] = more overlap = more copies. (On-demand
-#     syncing of signal markets is a future enhancement.)
+#   * UNIVERSE: the synced universe IS this strategy's OWN whitelist's active
+#     markets — main ranks the EdgePerBet whitelist once and syncs the markets
+#     those exact traders hold (their OPEN positions), so the tradeable set
+#     overlaps the copy signals by construction (≈1:1). And it is NOT a hard
+#     ceiling: a fresh buy in a market the snapshot didn't cover is synced
+#     ON-DEMAND at signal time (one CLOB /markets fetch + venue register, then
+#     traded immediately) — entry latency is NOT bounded by the snapshot cadence,
+#     which matters because reaction speed is part of the copy edge. On a
+#     Data-API failure the seed falls back to the liquidity universe.
 #
 # RUN (with the TUI so you can watch the copy line; `l` releases live, `k` kill,
 # `q` quit). Keys load from .env (PM_PRIVATE_KEY / PM_PROXY_ADDRESS /
@@ -44,15 +49,15 @@ capital_usd = 25.0    # MUST be <= your deposit-wallet USDC and <= bankroll
 
 [copy]
 per_position_usd        = 5.0    # per-copy notional (≥5 shares clears the venue min)
-max_concurrent_positions = 3     # at most 3 open copies → ≤ ~$15 directional at once
-max_gross_usd           = 20.0   # hard ceiling on total open copy exposure
+max_concurrent_positions = 5     # at most 3 open copies → ≤ ~$15 directional at once
+max_gross_usd           = 25.0   # hard ceiling on total open copy exposure (= capital carve → up to 5 concurrent $5 copies)
 stop_loss_pct           = 0.25   # cut a losing copy at -25%
 max_drift               = 0.15   # FRESHNESS: skip if our entry is >15% off the trader's fill
 reaction_window_secs    = 1800   # only copy a buy seen within 30 min
-min_bets                = 10     # min resolved bets to rank a trader (EdgePerBet)
-top_n                   = 30     # whitelist size
+min_bets                = 5     # min resolved bets to rank a trader (EdgePerBet)
+top_n                   = 100     # whitelist size
 whitelist_refresh_secs  = 21600  # re-rank the skilled set every 6h
-signal_poll_secs        = 90     # poll whitelisted traders' fresh buys every 90s
+signal_poll_secs        = 10    # poll whitelisted traders' fresh buys every 30s (faster = less reaction lag; on-demand sync means a hit trades immediately)
 follow_exit             = true   # sell when the copied trader sells
 
 # Disable the MM — only the copy strategy trades this canary.
@@ -81,12 +86,18 @@ basket_cap_usd   = 1.0   # moot (arb neutered) but must be > 0
 relayer_enabled  = true
 relayer_staging  = false
 
-# Sync a sizeable universe so more smart-money signals fall in tradeable markets.
+# FALLBACK universe — used ONLY if the copy whitelist-driven universe can't be
+# built (Data-API failure). `candidate_pool` also caps how many of the whitelist's
+# active condition-ids we sync; `auto_restart_secs` re-snapshots both.
 [universe]
-max_markets             = 400
+max_markets             = 10000
 prioritize_by_liquidity = true
-candidate_pool          = 500
-auto_restart_secs       = 1800
+candidate_pool          = 12000
+# OFF for the copy canary: a periodic re-exec would (until the position-reload
+# lands) orphan open copies and re-deploy on top. Copy doesn't need periodic
+# universe re-sync anyway — the whitelist refreshes on its own timer and unsynced
+# signals are on-demand synced. One long-lived process manages all positions.
+auto_restart_secs       = 0
 
 [segments]
 liquid_stable_min_volume    = 50000.0
@@ -94,5 +105,17 @@ liquid_stable_min_liquidity = 10000.0
 liquid_min_volume           = 2000.0
 liquid_min_liquidity        = 1000.0
 
+# UNIVERSE = THE COPY WHITELIST'S ACTIVE MARKETS (automatic when copy is on).
+# Because [strategies.copy] is enabled, the synced universe is built from the
+# strategy's OWN EdgePerBet whitelist's OPEN positions (their active markets) —
+# the exact traders it copies — so a fresh-buy signal lands in a synced,
+# tradeable market (≈1:1 coverage) instead of a generic liquidity scan. main
+# ranks the whitelist ONCE (shared with the strategy so the rank isn't run twice)
+# and unions its open-position condition-ids, capped at [universe].candidate_pool.
+# Re-built every auto_restart_secs; on any Data-API failure it falls back to the
+# [universe] liquidity set.
+#
+# Confluence (the SEPARATE top-PnL universe used by the MM) is therefore SKIPPED
+# while the copy strategy runs — leave it off.
 [confluence]
 enabled = false

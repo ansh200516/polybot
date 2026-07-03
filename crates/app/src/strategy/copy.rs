@@ -47,12 +47,14 @@ use pm_execution::venue::{BookSource, ExecutionVenue, PaperVenue, SubmitOutcome,
 use pm_ingestion::data_api::{
     ClosedPos, DataApiClient, LeaderboardEntry, OrderBy, TimePeriod, Trade, TradeSide, TradesFilter,
 };
+use pm_ingestion::rest::ClobRest;
 use pm_ingestion::smart_money::{Ranking, rank_wallets_oos, trader_records, within_drift};
 use pm_ingestion::supervisor::OnApplyFn;
+use pm_registry::gamma::ClobMarket;
 use pm_risk::inventory::{InventoryConfig, InventoryRisk, Marks};
 use pm_store::read::ReadStore;
 use pm_store::writer::StoreMsg;
-use pm_store::{FillRow, OrderRow, usdc_to_i64, utc_day_from_ms};
+use pm_store::{CopyPositionRow, FillRow, OrderRow, usdc_to_i64, utc_day_from_ms};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
@@ -156,6 +158,11 @@ pub(crate) struct CopyCandidate {
     pub condition_id: String,
     /// The outcome index within that market the trader bought (their side).
     pub outcome_index: i64,
+    /// The CLOB-tradeable token id of the bought outcome (the trade's `asset`) —
+    /// the EXACT token we mirror. Carried so an UNSYNCED market can be registered
+    /// on the venue ON-DEMAND (see `resolve_ondemand`) without re-deriving which
+    /// side from the market metadata.
+    pub asset: String,
     /// The whitelisted wallet whose (earliest qualifying) buy this represents.
     pub trader: String,
     /// The trader's fill price — our FRESHNESS reference (C4 `within_drift`).
@@ -179,11 +186,15 @@ pub(crate) struct CopyCandidate {
 ///
 /// DE-DUP: when several qualifying buys share a `(condition_id, outcome_index)`
 /// — whether two wallets on the same side or one wallet twice — only ONE
-/// candidate is emitted, the EARLIEST by `timestamp` (ties broken by whitelist
-/// order: the first listed wallet wins). The result is returned in a fully
-/// DETERMINISTIC order (`timestamp`, then `condition_id`, then `outcome_index`),
-/// independent of `HashMap` iteration order, so the live loop and the tests see
-/// a stable sequence.
+/// candidate is emitted, the MOST RECENT by `timestamp` (ties broken by
+/// whitelist order: the first listed wallet wins). The latest buy is the
+/// freshest evidence the smart money is STILL buying this side, and is the right
+/// drift reference: it MINIMIZES the gap to the current book (the earliest buy in
+/// a long reaction window is the stalest, cheapest fill — it maximizes drift and
+/// makes the freshness gate reject signals the trader is actively re-buying). The
+/// result is returned in a DETERMINISTIC order (`timestamp`, then `condition_id`,
+/// then `outcome_index`), independent of `HashMap` iteration order, so the live
+/// loop and the tests see a stable sequence.
 pub(crate) fn select_signals(
     recent_by_wallet: &HashMap<String, Vec<Trade>>,
     whitelist: &[String],
@@ -191,9 +202,10 @@ pub(crate) fn select_signals(
     now: i64,
     reaction_window_secs: i64,
 ) -> Vec<CopyCandidate> {
-    // Earliest qualifying buy per (condition_id, outcome_index). Iterating the
-    // whitelist in order makes the equal-timestamp tie-break deterministic
-    // (first-listed wallet wins).
+    // MOST RECENT qualifying buy per (condition_id, outcome_index) — the freshest
+    // conviction + the smallest drift to the current book. Iterating the whitelist
+    // in order makes the equal-timestamp tie-break deterministic (first-listed
+    // wallet wins).
     let mut best: HashMap<(String, i64), CopyCandidate> = HashMap::new();
     let stale_before = now - reaction_window_secs;
     for wallet in whitelist {
@@ -212,7 +224,7 @@ pub(crate) fn select_signals(
                 continue; // already acted on this market+side
             }
             let replace = match best.get(&key) {
-                Some(existing) => t.timestamp < existing.timestamp,
+                Some(existing) => t.timestamp > existing.timestamp,
                 None => true,
             };
             if replace {
@@ -221,6 +233,7 @@ pub(crate) fn select_signals(
                     CopyCandidate {
                         condition_id: t.condition_id.clone(),
                         outcome_index: t.outcome_index,
+                        asset: t.asset.clone(),
                         trader: wallet.clone(),
                         trigger_px: t.price,
                         timestamp: t.timestamp,
@@ -295,7 +308,7 @@ fn dedup_traders(month: Vec<LeaderboardEntry>, all: Vec<LeaderboardEntry>) -> Ve
 /// `EdgePerBet` bar). Returns `None` on ANY fetch error, so the caller KEEPS the
 /// prior whitelist — we never trade on a set that a transient API failure
 /// emptied or staled.
-async fn refresh_whitelist(client: &DataApiClient, params: &CopyParams) -> Option<Vec<String>> {
+pub async fn refresh_whitelist(client: &DataApiClient, params: &CopyParams) -> Option<Vec<String>> {
     // 1. Trader universe: top PnL, month ∪ all-time, de-duped (month first).
     let month = client
         .leaderboard(OrderBy::Pnl, TimePeriod::Month, params.top_n)
@@ -336,6 +349,132 @@ async fn refresh_whitelist(client: &DataApiClient, params: &CopyParams) -> Optio
         params.min_bets,
     );
     Some(whitelist)
+}
+
+/// De-dup a stream of OPEN-position `conditionId`s into a stable, first-seen list
+/// capped at `cap`. The input is built in whitelist order (best trader first)
+/// and, within a trader, the API's position order — so when the cap bites the
+/// HIGHEST-conviction smart-money markets survive. Pure (the TDD'd core of
+/// [`whitelist_universe_conditions`]); `cap == 0` ⇒ empty.
+pub(crate) fn dedup_open_conditions(conds: &[String], cap: usize) -> Vec<String> {
+    if cap == 0 {
+        return Vec::new();
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for c in conds {
+        if seen.insert(c.as_str()) {
+            out.push(c.clone());
+            if out.len() >= cap {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Build the copy strategy's smart-money UNIVERSE: the markets its EdgePerBet
+/// `whitelist` is ACTIVE in (their OPEN positions), as `conditionId`s for the
+/// universe sync ([`pm_ingestion::sync::SyncTask::with_confluence_conditions`]).
+///
+/// For each whitelisted wallet it pulls `/positions` (size ≥ `size_threshold`),
+/// keeps the OPEN ([`pm_ingestion::data_api::Position::is_open`]) ones, and
+/// unions their condition ids in whitelist-then-API order, de-duped + capped at
+/// `cap` ([`dedup_open_conditions`]). This makes the synced universe == the
+/// markets the copy strategy's OWN whitelist holds (≈1:1 coverage with its
+/// signals) instead of a generic liquidity scan.
+///
+/// Returns `None` on ANY positions-fetch error (the caller FALLS BACK to
+/// confluence / the liquidity universe rather than syncing a partial set);
+/// `Some(vec)` otherwise (empty if the whitelist holds no open positions).
+pub async fn whitelist_universe_conditions(
+    client: &DataApiClient,
+    whitelist: &[String],
+    size_threshold: f64,
+    cap: usize,
+) -> Option<Vec<String>> {
+    let mut open: Vec<String> = Vec::new();
+    for wallet in whitelist {
+        let positions = client.positions(wallet, size_threshold).await.ok()?;
+        for p in positions {
+            if p.is_open() {
+                open.push(p.condition_id);
+            }
+        }
+    }
+    Some(dedup_open_conditions(&open, cap))
+}
+
+/// Classify a CLOB `minimum_tick_size` float into a supported [`TickSize`], or
+/// `None` for an unsupported (e.g. legacy 0.04) grid we won't quote on. Mirrors
+/// `pm_ingestion::sync`'s own private classifier (kept local so the on-demand
+/// path doesn't widen the sync crate's public surface).
+fn classify_tick(tick: f64) -> Option<TickSize> {
+    if (tick - 0.01).abs() < 1e-9 {
+        Some(TickSize::Cent)
+    } else if (tick - 0.001).abs() < 1e-9 {
+        Some(TickSize::Milli)
+    } else {
+        None
+    }
+}
+
+/// Pure: from a freshly-fetched [`ClobMarket`] + the trade's `asset` token + the
+/// market's `condition_id` string, derive the `(tick, neg_risk, condition)`
+/// needed to register that token ON-DEMAND ([`CopyVenue::ensure_token`]) and
+/// trade it. Returns `None` (⇒ skip, never trade) when:
+/// * `asset` is empty or is NOT one of THIS market's outcome tokens (defensive —
+///   never register a token that doesn't belong to the condition);
+/// * the tick is unsupported ([`classify_tick`]);
+/// * the `condition_id` does not parse as a `B256` (the relayer redeem key).
+fn ondemand_token_params(
+    m: &ClobMarket,
+    asset: &str,
+    condition_id: &str,
+) -> Option<(TickSize, bool, B256)> {
+    if asset.is_empty() || !m.tokens.iter().any(|t| t.token_id == asset) {
+        return None;
+    }
+    let ts = classify_tick(m.minimum_tick_size)?;
+    let condition = condition_id.parse::<B256>().ok()?;
+    Some((ts, m.neg_risk, condition))
+}
+
+/// [`TickSize`] → its decimal-places code for persistence (`2` = cent 0.01, `3`
+/// = milli 0.001). Inverse of [`tick_from_decimals`].
+fn tick_to_decimals(ts: TickSize) -> i64 {
+    match ts {
+        TickSize::Cent => 2,
+        TickSize::Milli => 3,
+    }
+}
+
+/// Persisted decimal-places code → [`TickSize`]; `None` for an unsupported code.
+fn tick_from_decimals(d: i64) -> Option<TickSize> {
+    match d {
+        2 => Some(TickSize::Cent),
+        3 => Some(TickSize::Milli),
+        _ => None,
+    }
+}
+
+/// Build the persistable [`CopyPositionRow`] for an open position, so entry and
+/// partial exits keep the durable row in sync with the live `open` map (what a
+/// restart reloads to resume management).
+fn position_row(condition_id: &str, outcome_index: i64, pos: &CopyPosition) -> CopyPositionRow {
+    CopyPositionRow {
+        condition_id: condition_id.to_string(),
+        outcome_index,
+        asset: pos.asset.clone(),
+        neg_risk: pos.neg_risk,
+        tick_decimals: tick_to_decimals(pos.ts),
+        condition_hex: format!("{:#x}", pos.condition),
+        trader: pos.trader.clone(),
+        entry_ts: pos.entry_ts,
+        // µshares / µUSDC are tiny for a canary; clamp defensively into i64.
+        qty_micro: pos.qty_micro.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
+        cost_micro: pos.cost_micro.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +660,17 @@ pub trait CopyVenue: Send {
         &mut self,
         order: &Order,
     ) -> impl Future<Output = Result<SubmitOutcome, VenueError>> + Send;
+
+    /// Register an UNSYNCED market's outcome token ON-DEMAND, returning the
+    /// internal [`TokenId`] to trade it by (book reads + FAK). Idempotent by
+    /// `venue_id`. `None` (the default) ⇒ the venue can't trade unsynced markets
+    /// (the PAPER venue has no live book feed for them), so the caller skips —
+    /// only the LIVE venue overrides this. This is what lets the copy executor
+    /// trade a fresh smart-money signal in a market the periodic universe
+    /// snapshot never covered, the moment it is seen.
+    fn ensure_token(&mut self, _venue_id: &str, _neg_risk: bool, _ts: TickSize) -> Option<TokenId> {
+        None
+    }
 }
 
 /// How to TRADE a copied `(condition_id, outcome_index)`: the internal venue
@@ -533,6 +683,10 @@ pub struct TradeTokenInfo {
     pub token: TokenId,
     pub ts: TickSize,
     pub condition: B256,
+    /// Neg-risk flag for the market — carried so a RELOADED position can be
+    /// re-registered on the venue ([`CopyVenue::ensure_token`]) with the correct
+    /// exchange for signing exit orders.
+    pub neg_risk: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +723,12 @@ impl CopyVenue for pm_execution::live::LiveVenue {
 
     async fn submit_fak(&mut self, order: &Order) -> Result<SubmitOutcome, VenueError> {
         <pm_execution::live::LiveVenue as ExecutionVenue>::submit_fak(self, order).await
+    }
+
+    fn ensure_token(&mut self, venue_id: &str, neg_risk: bool, ts: TickSize) -> Option<TokenId> {
+        Some(pm_execution::live::LiveVenue::ensure_token(
+            self, venue_id, neg_risk, ts,
+        ))
     }
 }
 
@@ -652,6 +812,14 @@ impl CopyVenue for AppCopyVenue {
             AppCopyVenue::Paper(v) => v.submit_fak(order).await,
         }
     }
+
+    fn ensure_token(&mut self, venue_id: &str, neg_risk: bool, ts: TickSize) -> Option<TokenId> {
+        match self {
+            // Only the live venue can trade an unsynced market (live book reads).
+            AppCopyVenue::Live(v) => CopyVenue::ensure_token(v, venue_id, neg_risk, ts),
+            AppCopyVenue::Paper(_) => None,
+        }
+    }
 }
 
 /// One OPEN copied position (keyed in `open` by `(condition_id, outcome_index)`).
@@ -673,6 +841,11 @@ pub(crate) struct CopyPosition {
     pub ts: TickSize,
     /// On-chain condition id for the resolution redeem.
     pub condition: B256,
+    /// Venue token-id string of the held outcome — PERSISTED so a restart can
+    /// re-register the token on the venue and resume managing this position.
+    pub asset: String,
+    /// Neg-risk flag — persisted for the same re-registration on reload.
+    pub neg_risk: bool,
 }
 
 /// Bounded de-dup of acted-on `(condition_id, outcome_index)` keys: a `HashSet`
@@ -729,7 +902,18 @@ pub(crate) struct CopyLoop<V: CopyVenue> {
     /// Open copied positions, keyed by `(condition_id, outcome_index)`.
     open: HashMap<(String, i64), CopyPosition>,
     /// How to trade each copied `(condition_id, outcome_index)` (C5-populated).
-    tradeable: HashMap<(String, i64), TradeTokenInfo>,
+    /// Keyed by the VENUE TOKEN-ID (the Data-API trade's `asset`) so a copy buys
+    /// the EXACT token the trader bought — never the complement. Grown ON-DEMAND:
+    /// a fresh signal in an UNSYNCED market is resolved live via
+    /// [`resolver`](Self::resolver) and cached here so the trade fires NOW.
+    tradeable: HashMap<String, TradeTokenInfo>,
+    /// CLOB metadata resolver for ON-DEMAND market sync: when a signal lands in a
+    /// market the universe snapshot never covered, [`resolve_ondemand`](Self::resolve_ondemand)
+    /// fetches its tick + neg_risk here (one `/markets/{cid}` call, cached) and
+    /// registers the token on the venue, so entry latency isn't bounded by the
+    /// snapshot cadence. `None` ⇒ on-demand OFF (paper / no live venue): an
+    /// unsynced signal is skipped, as before.
+    resolver: Option<Arc<ClobRest>>,
     /// Durable store sink (order + signed-fill rows, `"copy"`-tagged).
     store_tx: mpsc::Sender<StoreMsg>,
     /// Resolved knobs (caps, drift, stop, reaction window, follow-exit, capital).
@@ -798,6 +982,52 @@ impl<V: CopyVenue> CopyLoop<V> {
         }
     }
 
+    /// ON-DEMAND market sync for a fresh signal in an UNSYNCED market: resolve the
+    /// market's tick + neg_risk LIVE (one `/markets/{cid}` call via the
+    /// [`resolver`](Self::resolver)), register the bought token on the venue
+    /// ([`CopyVenue::ensure_token`]), cache the resulting [`TradeTokenInfo`], and
+    /// return it — so the entry fires immediately rather than waiting for the next
+    /// universe snapshot. Best-effort: `None` (caller skips) when on-demand is off
+    /// (no resolver / paper venue), the fetch fails, the market metadata is
+    /// unusable ([`ondemand_token_params`]), or the venue can't register it.
+    async fn resolve_ondemand(&mut self, c: &CopyCandidate) -> Option<TradeTokenInfo> {
+        if c.asset.is_empty() {
+            return None;
+        }
+        // Fetch market metadata in a scope that ENDS the immutable resolver borrow
+        // before we take `&mut self.venue` below.
+        let market = {
+            let clob = self.resolver.as_ref()?;
+            match clob.market(&c.condition_id).await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::debug!(
+                        condition_id = %c.condition_id,
+                        error = %e,
+                        "copy: on-demand market resolve fetch failed — skipping"
+                    );
+                    return None;
+                }
+            }
+        };
+        let (ts, neg_risk, condition) =
+            ondemand_token_params(&market, &c.asset, &c.condition_id)?;
+        let token = self.venue.as_mut()?.ensure_token(&c.asset, neg_risk, ts)?;
+        let info = TradeTokenInfo {
+            token,
+            ts,
+            condition,
+            neg_risk,
+        };
+        self.tradeable.insert(c.asset.clone(), info.clone());
+        tracing::info!(
+            condition_id = %c.condition_id,
+            outcome_index = c.outcome_index,
+            "copy: on-demand synced an unsynced smart-money market — trading it now"
+        );
+        Some(info)
+    }
+
     /// ENTRY: for each fresh candidate, when a venue is present and NOT at a cap,
     /// place a FRESHNESS-GATED, capital/gross/floor-sized taker FAK BUY and book
     /// it. A candidate that is untradeable, has no ask, or whose price ran past
@@ -815,22 +1045,46 @@ impl<V: CopyVenue> CopyLoop<V> {
         if self.venue.is_none() {
             return; // paper-without-venue → inert
         }
+        // Per-cycle FUNNEL counters, logged once at the end so an operator can SEE
+        // exactly where this cycle's candidates died instead of inferring it from
+        // scattered per-candidate lines.
+        let mut entered = 0u32;
+        let mut skip_drift = 0u32;
+        let mut skip_no_ask = 0u32;
+        let mut skip_untradeable = 0u32;
+        let mut skip_at_cap = 0u32;
+        let mut skip_no_size = 0u32;
+        let mut already_holding = 0u32;
         for c in candidates {
             let key = (c.condition_id.clone(), c.outcome_index);
             // Already holding this market+side (open keys are `seen` so
             // select_signals excludes them — guard defensively anyway).
             if self.open.contains_key(&key) {
+                already_holding += 1;
                 continue;
             }
-            // Resolve the tradeable token; untradeable markets are consumed.
-            let Some(info) = self.tradeable.get(&key).cloned() else {
-                tracing::debug!(
-                    condition_id = %c.condition_id,
-                    outcome_index = c.outcome_index,
-                    "copy: skip entry — no tradeable token for this market"
-                );
-                seen.mark(key);
-                continue;
+            // Resolve the tradeable token BY THE TRADE'S `asset` (the exact token
+            // the trader bought) so we mirror their SIDE, never the complement.
+            // SYNCED markets hit the prebuilt map; an UNSYNCED market (a fresh
+            // signal the snapshot never covered) is synced ON-DEMAND right here so
+            // we trade it now instead of waiting for the next snapshot (entry
+            // latency is a copy-edge contributor). Still untradeable (paper /
+            // resolve failed / no asset) ⇒ consumed + skipped.
+            let info = match self.tradeable.get(&c.asset).cloned() {
+                Some(info) => info,
+                None => match self.resolve_ondemand(c).await {
+                    Some(info) => info,
+                    None => {
+                        tracing::debug!(
+                            condition_id = %c.condition_id,
+                            outcome_index = c.outcome_index,
+                            "copy: skip entry — market unsynced and on-demand resolve unavailable"
+                        );
+                        skip_untradeable += 1;
+                        seen.mark(key);
+                        continue;
+                    }
+                },
             };
             // Best ask = our marketable entry reference.
             let ask = match self.venue.as_mut() {
@@ -839,6 +1093,7 @@ impl<V: CopyVenue> CopyLoop<V> {
             };
             let Some(ask) = ask else {
                 tracing::debug!(condition_id = %c.condition_id, "copy: skip entry — no ask in book");
+                skip_no_ask += 1;
                 seen.mark(key);
                 continue;
             };
@@ -850,17 +1105,23 @@ impl<V: CopyVenue> CopyLoop<V> {
                     condition_id = %c.condition_id,
                     entry_px,
                     trigger_px = c.trigger_px,
+                    max_drift = self.params.max_drift,
                     "copy: skip entry — price ran past the drift gate"
                 );
+                skip_drift += 1;
                 seen.mark(key);
                 continue;
             }
             // Concurrency cap (NOT consumed — a freed slot can still take it).
+            // DEBUG, not INFO: when full this fires for EVERY remaining candidate
+            // each poll (dozens of lines); the per-cycle funnel's `skip_at_cap`
+            // already reports the count.
             if !concurrency_allows(self.open.len(), self.params.max_concurrent_positions) {
-                tracing::info!(
+                tracing::debug!(
                     open = self.open.len(),
                     "copy: skip entry — at concurrency cap (retry while fresh)"
                 );
+                skip_at_cap += 1;
                 continue;
             }
             // Capital + gross caps → size.
@@ -874,22 +1135,50 @@ impl<V: CopyVenue> CopyLoop<V> {
                 entry_px,
             );
             if size <= 0 {
-                tracing::info!(
+                // DEBUG, not INFO: like the concurrency cap, this fires for every
+                // remaining candidate once the gross/capital budget is exhausted;
+                // the funnel's `skip_no_size` reports the count.
+                tracing::debug!(
                     condition_id = %c.condition_id,
                     capital_left,
                     gross_left,
                     "copy: skip entry — caps/floor leave no size (retry while fresh)"
                 );
+                skip_no_size += 1;
                 continue; // not consumed: capital/gross may free up
             }
-            self.enter(key.clone(), c, &info, ask, size).await;
+            // `entered` counts CONFIRMED opens (a non-zero fill booked), not mere
+            // attempts — a FAK that fills nothing / is rejected returns false.
+            if self.enter(key.clone(), c, &info, ask, size).await {
+                entered += 1;
+            }
             seen.mark(key);
+        }
+        // FUNNEL summary (once per poll cycle that had candidates). entered=0 with
+        // skip_drift>0 ⇒ signals are real but the price already ran past the gate;
+        // NO funnel line at all ⇒ no fresh whitelisted buys this cycle (a signal
+        // problem, not a rejection). Lets an operator diagnose "why no trades".
+        if !candidates.is_empty() {
+            tracing::info!(
+                candidates = candidates.len(),
+                entered,
+                skip_drift,
+                skip_no_ask,
+                skip_untradeable,
+                skip_at_cap,
+                skip_no_size,
+                already_holding,
+                "copy: entry funnel"
+            );
         }
     }
 
     /// Place + book the taker FAK BUY for one sized candidate, recording the open
     /// position. Paper / live both go through [`CopyVenue::submit_fak`]; the fills
     /// are booked into inventory + the store via [`book_fills`](Self::book_fills).
+    ///
+    /// Returns `true` iff a position was actually OPENED (a non-zero fill booked)
+    /// so the caller's funnel counts confirmed entries, not mere attempts.
     async fn enter(
         &mut self,
         key: (String, i64),
@@ -897,7 +1186,7 @@ impl<V: CopyVenue> CopyLoop<V> {
         info: &TradeTokenInfo,
         ask: Px,
         size_micro: i128,
-    ) {
+    ) -> bool {
         // Marketable buy: limit == best ask (the FAK fills at/under it, killing
         // any unfilled remainder).
         let order = Order::new(
@@ -914,14 +1203,14 @@ impl<V: CopyVenue> CopyLoop<V> {
                 Ok(o) => o,
                 Err(e) => {
                     tracing::warn!(error = %e, condition_id = %c.condition_id, "copy: entry FAK rejected");
-                    return;
+                    return false;
                 }
             },
-            None => return,
+            None => return false,
         };
         if outcome.filled.0 == 0 {
             tracing::info!(condition_id = %c.condition_id, "copy: entry FAK filled nothing");
-            return;
+            return false;
         }
         // Persist the order row (FK parent of the fills) BEFORE the signed fills.
         let _ = self
@@ -932,20 +1221,30 @@ impl<V: CopyVenue> CopyLoop<V> {
             .book_fills(info.token, info.ts, Action::Buy, &order, &outcome)
             .await;
         if filled_micro <= 0 {
-            return;
+            return false;
         }
-        self.open.insert(
-            key,
-            CopyPosition {
-                trader: c.trader.clone(),
-                entry_ts: c.timestamp,
-                qty_micro: filled_micro,
-                cost_micro,
-                token: info.token,
-                ts: info.ts,
-                condition: info.condition,
-            },
-        );
+        let pos = CopyPosition {
+            trader: c.trader.clone(),
+            entry_ts: c.timestamp,
+            qty_micro: filled_micro,
+            cost_micro,
+            token: info.token,
+            ts: info.ts,
+            condition: info.condition,
+            asset: c.asset.clone(),
+            neg_risk: info.neg_risk,
+        };
+        // PERSIST for restart-safety: a reload rebuilds `open` + inventory from
+        // this row so the position keeps its follow-exit / stop-loss / redeem
+        // management across a restart instead of being orphaned + double-deployed.
+        let _ = self
+            .store_tx
+            .try_send(StoreMsg::CopyPositionUpsert(position_row(
+                &c.condition_id,
+                c.outcome_index,
+                &pos,
+            )));
+        self.open.insert(key, pos);
         tracing::info!(
             condition_id = %c.condition_id,
             outcome_index = c.outcome_index,
@@ -954,6 +1253,7 @@ impl<V: CopyVenue> CopyLoop<V> {
             cost_micro = cost_micro as i64,
             "copy: ENTERED (taker FAK buy, freshness-gated)"
         );
+        true
     }
 
     /// EXIT SWEEP (each cycle): for every open position, in deterministic key
@@ -1015,10 +1315,82 @@ impl<V: CopyVenue> CopyLoop<V> {
     /// Taker FAK SELL of the held qty at `limit` (the best bid, marketable),
     /// booking the fill and reducing/closing the open position. Long-only: never
     /// sells more than held. A zero-fill FAK leaves the position for a retry.
+    /// Best-effort delete of the persisted open position on a FULL close, so a
+    /// restart does not resurrect a position we no longer hold.
+    fn persist_close(&self, key: &(String, i64)) {
+        let _ = self.store_tx.try_send(StoreMsg::CopyPositionClose {
+            condition_id: key.0.clone(),
+            outcome_index: key.1,
+        });
+    }
+
+    /// RELOAD persisted open positions at startup so a restart RESUMES managing
+    /// them (follow-exit / stop-loss / redeem) instead of orphaning them AND
+    /// re-deploying on top (the gross cap now reflects them from t0). For each
+    /// durable row it re-registers the token on the venue (so the exit path can
+    /// trade it even if the market left the synced universe), rebuilds the `open`
+    /// entry, and seeds inventory (marks / stop-loss / gross). Rows with an
+    /// unsupported tick, an unparseable condition, or no venue (paper) are skipped;
+    /// a read failure just starts flat (prior behavior).
+    fn reload_positions(&mut self, read: &ReadStore) {
+        let rows = match read.copy_open_positions() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "copy: position reload read failed — starting flat");
+                return;
+            }
+        };
+        let mut restored = 0usize;
+        for row in rows {
+            let Some(ts) = tick_from_decimals(row.tick_decimals) else {
+                continue;
+            };
+            let Ok(condition) = row.condition_hex.parse::<B256>() else {
+                continue;
+            };
+            // Re-register on the venue (idempotent); None ⇒ no venue (paper) →
+            // nothing to manage, stop reloading.
+            let token = match self.venue.as_mut() {
+                Some(v) => match v.ensure_token(&row.asset, row.neg_risk, ts) {
+                    Some(t) => t,
+                    None => continue,
+                },
+                None => return,
+            };
+            let qty_micro = i128::from(row.qty_micro);
+            let cost_micro = i128::from(row.cost_micro);
+            // Seed inventory (buy: +shares, −cash) so marks / stop-loss / realized
+            // accounting resume from the real position, not flat.
+            self.inv.on_fill(token, qty_micro, Usdc(-cost_micro));
+            self.open.insert(
+                (row.condition_id.clone(), row.outcome_index),
+                CopyPosition {
+                    trader: row.trader,
+                    entry_ts: row.entry_ts,
+                    qty_micro,
+                    cost_micro,
+                    token,
+                    ts,
+                    condition,
+                    asset: row.asset,
+                    neg_risk: row.neg_risk,
+                },
+            );
+            restored += 1;
+        }
+        if restored > 0 {
+            tracing::info!(
+                restored,
+                "copy: reloaded open positions from the store — resuming management (restart-safe, no double-deploy)"
+            );
+        }
+    }
+
     async fn taker_exit(&mut self, key: &(String, i64), pos: &CopyPosition, limit: Px) {
         let qty = Qty(pos.qty_micro.max(0) as u64);
         if qty.0 == 0 {
             self.open.remove(key);
+            self.persist_close(key);
             return;
         }
         let order = Order::new(
@@ -1054,11 +1426,15 @@ impl<V: CopyVenue> CopyLoop<V> {
         let remaining = pos.qty_micro - filled;
         if remaining <= 0 {
             self.open.remove(key);
+            self.persist_close(key);
         } else if let Some(p) = self.open.get_mut(key) {
             // Pro-rata release of cost basis so the caps free correctly on a
             // partial exit (the FAK killed an unfilled remainder).
             p.cost_micro = pos.cost_micro * remaining / pos.qty_micro;
             p.qty_micro = remaining;
+            // Keep the durable row in sync with the reduced position.
+            let row = position_row(&key.0, key.1, p);
+            let _ = self.store_tx.try_send(StoreMsg::CopyPositionUpsert(row));
         }
     }
 
@@ -1079,6 +1455,7 @@ impl<V: CopyVenue> CopyLoop<V> {
         let delta = realized_after - realized_before;
         self.realized_micro += delta;
         self.open.remove(key);
+        self.persist_close(key);
         if delta != 0 {
             let _ = self.store_tx.try_send(StoreMsg::DayRealized {
                 utc_day: utc_day_from_ms(now_ms()),
@@ -1397,9 +1774,10 @@ pub struct CopyStrategy<V: CopyVenue> {
     /// M6 deposit-wallet relayer for resolved-winner redemption. `None` ⇒
     /// hold-to-resolution (resolved positions left for the next reconcile).
     relayer: Option<Arc<RelayerClient>>,
-    /// How to trade each copied `(condition_id, outcome_index)` — built by main
-    /// (C5) from the registry; empty by default (nothing is tradeable ⇒ inert).
-    tradeable: HashMap<(String, i64), TradeTokenInfo>,
+    /// How to trade a copied market — keyed by the venue token-id (the trade's
+    /// `asset`) — built by main (C5) from the registry; empty by default (nothing
+    /// tradeable ⇒ inert), grown on-demand for unsynced signals.
+    tradeable: HashMap<String, TradeTokenInfo>,
     /// Start the loop PAUSED when live is held (the operator releases via the
     /// host's `SetPaused(false)`), mirroring the MM. Gates the live path.
     start_paused: bool,
@@ -1416,6 +1794,20 @@ pub struct CopyStrategy<V: CopyVenue> {
     /// (the default) → the day-loss gate is inert (a fresh run reads no prior
     /// P&L). Set via [`with_store_path`](Self::with_store_path), mirroring the MM.
     store_path: Option<std::path::PathBuf>,
+    /// Pre-computed follow whitelist, SEEDED by main so the whitelist-driven
+    /// universe sync and the strategy share ONE snapshot (and the heavy
+    /// EdgePerBet rank isn't run twice at startup). `Some(non-empty)` ⇒ the loop
+    /// starts with this whitelist and DEFERS its first refresh by
+    /// `whitelist_refresh`; `None`/empty (the default) ⇒ the loop builds it
+    /// immediately (first tick), as before. Set via
+    /// [`with_initial_whitelist`](Self::with_initial_whitelist).
+    initial_whitelist: Option<Vec<String>>,
+    /// CLOB metadata resolver enabling ON-DEMAND market sync (live runs): when a
+    /// signal lands in an UNSYNCED market, the loop resolves its tick + neg_risk
+    /// via this client and registers the token on the venue so the entry isn't
+    /// delayed to the next universe snapshot. `None` (the default) ⇒ on-demand
+    /// OFF. Set via [`with_resolver`](Self::with_resolver); main wires it for live.
+    resolver: Option<Arc<ClobRest>>,
 }
 
 impl<V: CopyVenue> CopyStrategy<V> {
@@ -1434,6 +1826,8 @@ impl<V: CopyVenue> CopyStrategy<V> {
             start_paused: false,
             inv_cfg,
             store_path: None,
+            initial_whitelist: None,
+            resolver: None,
         }
     }
 
@@ -1456,9 +1850,9 @@ impl<V: CopyVenue> CopyStrategy<V> {
         self
     }
 
-    /// Provide the `(condition_id, outcome_index) →` [`TradeTokenInfo`] resolver
-    /// (main builds it from the registry for the markets the venue can trade).
-    pub fn with_tradeable(mut self, tradeable: HashMap<(String, i64), TradeTokenInfo>) -> Self {
+    /// Provide the `asset (venue token-id) →` [`TradeTokenInfo`] resolver (main
+    /// builds it from the registry for the markets the venue can trade).
+    pub fn with_tradeable(mut self, tradeable: HashMap<String, TradeTokenInfo>) -> Self {
         self.tradeable = tradeable;
         self
     }
@@ -1491,6 +1885,28 @@ impl<V: CopyVenue> CopyStrategy<V> {
         self.store_path = Some(store_path);
         self
     }
+
+    /// Seed the follow whitelist. main builds it ONCE for the whitelist-driven
+    /// universe ([`whitelist_universe_conditions`]) and shares the SAME snapshot
+    /// here, so the EdgePerBet rank doesn't run twice at startup and the universe
+    /// matches the traders the strategy copies. `Some(non-empty)` makes the loop
+    /// start with it and DEFER the first refresh by `whitelist_refresh`;
+    /// `None`/empty keeps the immediate-refresh behavior (the loop builds its own).
+    pub fn with_initial_whitelist(mut self, whitelist: Option<Vec<String>>) -> Self {
+        self.initial_whitelist = whitelist.filter(|w| !w.is_empty());
+        self
+    }
+
+    /// Attach (or clear) the CLOB metadata resolver that enables ON-DEMAND market
+    /// sync: with it, a fresh signal in a market the universe snapshot never
+    /// covered is resolved + registered live and traded immediately, instead of
+    /// being skipped until the next snapshot. main wires it for LIVE runs (where
+    /// the venue reads books live); paper leaves it `None` (no live book feed for
+    /// unsynced markets ⇒ on-demand can't fill anyway).
+    pub fn with_resolver(mut self, resolver: Option<Arc<ClobRest>>) -> Self {
+        self.resolver = resolver;
+        self
+    }
 }
 
 impl<V: CopyVenue + 'static> Strategy for CopyStrategy<V> {
@@ -1516,9 +1932,12 @@ impl<V: CopyVenue + 'static> Strategy for CopyStrategy<V> {
                 start_paused,
                 inv_cfg,
                 store_path,
+                initial_whitelist,
+                resolver,
             } = *self;
             run_copy_loop(
                 ctx, params, feed, venue, relayer, tradeable, start_paused, inv_cfg, store_path,
+                initial_whitelist, resolver,
             )
             .await;
         })
@@ -1547,10 +1966,12 @@ async fn run_copy_loop<V: CopyVenue>(
     feed: Option<Arc<DataApiClient>>,
     venue: Option<V>,
     relayer: Option<Arc<RelayerClient>>,
-    tradeable: HashMap<(String, i64), TradeTokenInfo>,
+    tradeable: HashMap<String, TradeTokenInfo>,
     start_paused: bool,
     inv_cfg: InventoryConfig,
     store_path: Option<std::path::PathBuf>,
+    initial_whitelist: Option<Vec<String>>,
+    resolver: Option<Arc<ClobRest>>,
 ) {
     let StrategyCtx {
         kill,
@@ -1570,6 +1991,7 @@ async fn run_copy_loop<V: CopyVenue>(
         inv: InventoryRisk::new(inv_cfg),
         open: HashMap::new(),
         tradeable,
+        resolver,
         store_tx,
         params: params.clone(),
         realized_micro: 0,
@@ -1585,20 +2007,45 @@ async fn run_copy_loop<V: CopyVenue>(
     // (`refresh_day_loss_gate`) also catches a MID-session crossing; a
     // missing/failed DB → no handle → not halted (fresh run) + an inert re-check.
     let day_loss_read = store_path.as_deref().and_then(|p| ReadStore::open(p).ok());
+    // RESTART-SAFETY: reload persisted open positions BEFORE the first poll so the
+    // loop resumes managing them (follow-exit / stop-loss / redeem) and the gross
+    // cap reflects them — instead of orphaning them and re-deploying on top.
+    if let Some(read) = day_loss_read.as_ref() {
+        state.reload_positions(read);
+    }
     state.arm_day_loss_gate(day_loss_read.as_ref(), now_ms());
     state.day_loss_read = day_loss_read;
 
     let mut seen = SeenKeys::default();
-    let mut whitelist: Vec<String> = Vec::new();
+    // SEEDED whitelist: main shares the snapshot it built for the whitelist-driven
+    // universe, so we start with it and DEFER the first re-rank (the heavy
+    // EdgePerBet fetch already ran in main; the auto_restart re-execs sooner than
+    // `whitelist_refresh` anyway). Unseeded ⇒ build it immediately (first tick).
+    let seeded = initial_whitelist.as_ref().is_some_and(|w| !w.is_empty());
+    let mut whitelist: Vec<String> = initial_whitelist.unwrap_or_default();
     let mut paused = start_paused;
     if start_paused {
         tracing::info!("copy: live held — trading PAUSED until release (press `l`)");
     }
+    if seeded {
+        tracing::info!(
+            traders = whitelist.len(),
+            "copy: seeded whitelist from the universe build — first refresh deferred"
+        );
+    }
 
-    // Both intervals fire an immediate first tick, so the whitelist is built and
-    // the first poll runs at startup; a steady cadence (Skip) afterwards rather
-    // than a catch-up burst after a stall (mirrors the MM / heartbeat).
-    let mut whitelist_tick = tokio::time::interval(params.whitelist_refresh);
+    // The poll fires an immediate first tick so trading starts at once. The
+    // whitelist refresh fires immediately too UNLESS seeded (then the first
+    // re-rank is deferred one full period). Skip-on-stall (steady cadence, not a
+    // catch-up burst) — mirrors the MM / heartbeat.
+    let mut whitelist_tick = if seeded {
+        tokio::time::interval_at(
+            tokio::time::Instant::now() + params.whitelist_refresh,
+            params.whitelist_refresh,
+        )
+    } else {
+        tokio::time::interval(params.whitelist_refresh)
+    };
     let mut poll_tick = tokio::time::interval(params.signal_poll);
     whitelist_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     poll_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1678,7 +2125,7 @@ mod tests {
         Trade {
             proxy_wallet: wallet.to_string(),
             condition_id: cid.to_string(),
-            asset: String::new(),
+            asset: asset_of(cid, oi),
             side,
             size: 10.0,
             price,
@@ -1742,10 +2189,94 @@ mod tests {
             vec![CopyCandidate {
                 condition_id: "m1".to_string(),
                 outcome_index: 0,
+                asset: asset_of("m1", 0),
                 trader: "0xA".to_string(),
                 trigger_px: 0.4,
                 timestamp: 9_000,
             }]
+        );
+    }
+
+    #[test]
+    fn dedup_open_conditions_dedups_preserving_first_seen_order() {
+        let conds = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+            "c".to_string(),
+            "b".to_string(),
+        ];
+        assert_eq!(
+            dedup_open_conditions(&conds, 10),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn dedup_open_conditions_caps_unique_count_keeping_earliest() {
+        // Built whitelist-first, so capping keeps the HIGHEST-conviction ids.
+        let conds = vec![
+            "a".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ];
+        assert_eq!(
+            dedup_open_conditions(&conds, 2),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn dedup_open_conditions_zero_cap_is_empty() {
+        assert!(dedup_open_conditions(&["a".to_string()], 0).is_empty());
+    }
+
+    #[test]
+    fn ondemand_token_params_accepts_a_valid_market() {
+        let cond = format!("0x{}", "ab".repeat(32));
+        let m: ClobMarket = serde_json::from_str(&format!(
+            r#"{{"condition_id":{cond:?},"minimum_tick_size":0.01,"neg_risk":true,
+                "tokens":[{{"token_id":"111","outcome":"Yes","price":0.4}},
+                          {{"token_id":"222","outcome":"No","price":0.6}}],"active":true}}"#
+        ))
+        .unwrap();
+        let (ts, neg_risk, condition) = ondemand_token_params(&m, "111", &cond).unwrap();
+        assert_eq!(ts, TickSize::Cent);
+        assert!(neg_risk, "neg_risk carried from the market");
+        assert_eq!(condition, cond.parse::<B256>().unwrap());
+    }
+
+    #[test]
+    fn ondemand_token_params_rejects_foreign_or_empty_asset() {
+        let cond = format!("0x{}", "cd".repeat(32));
+        let m: ClobMarket = serde_json::from_str(&format!(
+            r#"{{"condition_id":{cond:?},"minimum_tick_size":0.01,
+                "tokens":[{{"token_id":"111","outcome":"Yes","price":0.4}}],"active":true}}"#
+        ))
+        .unwrap();
+        assert!(ondemand_token_params(&m, "999", &cond).is_none(), "asset not in market");
+        assert!(ondemand_token_params(&m, "", &cond).is_none(), "empty asset");
+    }
+
+    #[test]
+    fn ondemand_token_params_rejects_bad_tick_or_condition() {
+        let cond = format!("0x{}", "ef".repeat(32));
+        let legacy: ClobMarket = serde_json::from_str(&format!(
+            r#"{{"condition_id":{cond:?},"minimum_tick_size":0.04,
+                "tokens":[{{"token_id":"111","outcome":"Yes","price":0.4}}],"active":true}}"#
+        ))
+        .unwrap();
+        assert!(ondemand_token_params(&legacy, "111", &cond).is_none(), "legacy 0.04 tick");
+        let m: ClobMarket = serde_json::from_str(
+            r#"{"condition_id":"not-hex","minimum_tick_size":0.01,
+                "tokens":[{"token_id":"111","outcome":"Yes","price":0.4}],"active":true}"#,
+        )
+        .unwrap();
+        assert!(
+            ondemand_token_params(&m, "111", "not-hex").is_none(),
+            "unparseable condition id"
         );
     }
 
@@ -1793,29 +2324,30 @@ mod tests {
     }
 
     #[test]
-    fn select_signals_two_wallets_same_key_yield_one_earliest() {
-        // Both whitelisted, same (cond, outcome); the EARLIER buy (0xB @9_000)
-        // represents the single candidate, regardless of whitelist order.
+    fn select_signals_two_wallets_same_key_yield_one_latest() {
+        // Both whitelisted, same (cond, outcome); the MOST RECENT buy (0xA @9_500)
+        // represents the single candidate (freshest conviction / smallest drift),
+        // regardless of whitelist order.
         let recent = tmap(vec![
             trade("0xA", "m1", 0, TradeSide::Buy, 0.45, 9_500),
             trade("0xB", "m1", 0, TradeSide::Buy, 0.40, 9_000),
         ]);
         let out = select_signals(&recent, &wl(&["0xA", "0xB"]), &HashSet::new(), NOW, WINDOW);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].trader, "0xB");
-        assert_eq!(out[0].timestamp, 9_000);
-        assert_eq!(out[0].trigger_px, 0.40);
+        assert_eq!(out[0].trader, "0xA");
+        assert_eq!(out[0].timestamp, 9_500);
+        assert_eq!(out[0].trigger_px, 0.45);
     }
 
     #[test]
-    fn select_signals_same_wallet_same_key_twice_yields_one_earliest() {
+    fn select_signals_same_wallet_same_key_twice_yields_one_latest() {
         let recent = tmap(vec![
             trade("0xA", "m1", 0, TradeSide::Buy, 0.50, 9_400),
             trade("0xA", "m1", 0, TradeSide::Buy, 0.42, 9_100),
         ]);
         let out = select_signals(&recent, &wl(&["0xA"]), &HashSet::new(), NOW, WINDOW);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].timestamp, 9_100);
+        assert_eq!(out[0].timestamp, 9_400);
     }
 
     #[test]
@@ -2057,7 +2589,7 @@ mod tests {
     /// [`loop_with_inv`] to pass TIGHT inventory caps.
     fn loop_with(
         venue: MockVenue,
-        tradeable: HashMap<(String, i64), TradeTokenInfo>,
+        tradeable: HashMap<String, TradeTokenInfo>,
         params: CopyParams,
     ) -> (CopyLoop<MockVenue>, tokio::task::JoinHandle<Store>) {
         let inv_cfg = fallback_inv_config(&params);
@@ -2069,7 +2601,7 @@ mod tests {
     /// TIGHT inventory stop-loss / daily-loss floor.
     fn loop_with_inv(
         venue: MockVenue,
-        tradeable: HashMap<(String, i64), TradeTokenInfo>,
+        tradeable: HashMap<String, TradeTokenInfo>,
         params: CopyParams,
         inv_cfg: InventoryConfig,
     ) -> (CopyLoop<MockVenue>, tokio::task::JoinHandle<Store>) {
@@ -2082,6 +2614,7 @@ mod tests {
             inv: InventoryRisk::new(inv_cfg),
             open: HashMap::new(),
             tradeable,
+            resolver: None,
             store_tx,
             params,
             realized_micro: 0,
@@ -2093,13 +2626,20 @@ mod tests {
         (state, writer)
     }
 
-    fn tradeable_of(cid: &str, oi: i64, token: TokenId) -> HashMap<(String, i64), TradeTokenInfo> {
+    /// Deterministic stand-in for a market+outcome's venue token-id (the trade's
+    /// `asset`), so the tradeable map and the candidates that look it up agree.
+    fn asset_of(cid: &str, oi: i64) -> String {
+        format!("{cid}#tok{oi}")
+    }
+
+    fn tradeable_of(cid: &str, oi: i64, token: TokenId) -> HashMap<String, TradeTokenInfo> {
         HashMap::from([(
-            (cid.to_string(), oi),
+            asset_of(cid, oi),
             TradeTokenInfo {
                 token,
                 ts: TickSize::Cent,
                 condition: B256::ZERO,
+                neg_risk: false,
             },
         )])
     }
@@ -2108,6 +2648,7 @@ mod tests {
         CopyCandidate {
             condition_id: cid.to_string(),
             outcome_index: oi,
+            asset: asset_of(cid, oi),
             trader: trader.to_string(),
             trigger_px,
             timestamp: ts,
@@ -2225,6 +2766,8 @@ mod tests {
                 token: TokenId(9),
                 ts: TickSize::Cent,
                 condition: B256::ZERO,
+                asset: String::new(),
+                neg_risk: false,
             },
         );
 
@@ -2271,6 +2814,8 @@ mod tests {
                 token,
                 ts: TickSize::Cent,
                 condition: B256::ZERO,
+                asset: String::new(),
+                neg_risk: false,
             },
         );
         // The source trader SOLD the copied outcome after entry.
@@ -2322,6 +2867,8 @@ mod tests {
                 token,
                 ts: TickSize::Cent,
                 condition: B256::ZERO,
+                asset: String::new(),
+                neg_risk: false,
             },
         );
 
@@ -2355,6 +2902,7 @@ mod tests {
             inv: InventoryRisk::new(fallback_inv_config(&params)),
             open: HashMap::new(),
             tradeable: tradeable_of("m1", 0, TokenId(1)),
+            resolver: None,
             store_tx,
             params,
             realized_micro: 0,
@@ -2425,6 +2973,8 @@ mod tests {
                 token: held,
                 ts: TickSize::Cent,
                 condition: B256::ZERO,
+                asset: String::new(),
+                neg_risk: false,
             },
         );
 
@@ -2864,11 +3414,12 @@ mod tests {
         let orders = Arc::clone(&venue.orders);
         let mut tradeable = tradeable_of("m1", 0, t1);
         tradeable.insert(
-            ("m2".to_string(), 1),
+            asset_of("m2", 1),
             TradeTokenInfo {
                 token: t2,
                 ts: TickSize::Cent,
                 condition: B256::ZERO,
+                neg_risk: false,
             },
         );
         let (mut state, writer) = loop_with(venue, tradeable, copy_params());
@@ -2916,6 +3467,8 @@ mod tests {
                 token: t2,
                 ts: TickSize::Cent,
                 condition: B256::ZERO,
+                asset: String::new(),
+                neg_risk: false,
             },
         );
         state.run_exit_sweep(&HashMap::new(), &HashMap::new()).await;
@@ -2956,6 +3509,7 @@ mod tests {
             inv: InventoryRisk::new(fallback_inv_config(&params)),
             open: HashMap::new(),
             tradeable: tradeable_of("m1", 0, t1),
+            resolver: None,
             store_tx,
             params,
             realized_micro: 0,

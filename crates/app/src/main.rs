@@ -316,22 +316,26 @@ struct MmLiveInputs {
     auth_address: alloy_primitives::Address,
 }
 
-/// Build the copy executor's `(condition_id, outcome_index) →` [`TradeTokenInfo`]
+/// Build the copy executor's `asset (venue token-id) →` [`TradeTokenInfo`]
 /// resolver (Task C5) from the registry: for every SYNCED-universe market, map
-/// outcome 0 → the YES token and outcome 1 → the NO token (the Data-API outcome
-/// convention the copy signals carry), each with the venue tick grid + the
-/// on-chain condition id (the relayer redeem key). A market whose condition id
-/// does not parse as a `B256` is skipped (it can't be redeemed and is almost
-/// never a real market).
+/// BOTH outcome tokens by their venue token-id string (the value a Data-API
+/// trade carries in `asset`), each with the venue tick grid + the on-chain
+/// condition id (the relayer redeem key). Keying by asset — instead of an
+/// `outcome_index → yes/no` assumption — guarantees a copy buys the EXACT token
+/// the trader bought (the prior oi-keyed map silently bought the COMPLEMENT when
+/// the Data-API outcome index didn't line up with the registry's label-based
+/// yes/no). A market whose condition id does not parse as a `B256` is skipped (it
+/// can't be redeemed and is almost never a real market).
 ///
-/// COVERAGE LIMITATION (canary, documented): the copy executor can only TRADE
-/// markets present in this map, i.e. the SYNCED universe — a smart-money signal
-/// in an UNSYNCED market resolves to no tradeable token and is skipped without an
-/// order. A future enhancement is on-demand syncing of a signal's market (à la
-/// confluence's `fetch_gamma_markets_by_condition`); until then, widen
-/// `[universe]` coverage to raise the hit rate.
-fn build_copy_tradeable(reg: &pm_registry::Registry) -> HashMap<(String, i64), TradeTokenInfo> {
-    let mut map: HashMap<(String, i64), TradeTokenInfo> = HashMap::new();
+/// This map SEEDS the executor with the synced universe (the whitelist's active
+/// markets). It is NOT a hard coverage ceiling: a fresh smart-money signal in a
+/// market NOT in this map is synced ON-DEMAND at signal time on live runs (the
+/// strategy's `resolve_ondemand`: one CLOB `/markets/{cid}` fetch +
+/// `LiveVenue::ensure_token`, then cached), so entry latency isn't bounded by the
+/// universe-snapshot cadence. The seed just front-loads the common case so most
+/// signals skip even that one fetch.
+fn build_copy_tradeable(reg: &pm_registry::Registry) -> HashMap<String, TradeTokenInfo> {
+    let mut map: HashMap<String, TradeTokenInfo> = HashMap::new();
     let mut skipped = 0usize;
     for m in reg.markets() {
         let Some(cond_str) = reg.market_condition(m.id) else {
@@ -342,23 +346,26 @@ fn build_copy_tradeable(reg: &pm_registry::Registry) -> HashMap<(String, i64), T
             skipped += 1;
             continue;
         };
-        // outcome 0 → YES token, outcome 1 → NO token.
-        map.insert(
-            (cond_str.to_string(), 0),
-            TradeTokenInfo {
-                token: m.yes,
-                ts: m.tick,
-                condition,
-            },
-        );
-        map.insert(
-            (cond_str.to_string(), 1),
-            TradeTokenInfo {
-                token: m.no,
-                ts: m.tick,
-                condition,
-            },
-        );
+        // Key BY THE VENUE TOKEN-ID STRING (the Data-API trade's `asset`), NOT by
+        // (condition, outcome_index). A copy signal carries the exact token the
+        // trader bought; resolving by that asset buys the SAME side they did,
+        // immune to any Yes/No labeling or outcome-index convention mismatch
+        // between the Data API and the registry (an oi→yes/no assumption silently
+        // bought the COMPLEMENT — betting AGAINST the smart money). `best_ask`
+        // then queries this same venue id, so the priced book is the trader's.
+        for tok in [m.yes, m.no] {
+            if let Some(venue_id) = reg.token_venue_id(tok) {
+                map.insert(
+                    venue_id.to_string(),
+                    TradeTokenInfo {
+                        token: tok,
+                        ts: m.tick,
+                        condition,
+                        neg_risk: m.neg_risk,
+                    },
+                );
+            }
+        }
     }
     if skipped > 0 {
         warn!(
@@ -746,12 +753,23 @@ async fn main() {
         info!("reward_farm policy active: forcing confluence OFF (it is a taker signal); MM quotes reward-eligible markets");
     }
 
+    // COPY mode drives the universe from its OWN EdgePerBet whitelist's active
+    // markets (built just below), so confluence's separate top-PnL universe is
+    // SKIPPED when copy is enabled — they are both smart-money universe sources
+    // and would otherwise double-fetch the leaderboard at startup. The copy
+    // whitelist-driven universe takes precedence; confluence remains the path for
+    // MM-only directional runs.
+    let copy_enabled = config.strategies.copy.enabled;
+    if copy_enabled && config.confluence.enabled {
+        info!("copy strategy active: confluence universe SKIPPED — the universe is the copy whitelist's active markets");
+    }
+
     // [confluence] — "follow the smart money": build the universe from the top
     // leaderboard traders' OPEN positions (their favored side per market) instead
     // of the liquidity-ranked Gamma keyset. Runs at startup, so auto_restart
     // re-runs it each relaunch for a fresh snapshot. Best-effort: on any Data-API
     // failure (or an empty result) we log and FALL BACK to the normal universe.
-    let confluence_markets = if config.confluence.enabled && !reward_farm_mode {
+    let confluence_markets = if config.confluence.enabled && !reward_farm_mode && !copy_enabled {
         if tui_active {
             println!("confluence: querying top-trader leaderboard + open positions ...");
         }
@@ -799,7 +817,7 @@ async fn main() {
         .iter()
         .map(|m| m.favored_token.clone())
         .collect();
-    if config.confluence.enabled && !reward_farm_mode {
+    if config.confluence.enabled && !reward_farm_mode && !copy_enabled {
         info!(
             markets = confluence_markets.len(),
             quoting_conditions = confluence_conditions.as_ref().map_or(0, Vec::len),
@@ -814,6 +832,93 @@ async fn main() {
             );
         }
     }
+
+    // COPY whitelist-driven universe: when the copy strategy runs, the synced
+    // universe should BE the markets its OWN EdgePerBet whitelist is active in
+    // (their OPEN positions) — the exact traders it copies — so a fresh-buy
+    // signal lands in a synced, tradeable market (≈1:1 coverage) instead of a
+    // generic liquidity scan. We build the whitelist ONCE here and SHARE it with
+    // the strategy (`with_initial_whitelist`), so the heavy EdgePerBet rank isn't
+    // run twice at startup and universe ↔ whitelist stay on one snapshot. Re-run
+    // each auto_restart for a fresh snapshot. Best-effort: any Data-API failure
+    // falls back to the liquidity universe (and the strategy builds its own
+    // whitelist). Takes precedence over `confluence_conditions`.
+    let mut copy_initial_whitelist: Option<Vec<String>> = None;
+    let copy_universe_conditions: Option<Vec<String>> = if copy_enabled {
+        // Cap exactly like the confluence/keyset universe so a trader holding
+        // hundreds of longshots can't explode the Gamma fetch.
+        let cap = if config.universe.prioritize_by_liquidity {
+            config
+                .universe
+                .candidate_pool
+                .max(config.universe.max_markets)
+        } else {
+            config.universe.max_markets
+        }
+        .max(1);
+        if tui_active {
+            println!(
+                "copy: building the smart-money universe from the EdgePerBet whitelist's active markets ..."
+            );
+        }
+        info!(
+            top_n = config.copy_params.top_n,
+            min_bets = config.copy_params.min_bets,
+            "copy: building whitelist-driven universe"
+        );
+        // One snapshot: rank the whitelist (EdgePerBet) exactly as the live loop,
+        // then union its open-position condition ids. `1.0` shares ignores dust.
+        let built: Option<(Vec<String>, Vec<String>)> = async {
+            let cp = CopyParams::from_config(&config.strategies.copy, &config.copy_params).ok()?;
+            let client = DataApiClient::new(None).ok()?;
+            let whitelist = pm_app::strategy::copy::refresh_whitelist(&client, &cp).await?;
+            if whitelist.is_empty() {
+                return Some((Vec::new(), Vec::new()));
+            }
+            let conds =
+                pm_app::strategy::copy::whitelist_universe_conditions(&client, &whitelist, 1.0, cap)
+                    .await?;
+            Some((whitelist, conds))
+        }
+        .await;
+        match built {
+            Some((wl, conds)) if !conds.is_empty() => {
+                info!(
+                    traders = wl.len(),
+                    markets = conds.len(),
+                    "copy: whitelist-driven universe ready"
+                );
+                if tui_active {
+                    println!(
+                        "arb: copy universe ready — {} smart-money markets ({} traders).",
+                        conds.len(),
+                        wl.len()
+                    );
+                }
+                copy_initial_whitelist = (!wl.is_empty()).then_some(wl);
+                Some(conds)
+            }
+            Some((wl, _)) => {
+                warn!(
+                    traders = wl.len(),
+                    "copy: whitelist-driven universe empty (no open positions / empty whitelist); falling back to liquidity universe"
+                );
+                copy_initial_whitelist = (!wl.is_empty()).then_some(wl);
+                None
+            }
+            None => {
+                warn!(
+                    "copy: whitelist-driven universe fetch failed; falling back to liquidity universe (strategy will build its own whitelist)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Precedence: copy whitelist-driven > confluence > liquidity (None).
+    let universe_conditions = copy_universe_conditions.or(confluence_conditions);
 
     let filter = UniverseFilter {
         max_markets: config.universe.max_markets,
@@ -832,7 +937,7 @@ async fn main() {
         tx,
     )
     .unwrap_or_else(|e| fatal(format!("SyncTask init: {e}")))
-    .with_confluence_conditions(confluence_conditions);
+    .with_confluence_conditions(universe_conditions);
 
     // In TUI mode tracing already goes to the ring buffer, so without this
     // line the user stares at a silent blank terminal for the whole sync
@@ -2052,10 +2157,12 @@ async fn main() {
     // forced the typed confirmation at startup) AND `[strategies.copy].live`.
     // EVERY other combination uses the PAPER taker venue.
     //
-    // COVERAGE LIMITATION (canary, documented in `build_copy_tradeable`): copy can
-    // only trade SYNCED-universe markets; a smart-money signal in an UNSYNCED
-    // market is skipped (no tradeable token). A future enhancement is on-demand
-    // syncing of signal markets.
+    // COVERAGE: copy trades the SYNCED universe (the whitelist's active markets)
+    // AND, on LIVE runs, syncs any UNSYNCED signal's market ON-DEMAND at signal
+    // time (`with_resolver` → `resolve_ondemand`), so a fresh smart-money buy is
+    // never skipped just because the snapshot didn't cover it — entry latency
+    // isn't bounded by the snapshot cadence. (Paper has no live book feed for
+    // unsynced markets, so it stays seed-only.)
     if let Some(copy_envelope) = copy_envelope {
         let copy_capital = copy_envelope.capital;
         let copy_live = mm_use_live(args.live, config.strategies.copy.live);
@@ -2074,9 +2181,10 @@ async fn main() {
             }
         };
 
-        // Tradeable map: (condition_id, outcome_index) → venue token/tick/condition
-        // for every SYNCED market (outcome 0 → yes, 1 → no). Empty markets without
-        // a parseable condition id are skipped (see `build_copy_tradeable`).
+        // Tradeable map: venue token-id (the trade's `asset`) → token/tick/condition
+        // for every SYNCED market's BOTH outcome tokens. Keyed by asset (not
+        // outcome_index) so a copy buys the EXACT token the trader bought. Markets
+        // without a parseable condition id are skipped (see `build_copy_tradeable`).
         let copy_tradeable = build_copy_tradeable(&reg);
         let copy_tradeable_markets = copy_tradeable.len();
 
@@ -2134,6 +2242,30 @@ async fn main() {
         // binds across the periodic auto-restart.
         let copy_inv_cfg = inventory_config(&config)
             .unwrap_or_else(|e| fatal(format!("inventory_config (copy): {e}")));
+        // ON-DEMAND market sync (LIVE only): a CLOB metadata client so a fresh
+        // signal in a market the universe snapshot never covered is resolved +
+        // registered live and TRADED AT ONCE, instead of waiting for the next
+        // snapshot (entry latency is a copy-edge contributor). Paper has no live
+        // book feed for unsynced markets, so it stays None (on-demand off). A
+        // separate client = its own rate budget (this account already runs the
+        // sync + venue clients); init failure just disables on-demand, not the run.
+        let copy_resolver: Option<Arc<ClobRest>> = if copy_live {
+            match ClobRest::new(
+                &config.endpoints.clob_base,
+                config.ingestion.rest_rate_capacity,
+                config.ingestion.rest_rate_per_sec,
+            ) {
+                Ok(c) => Some(Arc::new(c)),
+                Err(e) => {
+                    warn!(
+                        "copy: on-demand resolver init failed ({e}); unsynced signals will be skipped until the next snapshot"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let copy = CopyStrategy::new(copy_params)
             .with_feed(copy_feed)
             .with_venue(copy_venue)
@@ -2144,6 +2276,15 @@ async fn main() {
             // MM threads; the cap binds across the auto-restart).
             .with_inventory_config(copy_inv_cfg)
             .with_store_path(std::path::PathBuf::from(&config.store.path))
+            // Seed the whitelist snapshot main already built for the
+            // whitelist-driven universe, so the strategy trades the SAME traders
+            // the universe was synced for and the heavy EdgePerBet rank isn't run
+            // twice at startup (the loop defers its first refresh when seeded).
+            // `None` ⇒ the loop builds its own whitelist immediately (fallback).
+            .with_initial_whitelist(copy_initial_whitelist)
+            // ON-DEMAND market sync (live only): unsynced fresh signals are
+            // resolved + traded immediately instead of skipped (None on paper).
+            .with_resolver(copy_resolver)
             // Same live gate as arb/MM: when live is HELD (TUI before `l`), copy
             // starts PAUSED and only trades once the operator releases.
             .with_start_paused(copy_live && !released_at_start);

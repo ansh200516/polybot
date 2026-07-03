@@ -8,6 +8,10 @@
 *.sqlite-shm
 /data
 .env
+# SSH keys / secrets — NEVER commit these (they grant access to the box + funds).
+*.pem
+*.key
+id_rsa*
 *_out
 *_out.txt
 *output*.txt

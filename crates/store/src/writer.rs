@@ -6,8 +6,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
 use crate::{
-    ConversionRow, FillRow, HaltRow, MarketRow, OppRow, OrderEventRow, OrderRow, PnlRow, RelRow,
-    RfDecisionRow, RfOutcomeRow, Store,
+    ConversionRow, CopyPositionRow, FillRow, HaltRow, MarketRow, OppRow, OrderEventRow, OrderRow,
+    PnlRow, RelRow, RfDecisionRow, RfOutcomeRow, Store,
 };
 
 pub type Ack = Option<oneshot::Sender<()>>;
@@ -48,6 +48,17 @@ pub enum StoreMsg {
         utc_day: i64,
         strategy: String,
         delta_micro: i128,
+    },
+    /// UPSERT one open copy position so a RESTART resumes managing it (Task:
+    /// copy position-reload). Un-acked; a failed write surfaces as a
+    /// `write_error` (a lost persist would orphan the position on restart) but
+    /// never blocks the trading loop.
+    CopyPositionUpsert(CopyPositionRow),
+    /// DELETE a persisted copy position on a FULL close (exit / redeem), so a
+    /// restart does not resurrect a position we no longer hold. Un-acked.
+    CopyPositionClose {
+        condition_id: String,
+        outcome_index: i64,
     },
 }
 
@@ -113,6 +124,19 @@ pub async fn run_writer(mut store: Store, mut rx: mpsc::Receiver<StoreMsg>) -> S
                 }
                 (Ok(()), None, "day_realized")
             }
+            StoreMsg::CopyPositionUpsert(r) => (
+                store.upsert_copy_position(&r),
+                None,
+                "copy_position_upsert",
+            ),
+            StoreMsg::CopyPositionClose {
+                condition_id,
+                outcome_index,
+            } => (
+                store.close_copy_position(&condition_id, outcome_index),
+                None,
+                "copy_position_close",
+            ),
         };
         match result {
             Ok(()) => {

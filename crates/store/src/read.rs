@@ -13,7 +13,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
 
-use crate::{DAY_MS, PnlRow, StoreError};
+use crate::{CopyPositionRow, DAY_MS, PnlRow, StoreError};
 
 // ---------------------------------------------------------------------------
 // View types — subset of columns surfaced to the dashboard
@@ -293,6 +293,35 @@ impl ReadStore {
     /// *realized* sessions whose losses SUM over the cap across a day ARE caught.
     /// The MM latches when EITHER query reaches the cap; both scope to the UTC
     /// day, so a day rollover resets both to 0 and releases the gate.
+    /// All persisted OPEN copy positions, for the copy strategy to RELOAD on
+    /// startup and resume managing them (follow-exit / stop-loss / redeem) instead
+    /// of orphaning them. Ordered by `(condition_id, outcome_index)` for a stable
+    /// reload. Empty on a fresh DB.
+    pub fn copy_open_positions(&self) -> Result<Vec<CopyPositionRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT condition_id, outcome_index, asset, neg_risk, tick_decimals,
+                    condition_hex, trader, entry_ts, qty_micro, cost_micro
+             FROM copy_positions ORDER BY condition_id, outcome_index",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(CopyPositionRow {
+                    condition_id: r.get(0)?,
+                    outcome_index: r.get(1)?,
+                    asset: r.get(2)?,
+                    neg_risk: r.get::<_, i64>(3)? != 0,
+                    tick_decimals: r.get(4)?,
+                    condition_hex: r.get(5)?,
+                    trader: r.get(6)?,
+                    entry_ts: r.get(7)?,
+                    qty_micro: r.get(8)?,
+                    cost_micro: r.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn day_realized_micro(&self, strategy: &str, utc_day: i64) -> Result<i128, StoreError> {
         let total: Option<i64> = self
             .conn
