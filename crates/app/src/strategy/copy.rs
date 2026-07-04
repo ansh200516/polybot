@@ -1404,13 +1404,10 @@ impl<V: CopyVenue> CopyLoop<V> {
         if self.venue.is_none() {
             return; // paper-without-venue → inert
         }
-        // EQUITY-SCALED CAPS: only when there is something to size. Refresh live
-        // cash (TTL-gated inside), then snapshot the effective caps ONCE so every
-        // candidate this cycle sizes against a single equity view. No candidates ⇒
-        // skip the balance call entirely.
-        if !candidates.is_empty() {
-            self.refresh_equity_if_stale().await;
-        }
+        // EQUITY-SCALED CAPS: equity is refreshed once per cycle by the caller
+        // (`run_poll_cycle`, TTL-gated) so it's fresh here even while halted/quiet.
+        // Snapshot the effective caps ONCE so every candidate this cycle sizes
+        // against a single equity view.
         let (eff_per_position, eff_capital, eff_max_gross, eff_max_concurrent) =
             self.effective_caps();
         // Per-cycle FUNNEL counters, logged once at the end so an operator can SEE
@@ -2077,6 +2074,11 @@ async fn run_poll_cycle<V: CopyVenue>(
     // ones BEFORE the exit sweep / marks / entries, so deployed + concurrency and
     // the marked book all reflect what the wallet actually holds this cycle.
     state.reconcile_positions().await;
+    // LIVE EQUITY (TTL-gated inside): refresh EVERY cycle — NOT only when entering —
+    // so the equity-scaled caps AND the `pnl` account summary stay current even
+    // while HALTED or quiet (previously it only ran in the entry path, so it froze
+    // for the whole halt, making the dashboard portfolio go stale).
+    state.refresh_equity_if_stale().await;
     let mut recent_by_wallet: HashMap<String, Vec<Trade>> = HashMap::new();
     for wallet in whitelist {
         if let Ok(trades) = client.trades(TradesFilter::User(wallet), POLL_TRADE_LIMIT).await {

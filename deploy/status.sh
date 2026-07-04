@@ -15,9 +15,14 @@ WALLET="$(grep -E '^PM_DEPOSIT_WALLET=' "$ENV_FILE" 2>/dev/null | head -1 | cut 
 EQ_LINE="$(journalctl -u copybot --no-pager -o cat 2>/dev/null | sed -r 's/\x1b\[[0-9;]*m//g' | grep 'equity refreshed' | tail -1)"
 if [ -n "$EQ_LINE" ]; then
   val() { printf '%s\n' "$EQ_LINE" | grep -oE "$1=[0-9]+" | head -1 | cut -d= -f2; }
+  # Age of this reading (the bot refreshes equity every cycle; a large age ⇒ the
+  # loop is stalled/down — a stale portfolio here would NOT match the live UI).
+  EQ_TS="$(printf '%s' "$EQ_LINE" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+' | head -1)"
+  AGE=$(( $(date -u +%s) - $(date -u -d "${EQ_TS:-@0}" +%s 2>/dev/null || date -u +%s) ))
   awk -v c="$(val cash_micro)" -v p="$(val positions_micro)" -v e="$(val equity_micro)" \
-      -v mg="$(val max_gross_micro)" -v pp="$(val per_position_micro)" -v mc="$(val max_concurrent)" 'BEGIN{
-    printf "=== ACCOUNT — Polymarket portfolio (bot'\''s last equity refresh) ===\n";
+      -v mg="$(val max_gross_micro)" -v pp="$(val per_position_micro)" -v mc="$(val max_concurrent)" -v age="$AGE" 'BEGIN{
+    stale = (age > 180) ? "  ⚠ STALE — bot idle/halted/down, may not match live UI" : "";
+    printf "=== ACCOUNT — Polymarket portfolio (updated %ds ago)%s ===\n", age, stale;
     printf "  Portfolio: $%.2f    =    cash $%.2f    +    positions $%.2f\n", e/1e6, c/1e6, p/1e6;
     printf "  Copy caps: max_gross $%.2f (%.0f%% of equity)   per-copy $%.2f   max_concurrent %d\n\n",
            mg/1e6, (e>0 ? 100*mg/e : 0), pp/1e6, mc;
