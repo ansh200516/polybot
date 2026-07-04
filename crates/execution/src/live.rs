@@ -477,6 +477,49 @@ impl LiveVenue {
         Err(VenueError::Live("trades pagination runaway".into()))
     }
 
+    /// The deposit wallet's spendable CLOB **collateral** (the "Cash" the
+    /// Polymarket UI shows) in µUSDC, via the L2-authed
+    /// `GET /balance-allowance?asset_type=COLLATERAL&signature_type=3`. That cash
+    /// lives in the exchange contract (the wallet's raw USDC balance is 0), so it
+    /// is only readable through this authed endpoint. The HMAC signs the
+    /// query-LESS path (RECON-M5), matching [`data_rows`]. Used by the copy
+    /// strategy to size caps as a fraction of live account equity.
+    pub async fn available_collateral_micro(&mut self) -> Result<i128, VenueError> {
+        let path = "/balance-allowance";
+        let auth_address = self.cfg.auth_address.to_string();
+        self.limiter.acquire().await;
+        let ts = unix_seconds_string();
+        let headers = l2_headers(&self.cfg.creds, &auth_address, &ts, "GET", path, None)
+            .map_err(|e| VenueError::Live(e.to_string()))?;
+        // signature_type=3 (POLY_1271) so the CLOB reports the DEPOSIT-WALLET's
+        // collateral — the funder our orders draw from — not the key-bound EOA's
+        // (which is 0). Mirrors the order-signing `signature_type: 3`. Without it
+        // the read is 0 and the caller falls back to the static configured caps.
+        let url = format!("{}{}?asset_type=COLLATERAL&signature_type=3", self.cfg.base, path);
+        let mut req = self.http.get(&url);
+        for (k, v) in &headers {
+            req = req.header(*k, v);
+        }
+        let resp = req.send().await.map_err(|e| VenueError::Live(e.to_string()))?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| VenueError::Live(e.to_string()))?;
+        if !status.is_success() {
+            return Err(VenueError::Live(format!("balance-allowance {status}: {body}")));
+        }
+        // Diagnostic (no secrets): the raw shape, so a 0/unexpected reading on a V2
+        // deposit-wallet account can be matched against the real funder.
+        tracing::debug!(body = %body, "live: balance-allowance response");
+        parse_collateral_micro(&body)
+    }
+
+    /// The deposit (proxy) wallet address as lowercase hex — the Polymarket
+    /// account whose portfolio funds our orders. The copy strategy pairs its
+    /// Data-API `/value` (all open positions) with the CLOB cash balance to size
+    /// caps against live account equity.
+    pub fn deposit_wallet_hex(&self) -> String {
+        format!("{:#x}", self.cfg.deposit_wallet)
+    }
+
     /// Poll `/data/trades` for fills of `venue_order_id` on `venue_token`,
     /// converting each row to a [`Fill`] with the same money helpers as
     /// `PaperVenue::fill_now`. Stops when accumulated µshares reach
@@ -658,6 +701,23 @@ fn unix_seconds_string() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0)
         .to_string()
+}
+
+/// Parse the CLOB `/balance-allowance` body to the COLLATERAL balance in
+/// µUSDC. The `balance` field is the raw on-chain USDC amount (6 decimals),
+/// which IS micro-USDC, sent as a string (venue convention) or, defensively, a
+/// bare number. Errors if the field is absent or unparseable.
+fn parse_collateral_micro(body: &str) -> Result<i128, VenueError> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| VenueError::Live(e.to_string()))?;
+    let micro = match v.get("balance") {
+        Some(serde_json::Value::String(s)) => s.trim().parse::<i128>().ok(),
+        Some(serde_json::Value::Number(n)) => n.as_i64().map(i128::from),
+        _ => None,
+    };
+    micro.ok_or_else(|| {
+        VenueError::Live(format!("balance-allowance: missing/bad balance field: {body}"))
+    })
 }
 
 impl ExecutionVenue for LiveVenue {
@@ -1798,6 +1858,24 @@ mod tests {
     }
 
     // -- decimal helper unit test ------------------------------------------
+
+    #[test]
+    fn parse_collateral_micro_reads_balance_field() {
+        // `balance` is raw on-chain USDC (6 decimals) == µUSDC, as a string.
+        assert_eq!(
+            parse_collateral_micro(r#"{"balance":"28590000"}"#).unwrap(),
+            28_590_000
+        );
+        // Defensive: a bare JSON number is accepted too.
+        assert_eq!(
+            parse_collateral_micro(r#"{"balance":5000000}"#).unwrap(),
+            5_000_000
+        );
+        assert_eq!(parse_collateral_micro(r#"{"balance":"0"}"#).unwrap(), 0);
+        // Missing / malformed field or body → error (caller falls back to caps).
+        assert!(parse_collateral_micro(r#"{"allowance":"1"}"#).is_err());
+        assert!(parse_collateral_micro("not json").is_err());
+    }
 
     #[test]
     fn decimal_to_micro_is_exact_and_rejects_garbage() {

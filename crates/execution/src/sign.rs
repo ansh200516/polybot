@@ -357,39 +357,46 @@ pub fn clob_amounts(action: Action, ts: TickSize, limit_px: Px, qty: Qty) -> (u6
     }
 }
 
-/// USDC leg precision for a MARKET order: 2 decimals ⇒ a multiple of 10_000 µUSDC.
-const MARKET_USDC_GRAIN: u64 = 10_000;
-/// SHARES leg precision for a MARKET order: 4 decimals ⇒ a multiple of 100 µshares.
-const MARKET_SHARES_GRAIN: u64 = 100;
+/// MARKET-order amount precision is by ROLE, not by token: Polymarket accepts a
+/// **makerAmount with ≤ 2 decimals** (a multiple of 10_000 µ) and a **takerAmount
+/// with ≤ 4 decimals** (a multiple of 100 µ) — for BOTH sides. The maker/taker
+/// LEG flips with side (BUY: maker=USDC, taker=shares; SELL: maker=shares,
+/// taker=USDC), so the grain must follow the role, not the token.
+const MARKET_MAKER_GRAIN: u64 = 10_000; // makerAmount: 2 decimals
+const MARKET_TAKER_GRAIN: u64 = 100; //    takerAmount: 4 decimals
 
 /// (makerAmount, takerAmount) for a **MARKET** (taker FAK/FOK) order, µ units,
 /// rounded to Polymarket's market-order precision. The CLOB rejects a market
-/// order whose USDC amount carries more than 2 decimals or whose share amount
-/// carries more than 4 (`invalid amounts, the market buy orders maker amount
-/// supports a max accuracy of 2 decimals, taker amount a max of 4 decimals`), so
-/// the µ-exact [`clob_amounts`] (fine for a resting LIMIT order) is NOT valid
-/// here — a copy taker's `qty = notional / price` is arbitrary µshare precision.
+/// order whose maker amount carries more than 2 decimals or whose taker amount
+/// carries more than 4 (`invalid amounts, the … orders maker amount supports a
+/// max accuracy of 2 decimals, taker amount a max of 4 decimals`) — for BOTH buys
+/// AND sells — so the µ-exact [`clob_amounts`] (fine for a resting LIMIT order) is
+/// NOT valid here; a copy taker's `qty = notional / price` is arbitrary µshare
+/// precision.
 ///
-/// The USDC leg is snapped to [`MARKET_USDC_GRAIN`] (0.01) and the SHARES leg to
-/// [`MARKET_SHARES_GRAIN`] (0.0001). Rounding stays marketable + against-us:
-/// * BUY  — shares DOWN, USDC UP  (we still lift the book; never underpay it).
-/// * SELL — shares DOWN, USDC DOWN (we still hit the bid; never over-ask).
-///
-/// `maker ≤ taker` in µ-units keeps the implied price ≤ $1 for every price the
-/// engine trades (px < 1 by the sizing guard), so the order is well-formed.
+/// Precision is applied to the maker/taker ROLE (`MARKET_MAKER_GRAIN` = 2 dp,
+/// `MARKET_TAKER_GRAIN` = 4 dp), NOT to a fixed USDC/shares leg — the earlier
+/// leg-based rounding worked for buys (maker=USDC) but rejected every SELL, where
+/// maker=shares must be the 2-dp leg. Rounding stays marketable + against-us:
+/// * BUY  — shares (taker) DOWN, USDC (maker) UP  (still lift the book; never underpay).
+/// * SELL — shares (maker) DOWN, USDC (taker) DOWN (still hit the bid; never over-ask,
+///   never sell more than held).
 pub fn clob_market_amounts(action: Action, ts: TickSize, limit_px: Px, qty: Qty) -> (u64, u64) {
     let px_micro = limit_px.microusdc(ts);
-    // 4-decimal shares (rounded DOWN — never trade more than sized/held).
-    let shares = (qty.0 / MARKET_SHARES_GRAIN) * MARKET_SHARES_GRAIN;
     match action {
         Action::Buy => {
+            // taker = shares (4 dp, DOWN); maker = USDC (2 dp, UP).
+            let shares = (qty.0 / MARKET_TAKER_GRAIN) * MARKET_TAKER_GRAIN;
             let raw = buy_cost(px_micro, Qty(shares)).0 as u64;
-            let usdc = raw.div_ceil(MARKET_USDC_GRAIN) * MARKET_USDC_GRAIN;
+            let usdc = raw.div_ceil(MARKET_MAKER_GRAIN) * MARKET_MAKER_GRAIN;
             (usdc, shares)
         }
         Action::Sell => {
+            // maker = shares (2 dp, DOWN — never sell more than held);
+            // taker = USDC (4 dp, DOWN — never over-ask).
+            let shares = (qty.0 / MARKET_MAKER_GRAIN) * MARKET_MAKER_GRAIN;
             let raw = sell_proceeds(px_micro, Qty(shares)).0 as u64;
-            let usdc = (raw / MARKET_USDC_GRAIN) * MARKET_USDC_GRAIN;
+            let usdc = (raw / MARKET_TAKER_GRAIN) * MARKET_TAKER_GRAIN;
             (shares, usdc)
         }
     }
@@ -625,32 +632,34 @@ mod tests {
     }
 
     #[test]
-    fn market_amounts_snap_to_two_and_four_decimals() {
+    fn market_amounts_snap_maker_two_taker_four_decimals_both_sides() {
         use pm_core::num::{Px, Qty, TickSize};
-        // BUY 12.345678 sh @ 0.44 — the arbitrary-µshare copy size that the CLOB
-        // rejected. Shares → 4 decimals (12.3456 = 12_345_600 µ); USDC → 2 decimals.
+        // The rule is by ROLE for BOTH sides: makerAmount ≤ 2 dp, takerAmount ≤ 4 dp.
+        // BUY 12.345678 sh @ 0.44: maker = USDC (2 dp, UP), taker = shares (4 dp, DOWN).
         let (maker, taker) = clob_market_amounts(
             pm_engine::Action::Buy,
             TickSize::Cent,
             Px::new(44, TickSize::Cent).unwrap(),
             Qty(12_345_678),
         );
-        assert_eq!(taker, 12_345_600, "shares snapped to 4 decimals (× 100 µ)");
-        assert_eq!(maker % MARKET_USDC_GRAIN, 0, "USDC snapped to 2 decimals (× 10_000 µ)");
-        assert!(maker <= taker, "implied price ≤ $1");
-        // buy_cost(0.44, 12.3456) = 5_432_064 µUSDC → rounded UP to 5_440_000.
-        assert_eq!(maker, 5_440_000, "USDC rounded UP (against us) on a buy");
+        assert_eq!(taker, 12_345_600, "BUY taker=shares → 4 decimals (× 100 µ)");
+        assert_eq!(maker % MARKET_MAKER_GRAIN, 0, "BUY maker=USDC → 2 decimals (× 10_000 µ)");
+        assert_eq!(taker % MARKET_TAKER_GRAIN, 0);
+        assert_eq!(maker, 5_440_000, "BUY USDC rounded UP (against us)");
 
-        // SELL mirrors: shares (maker) → 4 dec, USDC (taker) → 2 dec, rounded DOWN.
+        // SELL 12.345678 sh @ 0.44 — the case that was REJECTED before the fix.
+        // maker = shares (2 dp, DOWN → 12.34); taker = USDC (4 dp, DOWN).
         let (maker_s, taker_s) = clob_market_amounts(
             pm_engine::Action::Sell,
             TickSize::Cent,
             Px::new(44, TickSize::Cent).unwrap(),
             Qty(12_345_678),
         );
-        assert_eq!(maker_s, 12_345_600, "SELL maker = shares, 4 decimals");
-        assert_eq!(taker_s % MARKET_USDC_GRAIN, 0, "SELL taker = USDC, 2 decimals");
-        assert_eq!(taker_s, 5_430_000, "USDC proceeds rounded DOWN (against us) on a sell");
+        assert_eq!(maker_s, 12_340_000, "SELL maker=shares → 2 decimals (× 10_000 µ)");
+        assert_eq!(maker_s % MARKET_MAKER_GRAIN, 0, "SELL maker must be 2 decimals (the bug: was 4)");
+        assert_eq!(taker_s % MARKET_TAKER_GRAIN, 0, "SELL taker=USDC → 4 decimals");
+        // sell_proceeds(0.44, 12.34) = 5_429_600 µUSDC (already 4-dp aligned).
+        assert_eq!(taker_s, 5_429_600, "SELL USDC proceeds rounded DOWN (against us)");
 
         // A round size stays byte-identical to the taker fixture (no regression).
         let (m, t) = clob_market_amounts(

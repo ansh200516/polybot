@@ -74,6 +74,17 @@ const WHITELIST_TRADE_LIMIT: usize = 1000;
 /// one page (the most recent fills) is plenty and keeps the poll light.
 const POLL_TRADE_LIMIT: usize = 100;
 
+/// Timeout for ONE poll cycle (exit sweep + reconcile + entries). Both this and
+/// the whitelist rank are awaited inline in the loop's `select!`, so a hung
+/// venue/Data-API await would otherwise silently freeze the whole loop (stopping
+/// stop-losses / follow-exits) while the process looks healthy. On timeout the
+/// cycle is skipped and retried next tick — the fix for the observed silent stall.
+const POLL_CYCLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Timeout for the periodic EdgePerBet whitelist rank (up to `top_n` traders ×
+/// paged trade history). Generous — a legit rank can take a while — but bounded
+/// so a slow/stuck rank can't freeze the poll arm. On timeout, keep the prior list.
+const WHITELIST_REFRESH_TIMEOUT: Duration = Duration::from_secs(300);
+
 // ---------------------------------------------------------------------------
 // CopyParams — the resolved `[copy]` knobs + capital envelope
 // ---------------------------------------------------------------------------
@@ -93,8 +104,18 @@ pub struct CopyParams {
     pub per_position_micro: i128,
     /// Cap on simultaneously-open copied positions (C4 gating).
     pub max_concurrent_positions: u32,
-    /// Gross exposure cap across open copied positions, µUSDC (C4 gating).
+    /// Gross exposure cap across open copied positions, µUSDC (C4 gating). When
+    /// `gross_pct > 0` this is only the FALLBACK; the effective cap is recomputed
+    /// each cycle from live equity (see `effective_caps`).
     pub max_gross_micro: i128,
+    /// DYNAMIC gross cap as a fraction of live account equity (cash + positions),
+    /// in `[0, 1]`. `0` ⇒ static `max_gross_micro`. When `> 0`, each cycle the
+    /// loop sets `max_gross = gross_pct × equity` (and the capital carve), keeps
+    /// the per-copy notional FIXED at `per_position_micro`, and scales CONCURRENCY
+    /// — `max_concurrent = min(max_gross / per_position, max_concurrent_positions)`
+    /// — so a funded account opens MORE fixed-size copies (up to the hard cap)
+    /// rather than larger ones. Falls back to the static caps if equity is unknown.
+    pub gross_pct: f64,
     /// Cut a copied position at this unrealized-loss fraction, in (0, 1] (C4).
     pub stop_loss_pct: f64,
     /// FRESHNESS cap: skip the copy if OUR entry price drifts more than this
@@ -133,6 +154,7 @@ impl CopyParams {
             per_position_micro: pm_config::usd_to_microusdc(params.per_position_usd)?,
             max_concurrent_positions: params.max_concurrent_positions,
             max_gross_micro: pm_config::usd_to_microusdc(params.max_gross_usd)?,
+            gross_pct: params.gross_pct,
             stop_loss_pct: params.stop_loss_pct,
             max_drift: params.max_drift,
             reaction_window_secs: params.reaction_window_secs,
@@ -572,6 +594,55 @@ fn concurrency_allows(open_positions: usize, max_concurrent: u32) -> bool {
     open_positions < max_concurrent as usize
 }
 
+/// On-chain reconcile thresholds. A wallet position is RESOLVED when its mark
+/// degenerates (`≤ eps` ⇒ loser, `≥ 1-eps` ⇒ winner) or it is `redeemable`; LIVE
+/// otherwise. A tracked row missing from the wallet for [`RECON_MISS_PRUNE`]
+/// consecutive reconciles is pruned (debounce vs a transient Data-API blip).
+const RECON_RESOLVED_EPS: f64 = 0.02;
+const RECON_MISS_PRUNE: u32 = 2;
+const RECON_DUST_SHARES: f64 = 0.01;
+
+/// What the on-chain reconcile should do with a tracked position, given the live
+/// wallet state for its `(condition_id, outcome_index)` as `(size, cur_price,
+/// redeemable)`, or `None` when the wallet doesn't hold it. Pure ⇒ unit-tested
+/// with no network/venue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconAction {
+    /// Still a live, tradeable holding — leave it under management.
+    Keep,
+    /// Held but resolved — settle (winner ⇒ book gain + redeem, loser ⇒ book loss).
+    Settle { won: bool },
+    /// Not (meaningfully) held in the wallet — prune candidate (debounced).
+    Gone,
+}
+
+pub(crate) fn reconcile_action(held: Option<(f64, f64, bool)>) -> ReconAction {
+    match held {
+        Some((size, cur_price, redeemable)) if size > RECON_DUST_SHARES => {
+            if redeemable || cur_price <= RECON_RESOLVED_EPS || cur_price >= 1.0 - RECON_RESOLVED_EPS
+            {
+                ReconAction::Settle { won: cur_price >= 0.5 }
+            } else {
+                ReconAction::Keep
+            }
+        }
+        _ => ReconAction::Gone,
+    }
+}
+
+/// Whether an exit (SELL FAK) rejection is TERMINAL — i.e. the venue is telling us
+/// the position isn't held as tracked (a balance/amount error that will recur on
+/// every retry: phantom row, already redeemed/sold, stale qty). Such a position
+/// must be PRUNED, not retried forever. A transient/other error (network, rate
+/// limit, one-sided book) returns `false` → keep and retry. Case-insensitive.
+pub(crate) fn exit_rejection_is_terminal(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("not enough balance")
+        || e.contains("invalid maker amount")
+        || e.contains("invalid taker amount")
+        || e.contains("invalid amount")
+}
+
 // ---------------------------------------------------------------------------
 // Store / inventory helpers (the booking glue, mirroring the MM)
 // ---------------------------------------------------------------------------
@@ -671,6 +742,22 @@ pub trait CopyVenue: Send {
     fn ensure_token(&mut self, _venue_id: &str, _neg_risk: bool, _ts: TickSize) -> Option<TokenId> {
         None
     }
+
+    /// The account's spendable CLOB collateral (µUSDC) — the "cash" leg of live
+    /// account equity that the copy strategy sizes its caps against. `None` (the
+    /// default) ⇒ unavailable (paper / no live balance), so the caller falls back
+    /// to the fixed configured caps. Only the LIVE venue overrides this.
+    fn available_collateral_micro(&mut self) -> impl Future<Output = Option<i128>> + Send {
+        async { None }
+    }
+
+    /// The deposit (proxy) wallet address (lowercase hex) whose Polymarket
+    /// portfolio value is the POSITIONS leg of live account equity (fetched via
+    /// the Data-API `/value`). `None` (default / paper) ⇒ no account to value, so
+    /// the caller falls back to the static caps.
+    fn deposit_wallet(&self) -> Option<String> {
+        None
+    }
 }
 
 /// How to TRADE a copied `(condition_id, outcome_index)`: the internal venue
@@ -729,6 +816,20 @@ impl CopyVenue for pm_execution::live::LiveVenue {
         Some(pm_execution::live::LiveVenue::ensure_token(
             self, venue_id, neg_risk, ts,
         ))
+    }
+
+    async fn available_collateral_micro(&mut self) -> Option<i128> {
+        match pm_execution::live::LiveVenue::available_collateral_micro(self).await {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::debug!(error = %e, "copy: collateral fetch failed — using cached/fallback caps");
+                None
+            }
+        }
+    }
+
+    fn deposit_wallet(&self) -> Option<String> {
+        Some(pm_execution::live::LiveVenue::deposit_wallet_hex(self))
     }
 }
 
@@ -817,6 +918,20 @@ impl CopyVenue for AppCopyVenue {
         match self {
             // Only the live venue can trade an unsynced market (live book reads).
             AppCopyVenue::Live(v) => CopyVenue::ensure_token(v, venue_id, neg_risk, ts),
+            AppCopyVenue::Paper(_) => None,
+        }
+    }
+
+    async fn available_collateral_micro(&mut self) -> Option<i128> {
+        match self {
+            AppCopyVenue::Live(v) => CopyVenue::available_collateral_micro(v).await,
+            AppCopyVenue::Paper(_) => None,
+        }
+    }
+
+    fn deposit_wallet(&self) -> Option<String> {
+        match self {
+            AppCopyVenue::Live(v) => CopyVenue::deposit_wallet(v),
             AppCopyVenue::Paper(_) => None,
         }
     }
@@ -944,6 +1059,29 @@ pub(crate) struct CopyLoop<V: CopyVenue> {
     /// `"copy"` day-realized ledger crossing the cap). `None` on paper/test paths
     /// with no store → the gate stays inert (a fresh run is never day-loss halted).
     day_loss_read: Option<ReadStore>,
+    /// Data-API feed (clone of the outer loop's) used to value the WHOLE account's
+    /// open positions (`/value`) — the POSITIONS leg of live account equity. `None`
+    /// (paper / no feed) ⇒ equity can't be valued → static caps.
+    feed: Option<Arc<DataApiClient>>,
+    /// EQUITY-SCALED CAPS (`params.gross_pct > 0`): last-fetched spendable CLOB
+    /// collateral (µUSDC) — the CASH leg of live account equity. `None` until the
+    /// first successful fetch ⇒ fall back to the static configured caps.
+    cash_micro: Option<i128>,
+    /// Last-fetched value of ALL the account's open positions (µUSDC) via the
+    /// Data-API `/value` — the POSITIONS leg of equity (the full Polymarket
+    /// portfolio, NOT just the copies this bot opened). `None` until first fetched.
+    positions_value_micro: Option<i128>,
+    /// Monotonic instant the equity legs were last refreshed (shared TTL gate), by
+    /// [`refresh_equity_if_stale`](Self::refresh_equity_if_stale) — so sizing
+    /// doesn't issue balance/value calls every poll.
+    equity_at: Option<std::time::Instant>,
+    /// ON-CHAIN RECONCILE (see [`reconcile_positions`](Self::reconcile_positions)):
+    /// consecutive cycles a tracked position was NOT found in the wallet's live
+    /// positions. A row is pruned only after [`RECON_MISS_PRUNE`] consecutive
+    /// misses, so a single transient Data-API blip can't orphan a real position.
+    recon_miss: HashMap<(String, i64), u32>,
+    /// Monotonic instant the on-chain reconcile last ran (its own TTL gate).
+    recon_at: Option<std::time::Instant>,
 }
 
 impl<V: CopyVenue> CopyLoop<V> {
@@ -951,6 +1089,227 @@ impl<V: CopyVenue> CopyLoop<V> {
     /// remaining capital / gross headroom are measured against.
     fn deployed_micro(&self) -> i128 {
         self.open.values().map(|p| p.cost_micro).sum()
+    }
+
+    /// Live account EQUITY in µUSDC = spendable CLOB collateral (cash) + the value
+    /// of ALL open positions in the account (the full Polymarket portfolio). `None`
+    /// until BOTH legs have been fetched (⇒ the caller uses the static caps).
+    fn equity_micro(&self) -> Option<i128> {
+        match (self.cash_micro, self.positions_value_micro) {
+            (Some(cash), Some(positions)) => Some(cash + positions),
+            _ => None,
+        }
+    }
+
+    /// The effective `(per_position, capital, max_gross, max_concurrent)` caps for
+    /// THIS cycle. With `gross_pct > 0` and known live equity: `max_gross =
+    /// gross_pct × equity`, the capital carve = `max_gross` (never binds before
+    /// gross), the per-copy notional stays FIXED at the configured
+    /// `per_position_usd`, and CONCURRENCY scales instead — `max_concurrent =
+    /// min(max_gross / per_position, configured hard cap)` — so a funded account
+    /// opens MORE fixed-size copies (never missing a signal for lack of a slot)
+    /// rather than fewer larger ones, up to the hard cap. Otherwise (`gross_pct ==
+    /// 0`, equity unknown, or non-positive) the static configured caps are returned.
+    fn effective_caps(&self) -> (i128, i128, i128, u32) {
+        let static_caps = (
+            self.params.per_position_micro,
+            self.params.capital.0,
+            self.params.max_gross_micro,
+            self.params.max_concurrent_positions,
+        );
+        if self.params.gross_pct <= 0.0 {
+            return static_caps;
+        }
+        let Some(equity) = self.equity_micro() else {
+            return static_caps;
+        };
+        if equity <= 0 {
+            return static_caps;
+        }
+        let max_gross = (equity as f64 * self.params.gross_pct) as i128;
+        if max_gross <= 0 {
+            return static_caps;
+        }
+        // Per-copy notional is FIXED (config `per_position_usd`); CONCURRENCY
+        // scales with the budget — how many fixed-size copies fit inside max_gross,
+        // hard-capped at `max_concurrent_positions` so a large account isn't spread
+        // across unbounded positions. `per_position > 0` by config validation.
+        let per_position = self.params.per_position_micro;
+        let hard_cap = i128::from(self.params.max_concurrent_positions);
+        let slots = (max_gross / per_position.max(1)).clamp(0, hard_cap) as u32;
+        (per_position, max_gross, max_gross, slots)
+    }
+
+    /// Refresh live account EQUITY when equity-scaled caps are on (`gross_pct > 0`)
+    /// and the cache is older than the TTL. Equity has TWO legs, fetched together:
+    /// the CASH (spendable CLOB collateral, via the venue) and the POSITIONS (the
+    /// WHOLE account's open-positions value via the Data-API `/value` — the full
+    /// Polymarket portfolio, not just the copies we opened). The cache only
+    /// advances when BOTH legs succeed, so a half-fetch never sizes off a wrong
+    /// equity; a transient failure keeps the prior value (or leaves it unset →
+    /// static fallback), never widening caps on a blip.
+    async fn refresh_equity_if_stale(&mut self) {
+        if self.params.gross_pct <= 0.0 {
+            return;
+        }
+        const TTL: Duration = Duration::from_secs(60);
+        if self.equity_at.map(|t| t.elapsed() < TTL).unwrap_or(false) {
+            return;
+        }
+        // Wallet first (immutable borrow) so the mutable collateral fetch is clear.
+        let wallet = self.venue.as_ref().and_then(|v| v.deposit_wallet());
+        let cash = match self.venue.as_mut() {
+            Some(v) => v.available_collateral_micro().await,
+            None => None,
+        };
+        // Positions leg: the account's full open-positions value. Clone the feed
+        // Arc so no `self` borrow is held across the await.
+        let feed = self.feed.clone();
+        let positions = match (feed, wallet) {
+            (Some(feed), Some(w)) => feed.portfolio_value_micro(&w).await.ok(),
+            _ => None,
+        };
+        if let (Some(cash), Some(positions)) = (cash, positions) {
+            self.cash_micro = Some(cash);
+            self.positions_value_micro = Some(positions);
+            self.equity_at = Some(std::time::Instant::now());
+            let (per_position, _capital, max_gross, max_concurrent) = self.effective_caps();
+            tracing::info!(
+                cash_micro = cash as i64,
+                positions_micro = positions as i64,
+                equity_micro = (cash + positions) as i64,
+                gross_pct = self.params.gross_pct,
+                max_gross_micro = max_gross as i64,
+                per_position_micro = per_position as i64,
+                max_concurrent,
+                "copy: equity refreshed — caps scaled to live account (cash + all positions)"
+            );
+        } else {
+            tracing::debug!(
+                cash_known = cash.is_some(),
+                positions_known = positions.is_some(),
+                "copy: equity refresh incomplete — keeping prior caps (static fallback if unset)"
+            );
+        }
+    }
+
+    /// ON-CHAIN RECONCILE (TTL-gated): make the bot's `open` book match what the
+    /// wallet ACTUALLY holds, so a resolved/redeemed/externally-closed position
+    /// doesn't linger as a phantom row — which would inflate `deployed`/concurrency
+    /// (starving new entries) and mislead the `pnl` dashboard. Fetches the wallet's
+    /// live positions (Data API) and, per tracked row: KEEP a live holding, SETTLE
+    /// a resolved one (loser ⇒ book −cost, winner ⇒ book +redeem), or — after
+    /// [`RECON_MISS_PRUNE`] consecutive misses, to survive a transient blip — PRUNE
+    /// one no longer held. Acts only on a SUCCESSFUL fetch; a fetch error is a
+    /// no-op (never prunes on missing data). Needs the feed + wallet (live only).
+    async fn reconcile_positions(&mut self) {
+        if self.open.is_empty() {
+            return;
+        }
+        const TTL: Duration = Duration::from_secs(60);
+        if self.recon_at.map(|t| t.elapsed() < TTL).unwrap_or(false) {
+            return;
+        }
+        let Some(wallet) = self.venue.as_ref().and_then(|v| v.deposit_wallet()) else {
+            return;
+        };
+        let Some(feed) = self.feed.clone() else {
+            return;
+        };
+        let positions = match feed.positions(&wallet, 0.0).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(error = %e, "copy: reconcile skipped — wallet positions fetch failed");
+                return;
+            }
+        };
+        self.recon_at = Some(std::time::Instant::now());
+        // Live wallet state keyed by (lower(condition_id), outcome_index).
+        let held: HashMap<(String, i64), (f64, f64, bool)> = positions
+            .iter()
+            .map(|p| {
+                (
+                    (p.condition_id.to_lowercase(), p.outcome_index),
+                    (p.size, p.cur_price, p.redeemable),
+                )
+            })
+            .collect();
+        let keys: Vec<(String, i64)> = self.open.keys().cloned().collect();
+        for key in keys {
+            let Some(pos) = self.open.get(&key).cloned() else {
+                continue;
+            };
+            match reconcile_action(held.get(&(key.0.to_lowercase(), key.1)).copied()) {
+                ReconAction::Keep => {
+                    self.recon_miss.remove(&key);
+                }
+                ReconAction::Settle { won } => {
+                    self.recon_miss.remove(&key);
+                    self.settle_reconciled(&key, &pos, won).await;
+                }
+                ReconAction::Gone => {
+                    let n = self.recon_miss.entry(key.clone()).or_insert(0);
+                    *n += 1;
+                    if *n >= RECON_MISS_PRUNE {
+                        self.prune_gone(&key, &pos);
+                        self.recon_miss.remove(&key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Settle a tracked position the wallet shows as RESOLVED: book the outcome
+    /// (winner ⇒ +qty redeemed, loser ⇒ 0) into inventory + the day-realized
+    /// ledger, drop it from `open`, persist the close, and redeem on-chain when a
+    /// relayer is present + it won. Same booking shape as [`settle_resolution`].
+    async fn settle_reconciled(&mut self, key: &(String, i64), pos: &CopyPosition, won: bool) {
+        let value = if won { pos.qty_micro } else { 0 };
+        let realized_before = self.inv.realized(pos.token).0;
+        self.inv.on_fill(pos.token, -pos.qty_micro, Usdc(value));
+        let delta = self.inv.realized(pos.token).0 - realized_before;
+        self.realized_micro += delta;
+        self.open.remove(key);
+        self.persist_close(key);
+        if delta != 0 {
+            let _ = self.store_tx.try_send(StoreMsg::DayRealized {
+                utc_day: utc_day_from_ms(now_ms()),
+                strategy: "copy".into(),
+                delta_micro: delta,
+            });
+        }
+        tracing::info!(
+            condition_id = %key.0,
+            outcome_index = key.1,
+            won,
+            value_micro = value as i64,
+            realized_delta = delta as i64,
+            "copy: reconciled a resolved position from live on-chain state"
+        );
+        if let Some(relayer) = self.relayer.clone().filter(|_| won) {
+            match relayer.redeem(pos.condition).await {
+                Ok(_) => tracing::info!(condition_id = %key.0, "copy: redeemed reconciled winner"),
+                Err(e) => tracing::warn!(error = %e, condition_id = %key.0, "copy: reconciled-winner redeem failed (booked locally)"),
+            }
+        }
+    }
+
+    /// Prune a tracked position the wallet NO LONGER holds (redeemed/sold/settled
+    /// off-bot). Flatten inventory at cost (NEUTRAL realized — the true P&L already
+    /// happened on-chain and is reflected in live equity; we don't fabricate it),
+    /// drop from `open`, and persist the close, so `deployed`/concurrency + `pnl`
+    /// track reality. Distinct from a settle: here there is no wallet mark to book.
+    fn prune_gone(&mut self, key: &(String, i64), pos: &CopyPosition) {
+        self.inv.on_fill(pos.token, -pos.qty_micro, Usdc(pos.cost_micro));
+        self.open.remove(key);
+        self.persist_close(key);
+        tracing::warn!(
+            condition_id = %key.0,
+            outcome_index = key.1,
+            cost_micro = pos.cost_micro as i64,
+            "copy: reconciled AWAY a position no longer held on-chain (pruned stale row; \
+             realized P&L already settled on-chain)"
+        );
     }
 
     /// View for the per-strategy dashboard. Surfaces the latched HALT reason, the
@@ -1045,6 +1404,15 @@ impl<V: CopyVenue> CopyLoop<V> {
         if self.venue.is_none() {
             return; // paper-without-venue → inert
         }
+        // EQUITY-SCALED CAPS: only when there is something to size. Refresh live
+        // cash (TTL-gated inside), then snapshot the effective caps ONCE so every
+        // candidate this cycle sizes against a single equity view. No candidates ⇒
+        // skip the balance call entirely.
+        if !candidates.is_empty() {
+            self.refresh_equity_if_stale().await;
+        }
+        let (eff_per_position, eff_capital, eff_max_gross, eff_max_concurrent) =
+            self.effective_caps();
         // Per-cycle FUNNEL counters, logged once at the end so an operator can SEE
         // exactly where this cycle's candidates died instead of inferring it from
         // scattered per-candidate lines.
@@ -1116,24 +1484,23 @@ impl<V: CopyVenue> CopyLoop<V> {
             // DEBUG, not INFO: when full this fires for EVERY remaining candidate
             // each poll (dozens of lines); the per-cycle funnel's `skip_at_cap`
             // already reports the count.
-            if !concurrency_allows(self.open.len(), self.params.max_concurrent_positions) {
+            if !concurrency_allows(self.open.len(), eff_max_concurrent) {
                 tracing::debug!(
                     open = self.open.len(),
+                    max_concurrent = eff_max_concurrent,
                     "copy: skip entry — at concurrency cap (retry while fresh)"
                 );
                 skip_at_cap += 1;
                 continue;
             }
-            // Capital + gross caps → size.
+            // Capital + gross caps → size. With `gross_pct > 0` these SCALE off
+            // live account equity (cash + positions), recomputed per cycle; else
+            // they are the static configured caps. `eff_*` is resolved once before
+            // the loop so every candidate this cycle sizes against one snapshot.
             let deployed = self.deployed_micro();
-            let capital_left = self.params.capital.0 - deployed;
-            let gross_left = self.params.max_gross_micro - deployed;
-            let size = copy_position_size_micro(
-                self.params.per_position_micro,
-                capital_left,
-                gross_left,
-                entry_px,
-            );
+            let capital_left = eff_capital - deployed;
+            let gross_left = eff_max_gross - deployed;
+            let size = copy_position_size_micro(eff_per_position, capital_left, gross_left, entry_px);
             if size <= 0 {
                 // DEBUG, not INFO: like the concurrency cap, this fires for every
                 // remaining candidate once the gross/capital budget is exhausted;
@@ -1393,6 +1760,19 @@ impl<V: CopyVenue> CopyLoop<V> {
             self.persist_close(key);
             return;
         }
+        // A holding at/below the venue's minimum sellable size can't be market-sold
+        // (the maker amount rounds sub-min → the CLOB rejects "invalid maker
+        // amount"). Don't retry it forever — prune it (a negligible on-chain remnant
+        // the reconcile also covers). This is the dust case behind the exit spam.
+        if pos.qty_micro < MIN_COPY_SHARES_MICRO {
+            tracing::warn!(
+                condition_id = %key.0,
+                qty_micro = pos.qty_micro as i64,
+                "copy: exit skipped — below venue minimum; pruning unsellable dust row"
+            );
+            self.prune_gone(key, pos);
+            return;
+        }
         let order = Order::new(
             format!("copy-exit:{}:{}", key.0, key.1),
             pos.token,
@@ -1406,7 +1786,24 @@ impl<V: CopyVenue> CopyLoop<V> {
             Some(v) => match v.submit_fak(&order).await {
                 Ok(o) => o,
                 Err(e) => {
-                    tracing::warn!(error = %e, condition_id = %key.0, "copy: exit FAK rejected");
+                    let msg = e.to_string();
+                    // A balance/amount rejection is DEFINITIVE proof we don't hold
+                    // this position as tracked (phantom DB row / already
+                    // redeemed/sold / stale qty). Prune it NOW instead of retrying
+                    // the same doomed sell every ~10s (the observed stop-loss spam
+                    // on a not-held token) — the venue is the source of truth here,
+                    // faster + surer than waiting on the reconcile's debounce.
+                    if exit_rejection_is_terminal(&msg) {
+                        tracing::warn!(
+                            error = %msg,
+                            condition_id = %key.0,
+                            "copy: exit rejected for balance/amount — not held as tracked; pruning stale row"
+                        );
+                        self.prune_gone(key, pos);
+                    } else {
+                        // Transient (network/rate/etc.) — keep it and retry next cycle.
+                        tracing::warn!(error = %msg, condition_id = %key.0, "copy: exit FAK rejected (transient) — retry next cycle");
+                    }
                     return;
                 }
             },
@@ -1676,6 +2073,10 @@ async fn run_poll_cycle<V: CopyVenue>(
     // RELEASE the latch on a UTC-day rollover, else RE-LATCH if the cumulative
     // `"copy"` ledger (or worst-point snapshot) crossed the cap mid-session.
     state.refresh_day_loss_gate(now_ms_val);
+    // ON-CHAIN RECONCILE (TTL-gated inside): prune phantom rows + settle resolved
+    // ones BEFORE the exit sweep / marks / entries, so deployed + concurrency and
+    // the marked book all reflect what the wallet actually holds this cycle.
+    state.reconcile_positions().await;
     let mut recent_by_wallet: HashMap<String, Vec<Trade>> = HashMap::new();
     for wallet in whitelist {
         if let Ok(trades) = client.trades(TradesFilter::User(wallet), POLL_TRADE_LIMIT).await {
@@ -1999,6 +2400,12 @@ async fn run_copy_loop<V: CopyVenue>(
         day: utc_day_from_ms(now_ms()),
         day_loss_halted: false,
         day_loss_read: None,
+        feed: feed.clone(),
+        cash_micro: None,
+        positions_value_micro: None,
+        equity_at: None,
+        recon_miss: HashMap::new(),
+        recon_at: None,
     };
     // PERSISTENT UTC-day loss cap (mirrors the MM): before the first tick, read
     // today's persisted `"copy"` P&L and latch `day_loss_halted` if the day is
@@ -2061,8 +2468,18 @@ async fn run_copy_loop<V: CopyVenue>(
         tokio::select! {
             _ = whitelist_tick.tick() => {
                 if let Some(client) = &feed {
-                    match refresh_whitelist(client, &state.params).await {
-                        Some(wl) => {
+                    // GUARD the heavy EdgePerBet rank (up to top_n traders × paged
+                    // trade history) with a timeout: it shares this `select!` with
+                    // the poll arm, so a slow/stuck refresh would otherwise FREEZE
+                    // the whole loop (no polling, no position management). On
+                    // timeout, keep the prior whitelist and let the loop continue.
+                    match tokio::time::timeout(
+                        WHITELIST_REFRESH_TIMEOUT,
+                        refresh_whitelist(client, &state.params),
+                    )
+                    .await
+                    {
+                        Ok(Some(wl)) => {
                             tracing::info!(
                                 traders = wl.len(),
                                 "copy: whitelist refreshed (EdgePerBet, top {})",
@@ -2072,9 +2489,14 @@ async fn run_copy_loop<V: CopyVenue>(
                         }
                         // Keep the PRIOR whitelist on any fetch error — never
                         // poll/trade on a transient-failure-emptied set.
-                        None => tracing::warn!(
+                        Ok(None) => tracing::warn!(
                             traders = whitelist.len(),
                             "copy: whitelist refresh failed — keeping prior whitelist"
+                        ),
+                        Err(_) => tracing::warn!(
+                            traders = whitelist.len(),
+                            "copy: whitelist refresh TIMED OUT — keeping prior whitelist (guards \
+                             against a hung Data-API rank freezing the loop)"
                         ),
                     }
                 }
@@ -2083,8 +2505,37 @@ async fn run_copy_loop<V: CopyVenue>(
                 // TRADE only when NOT paused AND a venue is present — otherwise
                 // the cycle is skipped entirely (no orders).
                 if !paused && state.venue.is_some() {
-                    run_poll_cycle(&mut state, &feed, &whitelist, &mut seen).await;
+                    // GUARD the whole cycle with a timeout: a hung venue/Data-API
+                    // await here would otherwise silently STALL the loop (stopping
+                    // stop-losses / follow-exits / reconciles) while the rest of the
+                    // process looks healthy. On timeout, skip this cycle; the next
+                    // tick retries. (This is the reliability fix for the observed
+                    // ~1 h silent stall.)
+                    if tokio::time::timeout(
+                        POLL_CYCLE_TIMEOUT,
+                        run_poll_cycle(&mut state, &feed, &whitelist, &mut seen),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!(
+                            timeout_s = POLL_CYCLE_TIMEOUT.as_secs(),
+                            "copy: poll cycle TIMED OUT — skipped, retrying next tick \
+                             (a network/venue call hung)"
+                        );
+                    }
                 }
+                // HEARTBEAT (every poll tick, paused or not): makes the loop's
+                // liveness unambiguous in the logs — a stall now shows as the
+                // heartbeat STOPPING, instead of silent ambiguity vs. "just quiet".
+                tracing::info!(
+                    open = state.open.len(),
+                    deployed_usd = state.deployed_micro() as f64 / 1e6,
+                    whitelist = whitelist.len(),
+                    paused,
+                    halted = state.halted || state.day_loss_halted,
+                    "copy: heartbeat"
+                );
             }
             cmd = ctl_rx.recv() => match cmd {
                 Some(StrategyCommand::SetPaused(p)) => paused = p,
@@ -2622,6 +3073,12 @@ mod tests {
             day: utc_day_from_ms(now_ms()),
             day_loss_halted: false,
             day_loss_read: None,
+            feed: None,
+            cash_micro: None,
+            positions_value_micro: None,
+            equity_at: None,
+            recon_miss: HashMap::new(),
+            recon_at: None,
         };
         (state, writer)
     }
@@ -2709,6 +3166,213 @@ mod tests {
 
     /// The freshness gate: an ask that ran past `max_drift` off the trader's
     /// trigger → NO order, and the (chased) signal is consumed.
+    #[tokio::test]
+    async fn effective_caps_fix_per_position_and_scale_concurrency() {
+        let venue = MockVenue {
+            asks: HashMap::new(),
+            bids: HashMap::new(),
+            orders: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        let mut params = copy_params(); // per-copy $5
+        params.gross_pct = 0.5;
+        params.max_concurrent_positions = 20; // the HARD cap on scaled concurrency
+        let (mut state, writer) = loop_with(venue, HashMap::new(), params.clone());
+
+        // (1) No balance fetched yet ⇒ SAFE static fallback (incl. the hard cap).
+        assert_eq!(
+            state.effective_caps(),
+            (
+                params.per_position_micro,
+                params.capital.0,
+                params.max_gross_micro,
+                params.max_concurrent_positions
+            ),
+            "equity unknown ⇒ static configured caps"
+        );
+
+        // (2) Equity = cash $20 + positions $20 = $40 → max_gross = 50% = $20.
+        // Per-copy stays FIXED at $5; concurrency = min($20 / $5, 20) = 4.
+        state.cash_micro = Some(20_000_000);
+        state.positions_value_micro = Some(20_000_000);
+        let (per_position, capital, max_gross, slots) = state.effective_caps();
+        assert_eq!(per_position, 5_000_000, "per-copy is FIXED at $5 (does not scale)");
+        assert_eq!(max_gross, 20_000_000, "max_gross = gross_pct × equity");
+        assert_eq!(capital, 20_000_000, "capital carve = max_gross");
+        assert_eq!(slots, 4, "concurrency = min(max_gross / per_position, hard cap)");
+
+        // (3) Big account → concurrency HARD-CAPPED at 20 (not $250/$5 = 50).
+        state.cash_micro = Some(500_000_000); // equity $500 → max_gross $250
+        state.positions_value_micro = Some(0);
+        let (pp_big, _cap_big, mg_big, slots_big) = state.effective_caps();
+        assert_eq!(pp_big, 5_000_000, "per-copy still $5");
+        assert_eq!(mg_big, 250_000_000);
+        assert_eq!(slots_big, 20, "concurrency hard-capped at 20 trades");
+
+        // (4) gross_pct = 0 ⇒ static caps regardless of equity.
+        let mut static_params = copy_params();
+        static_params.gross_pct = 0.0;
+        let (mut s2, w2) = loop_with(
+            MockVenue {
+                asks: HashMap::new(),
+                bids: HashMap::new(),
+                orders: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+            },
+            HashMap::new(),
+            static_params.clone(),
+        );
+        s2.cash_micro = Some(1_000_000_000);
+        s2.positions_value_micro = Some(1_000_000_000);
+        assert_eq!(
+            s2.effective_caps(),
+            (
+                static_params.per_position_micro,
+                static_params.capital.0,
+                static_params.max_gross_micro,
+                static_params.max_concurrent_positions
+            ),
+            "gross_pct = 0 ⇒ static caps regardless of equity"
+        );
+
+        drop(state);
+        drop(s2);
+        let _ = writer.await;
+        let _ = w2.await;
+    }
+
+    #[test]
+    fn reconcile_action_categorizes_wallet_state() {
+        use ReconAction::*;
+        // Live holding (held, mid mark, not redeemable) → keep.
+        assert_eq!(reconcile_action(Some((10.0, 0.55, false))), Keep);
+        // Resolved loser (mark ~0) → settle lost.
+        assert_eq!(reconcile_action(Some((10.0, 0.0, false))), Settle { won: false });
+        assert_eq!(reconcile_action(Some((10.0, 0.01, false))), Settle { won: false });
+        // Resolved winner (mark ~1) → settle won.
+        assert_eq!(reconcile_action(Some((10.0, 1.0, false))), Settle { won: true });
+        assert_eq!(reconcile_action(Some((10.0, 0.99, false))), Settle { won: true });
+        // Redeemable ⇒ resolved regardless of mid mark.
+        assert_eq!(reconcile_action(Some((10.0, 0.6, true))), Settle { won: true });
+        assert_eq!(reconcile_action(Some((10.0, 0.4, true))), Settle { won: false });
+        // Not held / dust / absent → gone.
+        assert_eq!(reconcile_action(None), Gone);
+        assert_eq!(reconcile_action(Some((0.0, 0.5, false))), Gone);
+        assert_eq!(reconcile_action(Some((0.005, 0.5, false))), Gone);
+    }
+
+    #[tokio::test]
+    async fn reconcile_settle_and_prune_clean_the_book() {
+        let win = TokenId(1); // resolved winner
+        let lose = TokenId(2); // resolved loser
+        let gone = TokenId(3); // no longer held on-chain
+        let venue = MockVenue {
+            asks: HashMap::new(),
+            bids: HashMap::new(),
+            orders: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        let (mut state, writer) = loop_with(venue, HashMap::new(), copy_params());
+        // Seed 3 opens: each 10 sh bought @ $0.50 (cost $5).
+        for (tok, cid) in [(win, "win"), (lose, "lose"), (gone, "gone")] {
+            state.inv.on_fill(tok, 10_000_000, Usdc(-5_000_000));
+            state.open.insert(
+                (cid.to_string(), 0),
+                CopyPosition {
+                    trader: "0xabc".into(),
+                    entry_ts: 0,
+                    qty_micro: 10_000_000,
+                    cost_micro: 5_000_000,
+                    token: tok,
+                    ts: TickSize::Cent,
+                    condition: B256::ZERO,
+                    asset: format!("{cid}#0"),
+                    neg_risk: false,
+                },
+            );
+        }
+        assert_eq!(state.open.len(), 3);
+        assert_eq!(state.deployed_micro(), 15_000_000);
+
+        // Winner: redeemed for $10 → realized +$5.
+        let p = state.open[&("win".to_string(), 0)].clone();
+        state.settle_reconciled(&("win".to_string(), 0), &p, true).await;
+        // Loser: 0 proceeds → realized −$5.
+        let p = state.open[&("lose".to_string(), 0)].clone();
+        state.settle_reconciled(&("lose".to_string(), 0), &p, false).await;
+        // Gone: neutral flatten at cost → realized unchanged.
+        let p = state.open[&("gone".to_string(), 0)].clone();
+        state.prune_gone(&("gone".to_string(), 0), &p);
+
+        assert_eq!(state.open.len(), 0, "all three reconciled out of the book");
+        assert_eq!(state.deployed_micro(), 0, "deployed frees up for correct sizing");
+        assert_eq!(
+            state.realized_micro, 0,
+            "net realized = +$5 (win) − $5 (lose) + $0 (neutral prune)"
+        );
+
+        drop(state);
+        let _ = writer.await;
+    }
+
+    #[test]
+    fn exit_rejection_terminal_vs_transient() {
+        // TERMINAL (venue says the position isn't held as tracked) → prune.
+        assert!(exit_rejection_is_terminal(
+            "live venue error: 400 Bad Request: {\"error\":\"invalid maker amount\"}"
+        ));
+        assert!(exit_rejection_is_terminal(
+            "not enough balance / allowance: the balance is not enough -> balance: 4575, order amount: 8470000"
+        ));
+        assert!(exit_rejection_is_terminal("invalid amounts, the sell orders maker amount ..."));
+        assert!(exit_rejection_is_terminal("INVALID MAKER AMOUNT")); // case-insensitive
+        // TRANSIENT / other → keep and retry.
+        assert!(!exit_rejection_is_terminal("connection reset by peer"));
+        assert!(!exit_rejection_is_terminal("429 Too Many Requests"));
+        assert!(!exit_rejection_is_terminal("request timed out"));
+    }
+
+    #[tokio::test]
+    async fn taker_exit_prunes_sub_minimum_dust() {
+        let token = TokenId(1);
+        let venue = MockVenue {
+            asks: HashMap::new(),
+            bids: HashMap::new(),
+            orders: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        let orders = Arc::clone(&venue.orders);
+        let (mut state, writer) = loop_with(venue, HashMap::new(), copy_params());
+        // Seed a sub-minimum holding: 3 shares (< the 5-share venue min), cost $2.
+        state.inv.on_fill(token, 3_000_000, Usdc(-2_000_000));
+        let pos = CopyPosition {
+            trader: "0xabc".into(),
+            entry_ts: 0,
+            qty_micro: 3_000_000,
+            cost_micro: 2_000_000,
+            token,
+            ts: TickSize::Cent,
+            condition: B256::ZERO,
+            asset: "dust#0".into(),
+            neg_risk: false,
+        };
+        state.open.insert(("dust".to_string(), 0), pos.clone());
+        assert_eq!(state.open.len(), 1);
+        // A market sell of sub-min dust would be rejected by the venue; taker_exit
+        // must prune it instead of looping — no submit attempted.
+        state
+            .taker_exit(&("dust".to_string(), 0), &pos, Px::new(50, TickSize::Cent).unwrap())
+            .await;
+        assert_eq!(state.open.len(), 0, "sub-minimum dust position pruned, not retried");
+        assert!(
+            orders.lock().unwrap().is_empty(),
+            "no order submitted for unsellable dust"
+        );
+
+        drop(state);
+        let _ = writer.await;
+    }
+
     #[tokio::test]
     async fn entry_skipped_when_price_ran_past_drift() {
         let token = TokenId(1);
@@ -2910,6 +3574,12 @@ mod tests {
             day: utc_day_from_ms(now_ms()),
             day_loss_halted: false,
             day_loss_read: None,
+            feed: None,
+            cash_micro: None,
+            positions_value_micro: None,
+            equity_at: None,
+            recon_miss: HashMap::new(),
+            recon_at: None,
         };
 
         let mut seen = SeenKeys::default();
@@ -3517,6 +4187,12 @@ mod tests {
             day: utc_day_from_ms(now_ms()),
             day_loss_halted: false,
             day_loss_read: None,
+            feed: None,
+            cash_micro: None,
+            positions_value_micro: None,
+            equity_at: None,
+            recon_miss: HashMap::new(),
+            recon_at: None,
         };
         let mut seen2 = SeenKeys::default();
         dormant

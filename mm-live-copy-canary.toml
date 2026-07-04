@@ -17,8 +17,10 @@
 # BLAST RADIUS (DIRECTIONAL — read this):
 #   * A copy is a one-sided bet: if the market resolves AGAINST us, the whole
 #     position is lost. The controls are HARD and small:
-#       - per_position_usd ($5) × max_concurrent_positions (3) ⇒ ≤ ~$15 at risk
-#         at once; max_gross_usd ($20) is the ceiling.
+#       - DYNAMIC: max_gross = gross_pct (0.5) × live account equity. Each copy is
+#         a FIXED $5; the NUMBER of concurrent copies scales with the budget
+#         (min(max_gross / $5, 20-trade hard cap)), so risk stays ≤ 50% of the
+#         account while never missing a signal for lack of a slot once funded.
 #       - stop_loss_pct (0.25) cuts a losing copy at -25% before resolution.
 #       - inventory_stop_loss / daily_loss / live.session_loss latch a halt.
 #   * UNIVERSE: the synced universe IS this strategy's OWN whitelist's active
@@ -39,20 +41,32 @@
 #     --live --config mm-live-copy-canary.toml --db /tmp/copy-canary.sqlite
 
 [capital]
-bankroll_usd   = 30.0   # Σ strategy capital ≤ this; copy carves $25, leaving a buffer
+bankroll_usd   = 30.0   # startup carve ceiling — a FALLBACK now: dynamic gross_pct sizing overrides at runtime
 per_market_usd = 10.0   # arb per-market sizing — MOOT (arb neutered below), but must be ≤ bankroll to pass validation (default 1000 > 30 would fail)
 
 [strategies.copy]
 enabled     = true
 live        = true
-capital_usd = 25.0    # MUST be <= your deposit-wallet USDC and <= bankroll
+capital_usd = 25.0    # FALLBACK carve (dynamic gross_pct overrides at runtime); MUST be <= bankroll
 
 [copy]
-per_position_usd        = 5.0    # per-copy notional (≥5 shares clears the venue min)
-max_concurrent_positions = 5     # at most 3 open copies → ≤ ~$15 directional at once
-max_gross_usd           = 25.0   # hard ceiling on total open copy exposure (= capital carve → up to 5 concurrent $5 copies)
-stop_loss_pct           = 0.25   # cut a losing copy at -25%
-max_drift               = 0.15   # FRESHNESS: skip if our entry is >15% off the trader's fill
+# DYNAMIC SIZING: with gross_pct > 0 the caps SCALE with live account EQUITY
+# (spendable CLOB collateral + marked value of open copies), refreshed each cycle
+# (60 s TTL). Each cycle: max_gross = gross_pct × equity; per-copy notional =
+# max_gross / max_concurrent_positions; the capital carve = max_gross. The *_usd
+# knobs below are only the FALLBACK — used at startup before the first balance
+# read, or if the balance endpoint is unreachable (never widens risk).
+gross_pct                = 0.5   # ≤ 50% of the account at risk; scales up as you win/deposit
+per_position_usd         = 5.0   # FIXED per-copy notional (≥5 shares clears the venue min) — does NOT scale
+# CONCURRENCY scales with the budget instead of the per-copy size: each cycle
+# max_concurrent = min(max_gross / per_position_usd, this hard cap). So a funded
+# account simply opens MORE $5 copies (never missing a signal for lack of a slot),
+# up to 20 open at once; a small account is naturally fewer (e.g. $17 gross / $5 ⇒
+# 3). In static mode (gross_pct=0) this is just the fixed cap.
+max_concurrent_positions = 20
+max_gross_usd            = 15.0  # FALLBACK gross ceiling — used only if gross_pct=0 or equity is unknown
+stop_loss_pct            = 0.25  # cut a losing copy at -25%
+max_drift                = 0.15  # FRESHNESS: skip if our entry is >15% off the trader's fill
 reaction_window_secs    = 1800   # only copy a buy seen within 30 min
 min_bets                = 5     # min resolved bets to rank a trader (EdgePerBet)
 top_n                   = 100     # whitelist size

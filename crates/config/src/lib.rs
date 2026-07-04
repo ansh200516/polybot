@@ -790,10 +790,23 @@ impl Default for RewardFarm {
 pub struct CopyParamsCfg {
     /// Notional opened per copied position, USD.
     pub per_position_usd: f64,
-    /// Cap on simultaneously-open copied positions.
+    /// Cap on simultaneously-open copied positions. In DYNAMIC mode
+    /// (`gross_pct > 0`) this is the HARD CAP on the budget-scaled concurrency
+    /// (`min(max_gross / per_position, this)`); in static mode it's the fixed cap.
     pub max_concurrent_positions: u32,
-    /// Gross exposure cap summed across open copied positions, USD.
+    /// Gross exposure cap summed across open copied positions, USD. Used as the
+    /// FALLBACK when `gross_pct == 0` OR the live account equity can't be fetched.
     pub max_gross_usd: f64,
+    /// DYNAMIC gross cap as a fraction of live account EQUITY (cash + open
+    /// positions value), in `[0, 1]`. `0` (default) ⇒ use the fixed
+    /// `max_gross_usd`. When `> 0`, the copy strategy each cycle sets
+    /// `max_gross = gross_pct × equity` (also its capital carve) and keeps the
+    /// per-copy notional FIXED at `per_position_usd`, scaling the CONCURRENCY
+    /// instead — `max_concurrent = min(max_gross / per_position, max_concurrent_positions)`
+    /// — so a funded account opens more fixed-size copies (up to the cap), never
+    /// missing a signal for lack of a slot. Falls back to `max_gross_usd` if the
+    /// balance fetch fails. Example: `0.5` = never more than half the account at risk.
+    pub gross_pct: f64,
     /// Cut a copied position at this unrealized-loss fraction (0.25 = −25%).
     /// A fraction in (0, 1].
     pub stop_loss_pct: f64,
@@ -828,6 +841,8 @@ impl Default for CopyParamsCfg {
             per_position_usd: 5.0,
             max_concurrent_positions: 3,
             max_gross_usd: 25.0,
+            // 0 ⇒ fixed max_gross_usd; set > 0 (e.g. 0.5) for equity-scaled caps.
+            gross_pct: 0.0,
             // Tight stop / freshness by default — conservative.
             stop_loss_pct: 0.25,
             max_drift: 0.15,
@@ -1261,6 +1276,11 @@ impl Config {
         }
         if cp.max_gross_usd <= 0.0 || !cp.max_gross_usd.is_finite() {
             return Err(ConfigError::BadMoney("copy.max_gross_usd must be > 0"));
+        }
+        // Dynamic equity-scaled gross: 0 = off (use fixed max_gross_usd). A value
+        // > 1 would risk more than the whole account; NaN/∞ is caught by the range.
+        if !(cp.gross_pct.is_finite() && (0.0..=1.0).contains(&cp.gross_pct)) {
+            return Err(ConfigError::BadMoney("copy.gross_pct must be in [0, 1]"));
         }
         if cp.max_concurrent_positions < 1 {
             return Err(ConfigError::BadMoney(

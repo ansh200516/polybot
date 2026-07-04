@@ -345,6 +345,17 @@ impl DataApiClient {
         parse_closed_positions(&body)
     }
 
+    /// The account's total OPEN-positions value in µUSDC via `/value?user=` — the
+    /// "Portfolio" positions figure the Polymarket UI shows (ALL of the wallet's
+    /// positions, not just ones our bot opened). This is the positions leg of the
+    /// copy strategy's live account equity (paired with the CLOB cash balance).
+    /// `Ok(0)` for an empty portfolio; errors only on transport/parse failure.
+    pub async fn portfolio_value_micro(&self, user: &str) -> Result<i128, IngestError> {
+        let url = format!("{}/value?user={}", self.base, user);
+        let body = self.get(&url).await?;
+        parse_portfolio_value_micro(&body)
+    }
+
     async fn get(&self, url: &str) -> Result<String, IngestError> {
         self.http
             .get(url)
@@ -379,10 +390,37 @@ pub fn parse_closed_positions(body: &str) -> Result<Vec<ClosedPos>, IngestError>
     serde_json::from_str(body).map_err(|e| IngestError::Parse(format!("closed-positions: {e}")))
 }
 
+/// Parse `/value` (`[{"user":..,"value":<usd float>}]`) to µUSDC (value × 1e6).
+/// An empty array (no positions) ⇒ 0. Errors only on unparseable JSON.
+pub fn parse_portfolio_value_micro(body: &str) -> Result<i128, IngestError> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| IngestError::Parse(format!("value: {e}")))?;
+    let usd = v
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|o| o.get("value"))
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.0);
+    Ok((usd * 1_000_000.0).round() as i128)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn parses_portfolio_value_to_micro() {
+        // Real /value shape: an array with one {user, value} object (USD float).
+        assert_eq!(
+            parse_portfolio_value_micro(r#"[{"user":"0x26fe","value":34.9483}]"#).unwrap(),
+            34_948_300
+        );
+        // Empty portfolio ⇒ 0 (no positions), not an error.
+        assert_eq!(parse_portfolio_value_micro("[]").unwrap(), 0);
+        // Garbage ⇒ error (caller falls back to static caps / prior equity).
+        assert!(parse_portfolio_value_micro("nope").is_err());
+    }
 
     #[test]
     fn parses_leaderboard_shape() {
