@@ -21,7 +21,8 @@
 #         a FIXED $5; the NUMBER of concurrent copies scales with the budget
 #         (min(max_gross / $5, 20-trade hard cap)), so risk stays ≤ 50% of the
 #         account while never missing a signal for lack of a slot once funded.
-#       - stop_loss_pct (0.25) cuts a losing copy at -25% before resolution.
+#       - stop_loss_pct (0.50) cuts a losing copy at -50% before resolution
+#         (wide, to avoid whipsawing on volatile in-play swings that revert).
 #       - inventory_stop_loss / daily_loss / live.session_loss latch a halt.
 #   * UNIVERSE: the synced universe IS this strategy's OWN whitelist's active
 #     markets — main ranks the EdgePerBet whitelist once and syncs the markets
@@ -65,7 +66,7 @@ per_position_usd         = 5.0   # FIXED per-copy notional (≥5 shares clears t
 # 3). In static mode (gross_pct=0) this is just the fixed cap.
 max_concurrent_positions = 20
 max_gross_usd            = 15.0  # FALLBACK gross ceiling — used only if gross_pct=0 or equity is unknown
-stop_loss_pct            = 0.25  # cut a losing copy at -25%
+stop_loss_pct            = 0.50  # cut a losing copy at -50% (wider than 25% to avoid whipsaws: in-play sports swing wildly then revert, so a tight stop sells dips that recover)
 max_drift                = 0.15  # FRESHNESS: skip if our entry is >15% off the trader's fill
 reaction_window_secs    = 1800   # only copy a buy seen within 30 min
 min_bets                = 5     # min resolved bets to rank a trader (EdgePerBet)
