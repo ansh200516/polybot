@@ -302,6 +302,34 @@ impl InventoryRisk {
         e.basis = basis_cash;
     }
 
+    /// Roll to a FRESH accounting day (called on a UTC-day rollover by an
+    /// inventory-bearing strategy): CLEAR the sticky halt latch and REBASE the
+    /// realized-P&L baseline to zero per token, while KEEPING each token's open
+    /// `net` + `basis` so the unrealized mark-to-market (and therefore the
+    /// `StopLoss` floor) still measures the standing position unchanged.
+    ///
+    /// This turns the `DailyLoss` floor into a TRUE per-day cap. `mark`'s
+    /// `mtm = realized + unrealized`; with realized rebased to 0, the total-P&L
+    /// floor now measures only the NEW day's booked P&L plus the current open
+    /// bleed — so a PRIOR day's banked losses no longer keep the strategy halted
+    /// forever (the observed "still halted days later" until a manual restart).
+    /// It self-heals, yet stays safe: the urgent `StopLoss` floor is re-armed and
+    /// `mark` will latch AGAIN this cycle if the standing inventory is STILL
+    /// bleeding past its cap, so genuinely-bad OPEN risk is never cleared away —
+    /// only the stale day-scoped latch and last day's realized are reset.
+    ///
+    /// NOTE: this intentionally breaks the per-token `realized − basis = Σ cash`
+    /// invariant at the roll boundary (realized is rebased to 0). Callers that
+    /// need a cumulative realized total across days must track it themselves (the
+    /// copy strategy keeps its own `realized_micro`; `mark` only ever consults
+    /// this realized for the halt floors, which is exactly what we rebase).
+    pub fn roll_day(&mut self) {
+        self.halted = None;
+        for ti in self.by_token.values_mut() {
+            ti.realized = Usdc(0);
+        }
+    }
+
     /// Pre-fill inventory cap check for a single quote (spec §5, Task 2.2).
     /// Read-only and INERT until a strategy calls it (Phase 4). Mirrors the
     /// plain-data, inclusive-boundary style of `RiskEngine::pre_check`.
@@ -1412,5 +1440,76 @@ mod tests {
         assert_eq!(st.mtm_pnl, Usdc(-10_000_000));
         assert_eq!(st.net_by_token, vec![(t, 100 * SHARE)], "seeded net is marked");
         assert_eq!(st.halted, None, "−$10 is well inside the $100 stop");
+    }
+
+    // ── roll_day: per-day self-heal of the sticky halt ────────────────────────
+
+    #[test]
+    fn roll_day_clears_latch_and_rebases_realized() {
+        // Bank a realized loss that trips DailyLoss, then roll the day: the sticky
+        // latch clears, realized rebases to 0, and open net/basis are kept — so the
+        // SAME small book does NOT immediately re-latch (the self-heal).
+        let mut c = cfg();
+        c.inventory_stop_loss_usd = Usdc(25_000_000); // $25
+        c.daily_loss_usd = Usdc(50_000_000); // $50
+        let t = TokenId(1);
+        let mut inv = InventoryRisk::new(c);
+
+        // Bank −$60 realized (buy 200 @ $0.50, sell 200 @ $0.20); tiny open long 10
+        // @ $0.50 → basis $5; mark $0.45 → unrealized −$0.50, mtm −$60.50 ≤ −$50.
+        inv.on_fill(t, 200 * SHARE, Usdc(-100_000_000));
+        inv.on_fill(t, -200 * SHARE, Usdc(40_000_000));
+        inv.on_fill(t, 10 * SHARE, Usdc(-5_000_000));
+        assert_eq!(
+            inv.mark(&Marks::from([(t, 450_000)])).halted,
+            Some(InvHalt::DailyLoss)
+        );
+
+        inv.roll_day();
+        assert_eq!(inv.halted(), None, "roll_day clears the sticky latch");
+        assert_eq!(inv.net(t), 10 * SHARE, "open net preserved");
+        assert_eq!(inv.basis(t), Usdc(5_000_000), "open basis preserved");
+        assert_eq!(inv.realized(t), Usdc(0), "realized rebased to 0");
+
+        // Re-mark the small book: mtm = 0 realized + (−$0.50) unrealized ≫ −$50 →
+        // stays un-halted. The prior day's −$60 no longer strands it.
+        let st2 = inv.mark(&Marks::from([(t, 450_000)]));
+        assert_eq!(st2.realized, Usdc(0));
+        assert_eq!(st2.unrealized, Usdc(-500_000));
+        assert_eq!(st2.mtm_pnl, Usdc(-500_000));
+        assert_eq!(st2.halted, None, "a fresh day with a small book stays un-halted");
+    }
+
+    #[test]
+    fn roll_day_rearms_when_open_position_still_breaches_stop() {
+        // roll_day must NOT clear genuinely-bad OPEN risk: after the roll, a
+        // standing position still bleeding past the unrealized StopLoss re-latches
+        // on the very next mark.
+        let mut c = cfg();
+        c.inventory_stop_loss_usd = Usdc(25_000_000); // $25
+        c.daily_loss_usd = Usdc(50_000_000); // $50
+        let t = TokenId(1);
+        let mut inv = InventoryRisk::new(c);
+        // Long 1000 @ $0.50 → basis $500; mark $0.20 → unrealized −$300 ≤ −$25.
+        inv.on_fill(t, 1000 * SHARE, Usdc(-500_000_000));
+        assert_eq!(
+            inv.mark(&Marks::from([(t, 200_000)])).halted,
+            Some(InvHalt::StopLoss)
+        );
+
+        inv.roll_day();
+        assert_eq!(inv.halted(), None, "roll_day clears the latch");
+        // The SAME underwater position re-arms the stop on the next mark.
+        let st = inv.mark(&Marks::from([(t, 200_000)]));
+        assert_eq!(
+            st.unrealized,
+            Usdc(-300_000_000),
+            "open bleed measured vs the KEPT basis"
+        );
+        assert_eq!(
+            st.halted,
+            Some(InvHalt::StopLoss),
+            "bad open risk re-arms — only the stale day-scoped latch is cleared"
+        );
     }
 }

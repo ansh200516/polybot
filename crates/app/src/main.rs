@@ -843,7 +843,7 @@ async fn main() {
     // each auto_restart for a fresh snapshot. Best-effort: any Data-API failure
     // falls back to the liquidity universe (and the strategy builds its own
     // whitelist). Takes precedence over `confluence_conditions`.
-    let mut copy_initial_whitelist: Option<Vec<String>> = None;
+    let mut copy_initial_whitelist: Option<pm_app::strategy::copy::Whitelist> = None;
     let copy_universe_conditions: Option<Vec<String>> = if copy_enabled {
         // Cap exactly like the confluence/keyset universe so a trader holding
         // hundreds of longshots can't explode the Gamma fetch.
@@ -866,44 +866,49 @@ async fn main() {
             min_bets = config.copy_params.min_bets,
             "copy: building whitelist-driven universe"
         );
-        // One snapshot: rank the whitelist (EdgePerBet) exactly as the live loop,
+        // One snapshot: build the specialist creamy layer exactly as the live loop,
         // then union its open-position condition ids. `1.0` shares ignores dust.
-        let built: Option<(Vec<String>, Vec<String>)> = async {
+        let built: Option<(pm_app::strategy::copy::Whitelist, Vec<String>)> = async {
             let cp = CopyParams::from_config(&config.strategies.copy, &config.copy_params).ok()?;
             let client = DataApiClient::new(None).ok()?;
             let whitelist = pm_app::strategy::copy::refresh_whitelist(&client, &cp).await?;
-            if whitelist.is_empty() {
-                return Some((Vec::new(), Vec::new()));
+            if whitelist.flat.is_empty() {
+                return Some((whitelist, Vec::new()));
             }
-            let conds =
-                pm_app::strategy::copy::whitelist_universe_conditions(&client, &whitelist, 1.0, cap)
-                    .await?;
+            let conds = pm_app::strategy::copy::whitelist_universe_conditions(
+                &client,
+                &whitelist.flat,
+                1.0,
+                cap,
+            )
+            .await?;
             Some((whitelist, conds))
         }
         .await;
         match built {
             Some((wl, conds)) if !conds.is_empty() => {
                 info!(
-                    traders = wl.len(),
+                    traders = wl.flat.len(),
+                    categories = wl.creamy.len(),
                     markets = conds.len(),
                     "copy: whitelist-driven universe ready"
                 );
                 if tui_active {
                     println!(
-                        "arb: copy universe ready — {} smart-money markets ({} traders).",
+                        "arb: copy universe ready — {} smart-money markets ({} specialists).",
                         conds.len(),
-                        wl.len()
+                        wl.flat.len()
                     );
                 }
-                copy_initial_whitelist = (!wl.is_empty()).then_some(wl);
+                copy_initial_whitelist = (!wl.flat.is_empty()).then_some(wl);
                 Some(conds)
             }
             Some((wl, _)) => {
                 warn!(
-                    traders = wl.len(),
+                    traders = wl.flat.len(),
                     "copy: whitelist-driven universe empty (no open positions / empty whitelist); falling back to liquidity universe"
                 );
-                copy_initial_whitelist = (!wl.is_empty()).then_some(wl);
+                copy_initial_whitelist = (!wl.flat.is_empty()).then_some(wl);
                 None
             }
             None => {

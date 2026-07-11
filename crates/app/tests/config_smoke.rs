@@ -2,6 +2,7 @@
 //! both deserializes (with `deny_unknown_fields`) and runs the semantic validator,
 //! so this guards a typo / out-of-range value in a config the bot actually runs
 //! with (e.g. the dynamic `gross_pct` copy caps in the copy canary).
+#![allow(clippy::expect_used)]
 
 #[test]
 fn copy_canary_config_is_valid() {

@@ -48,7 +48,9 @@ use pm_ingestion::data_api::{
     ClosedPos, DataApiClient, LeaderboardEntry, OrderBy, TimePeriod, Trade, TradeSide, TradesFilter,
 };
 use pm_ingestion::rest::ClobRest;
-use pm_ingestion::smart_money::{Ranking, rank_wallets_oos, trader_records, within_drift};
+use pm_ingestion::smart_money::{
+    category_adaptive_records, creamy_layer, market_category, trader_records, within_drift,
+};
 use pm_ingestion::supervisor::OnApplyFn;
 use pm_registry::gamma::ClobMarket;
 use pm_risk::inventory::{InventoryConfig, InventoryRisk, Marks};
@@ -68,6 +70,20 @@ use super::{CopyStatus, Strategy, StrategyCommand, StrategyCtx, StrategyId, Stra
 /// `DEFAULT_TRADE_LIMIT` so the live whitelist ranks on the same depth of
 /// history the offline grid validated.
 const WHITELIST_TRADE_LIMIT: usize = 1000;
+
+// SPECIALIST-ROUTING knobs (the two-stage ranking that REPLACED flat EdgePerBet).
+// These mirror the values the backtest validated (SpecialistAdaptive beat the old
+// global EdgePerBet ~4× on Sharpe, hit 57.5% vs 52.6%, 1/3 the drawdown, and won
+// 65/72 matched configs). Kept as consts (not config) so the live ranking is
+// EXACTLY the validated one; plumb to `[copy]` later if they need tuning.
+/// Recency half-life (DAYS) for the per-(trader, category) adaptive-skill decay.
+const SPECIALIST_HALF_LIFE_DAYS: f64 = 45.0;
+/// Effective-sample floor per (trader, category) to qualify for the creamy layer.
+const SPECIALIST_MIN_BETS: f64 = 5.0;
+/// Creamy-layer size PER category (top specialists kept).
+const SPECIALIST_TOP_K_PER_CAT: usize = 10;
+/// Lower-confidence-bound `z` for the adaptive score (`mean − z·stdev/√n_eff`).
+const SPECIALIST_Z: f64 = 1.0;
 
 /// Max fills pulled from each whitelisted wallet's `/trades?user=` history on
 /// the fast SIGNAL poll. We only care about buys inside the reaction window, so
@@ -203,8 +219,9 @@ pub(crate) struct CopyCandidate {
 ///   older than the reaction window, is dropped — we'd be chasing);
 /// * its `(condition_id, outcome_index)` is NOT in `seen` (the set of keys we
 ///   have already acted on this session), so a signal never re-fires;
-/// * the wallet is in `whitelist` (non-whitelisted wallets are ignored even if
-///   `recent_by_wallet` carries them).
+/// * the wallet is a CREAMY-LAYER SPECIALIST for the market's category
+///   ([`market_category`] of the trade's slug/title): a trader is copied ONLY in
+///   categories where they're proven, per the two-stage specialist routing.
 ///
 /// DE-DUP: when several qualifying buys share a `(condition_id, outcome_index)`
 /// — whether two wallets on the same side or one wallet twice — only ONE
@@ -219,21 +236,17 @@ pub(crate) struct CopyCandidate {
 /// loop and the tests see a stable sequence.
 pub(crate) fn select_signals(
     recent_by_wallet: &HashMap<String, Vec<Trade>>,
-    whitelist: &[String],
+    creamy: &HashMap<String, HashSet<String>>,
     seen: &HashSet<(String, i64)>,
     now: i64,
     reaction_window_secs: i64,
 ) -> Vec<CopyCandidate> {
     // MOST RECENT qualifying buy per (condition_id, outcome_index) — the freshest
-    // conviction + the smallest drift to the current book. Iterating the whitelist
-    // in order makes the equal-timestamp tie-break deterministic (first-listed
-    // wallet wins).
+    // conviction + the smallest drift to the current book. Tie-break on the wallet
+    // string so the pick is deterministic regardless of HashMap iteration order.
     let mut best: HashMap<(String, i64), CopyCandidate> = HashMap::new();
     let stale_before = now - reaction_window_secs;
-    for wallet in whitelist {
-        let Some(trades) = recent_by_wallet.get(wallet) else {
-            continue;
-        };
+    for (wallet, trades) in recent_by_wallet {
         for t in trades {
             if t.side != TradeSide::Buy {
                 continue;
@@ -241,12 +254,22 @@ pub(crate) fn select_signals(
             if t.timestamp < stale_before {
                 continue; // older than the reaction window → stale
             }
+            // SPECIALIST ROUTING: copy this trader ONLY where they are a proven
+            // creamy-layer specialist for the market's category.
+            let cat = market_category(&t.slug, &t.title);
+            if !creamy.get(&cat).is_some_and(|set| set.contains(wallet)) {
+                continue;
+            }
             let key = (t.condition_id.clone(), t.outcome_index);
             if seen.contains(&key) {
                 continue; // already acted on this market+side
             }
             let replace = match best.get(&key) {
-                Some(existing) => t.timestamp > existing.timestamp,
+                Some(existing) => {
+                    t.timestamp > existing.timestamp
+                        || (t.timestamp == existing.timestamp
+                            && wallet.as_str() < existing.trader.as_str())
+                }
                 None => true,
             };
             if replace {
@@ -316,21 +339,43 @@ fn dedup_traders(month: Vec<LeaderboardEntry>, all: Vec<LeaderboardEntry>) -> Ve
 // Thin I/O over C1's pure ranking (exercised live in C5's canary)
 // ---------------------------------------------------------------------------
 
-/// Rebuild the follow WHITELIST: pull the PnL leaderboard (month ∪ all-time,
-/// `top_n` each, de-duped), fetch each trader's own `/trades` + closed
-/// positions, derive resolutions from those closed positions
-/// ([`fold_resolutions`]), build their PRE-cutoff records
-/// ([`trader_records`]), and rank by [`Ranking::EdgePerBet`].
+/// The follow set produced by [`refresh_whitelist`]: the per-category CREAMY
+/// LAYER (`category → specialist wallets`) that [`select_signals`] routes on,
+/// plus a FLAT union of all specialist wallets in best-first order (for the
+/// universe sync + the whitelist-size telemetry).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Whitelist {
+    /// Stage-1 creamy layer: a buy is copyable only if its trader is in the set
+    /// for that market's [`market_category`].
+    pub creamy: HashMap<String, HashSet<String>>,
+    /// Union of all creamy-layer wallets, ordered best-specialist-first (highest
+    /// adaptive score across categories) — what the universe sync pulls positions
+    /// for and the telemetry counts.
+    pub flat: Vec<String>,
+}
+
+/// Rebuild the follow set via the TWO-STAGE SPECIALIST ROUTING that replaced the
+/// old global [`Ranking::EdgePerBet`] (validated in the backtest: ~4× the Sharpe,
+/// higher hit rate, a third of the drawdown, winning 65/72 matched configs).
 ///
-/// CUTOFF: for the LIVE whitelist we want each trader's skill over their WHOLE
-/// resolved record, so `cutoff_ts = now` — [`trader_records`] keeps every buy
-/// with `timestamp < cutoff_ts`, i.e. all of their past resolved bets.
+/// Pull the PnL leaderboard (month ∪ all-time, `top_n` each, de-duped), fetch
+/// each trader's own `/trades` + closed positions, derive resolutions from the
+/// closed positions ([`fold_resolutions`]), then:
+/// - STAGE 1 — [`category_adaptive_records`] scores each `(trader, category)` on
+///   a recency-decayed (`SPECIALIST_HALF_LIFE_DAYS`), sample-aware edge, and
+///   [`creamy_layer`] keeps the top `SPECIALIST_TOP_K_PER_CAT` specialists per
+///   category (effective sample ≥ `SPECIALIST_MIN_BETS`, positive score);
+/// - STAGE 2 — keep only creamy-layer traders whose GLOBAL pre-cutoff
+///   [`trader_records`] `mean_edge > 0` (the "EdgePerBet on the creamy layer"
+///   gate).
 ///
-/// Returns `Some(wallets)` on success (possibly empty if nobody clears the
-/// `EdgePerBet` bar). Returns `None` on ANY fetch error, so the caller KEEPS the
-/// prior whitelist — we never trade on a set that a transient API failure
-/// emptied or staled.
-pub async fn refresh_whitelist(client: &DataApiClient, params: &CopyParams) -> Option<Vec<String>> {
+/// CUTOFF: live wants each trader's WHOLE resolved record, so `cutoff_ts = now`
+/// and the recency decay is measured back from now.
+///
+/// Returns `Some(Whitelist)` on success (possibly empty if nobody qualifies).
+/// Returns `None` on ANY fetch error, so the caller KEEPS the prior set — we
+/// never trade on a set a transient API failure emptied or staled.
+pub async fn refresh_whitelist(client: &DataApiClient, params: &CopyParams) -> Option<Whitelist> {
     // 1. Trader universe: top PnL, month ∪ all-time, de-duped (month first).
     let month = client
         .leaderboard(OrderBy::Pnl, TimePeriod::Month, params.top_n)
@@ -359,18 +404,42 @@ pub async fn refresh_whitelist(client: &DataApiClient, params: &CopyParams) -> O
         trades_by_wallet.insert(wallet.to_string(), trades);
     }
 
-    // 3. Rank on the WHOLE resolved record (cutoff = now → all past bets), then
-    //    take the EdgePerBet top-N. Pure, shared with the backtest (C1).
+    // 3. SPECIALIST ROUTING (cutoff = now → whole resolved record, recency-decayed).
     let now = now_ms() / 1000;
+    let half_life_secs = SPECIALIST_HALF_LIFE_DAYS * 86_400.0;
+    // Stage 1: per-(trader, category) adaptive records → per-category creamy layer.
+    let adaptive =
+        category_adaptive_records(&trades_by_wallet, &resolutions, now, half_life_secs, SPECIALIST_Z);
+    let mut creamy = creamy_layer(&adaptive, SPECIALIST_TOP_K_PER_CAT, SPECIALIST_MIN_BETS);
+    // Stage 2: EdgePerBet gate — drop creamy traders whose GLOBAL mean edge ≤ 0.
     let records = trader_records(&trades_by_wallet, &resolutions, now);
-    let whitelist = rank_wallets_oos(
-        Ranking::EdgePerBet,
-        &traders,
-        &records,
-        params.top_n,
-        params.min_bets,
-    );
-    Some(whitelist)
+    let edge_ok: HashSet<&str> = records
+        .iter()
+        .filter(|(_, r)| r.mean_edge > 0.0)
+        .map(|(w, _)| w.as_str())
+        .collect();
+    for set in creamy.values_mut() {
+        set.retain(|w| edge_ok.contains(w.as_str()));
+    }
+    creamy.retain(|_, set| !set.is_empty());
+
+    // Flat union, best-specialist-first (highest adaptive score across categories)
+    // so the universe cap keeps the strongest specialists' markets.
+    let mut best_score: HashMap<&str, f64> = HashMap::new();
+    for ((wallet, cat), r) in &adaptive {
+        if creamy.get(cat).is_some_and(|s| s.contains(wallet)) {
+            let e = best_score.entry(wallet.as_str()).or_insert(f64::MIN);
+            if r.score > *e {
+                *e = r.score;
+            }
+        }
+    }
+    let mut flat_scored: Vec<(String, f64)> =
+        best_score.into_iter().map(|(w, s)| (w.to_string(), s)).collect();
+    flat_scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let flat: Vec<String> = flat_scored.into_iter().map(|(w, _)| w).collect();
+
+    Some(Whitelist { creamy, flat })
 }
 
 /// De-dup a stream of OPEN-position `conditionId`s into a stable, first-seen list
@@ -1037,9 +1106,12 @@ pub(crate) struct CopyLoop<V: CopyVenue> {
     realized_micro: i128,
     /// Latched once an inventory halt (`inv.halted()` — the inventory stop-loss /
     /// daily-loss floor crossed on the marked book) fires: NO new entries resume
-    /// this session, mirroring the MM's `halted`. Exits/redeem still run so a held
-    /// position can be flattened. Sticky for the session (cleared only by a
-    /// restart, like the MM's `InvHalt`).
+    /// until it clears, mirroring the MM's `halted`. Exits/redeem still run so a
+    /// held position can be flattened. Sticky WITHIN a UTC day, but self-heals on
+    /// the day rollover — [`refresh_day_loss_gate`](Self::refresh_day_loss_gate)
+    /// rolls the [`InventoryRisk`] day and drops this, so a bad day no longer
+    /// strands the strategy halted across midnights until a manual restart. It
+    /// re-arms the same cycle if the marked book still breaches a floor.
     halted: bool,
     /// UTC-day index ([`utc_day_from_ms`]) this loop is accounting against. Set at
     /// startup and advanced on a day rollover, which releases
@@ -1936,7 +2008,8 @@ impl<V: CopyVenue> CopyLoop<V> {
     /// what makes `inv.halted()` MEAN something for copy: without a mark the latch
     /// can never fire. A held position with no live bid is left UNMARKED, which
     /// (per the `mark` contract) WITHHOLDS the latch that cycle — a transient data
-    /// gap never permanently halts the strategy. Sticky once latched.
+    /// gap never permanently halts the strategy. Sticky WITHIN a UTC day; the day
+    /// rollover self-heals it (see [`refresh_day_loss_gate`](Self::refresh_day_loss_gate)).
     async fn mark_and_check(&mut self) {
         if self.halted {
             return; // already latched (sticky) — nothing more to check.
@@ -2000,15 +2073,21 @@ impl<V: CopyVenue> CopyLoop<V> {
     }
 
     /// Per-cycle PERSISTENT day-loss maintenance (mirrors the top of the MM's
-    /// `tick`): (1) on a UTC-day ROLLOVER advance the tracked day and RELEASE the
-    /// cross-restart day-loss latch — a fresh day gets a fresh cap (the in-session
-    /// inventory [`halted`](Self::halted) latch is deliberately left untouched, so
-    /// an inventory halt stays latched for the whole session); (2) otherwise,
-    /// while un-halted, RE-READ both gate arms for `"copy"` so the cap also binds
-    /// MID-session (the cumulative day-realized ledger crossing the cap), not only
-    /// across auto-restarts. Inert when there is no store handle. Takes an
-    /// explicit `now_ms` (like [`arm_day_loss_gate`](Self::arm_day_loss_gate)) so
-    /// the loop passes [`now_ms`] and tests drive the rollover deterministically.
+    /// `tick`): (1) on a UTC-day ROLLOVER advance the tracked day and RELEASE both
+    /// loss latches — a fresh day gets a fresh cap. This releases the cross-restart
+    /// `day_loss_halted` cap AND self-heals the in-session inventory
+    /// [`halted`](Self::halted) latch by rolling the [`InventoryRisk`] day
+    /// ([`InventoryRisk::roll_day`]: clear the latch + rebase realized, keeping open
+    /// net/basis). Without this the inventory halt was sticky for the whole session,
+    /// so one bad day stranded the strategy halted across every following midnight
+    /// until a MANUAL restart (the observed "still halted days later"). It re-arms
+    /// safely: [`mark_and_check`](Self::mark_and_check) re-latches THIS cycle if the
+    /// current marked book still breaches a floor. (2) Otherwise, while un-halted,
+    /// RE-READ both gate arms for `"copy"` so the cap also binds MID-session (the
+    /// cumulative day-realized ledger crossing the cap), not only across
+    /// auto-restarts. Inert when there is no store handle. Takes an explicit
+    /// `now_ms` (like [`arm_day_loss_gate`](Self::arm_day_loss_gate)) so the loop
+    /// passes [`now_ms`] and tests drive the rollover deterministically.
     fn refresh_day_loss_gate(&mut self, now_ms: i64) {
         let today = utc_day_from_ms(now_ms);
         if today > self.day {
@@ -2020,6 +2099,21 @@ impl<V: CopyVenue> CopyLoop<V> {
                 );
                 self.day_loss_halted = false;
             }
+            // Self-heal the IN-SESSION inventory halt too: rebase the InventoryRisk
+            // day (clear the sticky latch + zero realized, keeping open net/basis)
+            // and drop `self.halted`, so a prior day's banked losses no longer keep
+            // the strategy halted across midnights until a manual restart. Genuinely
+            // bad OPEN risk is not cleared: `mark_and_check` later this cycle re-arms
+            // the latch if the current marked book still breaches a floor.
+            if self.halted {
+                tracing::warn!(
+                    utc_day = today,
+                    "copy: UTC day rolled over — self-healing in-session inventory halt \
+                     (re-arms this cycle if the marked book still breaches a floor)"
+                );
+            }
+            self.inv.roll_day();
+            self.halted = false;
         }
         if !self.day_loss_halted {
             let cap_micro = self.inv.config().daily_loss_usd.0;
@@ -2059,6 +2153,7 @@ async fn run_poll_cycle<V: CopyVenue>(
     state: &mut CopyLoop<V>,
     feed: &Option<Arc<DataApiClient>>,
     whitelist: &[String],
+    creamy: &HashMap<String, HashSet<String>>,
     seen: &mut SeenKeys,
 ) {
     let Some(client) = feed else {
@@ -2119,7 +2214,7 @@ async fn run_poll_cycle<V: CopyVenue>(
     if !state.halted && !state.day_loss_halted {
         let candidates = select_signals(
             &recent_by_wallet,
-            whitelist,
+            creamy,
             seen.set(),
             now,
             state.params.reaction_window_secs,
@@ -2204,7 +2299,7 @@ pub struct CopyStrategy<V: CopyVenue> {
     /// `whitelist_refresh`; `None`/empty (the default) ⇒ the loop builds it
     /// immediately (first tick), as before. Set via
     /// [`with_initial_whitelist`](Self::with_initial_whitelist).
-    initial_whitelist: Option<Vec<String>>,
+    initial_whitelist: Option<Whitelist>,
     /// CLOB metadata resolver enabling ON-DEMAND market sync (live runs): when a
     /// signal lands in an UNSYNCED market, the loop resolves its tick + neg_risk
     /// via this client and registers the token on the venue so the entry isn't
@@ -2295,8 +2390,8 @@ impl<V: CopyVenue> CopyStrategy<V> {
     /// matches the traders the strategy copies. `Some(non-empty)` makes the loop
     /// start with it and DEFER the first refresh by `whitelist_refresh`;
     /// `None`/empty keeps the immediate-refresh behavior (the loop builds its own).
-    pub fn with_initial_whitelist(mut self, whitelist: Option<Vec<String>>) -> Self {
-        self.initial_whitelist = whitelist.filter(|w| !w.is_empty());
+    pub fn with_initial_whitelist(mut self, whitelist: Option<Whitelist>) -> Self {
+        self.initial_whitelist = whitelist.filter(|w| !w.flat.is_empty());
         self
     }
 
@@ -2373,7 +2468,7 @@ async fn run_copy_loop<V: CopyVenue>(
     start_paused: bool,
     inv_cfg: InventoryConfig,
     store_path: Option<std::path::PathBuf>,
-    initial_whitelist: Option<Vec<String>>,
+    initial_whitelist: Option<Whitelist>,
     resolver: Option<Arc<ClobRest>>,
 ) {
     let StrategyCtx {
@@ -2430,8 +2525,12 @@ async fn run_copy_loop<V: CopyVenue>(
     // universe, so we start with it and DEFER the first re-rank (the heavy
     // EdgePerBet fetch already ran in main; the auto_restart re-execs sooner than
     // `whitelist_refresh` anyway). Unseeded ⇒ build it immediately (first tick).
-    let seeded = initial_whitelist.as_ref().is_some_and(|w| !w.is_empty());
-    let mut whitelist: Vec<String> = initial_whitelist.unwrap_or_default();
+    let seeded = initial_whitelist.as_ref().is_some_and(|w| !w.flat.is_empty());
+    let seed = initial_whitelist.unwrap_or_default();
+    // `whitelist` is the FLAT union (recent-trades fetch + universe + telemetry);
+    // `creamy` is the per-category routing map `select_signals` gates on.
+    let mut whitelist: Vec<String> = seed.flat;
+    let mut creamy: HashMap<String, HashSet<String>> = seed.creamy;
     let mut paused = start_paused;
     if start_paused {
         tracing::info!("copy: live held — trading PAUSED until release (press `l`)");
@@ -2483,11 +2582,14 @@ async fn run_copy_loop<V: CopyVenue>(
                     {
                         Ok(Some(wl)) => {
                             tracing::info!(
-                                traders = wl.len(),
-                                "copy: whitelist refreshed (EdgePerBet, top {})",
-                                state.params.top_n
+                                traders = wl.flat.len(),
+                                categories = wl.creamy.len(),
+                                "copy: whitelist refreshed (specialist routing: per-category \
+                                 creamy layer, top {} per category)",
+                                SPECIALIST_TOP_K_PER_CAT
                             );
-                            whitelist = wl;
+                            whitelist = wl.flat;
+                            creamy = wl.creamy;
                         }
                         // Keep the PRIOR whitelist on any fetch error — never
                         // poll/trade on a transient-failure-emptied set.
@@ -2515,7 +2617,7 @@ async fn run_copy_loop<V: CopyVenue>(
                     // ~1 h silent stall.)
                     if tokio::time::timeout(
                         POLL_CYCLE_TIMEOUT,
-                        run_poll_cycle(&mut state, &feed, &whitelist, &mut seen),
+                        run_poll_cycle(&mut state, &feed, &whitelist, &creamy, &mut seen),
                     )
                     .await
                     .is_err()
@@ -2597,8 +2699,11 @@ mod tests {
         m
     }
 
-    fn wl(ws: &[&str]) -> Vec<String> {
-        ws.iter().map(|s| (*s).to_string()).collect()
+    /// A creamy layer for `select_signals` tests. All test trades carry empty
+    /// slug/title, so `market_category` classifies them "other" — listing the
+    /// wallets there routes them exactly like the old flat whitelist did.
+    fn creamy_of(ws: &[&str]) -> HashMap<String, HashSet<String>> {
+        HashMap::from([("other".to_string(), ws.iter().map(|s| (*s).to_string()).collect())])
     }
 
     fn seen_of(keys: &[(&str, i64)]) -> HashSet<(String, i64)> {
@@ -2636,7 +2741,7 @@ mod tests {
     #[test]
     fn select_signals_fresh_whitelisted_buy_is_a_candidate() {
         let recent = tmap(vec![trade("0xA", "m1", 0, TradeSide::Buy, 0.4, 9_000)]);
-        let out = select_signals(&recent, &wl(&["0xA"]), &HashSet::new(), NOW, WINDOW);
+        let out = select_signals(&recent, &creamy_of(&["0xA"]), &HashSet::new(), NOW, WINDOW);
         assert_eq!(
             out,
             vec![CopyCandidate {
@@ -2737,7 +2842,7 @@ mod tests {
     fn select_signals_buy_older_than_window_is_excluded() {
         // 8_000 < 8_200 (now - window) ⇒ stale.
         let recent = tmap(vec![trade("0xA", "m1", 0, TradeSide::Buy, 0.4, 8_000)]);
-        let out = select_signals(&recent, &wl(&["0xA"]), &HashSet::new(), NOW, WINDOW);
+        let out = select_signals(&recent, &creamy_of(&["0xA"]), &HashSet::new(), NOW, WINDOW);
         assert!(out.is_empty());
     }
 
@@ -2745,14 +2850,14 @@ mod tests {
     fn select_signals_buy_exactly_at_window_edge_is_included() {
         // timestamp == now - window (8_200) is still fresh (>=).
         let recent = tmap(vec![trade("0xA", "m1", 0, TradeSide::Buy, 0.4, 8_200)]);
-        let out = select_signals(&recent, &wl(&["0xA"]), &HashSet::new(), NOW, WINDOW);
+        let out = select_signals(&recent, &creamy_of(&["0xA"]), &HashSet::new(), NOW, WINDOW);
         assert_eq!(out.len(), 1);
     }
 
     #[test]
     fn select_signals_sell_is_excluded() {
         let recent = tmap(vec![trade("0xA", "m1", 0, TradeSide::Sell, 0.4, 9_000)]);
-        let out = select_signals(&recent, &wl(&["0xA"]), &HashSet::new(), NOW, WINDOW);
+        let out = select_signals(&recent, &creamy_of(&["0xA"]), &HashSet::new(), NOW, WINDOW);
         assert!(out.is_empty());
     }
 
@@ -2760,19 +2865,35 @@ mod tests {
     fn select_signals_non_whitelisted_wallet_is_excluded() {
         // 0xZ has a fresh buy but is NOT on the whitelist.
         let recent = tmap(vec![trade("0xZ", "m1", 0, TradeSide::Buy, 0.4, 9_000)]);
-        let out = select_signals(&recent, &wl(&["0xA"]), &HashSet::new(), NOW, WINDOW);
+        let out = select_signals(&recent, &creamy_of(&["0xA"]), &HashSet::new(), NOW, WINDOW);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn select_signals_routes_by_specialist_category() {
+        // 0xA is a BASEBALL specialist only. Their baseball buy (mlb slug) is a
+        // candidate; the SAME trader's soccer buy (fifwc slug) is NOT — specialist
+        // routing copies a trader only where they're proven.
+        let mut base = trade("0xA", "mBASE", 0, TradeSide::Buy, 0.5, 9_000);
+        base.slug = "mlb-nyy-bos-2026".to_string();
+        let mut socc = trade("0xA", "mSOCC", 0, TradeSide::Buy, 0.5, 9_100);
+        socc.slug = "fifwc-bra-arg-2026".to_string();
+        let recent = tmap(vec![base, socc]);
+        let creamy = HashMap::from([("baseball".to_string(), HashSet::from(["0xA".to_string()]))]);
+        let out = select_signals(&recent, &creamy, &HashSet::new(), NOW, WINDOW);
+        assert_eq!(out.len(), 1, "only the baseball (specialist) buy is a candidate");
+        assert_eq!(out[0].condition_id, "mBASE");
     }
 
     #[test]
     fn select_signals_already_seen_key_is_excluded() {
         let recent = tmap(vec![trade("0xA", "m1", 0, TradeSide::Buy, 0.4, 9_000)]);
         let seen = seen_of(&[("m1", 0)]);
-        let out = select_signals(&recent, &wl(&["0xA"]), &seen, NOW, WINDOW);
+        let out = select_signals(&recent, &creamy_of(&["0xA"]), &seen, NOW, WINDOW);
         assert!(out.is_empty());
         // A different outcome on the same market is NOT seen ⇒ still a candidate.
         let recent2 = tmap(vec![trade("0xA", "m1", 1, TradeSide::Buy, 0.4, 9_000)]);
-        let out2 = select_signals(&recent2, &wl(&["0xA"]), &seen, NOW, WINDOW);
+        let out2 = select_signals(&recent2, &creamy_of(&["0xA"]), &seen, NOW, WINDOW);
         assert_eq!(out2.len(), 1);
     }
 
@@ -2785,7 +2906,7 @@ mod tests {
             trade("0xA", "m1", 0, TradeSide::Buy, 0.45, 9_500),
             trade("0xB", "m1", 0, TradeSide::Buy, 0.40, 9_000),
         ]);
-        let out = select_signals(&recent, &wl(&["0xA", "0xB"]), &HashSet::new(), NOW, WINDOW);
+        let out = select_signals(&recent, &creamy_of(&["0xA", "0xB"]), &HashSet::new(), NOW, WINDOW);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].trader, "0xA");
         assert_eq!(out[0].timestamp, 9_500);
@@ -2798,7 +2919,7 @@ mod tests {
             trade("0xA", "m1", 0, TradeSide::Buy, 0.50, 9_400),
             trade("0xA", "m1", 0, TradeSide::Buy, 0.42, 9_100),
         ]);
-        let out = select_signals(&recent, &wl(&["0xA"]), &HashSet::new(), NOW, WINDOW);
+        let out = select_signals(&recent, &creamy_of(&["0xA"]), &HashSet::new(), NOW, WINDOW);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].timestamp, 9_400);
     }
@@ -2811,7 +2932,7 @@ mod tests {
             trade("0xA", "m2", 1, TradeSide::Buy, 0.5, 9_500),
             trade("0xA", "m1", 0, TradeSide::Buy, 0.4, 9_000),
         ]);
-        let out = select_signals(&recent, &wl(&["0xA"]), &HashSet::new(), NOW, WINDOW);
+        let out = select_signals(&recent, &creamy_of(&["0xA"]), &HashSet::new(), NOW, WINDOW);
         let keys: Vec<(&str, i64)> = out
             .iter()
             .map(|c| (c.condition_id.as_str(), c.outcome_index))
@@ -3873,6 +3994,71 @@ mod tests {
             orders.lock().unwrap().clone(),
             vec![(token, Action::Buy, 50, 10_000_000)],
             "a fresh UTC day re-opens entries"
+        );
+
+        drop(state);
+        let _ = writer.await;
+    }
+
+    /// UTC-day ROLLOVER SELF-HEAL of the IN-SESSION inventory halt: a latched
+    /// `state.halted` (the `InventoryRisk` daily/stop floor, previously sticky for
+    /// the whole session) is now RELEASED on the rollover, so one bad day no longer
+    /// strands the strategy halted across every following midnight until a MANUAL
+    /// restart. (Re-arm-when-still-breaching is covered by the pure
+    /// `InventoryRisk::roll_day` tests.)
+    #[tokio::test]
+    async fn inventory_halt_self_heals_on_utc_rollover_and_entries_resume() {
+        use pm_risk::inventory::InvHalt;
+        let token = TokenId(1);
+        let venue = MockVenue {
+            asks: HashMap::from([(token, cent(50))]),
+            bids: HashMap::new(),
+            orders: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        let orders = Arc::clone(&venue.orders);
+        let (mut state, writer) = loop_with_inv(
+            venue,
+            tradeable_of("m1", 0, token),
+            copy_params(),
+            breaker_inv_cfg(6_000_000, 6_000_000), // $6 stop / $6 daily
+        );
+
+        // Latch the in-session inventory halt on UTC day 0 exactly as
+        // `mark_and_check` would: bank −$10 realized via a flat round-trip, mark,
+        // and mirror the resulting latch onto `state.halted`.
+        state.inv.on_fill(token, 100_000_000, Usdc(-50_000_000)); // buy 100 @ $0.50
+        state.inv.on_fill(token, -100_000_000, Usdc(40_000_000)); // sell 100 @ $0.40 → −$10, flat
+        assert_eq!(state.inv.mark(&Marks::new()).halted, Some(InvHalt::DailyLoss));
+        state.halted = true;
+        state.day = utc_day_from_ms(1_000); // accounting UTC day 0
+
+        // Entries are blocked BEFORE the rollover.
+        let mut seen = SeenKeys::default();
+        state
+            .run_entries(&[candidate("m1", 0, "0xA", 0.50, 9_000)], &mut seen)
+            .await;
+        assert!(
+            orders.lock().unwrap().is_empty(),
+            "the in-session inventory halt blocks entries before the rollover"
+        );
+
+        // UTC day rolls over → self-heal: `state.halted` drops and the
+        // InventoryRisk latch clears (the fresh day's flat book won't re-latch).
+        let day1_ms = 1_000i64 + 24 * 3_600 * 1_000;
+        state.refresh_day_loss_gate(day1_ms);
+        assert!(!state.halted, "rollover self-heals the in-session inventory halt");
+        assert_eq!(state.inv.halted(), None, "InventoryRisk latch cleared by roll_day");
+        assert_eq!(state.day, utc_day_from_ms(day1_ms), "now accounting the fresh day");
+
+        // Entries RESUME on the fresh day.
+        state
+            .run_entries(&[candidate("m1", 0, "0xA", 0.50, 9_000)], &mut seen)
+            .await;
+        assert_eq!(
+            orders.lock().unwrap().clone(),
+            vec![(token, Action::Buy, 50, 10_000_000)],
+            "a fresh UTC day re-opens entries after the inventory halt self-heals"
         );
 
         drop(state);

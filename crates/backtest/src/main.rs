@@ -240,6 +240,7 @@ async fn main() -> ExitCode {
             "lags_min": cfg.lags_min.clone(),
             "exits": cfg.exits.iter().map(|e| e.as_str()).collect::<Vec<_>>(),
             "freshness": cfg.freshness.clone(),
+            "stops": cfg.stops.clone(),
         },
         "universe": {
             "traders": data.traders.len(),
@@ -309,9 +310,9 @@ fn print_summary(results: &[GridResult], ranked: &[(&'static str, usize)]) {
         "SUMMARY — all-scope cells with n>={MIN_DISPLAY_SAMPLE}, sorted by Sharpe (desc). Returns are per-trade fractions."
     );
     println!(
-        "{:<14} {:>2} {:>4} {:<11} {:>6} {:>5} {:>5} {:>9} {:>6} {:>9} {:>8} {:>8}",
-        "RANKING", "K", "LAG", "EXIT", "FRESH", "N", "SKIP", "MEANRET%", "HIT%", "TOTRET", "SHARPE",
-        "MAXDD",
+        "{:<14} {:>2} {:>4} {:<11} {:>6} {:>5} {:>5} {:>5} {:>9} {:>6} {:>9} {:>8} {:>8}",
+        "RANKING", "K", "LAG", "EXIT", "FRESH", "STOP", "N", "SKIP", "MEANRET%", "HIT%", "TOTRET",
+        "SHARPE", "MAXDD",
     );
     let mut shown = 0usize;
     for r in &all_rows {
@@ -320,12 +321,13 @@ fn print_summary(results: &[GridResult], ranked: &[(&'static str, usize)]) {
         }
         let m = &r.metrics;
         println!(
-            "{:<14} {:>2} {:>3}m {:<11} {:>6} {:>5} {:>5} {:>9.2} {:>6.1} {:>9.3} {:>8.3} {:>8.3}",
+            "{:<14} {:>2} {:>3}m {:<11} {:>6} {:>5} {:>5} {:>5} {:>9.2} {:>6.1} {:>9.3} {:>8.3} {:>8.3}",
             r.ranking,
             r.k,
             r.lag_min,
             r.exit,
             fresh_label(r.max_drift),
+            stop_label(r.stop_loss),
             m.n,
             m.skipped,
             m.mean_ret * 100.0,
@@ -352,6 +354,9 @@ fn print_summary(results: &[GridResult], ranked: &[(&'static str, usize)]) {
             "VERDICT: NO-GO — no positive edge with adequate sample (n>={MIN_VERDICT_SAMPLE})"
         ),
     }
+
+    // The headline the operator asked for: stop vs no-stop on the SAME edge.
+    print_stop_comparison(results);
 
     // Best cell per ranking (all scope, any positive sample), so a weak overall
     // verdict still shows which selection rule did best out-of-sample.
@@ -382,6 +387,69 @@ fn print_summary(results: &[GridResult], ranked: &[(&'static str, usize)]) {
     }
 }
 
+/// STOP-LOSS A/B: hold the winning copy CONFIG fixed and vary ONLY the stop, so
+/// all arms replay the SAME signal population — the honest read on "stop vs no
+/// stop for our edge over a longer run". The reference config is the best-by-
+/// Sharpe NO-STOP `all`-scope cell with an adequate sample; we then pull the
+/// matching `none`/`50%`/`25%` rows for `all`, `sports` and `nonsports` and print
+/// them together. `total_ret` = cumulative edge (does stopping add or bleed
+/// return?), `max_drawdown` = the pain a stop is supposed to buy down.
+fn print_stop_comparison(results: &[GridResult]) {
+    println!();
+    println!("STOP-LOSS A/B — same config, only the stop differs (returns are per-trade fractions):");
+
+    let mut no_stop_all: Vec<&GridResult> = results
+        .iter()
+        .filter(|r| r.scope == "all" && r.stop_loss.is_none() && r.metrics.n >= MIN_VERDICT_SAMPLE)
+        .collect();
+    sort_by_sharpe_desc(&mut no_stop_all);
+    let Some(reference) = no_stop_all.first() else {
+        println!("(no adequately-sampled no-stop cell to anchor the comparison)");
+        return;
+    };
+
+    println!(
+        "reference config: {} k={} lag={}m {} fresh={} (best no-stop cell, n={})",
+        reference.ranking,
+        reference.k,
+        reference.lag_min,
+        reference.exit,
+        fresh_label(reference.max_drift),
+        reference.metrics.n,
+    );
+    println!(
+        "{:<10} {:>5} {:>5} {:>9} {:>6} {:>9} {:>8} {:>8}",
+        "STOP·SCOPE", "N", "SKIP", "MEANRET%", "HIT%", "TOTRET", "SHARPE", "MAXDD",
+    );
+    for scope in ["all", "sports", "nonsports"] {
+        for stop in [None, Some(0.50), Some(0.25)] {
+            let Some(r) = results.iter().find(|r| {
+                r.ranking == reference.ranking
+                    && r.k == reference.k
+                    && r.lag_min == reference.lag_min
+                    && r.exit == reference.exit
+                    && fresh_label(r.max_drift) == fresh_label(reference.max_drift)
+                    && stop_label(r.stop_loss) == stop_label(stop)
+                    && r.scope == scope
+            }) else {
+                continue;
+            };
+            let m = &r.metrics;
+            println!(
+                "{:<10} {:>5} {:>5} {:>9.2} {:>6.1} {:>9.3} {:>8.3} {:>8.3}",
+                format!("{}·{}", stop_label(stop), scope),
+                m.n,
+                m.skipped,
+                m.mean_ret * 100.0,
+                m.hit_rate * 100.0,
+                m.total_ret,
+                m.sharpe,
+                m.max_drawdown,
+            );
+        }
+    }
+}
+
 /// The best (highest-Sharpe) row matching `pred` with at least one fill.
 fn best_row(
     results: &[GridResult],
@@ -409,6 +477,7 @@ fn sort_by_sharpe_desc(rows: &mut [&GridResult]) {
             .then(a.lag_min.cmp(&b.lag_min))
             .then(a.exit.cmp(&b.exit))
             .then(fresh_label(a.max_drift).cmp(&fresh_label(b.max_drift)))
+            .then(stop_label(a.stop_loss).cmp(&stop_label(b.stop_loss)))
             .then(a.scope.cmp(&b.scope))
     });
 }
@@ -425,12 +494,13 @@ fn fresh_label(d: Option<f64>) -> String {
 fn describe(r: &GridResult) -> String {
     let m = &r.metrics;
     format!(
-        "{} k={} lag={}m {} fresh={} [{}] | n={} skipped={} mean_ret={:.2}% hit={:.1}% total_ret={:.3} sharpe={:.3} maxDD={:.3}",
+        "{} k={} lag={}m {} fresh={} stop={} [{}] | n={} skipped={} mean_ret={:.2}% hit={:.1}% total_ret={:.3} sharpe={:.3} maxDD={:.3}",
         r.ranking,
         r.k,
         r.lag_min,
         r.exit,
         fresh_label(r.max_drift),
+        stop_label(r.stop_loss),
         r.scope,
         m.n,
         m.skipped,
@@ -440,6 +510,14 @@ fn describe(r: &GridResult) -> String {
         m.sharpe,
         m.max_drawdown,
     )
+}
+
+/// A stable display label for a stop-loss fraction (`none` or e.g. `50%`).
+fn stop_label(s: Option<f64>) -> String {
+    match s {
+        None => "none".to_string(),
+        Some(x) => format!("{:.0}%", x * 100.0),
+    }
 }
 
 /// Current UTC time as Unix-epoch seconds (0 if the clock predates the epoch).

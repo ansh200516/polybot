@@ -253,6 +253,216 @@ pub fn within_drift(entry_px: f64, trigger_px: f64, max_drift: f64) -> bool {
     trigger_px > 0.0 && (entry_px - trigger_px).abs() / trigger_px <= max_drift
 }
 
+// ---------------------------------------------------------------------------
+// Specialist routing — per-(trader, category) ADAPTIVE-SKILL ranking
+// ---------------------------------------------------------------------------
+//
+// A single global score ranks a trader by ALL their history at once, so a
+// politics whale's random sports flyer counts the same as their bread-and-butter
+// bet, and a stale-but-legendary record keeps them "top" long after they cool.
+// Specialist routing fixes both: rank each `(trader, CATEGORY)` pair on a
+// RECENCY-DECAYED, sample-aware edge, keep only the top specialists per category
+// (the "creamy layer"), and copy a trader ONLY in a category where they're
+// proven.
+
+/// Classify a market into a coarse CATEGORY from its `slug` (primary) and
+/// `title` (fallback). Polymarket slugs lead with a league/topic token —
+/// `mlb-…`, `nba-…`, `fifwc-…`, `cs2-…`, `atp-…`, `ufc-…` — that maps cleanly to
+/// a sport. Generic `will-…` question markets carry no league token, so they
+/// fall back to keyword-classifying the title (politics / crypto / econ), else
+/// `"other"`. Deterministic and allocation-light; the returned label is stable
+/// (used as a routing key).
+pub fn market_category(slug: &str, title: &str) -> String {
+    let s = slug.to_ascii_lowercase();
+    // Scan slug tokens for the FIRST recognized league/topic token (the leading
+    // token is usually the league, but some slugs lead with a team code, so scan
+    // a few tokens in).
+    for tok in s.split('-').take(4) {
+        if let Some(cat) = league_category(tok) {
+            return cat.to_string();
+        }
+    }
+    // No league token (generic `will-…` etc.) → keyword-classify the title.
+    title_category(title)
+}
+
+/// Map a single slug token to a sport category, or `None` if unrecognized.
+fn league_category(tok: &str) -> Option<&'static str> {
+    // Grouped by sport so per-category samples stay thick enough to rank.
+    const SOCCER: &[&str] = &[
+        "fifwc", "fifac", "wcq", "epl", "ucl", "uel", "uecl", "laliga", "seriea", "bun", "dfb",
+        "ligue1", "mls", "bra", "bra2", "ere", "ered", "por", "ned", "copa", "euro", "afcon",
+        "concacaf", "soccer", "fut", "ita", "eng", "esp", "ger", "fra", "libertadores", "sudamericana",
+    ];
+    const BASKETBALL: &[&str] = &["nba", "wnba", "cbb", "ncaab", "basketball", "euroleague"];
+    const BASEBALL: &[&str] = &["mlb", "npb", "kbo", "baseball"];
+    const HOCKEY: &[&str] = &["nhl", "hockey", "khl"];
+    const AMFOOTBALL: &[&str] = &["nfl", "cfb", "ncaaf"];
+    const TENNIS: &[&str] = &["atp", "wta", "tennis", "ao", "rg", "wimbledon", "usopen"];
+    const COMBAT: &[&str] = &["ufc", "mma", "boxing", "box", "bellator", "pfl"];
+    const ESPORTS: &[&str] = &[
+        "cs2", "csgo", "cs", "lol", "dota2", "dota", "valorant", "val", "owl", "r6", "rl", "esports",
+    ];
+    const CRICKET: &[&str] = &["cricket", "ipl", "t20", "bbl", "odi"];
+    const MOTORSPORT: &[&str] = &["f1", "nascar", "motogp", "indycar"];
+    const GOLF: &[&str] = &["golf", "pga", "liv", "masters"];
+    for (cat, toks) in [
+        ("soccer", SOCCER),
+        ("basketball", BASKETBALL),
+        ("baseball", BASEBALL),
+        ("hockey", HOCKEY),
+        ("amfootball", AMFOOTBALL),
+        ("tennis", TENNIS),
+        ("combat", COMBAT),
+        ("esports", ESPORTS),
+        ("cricket", CRICKET),
+        ("motorsport", MOTORSPORT),
+        ("golf", GOLF),
+    ] {
+        if toks.contains(&tok) {
+            return Some(cat);
+        }
+    }
+    None
+}
+
+/// Keyword-classify a non-league market by its title into politics / crypto /
+/// econ, else `"other"`. Case-insensitive substring match.
+fn title_category(title: &str) -> String {
+    let t = title.to_ascii_lowercase();
+    let any = |kws: &[&str]| kws.iter().any(|k| t.contains(k));
+    if any(&[
+        "election", "senate", "president", "congress", "governor", "primary", "democrat",
+        "republican", "parliament", "referendum", "prime minister", "trump", "biden", "poll",
+        "vote", "nomin", "cabinet", "impeach",
+    ]) {
+        "politics".to_string()
+    } else if any(&[
+        "bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "$sol", "dogecoin", "xrp", "binance",
+        "stablecoin",
+    ]) {
+        "crypto".to_string()
+    } else if any(&[
+        "fed", "cpi", "gdp", "inflation", "interest rate", "rate cut", "rate hike", "recession",
+        "unemployment", "jobs report", "powell", "fomc",
+    ]) {
+        "econ".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+/// One `(trader, category)` ADAPTIVE record: a recency-decayed, sample-aware
+/// view of the trader's resolved BUYS in that category. `score` — the value the
+/// creamy layer ranks by — is the lower-confidence bound
+/// `wmean_edge − z · wstdev / √n_eff`: it rewards a high recent edge but shrinks
+/// it for a thin or volatile record, so a lucky 2-bet fluke can't out-rank a
+/// steady specialist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdaptiveRecord {
+    /// Kish EFFECTIVE sample size `(Σw)² / Σw²` — the decay-adjusted bet count.
+    pub n_eff: f64,
+    /// Recency-weighted mean edge (`won − price`), decayed by `half_life`.
+    pub wmean_edge: f64,
+    /// Lower-confidence-bound skill score (the creamy-layer sort key).
+    pub score: f64,
+}
+
+/// Build per-`(wallet, category)` [`AdaptiveRecord`]s from each trader's resolved
+/// PRE-`cutoff_ts` BUYS (the OUT-OF-SAMPLE selection set — post-cutoff trades are
+/// the copy-test and are excluded), category derived per market via
+/// [`market_category`]. Each bet's edge `(won?1:0) − price` is weighted by an
+/// EXPONENTIAL recency decay `0.5^((cutoff_ts − t)/half_life_secs)` (measured
+/// back from the decision point `cutoff_ts`, so recent-relative-to-cutoff bets
+/// dominate). Resolutions come from the INDEPENDENT Gamma map (same as
+/// [`trader_records`]). Pure and deterministic.
+pub fn category_adaptive_records(
+    trades_by_wallet: &HashMap<String, Vec<Trade>>,
+    resolutions: &HashMap<String, i64>,
+    cutoff_ts: i64,
+    half_life_secs: f64,
+    z: f64,
+) -> HashMap<(String, String), AdaptiveRecord> {
+    // Weighted accumulators per (wallet, category): Σw, Σw·e, Σw·e², Σw².
+    #[derive(Default)]
+    struct Acc {
+        w: f64,
+        we: f64,
+        we2: f64,
+        w2: f64,
+    }
+    let mut acc: HashMap<(String, String), Acc> = HashMap::new();
+    for (wallet, trades) in trades_by_wallet {
+        for t in trades {
+            if t.side != TradeSide::Buy || t.timestamp >= cutoff_ts {
+                continue;
+            }
+            let Some(&win) = resolutions.get(&t.condition_id) else {
+                continue;
+            };
+            let cat = market_category(&t.slug, &t.title);
+            let won = if win == t.outcome_index { 1.0 } else { 0.0 };
+            let edge = won - t.price;
+            let age = (cutoff_ts - t.timestamp) as f64;
+            let w = 0.5_f64.powf(age / half_life_secs);
+            let e = acc.entry((wallet.clone(), cat)).or_default();
+            e.w += w;
+            e.we += w * edge;
+            e.we2 += w * edge * edge;
+            e.w2 += w * w;
+        }
+    }
+    let mut out: HashMap<(String, String), AdaptiveRecord> = HashMap::new();
+    for (key, a) in acc {
+        if a.w <= 0.0 || a.w2 <= 0.0 {
+            continue;
+        }
+        let wmean = a.we / a.w;
+        let n_eff = a.w * a.w / a.w2;
+        // Weighted population variance, floored at 0 against fp drift.
+        let var = (a.we2 / a.w - wmean * wmean).max(0.0);
+        let stdev = var.sqrt();
+        let score = wmean - z * stdev / n_eff.sqrt();
+        out.insert(
+            key,
+            AdaptiveRecord {
+                n_eff,
+                wmean_edge: wmean,
+                score,
+            },
+        );
+    }
+    out
+}
+
+/// Select the per-category CREAMY LAYER from [`category_adaptive_records`]: in
+/// each category, keep wallets with `n_eff ≥ min_bets` AND `score > 0`, rank by
+/// `score` (then wallet for determinism), take the top `k_per_cat`. Returns
+/// `category → set of specialist wallets` for O(1) routing lookups.
+pub fn creamy_layer(
+    records: &HashMap<(String, String), AdaptiveRecord>,
+    k_per_cat: usize,
+    min_bets: f64,
+) -> HashMap<String, HashSet<String>> {
+    let mut by_cat: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+    for ((wallet, cat), r) in records {
+        if r.n_eff >= min_bets && r.score > 0.0 {
+            by_cat
+                .entry(cat.clone())
+                .or_default()
+                .push((wallet.clone(), r.score));
+        }
+    }
+    by_cat
+        .into_iter()
+        .map(|(cat, mut v)| {
+            v.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            v.truncate(k_per_cat);
+            (cat, v.into_iter().map(|(w, _)| w).collect())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -455,5 +665,104 @@ mod tests {
         // cap (matches the backtest's old inline `+inf > max_drift` -> skip).
         assert!(!within_drift(0.50, 0.0, 1.0));
         assert!(!within_drift(0.50, 0.0, f64::INFINITY));
+    }
+
+    // ===================== specialist routing =====================
+    fn buy_s(wallet: &str, cid: &str, oi: i64, price: f64, ts: i64, slug: &str) -> Trade {
+        let mut t = trade(wallet, cid, oi, TradeSide::Buy, price, ts);
+        t.slug = slug.to_string();
+        t
+    }
+
+    #[test]
+    fn market_category_maps_leagues_and_title_fallback() {
+        // League slugs → sport categories (first recognized token wins).
+        assert_eq!(market_category("mlb-nyy-bos-2026-05-01", ""), "baseball");
+        assert_eq!(market_category("nba-lal-bos-2026-01-15", ""), "basketball");
+        assert_eq!(market_category("nhl-bos-mtl-2026", ""), "hockey");
+        assert_eq!(market_category("cs2-navi-vitality-2026", ""), "esports");
+        assert_eq!(
+            market_category("fifwc-jor-alg-2026-06-22-alg", "Will Algeria win on 2026-06-22?"),
+            "soccer"
+        );
+        // Generic `will-…` slugs carry no league token → title keyword fallback.
+        assert_eq!(
+            market_category("will-trump-2028", "Will Trump win the 2028 election?"),
+            "politics"
+        );
+        assert_eq!(
+            market_category("will-btc-100k", "Will Bitcoin hit $100k in 2026?"),
+            "crypto"
+        );
+        assert_eq!(
+            market_category("will-fed-cut", "Will the Fed cut the interest rate in March?"),
+            "econ"
+        );
+        assert_eq!(
+            market_category("some-market", "A market about nothing in particular"),
+            "other"
+        );
+    }
+
+    #[test]
+    fn category_adaptive_records_score_and_recency() {
+        let cutoff = 1_000_000i64;
+        let hl = 30.0 * 86_400.0; // 30-day half-life
+
+        let mut trades: Vec<Trade> = Vec::new();
+        // A: 5 winning baseball buys @0.5 (edge +0.5), ALL just before cutoff →
+        // near-equal weights → wmean ≈ 0.5, var ≈ 0, n_eff ≈ 5, score ≈ 0.5.
+        for i in 0..5i64 {
+            trades.push(buy_s("0xA", &format!("a{i}"), 0, 0.5, cutoff - 10 - i, "mlb-a"));
+        }
+        // B: 5 winning baseball buys @0.5 OLD (120d back), 5 LOSING @0.5 RECENT →
+        // the recent losses dominate the recency-weighted mean.
+        for i in 0..5i64 {
+            trades.push(buy_s("0xB", &format!("bw{i}"), 0, 0.5, cutoff - 120 * 86_400 - i, "mlb-b"));
+        }
+        for i in 0..5i64 {
+            trades.push(buy_s("0xB", &format!("bl{i}"), 0, 0.5, cutoff - 10 - i, "mlb-b"));
+        }
+        let tm = tmap(trades);
+        let mut res: HashMap<String, i64> = HashMap::new();
+        for i in 0..5 {
+            res.insert(format!("a{i}"), 0); // A wins (res == oi 0)
+            res.insert(format!("bw{i}"), 0); // B old wins
+            res.insert(format!("bl{i}"), 1); // B recent losses (res 1 != oi 0)
+        }
+        let recs = category_adaptive_records(&tm, &res, cutoff, hl, 1.0);
+        let a = recs
+            .get(&("0xA".to_string(), "baseball".to_string()))
+            .expect("A baseball record");
+        let b = recs
+            .get(&("0xB".to_string(), "baseball".to_string()))
+            .expect("B baseball record");
+        assert!((a.wmean_edge - 0.5).abs() < 1e-6, "A ~ +0.5 recency-weighted edge");
+        assert!((a.n_eff - 5.0).abs() < 0.1, "A effective sample ~ 5 (equal weights)");
+        assert!(a.score > 0.0, "A is a positive specialist");
+        assert!(
+            b.wmean_edge < a.wmean_edge,
+            "B's recent losses drag its recency-weighted edge below A ({} < {})",
+            b.wmean_edge,
+            a.wmean_edge
+        );
+    }
+
+    #[test]
+    fn creamy_layer_keeps_top_specialists_and_gates() {
+        let ar = |n_eff, score| AdaptiveRecord { n_eff, wmean_edge: score, score };
+        let mut records: HashMap<(String, String), AdaptiveRecord> = HashMap::new();
+        records.insert(("0xStrong".into(), "baseball".into()), ar(8.0, 0.30));
+        records.insert(("0xWeak".into(), "baseball".into()), ar(8.0, -0.20)); // score ≤ 0 → dropped
+        records.insert(("0xThin".into(), "baseball".into()), ar(2.0, 0.80)); // n_eff < min → dropped
+        records.insert(("0xPol".into(), "politics".into()), ar(6.0, 0.15));
+
+        let cl = creamy_layer(&records, 1, 3.0);
+        let base = cl.get("baseball").expect("baseball layer");
+        assert!(base.contains("0xStrong"), "top positive specialist kept");
+        assert!(!base.contains("0xWeak"), "non-positive score dropped");
+        assert!(!base.contains("0xThin"), "thin effective sample dropped by min_bets");
+        assert_eq!(base.len(), 1, "top-1 per category");
+        assert!(cl.get("politics").expect("politics layer").contains("0xPol"));
     }
 }

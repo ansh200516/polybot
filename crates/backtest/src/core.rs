@@ -29,7 +29,8 @@ use pm_ingestion::data_api::{ClosedPos, LeaderboardEntry, Trade, TradeSide};
 // the live copy strategy). Re-export the items the backtest historically exposed
 // via `core::` so `lib.rs` / `main.rs` keep compiling unchanged.
 pub use pm_ingestion::smart_money::{
-    Ranking, TraderRecord, rank_wallets_oos, trader_records, within_drift,
+    AdaptiveRecord, Ranking, TraderRecord, category_adaptive_records, creamy_layer, market_category,
+    rank_wallets_oos, trader_records, within_drift,
 };
 use pm_ingestion::smart_money::wilson_lower_bound;
 
@@ -225,6 +226,61 @@ pub fn signals_after(
     out
 }
 
+/// SPECIALIST-ROUTED variant of [`signals_after`]: a post-`cutoff_ts` BUY is a
+/// candidate only if its trader is in the CREAMY LAYER for that market's CATEGORY
+/// ([`market_category`] over the trade's slug/title). This is the copy-test
+/// signal source for the two-stage specialist strategy — Stage 1 having already
+/// picked the per-category specialists into `creamy` (`category → wallets`).
+/// Same K-convergence, cutoff, and deterministic `(timestamp, condition, outcome)`
+/// ordering as [`signals_after`]; only the eligibility gate differs.
+pub fn specialist_signals(
+    creamy: &HashMap<String, HashSet<String>>,
+    trades_by_wallet: &HashMap<String, Vec<Trade>>,
+    k: usize,
+    window_secs: i64,
+    cutoff_ts: i64,
+) -> Vec<FollowSignal> {
+    let mut groups: HashMap<(String, i64), Vec<BuyEvent>> = HashMap::new();
+    for (wallet, trades) in trades_by_wallet {
+        for t in trades {
+            if t.side != TradeSide::Buy || t.timestamp < cutoff_ts {
+                continue;
+            }
+            // Route by the market's category: eligible iff this trader is a
+            // creamy-layer specialist THERE.
+            let cat = market_category(&t.slug, &t.title);
+            if !creamy.get(&cat).is_some_and(|set| set.contains(wallet)) {
+                continue;
+            }
+            groups
+                .entry((t.condition_id.clone(), t.outcome_index))
+                .or_default()
+                .push((t.timestamp, wallet.clone(), t.price));
+        }
+    }
+
+    let mut out: Vec<FollowSignal> = Vec::new();
+    for ((condition_id, outcome_index), mut buys) in groups {
+        buys.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        if let Some((timestamp, wallets, trigger_price)) = first_convergence(&buys, k, window_secs) {
+            out.push(FollowSignal {
+                condition_id,
+                outcome_index,
+                timestamp,
+                wallets,
+                trigger_price,
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then_with(|| a.condition_id.cmp(&b.condition_id))
+            .then_with(|| a.outcome_index.cmp(&b.outcome_index))
+    });
+    out
+}
+
 /// The earliest BUY time `t` such that `k` DISTINCT wallets have a BUY in the
 /// trailing window `[t - window_secs, t]`, paired with those distinct wallets
 /// (in convergence order) and the price of the triggering BUY at `t`. `buys`
@@ -292,6 +348,13 @@ pub struct SimParams {
     /// and the smart-money edge — being in near their price — is gone). `None`
     /// disables the filter (copy at any drift).
     pub max_drift: Option<f64>,
+    /// HARD STOP-LOSS as a fraction of the entry price. `Some(0.25)` closes the
+    /// position at the FIRST tape mark that has fallen to `entry·(1 − 0.25)`
+    /// (realizing ≈ −25% minus fee), *before* the base exit
+    /// ([`ExitMode`]) can play out. `None` disables the stop (hold to the base
+    /// exit — resolution or the leaders' own exit). This is the knob under test:
+    /// stop vs no-stop over the same signal population.
+    pub stop_loss: Option<f64>,
 }
 
 /// The outcome of simulating one [`FollowSignal`].
@@ -345,15 +408,43 @@ pub fn simulate_signal(
     }
 
     let resolution = resolution_px(winning_outcome, sig.outcome_index);
-    let exit_px = match p.exit {
-        ExitMode::Resolution => resolution,
-        // Earliest leader SELL → price off the tape after the lag; fall back to
-        // resolution if there is no such SELL or no tape after the exit time.
-        ExitMode::FollowExit => earliest_follow_sell(sig, trades_by_wallet)
-            .and_then(|sell_ts| {
-                tape_price_at_or_after(tape, sell_ts + p.lag_secs, sig.outcome_index)
-            })
-            .unwrap_or(resolution),
+    // BASE exit = where the position would close absent any stop: its price AND
+    // the time it happens. Resolution is booked after the whole tape, so it has
+    // no in-tape timestamp — `i64::MAX` lets the stop scan the full remaining
+    // tape against it. FollowExit prices the earliest leader SELL off the tape
+    // after the lag; with no such sell (or no tape after it) it degrades to
+    // resolution.
+    let (base_exit_px, base_exit_time) = match p.exit {
+        ExitMode::Resolution => (resolution, i64::MAX),
+        ExitMode::FollowExit => match earliest_follow_sell(sig, trades_by_wallet) {
+            Some(sell_ts) => {
+                let exit_time = sell_ts + p.lag_secs;
+                match tape_price_at_or_after(tape, exit_time, sig.outcome_index) {
+                    Some(px) => (px, exit_time),
+                    None => (resolution, i64::MAX),
+                }
+            }
+            None => (resolution, i64::MAX),
+        },
+    };
+
+    // HARD STOP-LOSS: the first tape mark strictly after entry and at/before the
+    // base-exit time that has fallen to `entry·(1 − stop)` closes the position
+    // early at that (low) fillable price. If the mark never crosses in-window the
+    // base exit stands. `None` ⇒ no stop (hold to the base exit).
+    let exit_px = match p.stop_loss {
+        Some(stop) => {
+            let stop_px = entry_px * (1.0 - stop);
+            stop_exit_px(
+                tape,
+                entry_time,
+                base_exit_time,
+                sig.outcome_index,
+                stop_px,
+            )
+            .unwrap_or(base_exit_px)
+        }
+        None => base_exit_px,
     };
 
     let ret = (exit_px - entry_px) / entry_px - p.fee_frac;
@@ -390,6 +481,26 @@ fn tape_price_at_or_after(tape: &[Trade], at: i64, outcome: i64) -> Option<f64> 
     tape.iter()
         .find(|t| t.timestamp >= at)
         .map(|t| normalize_price(t, outcome))
+}
+
+/// STOP scan: binary-normalized price of the FIRST tape trade STRICTLY after
+/// `entry_time` and at/before `until` whose price for `outcome` has fallen to
+/// `stop_px` (`≤`). That trade price is the realistic stop fill (we sell into
+/// the same print that breached the level). `None` if the mark never reaches the
+/// stop inside the window (the tape is ascending by timestamp). `until` is the
+/// base-exit time — `i64::MAX` for a hold-to-resolution position scans the rest
+/// of the tape.
+fn stop_exit_px(
+    tape: &[Trade],
+    entry_time: i64,
+    until: i64,
+    outcome: i64,
+    stop_px: f64,
+) -> Option<f64> {
+    tape.iter()
+        .filter(|t| t.timestamp > entry_time && t.timestamp <= until)
+        .map(|t| normalize_price(t, outcome))
+        .find(|&px| px <= stop_px)
 }
 
 /// Earliest timestamp (strictly after `sig.timestamp`) at which any signal
@@ -877,12 +988,53 @@ mod tests {
         assert!(signals(&wl(&["0xA", "0xB", "0xC"]), &miss, 3, 100).is_empty());
     }
 
+    // ===================== specialist_signals (category routing) =====================
+    fn buy_slug(wallet: &str, cid: &str, oi: i64, price: f64, ts: i64, slug: &str) -> Trade {
+        let mut t = trade(wallet, cid, oi, TradeSide::Buy, price, ts);
+        t.slug = slug.to_string();
+        t
+    }
+
+    #[test]
+    fn specialist_signals_route_by_category_and_creamy_membership() {
+        use std::collections::HashSet;
+        // 0xA is a baseball specialist; 0xB is not in any creamy layer.
+        let creamy: HashMap<String, HashSet<String>> =
+            HashMap::from([("baseball".to_string(), HashSet::from(["0xA".to_string()]))]);
+        let trades = tmap(vec![
+            // 0xA buys a BASEBALL market (mlb slug) → routed (0xA ∈ baseball layer).
+            buy_slug("0xA", "0xBASE", 0, 0.5, 2000, "mlb-nyy-bos-2026"),
+            // 0xA buys a SOCCER market → 0xA is NOT a soccer specialist → skipped.
+            buy_slug("0xA", "0xSOCC", 0, 0.5, 2100, "fifwc-bra-arg-2026"),
+            // 0xB buys a baseball market → 0xB not in the layer → skipped.
+            buy_slug("0xB", "0xBASE2", 0, 0.5, 2200, "mlb-lad-sf-2026"),
+        ]);
+        let sigs = specialist_signals(&creamy, &trades, 1, 86_400, 1_000);
+        assert_eq!(sigs.len(), 1, "only the routed baseball specialist buy fires");
+        assert_eq!(sigs[0].condition_id, "0xBASE");
+        assert_eq!(sigs[0].wallets, wl(&["0xA"]));
+    }
+
+    #[test]
+    fn specialist_signals_respect_cutoff() {
+        use std::collections::HashSet;
+        let creamy: HashMap<String, HashSet<String>> =
+            HashMap::from([("baseball".to_string(), HashSet::from(["0xA".to_string()]))]);
+        let trades = tmap(vec![
+            buy_slug("0xA", "0xPRE", 0, 0.5, 500, "mlb-a"), // pre-cutoff → excluded
+            buy_slug("0xA", "0xPOST", 0, 0.5, 1500, "mlb-b"), // post-cutoff → signal
+        ]);
+        let sigs = specialist_signals(&creamy, &trades, 1, 86_400, 1_000);
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].condition_id, "0xPOST");
+    }
+
     // ===================== simulate_signal =====================
     #[test]
     fn sim_entry_picks_first_trade_at_lag_boundary_and_resolution_winner() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1000, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None, stop_loss: None };
         let r = simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "Will the Fed cut rates?");
         assert_filled(&r, 0.45, 1.0, (1.0 - 0.45) / 0.45, false);
     }
@@ -891,7 +1043,7 @@ mod tests {
     fn sim_resolution_loser_and_fee() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1000, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.02, exit: ExitMode::Resolution, max_drift: None };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.02, exit: ExitMode::Resolution, max_drift: None, stop_loss: None };
         let r = simulate_signal(&s, &tape, 1, &HashMap::new(), &p, "Market");
         assert_filled(&r, 0.45, 0.0, (0.0 - 0.45) / 0.45 - 0.02, false);
     }
@@ -900,7 +1052,7 @@ mod tests {
     fn sim_binary_normalization_buy_outcome1() {
         let tape = fixture_tape();
         let s = sig("0xM", 1, 1000, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None, stop_loss: None };
         // Entry trade @1010 is an OUTCOME 0 trade @0.45 -> price of outcome 1 = 0.55.
         let r = simulate_signal(&s, &tape, 1, &HashMap::new(), &p, "Market");
         assert_filled(&r, 0.55, 1.0, (1.0 - 0.55) / 0.55, false);
@@ -910,7 +1062,7 @@ mod tests {
     fn sim_binary_normalization_entry_on_opposite_outcome_trade() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1010, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None, stop_loss: None };
         // Entry_time = 1020 -> the OUTCOME 1 trade @0.70 -> price of outcome 0 = 0.30.
         let r = simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "Market");
         assert_filled(&r, 0.30, 1.0, (1.0 - 0.30) / 0.30, false);
@@ -920,7 +1072,7 @@ mod tests {
     fn sim_skips_when_no_tape_after_lag() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1100, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None, stop_loss: None };
         assert_eq!(
             simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "Market"),
             SimResult::Skipped
@@ -930,7 +1082,7 @@ mod tests {
     #[test]
     fn sim_skips_on_empty_tape() {
         let s = sig("0xM", 0, 1000, &["0xA"]);
-        let p = SimParams { lag_secs: 0, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
+        let p = SimParams { lag_secs: 0, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None, stop_loss: None };
         assert_eq!(
             simulate_signal(&s, &[], 0, &HashMap::new(), &p, "Market"),
             SimResult::Skipped
@@ -941,7 +1093,7 @@ mod tests {
     fn sim_skips_on_degenerate_entry_price() {
         let tape = vec![trade("0xMM", "0xM", 0, TradeSide::Buy, 1.0, 2000)];
         let s = sig("0xM", 0, 1990, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None, stop_loss: None };
         assert_eq!(
             simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "Market"),
             SimResult::Skipped
@@ -952,7 +1104,7 @@ mod tests {
     fn sim_follow_exit_picks_earliest_valid_sell() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1000, &["0xA", "0xB"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::FollowExit, max_drift: None };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::FollowExit, max_drift: None, stop_loss: None };
         let follows = tmap(vec![
             trade("0xA", "0xM", 1, TradeSide::Sell, 0.5, 1005), // wrong outcome
             trade("0xB", "0xM", 0, TradeSide::Sell, 0.5, 999),  // before signal ts
@@ -969,7 +1121,7 @@ mod tests {
     fn sim_follow_exit_falls_back_to_resolution_without_sell() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1000, &["0xA", "0xB"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::FollowExit, max_drift: None };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::FollowExit, max_drift: None, stop_loss: None };
         let r = simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "Market");
         assert_filled(&r, 0.45, 1.0, (1.0 - 0.45) / 0.45, false);
     }
@@ -978,7 +1130,7 @@ mod tests {
     fn sim_follow_exit_falls_back_when_no_tape_after_exit() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1000, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::FollowExit, max_drift: None };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::FollowExit, max_drift: None, stop_loss: None };
         // Sell @1095 -> exit_time = 1105 > last tape (1100) -> fall back to resolution (loser -> 0.0).
         let follows = tmap(vec![trade("0xA", "0xM", 0, TradeSide::Sell, 0.5, 1095)]);
         let r = simulate_signal(&s, &tape, 1, &follows, &p, "Market");
@@ -989,12 +1141,87 @@ mod tests {
     fn sim_sets_sports_flag_from_title() {
         let tape = fixture_tape();
         let s = sig("0xM", 0, 1000, &["0xA"]);
-        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
+        let p = SimParams { lag_secs: 10, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None, stop_loss: None };
         let r = simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "France vs Brazil: who wins?");
         match r {
             SimResult::Filled { sports, .. } => assert!(sports),
             SimResult::Skipped => panic!("expected Filled"),
         }
+    }
+
+    // ===================== stop-loss =====================
+    // Entry @0.45 (ts=1010); the outcome-0 mark then goes 0.30 (t=1020) → 0.50 →
+    // 0.60 and RESOLVES a WINNER (1.0). This dip-then-recover-then-win path is the
+    // exact case that separates "stop" from "no stop".
+
+    #[test]
+    fn sim_stop_triggers_cuts_at_breach_price() {
+        // 25% stop: stop_px = 0.45·0.75 = 0.3375; first mark ≤ it is 0.30 @t=1020
+        // → we sell into that print. A tight stop CUTS a position that would have
+        // resolved a winner: exit 0.30, ret = (0.30−0.45)/0.45 = −0.3333.
+        let tape = fixture_tape();
+        let s = sig("0xM", 0, 1000, &["0xA"]);
+        let p = SimParams {
+            lag_secs: 10,
+            fee_frac: 0.0,
+            exit: ExitMode::Resolution,
+            max_drift: None,
+            stop_loss: Some(0.25),
+        };
+        let r = simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "Market");
+        assert_filled(&r, 0.45, 0.30, (0.30 - 0.45) / 0.45, false);
+    }
+
+    #[test]
+    fn sim_no_stop_holds_dip_through_to_winner() {
+        // Same signal, NO stop: the 0.30 dip is ignored and the winner resolves at
+        // 1.0 — the mirror of the test above (the return the stop gave up).
+        let tape = fixture_tape();
+        let s = sig("0xM", 0, 1000, &["0xA"]);
+        let p = SimParams {
+            lag_secs: 10,
+            fee_frac: 0.0,
+            exit: ExitMode::Resolution,
+            max_drift: None,
+            stop_loss: None,
+        };
+        let r = simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "Market");
+        assert_filled(&r, 0.45, 1.0, (1.0 - 0.45) / 0.45, false);
+    }
+
+    #[test]
+    fn sim_wide_stop_does_not_trigger() {
+        // 50% stop: stop_px = 0.225; no mark ever falls that far, so the stop is
+        // inert and the base (resolution winner) exit stands at 1.0.
+        let tape = fixture_tape();
+        let s = sig("0xM", 0, 1000, &["0xA"]);
+        let p = SimParams {
+            lag_secs: 10,
+            fee_frac: 0.0,
+            exit: ExitMode::Resolution,
+            max_drift: None,
+            stop_loss: Some(0.50),
+        };
+        let r = simulate_signal(&s, &tape, 0, &HashMap::new(), &p, "Market");
+        assert_filled(&r, 0.45, 1.0, (1.0 - 0.45) / 0.45, false);
+    }
+
+    #[test]
+    fn sim_stop_caps_loss_on_a_loser() {
+        // Same 0.30 breach, but the market RESOLVES a LOSER. The stop caps the
+        // loss at −33% (exit 0.30) instead of the −100% a hold-to-resolution would
+        // eat — the case where a stop earns its keep.
+        let tape = fixture_tape();
+        let s = sig("0xM", 0, 1000, &["0xA"]);
+        let p = SimParams {
+            lag_secs: 10,
+            fee_frac: 0.0,
+            exit: ExitMode::Resolution,
+            max_drift: None,
+            stop_loss: Some(0.25),
+        };
+        let r = simulate_signal(&s, &tape, 1, &HashMap::new(), &p, "Market");
+        assert_filled(&r, 0.45, 0.30, (0.30 - 0.45) / 0.45, false);
     }
 
     // ===================== metrics =====================
@@ -1102,7 +1329,7 @@ mod tests {
         let tape = vec![trade("0xMM", "m", 0, TradeSide::Buy, 0.60, 1000)];
         let s = sig_tp("m", 0, 1000, &["0xA"], 0.40);
 
-        let none = SimParams { lag_secs: 0, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None };
+        let none = SimParams { lag_secs: 0, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: None, stop_loss: None };
         assert_filled(
             &simulate_signal(&s, &tape, 0, &HashMap::new(), &none, "Market"),
             0.60,
@@ -1111,14 +1338,14 @@ mod tests {
             false,
         );
 
-        let tight = SimParams { lag_secs: 0, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: Some(0.2) };
+        let tight = SimParams { lag_secs: 0, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: Some(0.2), stop_loss: None };
         assert_eq!(
             simulate_signal(&s, &tape, 0, &HashMap::new(), &tight, "Market"),
             SimResult::Skipped,
             "0.5 drift > 0.2 max_drift -> chasing -> skip"
         );
 
-        let loose = SimParams { lag_secs: 0, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: Some(0.6) };
+        let loose = SimParams { lag_secs: 0, fee_frac: 0.0, exit: ExitMode::Resolution, max_drift: Some(0.6), stop_loss: None };
         match simulate_signal(&s, &tape, 0, &HashMap::new(), &loose, "Market") {
             SimResult::Filled { entry_px, .. } => assert!((entry_px - 0.60).abs() < 1e-12),
             SimResult::Skipped => panic!("0.5 drift <= 0.6 max_drift -> allowed"),

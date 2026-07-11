@@ -43,8 +43,9 @@ use pm_ingestion::data_api::{
 use pm_registry::gamma::GammaMarket;
 
 use crate::core::{
-    ExitMode, Metrics, PRICE_BUCKETS, Ranking, SimParams, SimResult, metrics, price_bucket,
-    rank_wallets_oos, signals_after, simulate_signal, trader_records,
+    ExitMode, FollowSignal, Metrics, PRICE_BUCKETS, Ranking, SimParams, SimResult,
+    category_adaptive_records, creamy_layer, metrics, price_bucket, rank_wallets_oos,
+    signals_after, simulate_signal, specialist_signals, trader_records,
 };
 
 /// Default size of the leaderboard pull, per `(orderBy, timePeriod)` slice.
@@ -622,6 +623,9 @@ pub struct GridResult {
     /// FRESHNESS filter: max tolerated entry-vs-trigger price drift, or `null`
     /// (no filter). Serialized as a number or null ([`SimParams::max_drift`]).
     pub max_drift: Option<f64>,
+    /// HARD STOP-LOSS as a fraction of entry, or `null` (no stop — hold to the
+    /// base exit). Serialized as a number or null ([`SimParams::stop_loss`]).
+    pub stop_loss: Option<f64>,
     /// `"all"` | `"sports"` | `"nonsports"` | `"px:<bucket>"` (see
     /// [`crate::core::PRICE_BUCKETS`]).
     pub scope: String,
@@ -630,7 +634,8 @@ pub struct GridResult {
 }
 
 /// The parameter grid swept by [`run_grid`]. [`Default`] is the FIX-B spec grid:
-/// rankings × Ks × lags × exits × freshness = 3 × 3 × 4 × 2 × 3 = 216 cells.
+/// rankings × Ks × lags × exits × freshness × stops =
+/// 3 × 3 × 4 × 2 × 3 × 3 = 648 cells.
 #[derive(Debug, Clone)]
 pub struct GridConfig {
     /// Wallet-selection rankings to sweep.
@@ -644,6 +649,10 @@ pub struct GridConfig {
     /// FRESHNESS thresholds to sweep: `None` (no filter) and the fractional
     /// entry-vs-trigger drift caps ([`SimParams::max_drift`]).
     pub freshness: Vec<Option<f64>>,
+    /// HARD STOP-LOSS fractions to sweep: `None` (hold to the base exit — the
+    /// "no stop" arm) and the fractional per-position stops under test
+    /// ([`SimParams::stop_loss`]), e.g. `Some(0.25)` / `Some(0.50)`.
+    pub stops: Vec<Option<f64>>,
     /// Whitelist size cap (per ranking).
     pub top_n: usize,
     /// Minimum PRE-cutoff resolved-bet sample for the skill rankings
@@ -658,6 +667,25 @@ pub struct GridConfig {
     /// signals. Callers MUST set this (e.g. `now − 90 days`); [`Default`] leaves
     /// it at `0` (epoch), which makes the whole history the test set.
     pub cutoff_ts: i64,
+    /// SPECIALIST ROUTING (the two-stage layered strategy): when `true`, ALSO
+    /// sweep a `"SpecialistAdaptive"` ranking that (Stage 1) picks a per-category
+    /// creamy layer by the recency-decayed adaptive-skill score and (Stage 2)
+    /// copies only those specialists' fresh buys IN their category.
+    pub specialist: bool,
+    /// Recency half-life (DAYS) for the adaptive-skill decay
+    /// ([`category_adaptive_records`]). Recent bets dominate the score.
+    pub specialist_half_life_days: f64,
+    /// Effective-sample floor per `(trader, category)` for the creamy layer
+    /// ([`creamy_layer`]'s `min_bets`, a decay-adjusted count so it's a float).
+    pub specialist_min_bets: f64,
+    /// Creamy-layer size PER category (top specialists kept).
+    pub specialist_top_k_per_cat: usize,
+    /// Lower-confidence-bound `z` for the adaptive score (`mean − z·stdev/√n_eff`).
+    pub specialist_z: f64,
+    /// STAGE 2: also require a creamy-layer trader to clear a positive GLOBAL
+    /// pre-cutoff EdgePerBet (`mean_edge > 0`) before copying — the "apply
+    /// EdgePerBet on the creamy layer" gate.
+    pub specialist_edge_gate: bool,
 }
 
 impl Default for GridConfig {
@@ -668,11 +696,23 @@ impl Default for GridConfig {
             lags_min: vec![1, 5, 30, 60],
             exits: vec![ExitMode::Resolution, ExitMode::FollowExit],
             freshness: vec![None, Some(0.35), Some(0.15)],
+            // stop vs no-stop is the knob under test: no stop, the live −50%, and
+            // the older −25%.
+            stops: vec![None, Some(0.50), Some(0.25)],
             top_n: 30,
             min_bets: 10,
             window_secs: 86_400,
             fee_frac: 0.0,
             cutoff_ts: 0,
+            // Two-stage specialist routing on by default: 45-day recency half-life,
+            // ≥5 effective bets per (trader, category), top-10 specialists per
+            // category, z=1 confidence shrink, and the EdgePerBet Stage-2 gate.
+            specialist: true,
+            specialist_half_life_days: 45.0,
+            specialist_min_bets: 5.0,
+            specialist_top_k_per_cat: 10,
+            specialist_z: 1.0,
+            specialist_edge_gate: true,
         }
     }
 }
@@ -683,10 +723,11 @@ impl Default for GridConfig {
 /// SELECTION uses only PRE-`cutoff_ts` history and the COPY TEST uses only
 /// POST-`cutoff_ts` signals, so the two are DISJOINT (no survivorship bias).
 ///
-/// For each `(ranking, k, lag, exit, freshness)` cell it emits one row per scope:
-/// `"all"`, `"sports"`, `"nonsports"`, then one `"px:<bucket>"` per
+/// For each `(ranking, k, lag, exit, freshness, stop)` cell it emits one row per
+/// scope: `"all"`, `"sports"`, `"nonsports"`, then one `"px:<bucket>"` per
 /// [`PRICE_BUCKETS`] entry — `3 + PRICE_BUCKETS.len()` rows in a fixed order. The
-/// total length is `rankings × ks × lags_min × exits × freshness × (3 + buckets)`
+/// total length is
+/// `rankings × ks × lags_min × exits × freshness × stops × (3 + buckets)`
 /// in grid order.
 ///
 /// Per cell:
@@ -695,8 +736,8 @@ impl Default for GridConfig {
 /// 2. `sigs = signals_after(whitelist, k, window, cutoff_ts)`; re-sorted ascending
 ///    by timestamp so [`metrics`]' max-drawdown sees true time order.
 /// 3. Each signal with a known resolution AND a tape is simulated with
-///    `SimParams { lag_secs: lag_min*60, fee_frac, exit, max_drift }`, in
-///    signal-time order (the freshness filter may turn a copy into `Skipped`).
+///    `SimParams { lag_secs: lag_min*60, fee_frac, exit, max_drift, stop_loss }`,
+///    in signal-time order (the freshness filter may turn a copy into `Skipped`).
 /// 4. Scope split: `"all"` gets every result (so `Skipped` are counted there);
 ///    `"sports"`/`"nonsports"`/`"px:<bucket>"` get only the `Filled` results,
 ///    partitioned by the sports flag / entry-price bucket (time order preserved).
@@ -717,60 +758,112 @@ pub fn run_grid(data: &FetchedData, cfg: &GridConfig) -> Vec<GridResult> {
             let mut sigs =
                 signals_after(&whitelist, &data.trades_by_wallet, k, cfg.window_secs, cfg.cutoff_ts);
             sigs.sort_by_key(|s| s.timestamp);
+            sweep_and_emit(&mut out, data, cfg, ranking.as_str(), k, &sigs);
+        }
+    }
 
-            for &lag_min in &cfg.lags_min {
-                for &exit in &cfg.exits {
-                    for &max_drift in &cfg.freshness {
-                        let p = SimParams {
-                            lag_secs: lag_min * 60,
-                            fee_frac: cfg.fee_frac,
-                            exit,
-                            max_drift,
-                        };
-
-                        // Simulate each signal that has BOTH a resolution and a
-                        // tape, in signal-timestamp order.
-                        let mut all: Vec<SimResult> = Vec::with_capacity(sigs.len());
-                        for sig in &sigs {
-                            let (Some(&winning_outcome), Some(tape)) = (
-                                data.resolutions.get(&sig.condition_id),
-                                data.tape_by_market.get(&sig.condition_id),
-                            ) else {
-                                continue;
-                            };
-                            let title =
-                                data.titles.get(&sig.condition_id).map_or("", String::as_str);
-                            all.push(simulate_signal(
-                                sig,
-                                tape,
-                                winning_outcome,
-                                &data.trades_by_wallet,
-                                &p,
-                                title,
-                            ));
-                        }
-
-                        emit_scopes(&mut out, ranking, k, lag_min, exit, max_drift, &all);
-                    }
-                }
+    // SPECIALIST ROUTING (the two-stage layered strategy) as an extra ranking.
+    if cfg.specialist {
+        // Stage 1: per-(trader, category) recency-decayed adaptive-skill records
+        // (PRE-cutoff, OOS) → the per-category creamy layer of top specialists.
+        let half_life_secs = cfg.specialist_half_life_days * 86_400.0;
+        let adaptive = category_adaptive_records(
+            &data.trades_by_wallet,
+            &data.resolutions,
+            cfg.cutoff_ts,
+            half_life_secs,
+            cfg.specialist_z,
+        );
+        let mut creamy = creamy_layer(&adaptive, cfg.specialist_top_k_per_cat, cfg.specialist_min_bets);
+        // Stage 2: EdgePerBet gate — keep only creamy-layer traders whose GLOBAL
+        // pre-cutoff mean edge is positive ("apply EdgePerBet on the creamy layer").
+        if cfg.specialist_edge_gate {
+            let edge_ok: HashSet<&str> = records
+                .iter()
+                .filter(|(_, r)| r.mean_edge > 0.0)
+                .map(|(w, _)| w.as_str())
+                .collect();
+            for set in creamy.values_mut() {
+                set.retain(|w| edge_ok.contains(w.as_str()));
             }
+        }
+        for &k in &cfg.ks {
+            let mut sigs =
+                specialist_signals(&creamy, &data.trades_by_wallet, k, cfg.window_secs, cfg.cutoff_ts);
+            sigs.sort_by_key(|s| s.timestamp);
+            sweep_and_emit(&mut out, data, cfg, "SpecialistAdaptive", k, &sigs);
         }
     }
 
     out
 }
 
+/// Sweep the lag × exit × freshness × stop dimensions for ONE
+/// `(ranking_label, k, sigs)` combination and push the scope rows. Shared by the
+/// flat-ranking path and the specialist-routing path so both simulate + emit
+/// identically — only the SIGNAL SOURCE differs (a flat whitelist vs. the
+/// per-category creamy layer).
+fn sweep_and_emit(
+    out: &mut Vec<GridResult>,
+    data: &FetchedData,
+    cfg: &GridConfig,
+    ranking_label: &str,
+    k: usize,
+    sigs: &[FollowSignal],
+) {
+    for &lag_min in &cfg.lags_min {
+        for &exit in &cfg.exits {
+            for &max_drift in &cfg.freshness {
+                for &stop_loss in &cfg.stops {
+                    let p = SimParams {
+                        lag_secs: lag_min * 60,
+                        fee_frac: cfg.fee_frac,
+                        exit,
+                        max_drift,
+                        stop_loss,
+                    };
+
+                    // Simulate each signal that has BOTH a resolution and a tape,
+                    // in signal-timestamp order.
+                    let mut all: Vec<SimResult> = Vec::with_capacity(sigs.len());
+                    for sig in sigs {
+                        let (Some(&winning_outcome), Some(tape)) = (
+                            data.resolutions.get(&sig.condition_id),
+                            data.tape_by_market.get(&sig.condition_id),
+                        ) else {
+                            continue;
+                        };
+                        let title = data.titles.get(&sig.condition_id).map_or("", String::as_str);
+                        all.push(simulate_signal(
+                            sig,
+                            tape,
+                            winning_outcome,
+                            &data.trades_by_wallet,
+                            &p,
+                            title,
+                        ));
+                    }
+
+                    emit_scopes(out, ranking_label, k, lag_min, exit, max_drift, stop_loss, &all);
+                }
+            }
+        }
+    }
+}
+
 /// Partition one cell's `Filled` results by sports flag and entry-price bucket,
 /// and push the `"all"` + `"sports"` + `"nonsports"` + `"px:<bucket>"` scope rows
 /// (in that fixed order) for the `(ranking, k, lag, exit, max_drift)` cell. Time
 /// order is preserved within every partition.
+#[allow(clippy::too_many_arguments)]
 fn emit_scopes(
     out: &mut Vec<GridResult>,
-    ranking: Ranking,
+    ranking: &str,
     k: usize,
     lag_min: i64,
     exit: ExitMode,
     max_drift: Option<f64>,
+    stop_loss: Option<f64>,
     all: &[SimResult],
 ) {
     let mut sports: Vec<SimResult> = Vec::new();
@@ -796,11 +889,12 @@ fn emit_scopes(
 
     let push = |out: &mut Vec<GridResult>, scope: String, results: &[SimResult]| {
         out.push(GridResult {
-            ranking: ranking.as_str().to_string(),
+            ranking: ranking.to_string(),
             k,
             lag_min,
             exit: exit.as_str().to_string(),
             max_drift,
+            stop_loss,
             scope,
             metrics: metrics(results),
         });
@@ -1104,7 +1198,9 @@ mod tests {
         }
     }
 
-    /// Locate one grid cell + scope (helper for the hand-computed assertions).
+    /// Locate one grid cell + scope in the NO-STOP arm (the hand-computed
+    /// assertions below all reason about hold-to-base-exit returns). Stop-loss
+    /// cells are asserted separately.
     fn cell<'a>(
         results: &'a [GridResult],
         ranking: &str,
@@ -1122,6 +1218,7 @@ mod tests {
                     && r.lag_min == lag_min
                     && r.exit == exit
                     && r.max_drift == max_drift
+                    && r.stop_loss.is_none()
                     && r.scope == scope
             })
             .expect("grid cell present")
@@ -1210,25 +1307,35 @@ mod tests {
             lags_min: vec![1, 5],
             exits: vec![ExitMode::Resolution, ExitMode::FollowExit],
             freshness: vec![None, Some(0.13)],
+            stops: vec![None, Some(0.50)],
             top_n: 10,
             min_bets: 2,
             window_secs: 86_400,
             fee_frac: 0.0,
             cutoff_ts: CUTOFF,
+            // This test asserts the FLAT-ranking cardinality + hand-computed cells;
+            // keep the specialist sweep off so it stays focused.
+            specialist: false,
+            specialist_half_life_days: 45.0,
+            specialist_min_bets: 5.0,
+            specialist_top_k_per_cat: 10,
+            specialist_z: 1.0,
+            specialist_edge_gate: true,
         };
 
         let results = run_grid(&data, &cfg);
 
-        // ---- cardinality: rankings × ks × lags × exits × freshness × scopes ----
+        // ---- cardinality: rankings × ks × lags × exits × freshness × stops × scopes ----
         let n_scopes = 3 + PRICE_BUCKETS.len();
         let expected = cfg.rankings.len()
             * cfg.ks.len()
             * cfg.lags_min.len()
             * cfg.exits.len()
             * cfg.freshness.len()
+            * cfg.stops.len()
             * n_scopes;
         assert_eq!(results.len(), expected);
-        assert_eq!(expected, 3 * 2 * 2 * 2 * 2 * 8);
+        assert_eq!(expected, 3 * 2 * 2 * 2 * 2 * 2 * 8);
 
         // Each cell emits its scope rows in a fixed all→sports→nonsports→px order.
         for chunk in results.chunks(n_scopes) {
@@ -1281,5 +1388,25 @@ mod tests {
         assert_eq!(fresh_ns.metrics.n, 1); // only M1 (non-sports) survives
         let fresh_sp = cell(&results, "RawLeaderboard", 1, 1, "Resolution", Some(0.13), "sports");
         assert_eq!(fresh_sp.metrics.n, 0);
+
+        // ---- stop-loss dimension is wired and INERT on this all-rising fixture:
+        //      both marks only climb (M1 0.50→0.55, M2 0.40→0.50) before resolving
+        //      winners, so a 50% stop never breaches and the stop cell must equal
+        //      the no-stop cell (same n and total_ret). ----
+        let no_stop = cell(&results, "RawLeaderboard", 1, 1, "Resolution", None, "all");
+        let stopped = results
+            .iter()
+            .find(|r| {
+                r.ranking == "RawLeaderboard"
+                    && r.k == 1
+                    && r.lag_min == 1
+                    && r.exit == "Resolution"
+                    && r.max_drift.is_none()
+                    && r.stop_loss == Some(0.50)
+                    && r.scope == "all"
+            })
+            .expect("stop cell present");
+        assert_eq!(stopped.metrics.n, no_stop.metrics.n);
+        assert!((stopped.metrics.total_ret - no_stop.metrics.total_ret).abs() < 1e-12);
     }
 }
