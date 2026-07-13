@@ -923,6 +923,16 @@ pub struct Btc5mParamsCfg {
     /// Window, seconds, over which spot samples are kept at full (dense)
     /// resolution before being thinned.
     pub dense_window_secs: i64,
+    /// Only enter when secs_to_go ≤ this (and > 0). Phase 2.
+    pub entry_window_secs: i64,
+    /// Required net edge to enter, in PROBABILITY units (0.02 = 2¢/share). Phase 2.
+    pub edge_buffer_c: f64,
+    /// Fixed micro notional per entry, USD. Phase 2.
+    pub entry_notional_usd: f64,
+    /// Max total taker notional deployed per UTC day, USD. Phase 2.
+    pub max_daily_notional_usd: f64,
+    /// Daily realized-loss floor, USD; breaching it halts the strategy. Phase 2.
+    pub max_daily_loss_usd: f64,
 }
 
 impl Default for Btc5mParamsCfg {
@@ -935,6 +945,11 @@ impl Default for Btc5mParamsCfg {
             spot_sources: vec!["coinbase".into(), "kraken".into()],
             spot_poll_ms: 1000,
             dense_window_secs: 60,
+            entry_window_secs: 20,
+            edge_buffer_c: 0.02,
+            entry_notional_usd: 10.0,
+            max_daily_notional_usd: 200.0,
+            max_daily_loss_usd: 25.0,
         }
     }
 }
@@ -1427,6 +1442,21 @@ impl Config {
                 "btc5m.spot_sources must list at least one source",
             ));
         }
+        if !(bp.entry_window_secs > 0 && bp.entry_window_secs < 300) {
+            return Err(ConfigError::BadMoney("btc5m.entry_window_secs must be in (0, 300)"));
+        }
+        if !(bp.edge_buffer_c.is_finite() && bp.edge_buffer_c > 0.0 && bp.edge_buffer_c < 1.0) {
+            return Err(ConfigError::BadMoney("btc5m.edge_buffer_c must be in (0, 1)"));
+        }
+        if !(bp.entry_notional_usd.is_finite() && bp.entry_notional_usd > 0.0) {
+            return Err(ConfigError::BadMoney("btc5m.entry_notional_usd must be > 0"));
+        }
+        if !(bp.max_daily_notional_usd.is_finite() && bp.max_daily_notional_usd >= bp.entry_notional_usd) {
+            return Err(ConfigError::BadMoney("btc5m.max_daily_notional_usd must be ≥ entry_notional_usd"));
+        }
+        if !(bp.max_daily_loss_usd.is_finite() && bp.max_daily_loss_usd > 0.0) {
+            return Err(ConfigError::BadMoney("btc5m.max_daily_loss_usd must be > 0"));
+        }
         Ok(())
     }
 }
@@ -1502,6 +1532,17 @@ mod tests {
 
         // spot_sources must list at least one source.
         assert!(Config::from_toml_str("[btc5m]\nspot_sources = []\n").is_err());
+    }
+
+    #[test]
+    fn btc5m_phase2_knobs_default_and_validate() {
+        let c = Config::default();
+        assert_eq!(c.btc5m_params.entry_window_secs, 20);
+        assert_eq!(c.btc5m_params.entry_notional_usd, 10.0);
+        assert!(Config::from_toml_str("[btc5m]\nedge_buffer_c = 0.0\n").is_err());
+        assert!(Config::from_toml_str("[btc5m]\nentry_window_secs = 0\n").is_err());
+        assert!(Config::from_toml_str("[btc5m]\nentry_window_secs = 400\n").is_err());
+        assert!(Config::from_toml_str("[btc5m]\nmax_daily_loss_usd = 0.0\n").is_err());
     }
 
     #[test]
