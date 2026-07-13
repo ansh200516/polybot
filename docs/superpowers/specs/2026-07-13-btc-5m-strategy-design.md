@@ -184,11 +184,21 @@ Phase 1 logs feed a daily report: for each τ-bucket, (fair − best-offer) net 
 
 **Built + merged (disabled):** Phase-0/1 read-only shadow harness — config gate `[strategies.btc5m]` (default off), composite spot feed (Coinbase+Kraken median → causal EWMA vol), fair-value model, Gamma 5-min discovery/rotation, CLOB `/book` poll, `btc5m_shadow` store, `pnl` BTC section, and `deploy/btc5m_report.py` gate metric. Full workspace green (873 tests), release build clean, grep-verified no order path. Runs in parallel with the copy bot; `enabled=false` ⇒ zero behavior change.
 
-**Close BEFORE trusting the gate number / before Phase 2 (need a live Gamma probe first):**
-1. **Log the real venue strike + basis.** Today `Window.strike` = our composite spot at window-open (a proxy). Near expiry σ_τ is small, so a few-$ strike error swings `p_up` ~10% and the report compares a proxy-strike `fair` against a real-strike `book` — contaminating the go/no-go. If Gamma exposes the numeric "Price to Beat", parse it into the window + log both it and the composite↔strike basis (spec §7).
-2. **Log the resolved outcome per window** (re-query Gamma after close) → enables realized-vs-modeled calibration (spec §8), the sanity check before believing the edge.
-3. **Document/persist the ~3h vol warmup.** `vol_warmup_samples=180` ⇒ ~180 wall-clock minutes before the first non-skipped sample, and it re-warms on every restart (in-memory counter). A fresh deploy shows "shadow samples: 0" for ~3h (not broken). Consider persisting/seeding vol so restarts don't lose coverage.
+**Live Gamma/CLOB probe — DONE 2026-07-13 (all deploy-time unknowns resolved):**
+- ✅ **Slug** = `btc-updown-5m-<window-open-unix-secs>` — every boundary resolved; `slug_fn` is correct. (Markets are pre-created ~24h ahead.)
+- ✅ **Token order** — `outcomes=["Up","Down"]`, so `clobTokenIds[0]` = Up = the YES token our code prices. Correct.
+- ✅ **`/book`** — works on LIVE tokens (`{bids:[{price,size}],asks:[…]}`, string prices); arrays are **not** sorted best-first (first level seen was 0.01/0.99), confirming `clob.rs`'s max-bid/min-ask-over-all-levels is required. The earlier 404 was only a *closed* window.
+- ✅ **Tick** varies per window (saw both 0.01 and 0.001) — read live (code does).
+- ✅ **Spot** — Coinbase + Kraken reachable (from a mac; still confirm from the India box, esp. Coinbase geo).
+- Machine-readable extras: `feeSchedule={rate:0.07, rebateRate:0.2}`, `resolutionSource=data.chain.link/streams/btc-usd`, `rewardsMaxSpread=4.5`, `rewardsMinSize=50`.
 
-**Deploy-time checks before flipping `enabled=true`:** window slug format `btc-updown-5m-<open-unix-secs>` (best-guess); `clobTokenIds[0]` == YES/UP outcome; `/book` field shape for these markets; spot-source reachability from the box (**Coinbase geo-restrictions** — if the feed never succeeds, `vol_ready` never flips and no rows log); reward-pool rate (Phase-0 precondition, informs Phase 3).
+**Strike + outcome — sourced from Gamma, but MIND THE TIMING:** `event.eventMetadata` exposes **`{priceToBeat, finalPrice}`** (the TRUE strike + close) **only AFTER the window resolves** — it is `null` during the live window. Therefore:
+1. **Live pricing keeps the composite-spot-at-open proxy** (no live strike source short of reading Chainlink Data Streams directly).
+2. **Add a resolution backfill (cheapest in `btc5m_report.py`, offline, no Rust change):** for each `condition_id` in `btc5m_shadow`, fetch its `eventMetadata.priceToBeat`/`finalPrice` + `outcomePrices`, then (a) recompute the gate on the TRUE strike, (b) report the proxy↔true-strike **basis** distribution, (c) validate realized-vs-modeled against the TRUE outcome. This closes follow-ups #2/#3 and makes the gate trustworthy without touching the live loop.
+3. **Document/persist the ~3h vol warmup** (`vol_warmup_samples=180` ⇒ ~180 wall-clock min before the first non-skipped sample; re-warms per restart — a fresh deploy shows "shadow samples: 0" for ~3h, not broken).
+
+**Phase-3 economics flag (from the probe):** these markets show **`holdingRewardsEnabled=false`** (liquidity/"holding" rewards likely do NOT fund the 5-min windows), while the **20% maker rebate IS live** (`feeSchedule.rebateRate=0.2`). So the Phase-3 maker case leans on rebate + spread, not liquidity rewards — confirm the live per-market reward rate before sizing Phase 3.
+
+**Remaining deploy-time checks before flipping `enabled=true`:** confirm spot reachability **from the India box** (Coinbase geo — if the feed never succeeds, `vol_ready` never flips and no rows log); the rest (slug, token order, `/book`, tick) are now verified above.
 
 **Minor (housekeeping):** set canary `[strategies.btc5m].capital_usd = 0` during pure shadow (currently 25, carved from arb though unused); the `z_threshold`/`dense_window_secs`/`live` knobs are future-phase (only the offline report reads `z_threshold`); the report's `n_leader` counts book-less rows while edge stats exclude them (overstates harvestable count).
