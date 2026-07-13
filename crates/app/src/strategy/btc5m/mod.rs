@@ -26,6 +26,11 @@ use crate::strategy::btc5m::shadow::ShadowSample;
 pub struct Btc5mStrategy {
     id: StrategyId,
     sample_ms: u64,
+    /// HTTP client + CLOB REST base for polling the current window's YES-token
+    /// `/book` directly (the dynamically-discovered 5m token is in neither the
+    /// shared registry nor any WS supervisor, so `ctx.fetcher` can't see it).
+    book_http: reqwest::Client,
+    clob_base: String,
     gamma: Option<GammaClient>,
     slug_fn: Option<Box<dyn Fn(i64) -> String + Send>>,
     spot: Option<SpotFeed>,
@@ -39,10 +44,14 @@ impl Btc5mStrategy {
         slug_fn: Box<dyn Fn(i64) -> String + Send>,
         spot: SpotFeed,
         sample_ms: u64,
+        book_http: reqwest::Client,
+        clob_base: String,
     ) -> Self {
         Btc5mStrategy {
             id: StrategyId("btc5m"),
             sample_ms,
+            book_http,
+            clob_base,
             gamma: Some(gamma),
             slug_fn: Some(slug_fn),
             spot: Some(spot),
@@ -61,6 +70,9 @@ impl Btc5mStrategy {
         Btc5mStrategy {
             id: StrategyId("btc5m"),
             sample_ms,
+            // Never used in tests: the seed=Some guard below skips the book poll.
+            book_http: reqwest::Client::new(),
+            clob_base: String::new(),
             gamma: None,
             slug_fn: None,
             spot: None,
@@ -89,13 +101,15 @@ impl Strategy for Btc5mStrategy {
 
     fn run(self: Box<Self>, ctx: StrategyCtx) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
+            // `registry`/`fetcher` intentionally dropped: they only know the
+            // static arb/mm/copy token universe + its WS supervisors, never the
+            // dynamically-discovered 5m window token (see the CLOB poll below).
             let StrategyCtx {
-                registry,
-                fetcher,
                 store_tx,
                 kill,
                 mut ctl_rx,
                 status_tx,
+                ..
             } = ctx;
             let mut paused = false;
             let mut rot = Rotation::default();
@@ -138,17 +152,23 @@ impl Strategy for Btc5mStrategy {
                         let sigma_tau = sigma_1min * ((secs.max(0) as f64) / 60.0).sqrt();
                         let p_up = match fair_p_up(spot, win.strike, secs as f64, sigma_1min) { Some(p) => p, None => continue };
 
+                        // Poll the public CLOB /book directly for the rotating
+                        // window's YES token — it is discovered dynamically via
+                        // Gamma, so `ctx.fetcher`/`registry` (static universe + WS
+                        // supervisors) can't see it. µUSDC comes straight from the
+                        // parse. READ-ONLY sampling. Tests (seed=Some) skip the
+                        // network so the book stays 0; the row still logs fair value.
                         let (mut bid_micro, mut ask_micro) = (0i64, 0i64);
-                        let ts = if win.gamma.tick_decimals == 3 { pm_core::num::TickSize::Milli } else { pm_core::num::TickSize::Cent };
-                        // Map the YES-token venue-id STRING to the registry's dense
-                        // `TokenId` handle (what `BookFetcher` keys on — the venue's
-                        // uint256 id never enters the hot path). An un-interned token
-                        // ⇒ no book this tick (fields stay 0), never a panic. READ-ONLY.
-                        if let Some(token) = registry.venue_token_id(&win.gamma.yes_token)
-                            && let Some((book, true)) = fetcher.fetch(token).await
+                        if me.seed.is_none()
+                            && let Ok((bid, ask)) = pm_ingestion::clob::fetch_book_best(
+                                &me.book_http,
+                                &me.clob_base,
+                                &win.gamma.yes_token,
+                            )
+                            .await
                         {
-                            if let Some(px) = book.bids.best() { bid_micro = px.microusdc(ts) as i64; }
-                            if let Some(px) = book.asks.best() { ask_micro = px.microusdc(ts) as i64; }
+                            bid_micro = bid.unwrap_or(0);
+                            ask_micro = ask.unwrap_or(0);
                         }
 
                         let sample = ShadowSample {
