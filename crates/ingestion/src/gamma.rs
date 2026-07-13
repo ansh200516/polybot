@@ -82,16 +82,26 @@ fn outcome_from_prices(op: &serde_json::Value) -> Option<bool> {
     Some(first >= 0.5)
 }
 
-/// Parse a RESOLVED 5-min window's outcome from a Gamma `/events` body.
-/// `Some(true)` = UP won, `Some(false)` = DOWN won, `None` = NOT yet resolved
-/// (or the event/market was not found — the caller retries next sweep).
+/// Parse a RESOLVED 5-min window's outcome from a Gamma `/events` body,
+/// TRUSTED ONLY when one of the event's markets' `conditionId` matches
+/// `expected_condition_id` (case-insensitive). `Some(true)` = UP won,
+/// `Some(false)` = DOWN won, `None` = NOT yet resolved, the event/market was
+/// not found, OR the resolved event's conditionId did not match (the caller
+/// retries next sweep in all three cases).
 ///
 /// Resolution is signalled by a NON-NULL `eventMetadata` (present ONLY after the
 /// window resolves), so a `null`/absent `eventMetadata` is treated as unresolved
 /// and never guessed from a live mid-price `outcomePrices`. Within a resolved
 /// event UP won iff `finalPrice >= priceToBeat` (equivalently `outcomePrices ==
 /// ["1","0"]`, used as a fallback when the metadata lacks the prices).
-pub fn parse_window_outcome(body: &str) -> Option<bool> {
+///
+/// CONDITION-ID CROSS-CHECK (Task 6 review FIX 3): a slug/time match alone does
+/// NOT prove the returned event is the SAME market as the held position, so a
+/// resolved event is trusted only once one of its `markets[].conditionId`
+/// equals `expected_condition_id`; otherwise this event is skipped (treated
+/// like unresolved) and the next one (if any) is tried. The `outcomePrices`
+/// fallback also reads from that SAME matched market, never an unrelated one.
+pub fn parse_window_outcome(body: &str, expected_condition_id: &str) -> Option<bool> {
     let events: serde_json::Value = serde_json::from_str(body).ok()?;
     for ev in events.as_array()? {
         // `eventMetadata` non-null ⇒ resolved. null/absent ⇒ unresolved: skip
@@ -100,19 +110,28 @@ pub fn parse_window_outcome(body: &str) -> Option<bool> {
             Some(m) if !m.is_null() => m,
             _ => continue,
         };
+        // Only trust this event if one of its markets IS the held position's
+        // conditionId (case-insensitive) — else skip to the next event rather
+        // than reading an unrelated market's resolution.
+        let matched = match ev.get("markets").and_then(|m| m.as_array()).and_then(|ms| {
+            ms.iter().find(|m| {
+                m.get("conditionId")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.eq_ignore_ascii_case(expected_condition_id))
+            })
+        }) {
+            Some(m) => m,
+            None => continue,
+        };
         if let (Some(ptb), Some(fin)) = (
             meta.get("priceToBeat").and_then(json_f64),
             meta.get("finalPrice").and_then(json_f64),
         ) {
             return Some(fin >= ptb);
         }
-        // Resolved, but the metadata lacked the prices: read the resolved
+        // Resolved, but the metadata lacked the prices: read the MATCHED
         // market's `outcomePrices` instead.
-        if let Some(up) = ev
-            .get("markets")
-            .and_then(|m| m.as_array())
-            .and_then(|ms| ms.iter().find_map(|m| m.get("outcomePrices").and_then(outcome_from_prices)))
-        {
+        if let Some(up) = matched.get("outcomePrices").and_then(outcome_from_prices) {
             return Some(up);
         }
     }
@@ -135,17 +154,23 @@ impl GammaClient {
     }
 
     /// Fetch the RESOLVED outcome of the 5-min window that OPENED at `open_unix`
-    /// seconds (series slug `btc-updown-5m-<open_unix>`), if it has resolved.
-    /// `Ok(Some(true))` = UP won, `Ok(Some(false))` = DOWN won, `Ok(None)` =
-    /// not yet resolved / not found. Mirrors [`Self::current_window`]'s I/O; the
-    /// settle sweep rebuilds `open_unix` from a held position's close time
-    /// (`t_close_ms/1000 - 300`).
-    pub async fn window_outcome(&self, open_unix: i64) -> Result<Option<bool>, IngestError> {
+    /// seconds (series slug `btc-updown-5m-<open_unix>`), if it has resolved AND
+    /// its conditionId matches `expected_condition_id` (case-insensitive; see
+    /// [`parse_window_outcome`]'s FIX 3 doc). `Ok(Some(true))` = UP won,
+    /// `Ok(Some(false))` = DOWN won, `Ok(None)` = not yet resolved / not found /
+    /// conditionId mismatch. Mirrors [`Self::current_window`]'s I/O; the settle
+    /// sweep rebuilds `open_unix` from a held position's close time
+    /// (`t_close_ms/1000 - 300`) and passes that SAME position's conditionId.
+    pub async fn window_outcome(
+        &self,
+        open_unix: i64,
+        expected_condition_id: &str,
+    ) -> Result<Option<bool>, IngestError> {
         let url = format!("{}/events?slug=btc-updown-5m-{}", self.base, open_unix);
         let body = self.http.get(&url).send().await.map_err(|e| IngestError::Http(e.to_string()))?
             .error_for_status().map_err(|e| IngestError::Http(e.to_string()))?
             .text().await.map_err(|e| IngestError::Http(e.to_string()))?;
-        Ok(parse_window_outcome(&body))
+        Ok(parse_window_outcome(&body, expected_condition_id))
     }
 }
 
@@ -182,35 +207,57 @@ mod tests {
 
     #[test]
     fn parse_outcome_resolved_up_down_and_unresolved() {
-        // Resolved UP: finalPrice ≥ priceToBeat.
+        // Resolved UP: finalPrice ≥ priceToBeat. `expected_condition_id` matches
+        // the market's `conditionId` ("x") in every case below.
         let up = r#"[{"eventMetadata":{"priceToBeat":100.0,"finalPrice":105.0},"markets":[{"conditionId":"x"}]}]"#;
-        assert_eq!(parse_window_outcome(up), Some(true), "final ≥ ptb ⇒ UP won");
+        assert_eq!(parse_window_outcome(up, "x"), Some(true), "final ≥ ptb ⇒ UP won");
         // Resolved DOWN: finalPrice < priceToBeat.
-        let down = r#"[{"eventMetadata":{"priceToBeat":100.0,"finalPrice":95.0}}]"#;
-        assert_eq!(parse_window_outcome(down), Some(false), "final < ptb ⇒ DOWN won");
+        let down = r#"[{"eventMetadata":{"priceToBeat":100.0,"finalPrice":95.0},"markets":[{"conditionId":"x"}]}]"#;
+        assert_eq!(parse_window_outcome(down, "x"), Some(false), "final < ptb ⇒ DOWN won");
         // Exact tie resolves UP (the `>=` convention, matching `outcomePrices`).
-        let tie = r#"[{"eventMetadata":{"priceToBeat":100.0,"finalPrice":100.0}}]"#;
-        assert_eq!(parse_window_outcome(tie), Some(true), "final == ptb ⇒ UP (>=)");
+        let tie = r#"[{"eventMetadata":{"priceToBeat":100.0,"finalPrice":100.0},"markets":[{"conditionId":"x"}]}]"#;
+        assert_eq!(parse_window_outcome(tie, "x"), Some(true), "final == ptb ⇒ UP (>=)");
         // Numeric fields can arrive as strings (Gamma stringifies some).
-        let strnum = r#"[{"eventMetadata":{"priceToBeat":"100.0","finalPrice":"105.0"}}]"#;
-        assert_eq!(parse_window_outcome(strnum), Some(true), "string-encoded numbers parse");
+        let strnum = r#"[{"eventMetadata":{"priceToBeat":"100.0","finalPrice":"105.0"},"markets":[{"conditionId":"x"}]}]"#;
+        assert_eq!(parse_window_outcome(strnum, "x"), Some(true), "string-encoded numbers parse");
         // NOT resolved yet: eventMetadata null ⇒ None, even if a live-mid
         // outcomePrices is present (must NOT be decided from a mid price).
         let pending = r#"[{"eventMetadata":null,"markets":[{"conditionId":"x","outcomePrices":"[\"0.6\",\"0.4\"]"}]}]"#;
-        assert_eq!(parse_window_outcome(pending), None, "eventMetadata null ⇒ unresolved");
+        assert_eq!(parse_window_outcome(pending, "x"), None, "eventMetadata null ⇒ unresolved");
         // Absent event / not found.
-        assert_eq!(parse_window_outcome("[]"), None);
-        assert_eq!(parse_window_outcome(r#"[{"markets":[]}]"#), None, "no eventMetadata ⇒ unresolved");
+        assert_eq!(parse_window_outcome("[]", "x"), None);
+        assert_eq!(parse_window_outcome(r#"[{"markets":[]}]"#, "x"), None, "no eventMetadata ⇒ unresolved");
     }
 
     #[test]
     fn parse_outcome_via_outcome_prices_fallback() {
         // Resolved (eventMetadata present) but WITHOUT the numeric prices ⇒ fall
-        // back to the resolved market's outcomePrices. Array form ⇒ UP.
-        let arr = r#"[{"eventMetadata":{},"markets":[{"outcomePrices":["1","0"]}]}]"#;
-        assert_eq!(parse_window_outcome(arr), Some(true), "[\"1\",\"0\"] ⇒ UP won");
+        // back to the MATCHED market's outcomePrices. Array form ⇒ UP.
+        let arr = r#"[{"eventMetadata":{},"markets":[{"conditionId":"C1","outcomePrices":["1","0"]}]}]"#;
+        assert_eq!(parse_window_outcome(arr, "C1"), Some(true), "[\"1\",\"0\"] ⇒ UP won");
         // Encoded-string form ⇒ DOWN.
-        let enc = r#"[{"eventMetadata":{},"markets":[{"outcomePrices":"[\"0\",\"1\"]"}]}]"#;
-        assert_eq!(parse_window_outcome(enc), Some(false), "[\"0\",\"1\"] ⇒ DOWN won");
+        let enc = r#"[{"eventMetadata":{},"markets":[{"conditionId":"C1","outcomePrices":"[\"0\",\"1\"]"}]}]"#;
+        assert_eq!(parse_window_outcome(enc, "C1"), Some(false), "[\"0\",\"1\"] ⇒ DOWN won");
+    }
+
+    /// FIX 3 (Task 6 review): a resolved event whose market `conditionId` does
+    /// NOT match the HELD position's must be UNTRUSTED (`None`), not silently
+    /// accepted on slug/time alone — otherwise a stale or wrong market could
+    /// decide a held position's settlement. The match itself is
+    /// case-insensitive (Gamma / on-chain hex casing varies), so an equal id
+    /// still resolves normally once cased differently.
+    #[test]
+    fn parse_outcome_untrusted_on_conditionid_mismatch() {
+        let body = r#"[{"eventMetadata":{"priceToBeat":100.0,"finalPrice":105.0},"markets":[{"conditionId":"0xOTHER"}]}]"#;
+        assert_eq!(
+            parse_window_outcome(body, "0xHELD"),
+            None,
+            "resolved event but conditionId mismatch ⇒ untrusted"
+        );
+        assert_eq!(
+            parse_window_outcome(body, "0xother"),
+            Some(true),
+            "case-insensitive conditionId match ⇒ trusted"
+        );
     }
 }

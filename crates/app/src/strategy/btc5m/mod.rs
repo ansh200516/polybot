@@ -516,7 +516,11 @@ impl<V: CopyVenue> Btc5mStrategy<V> {
         open_unix: i64,
     ) -> Option<bool> {
         match gamma {
-            Some(g) => match g.window_outcome(open_unix).await {
+            // FIX 3 (Task 6 review): pass the HELD position's `condition_id`
+            // through so the fetch only trusts a resolved event whose market
+            // actually matches it (see `parse_window_outcome`'s cross-check) —
+            // a slug/time match alone is not enough to prove it's this market.
+            Some(g) => match g.window_outcome(open_unix, condition_id).await {
                 Ok(o) => o,
                 Err(e) => {
                     tracing::warn!(error = %e, open_unix, "btc5m: window_outcome fetch failed — retry next sweep");
@@ -546,6 +550,23 @@ impl<V: CopyVenue> Btc5mStrategy<V> {
             pos.qty_micro,
             pos.cost_micro,
         );
+        // FIX 2 (Task 6 review): CLOSE the durable row (+ drop the in-memory
+        // backstop) BEFORE booking the realized delta into the day-realized
+        // ledger. A crash between the two writer commits then leaves the
+        // position CLOSED — a restart's `reload_open` never re-sees it, so it
+        // can't re-settle/double-book; the only casualty is that one ledger add
+        // is dropped (an UNDER-count, the safe direction). The old order risked
+        // the opposite: a crash after `DayRealized` landed but before the close
+        // would leave the row open, so a restart would re-settle it and
+        // DOUBLE-add the same delta to the durable ledger. Removing the key
+        // here is what makes settle IDEMPOTENT: a later sweep can't re-book it.
+        let _ = store_tx
+            .send(StoreMsg::Btc5mPositionClose {
+                condition_id: key.0.clone(),
+                outcome_index: key.1,
+            })
+            .await;
+        self.open.remove(key);
         // Realized delta → the cumulative day-realized ledger (best-effort).
         let _ = store_tx
             .send(StoreMsg::DayRealized {
@@ -554,15 +575,6 @@ impl<V: CopyVenue> Btc5mStrategy<V> {
                 delta_micro: realized as i128,
             })
             .await;
-        // Close the durable row + drop the in-memory backstop entry. Removing the
-        // key here is what makes settle IDEMPOTENT: a later sweep can't re-book it.
-        let _ = store_tx
-            .send(StoreMsg::Btc5mPositionClose {
-                condition_id: key.0.clone(),
-                outcome_index: key.1,
-            })
-            .await;
-        self.open.remove(key);
         // DAILY-LOSS LATCH — this is what activates `max_daily_loss_usd`: once the
         // day's realized reaches the floor, latch `halted` (the entry gate blocks).
         self.day_realized_micro = self.day_realized_micro.saturating_add(realized);
@@ -657,6 +669,47 @@ impl<V: CopyVenue> Btc5mStrategy<V> {
             tracing::info!(restored, "btc5m: reloaded open positions from the store — resuming settlement (restart-safe)");
         }
     }
+
+    /// Arm the PERSISTENT UTC-day loss-cap latch at startup (Task 6 review
+    /// FIX 1; mirrors copy/mm's `arm_day_loss_gate`). Reads the CUMULATIVE
+    /// day-realized LEDGER (`ReadStore::day_realized_micro`, the SAME ledger
+    /// `settle_one` feeds via `StoreMsg::DayRealized`) for `"btc5m"` on today's
+    /// UTC day and, if it is already at/under the `max_daily_loss_usd` floor,
+    /// latches `halted` BEFORE the loop starts ticking.
+    ///
+    /// Without this, `day_realized_micro`/`halted` reset to 0/false on every
+    /// process start (they are in-memory only, and `reload_open` restores only
+    /// the `open` position map) — so a breaker that tripped in a prior session
+    /// would silently re-arm on the very next `Restart=always` auto-restart.
+    /// This is what makes the daily-loss cap bind ACROSS restarts.
+    ///
+    /// No read handle (fresh DB / not yet wired), a read error, or no ledger row
+    /// today all read as `0` (a read error is logged) — a fresh run is NEVER
+    /// halted by default. Called ONCE, right after `reload_open` and before the
+    /// loop starts. In-session accumulation (`settle_one`) and the
+    /// day-rollover reset (`roll_day`) are unchanged; this only seeds the
+    /// starting value so a PRIOR session's breach survives the restart.
+    fn arm_day_loss_gate(&mut self, read: Option<&ReadStore>, now_ms: i64) {
+        let today = utc_day_from_ms(now_ms);
+        self.day = today;
+        let Some(read) = read else { return };
+        let realized = read.day_realized_micro("btc5m", today).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "btc5m: day-realized ledger read failed — treating as 0");
+            0
+        });
+        self.day_realized_micro = realized.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        let loss_floor = -((self.params.max_daily_loss_usd * 1_000_000.0) as i64);
+        if self.day_realized_micro <= loss_floor {
+            self.halted = true;
+            tracing::warn!(
+                utc_day = today,
+                day_realized_micro = self.day_realized_micro,
+                loss_floor_micro = loss_floor,
+                "btc5m: daily-loss cap ALREADY hit for the UTC day (persisted across restart) — \
+                 entries halted until the day rolls over"
+            );
+        }
+    }
 }
 
 impl<V: CopyVenue + 'static> Strategy for Btc5mStrategy<V> {
@@ -691,10 +744,18 @@ impl<V: CopyVenue + 'static> Strategy for Btc5mStrategy<V> {
             // RESTART-SAFETY: reload persisted open positions BEFORE the first
             // sweep so a restart RESUMES settling them instead of orphaning an
             // on-chain fill with no tracked row. `store_path` is `None` until Task
-            // 7 wires it (like `relayer`), so this is inert until then.
-            if let Some(read) = me.store_path.as_deref().and_then(|p| ReadStore::open(p).ok()) {
-                me.reload_open(&read);
+            // 7 wires it (like `relayer`), so this is inert until then. The same
+            // read handle is reused (not re-opened) to also arm the FIX 1
+            // restart-durable daily-loss latch below.
+            let day_loss_read = me.store_path.as_deref().and_then(|p| ReadStore::open(p).ok());
+            if let Some(read) = day_loss_read.as_ref() {
+                me.reload_open(read);
             }
+            // FIX 1 (Task 6 review): arm the PERSISTENT daily-loss latch from the
+            // durable day-realized ledger so the breaker binds across the
+            // `Restart=always` auto-restart instead of resetting every process
+            // start.
+            me.arm_day_loss_gate(day_loss_read.as_ref(), Self::now_ms());
 
             let mut tick = tokio::time::interval(Duration::from_millis(me.sample_ms.max(1)));
             tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1141,6 +1202,67 @@ mod tests {
             rs.day_realized_micro("btc5m", day).unwrap(),
             -8_800_000,
             "the day-realized ledger accumulated both settle deltas (+1.10 − 9.90)"
+        );
+    }
+
+    /// FIX 1 (Task 6 review): the daily-loss cap must be RESTART-DURABLE. A
+    /// PRIOR session's realized losses, once past the floor, must keep new
+    /// entries halted even though the in-memory `day_realized_micro`/`halted`
+    /// reset to 0/false on a fresh process start (this strategy runs under
+    /// `Restart=always`). Seeds the durable day-realized LEDGER (the same one
+    /// `settle_one` feeds via `StoreMsg::DayRealized`) below the default $25
+    /// cap, drives the exact startup sequence `run` uses (open once, reuse for
+    /// both `reload_open` and `arm_day_loss_gate`), and asserts the latch trips
+    /// from the durable ledger ALONE — mirrors copy/mm's `arm_day_loss_gate`
+    /// tests.
+    #[tokio::test]
+    async fn arm_day_loss_gate_halts_from_a_prior_session_breach() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("btc5m_daycap.sqlite");
+        let now = crate::coordinator::now_ms();
+        let today = pm_store::utc_day_from_ms(now);
+
+        // A PRIOR session's realized ledger already breached the $25 default
+        // cap (−$30 ≤ −$25) — written the same way `settle_one`'s
+        // `StoreMsg::DayRealized` is drained by the writer.
+        let mut s = Store::open(&path).unwrap();
+        s.add_day_realized(today, "btc5m", -30_000_000).unwrap();
+        drop(s); // release the writer before the read-only connection opens.
+
+        let orders: OrderLog = Arc::new(Mutex::new(Vec::new()));
+        let venue = MockVenue { token: TokenId(7), orders: Arc::clone(&orders) };
+        // live + venue present so `entry_allowed()` reflects ONLY `halted` here
+        // (same technique as the settle-sweep test above).
+        let mut me = Btc5mStrategy::new_for_test(
+            window(now + 15_000),
+            62_900.0,
+            62_940.0,
+            40.0,
+            5,
+            true,
+            Some(venue),
+            Btc5mParams::default(), // $25 daily-loss cap
+            Some(900_000),
+        )
+        .with_store_path(path.clone());
+        assert!(
+            me.entry_allowed(),
+            "pre-arm: fresh in-memory state (day_realized_micro=0, halted=false)"
+        );
+
+        // Drive the exact startup sequence `run` uses: open once, reuse for both.
+        let read = pm_store::read::ReadStore::open(&path).unwrap();
+        me.reload_open(&read);
+        me.arm_day_loss_gate(Some(&read), now);
+
+        assert_eq!(
+            me.day_realized_micro, -30_000_000,
+            "arms from the durable ledger, not the in-memory 0"
+        );
+        assert!(me.halted, "a prior-session breach must latch `halted` at startup");
+        assert!(
+            !me.entry_allowed(),
+            "the restart-durable latch blocks entries even on a fresh process"
         );
     }
 }
