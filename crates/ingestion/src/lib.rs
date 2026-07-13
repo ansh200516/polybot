@@ -3,6 +3,7 @@
 pub mod confluence;
 pub mod data_api;
 pub mod decimal;
+pub mod gamma;
 pub mod livebook;
 pub mod rest;
 pub mod shard;
