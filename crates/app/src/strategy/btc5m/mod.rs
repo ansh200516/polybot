@@ -272,6 +272,16 @@ impl<V: CopyVenue> Btc5mStrategy<V> {
         self
     }
 
+    /// Attach the taker [`CopyVenue`] (Task 7 wiring; mirrors copy's
+    /// `with_venue`). `None` ⇒ shadow-only — the order path stays unreachable
+    /// whatever `live` is (see [`Self::entry_allowed`]: `self.live &&
+    /// self.venue.is_some()`). Production wires the real `LiveVenue`; tests
+    /// inject a mock via `new_for_test`.
+    pub fn with_venue(mut self, venue: Option<V>) -> Self {
+        self.venue = venue;
+        self
+    }
+
     /// Test constructor: a pre-seeded window+spot (no network), an injectable
     /// `venue`, the `live` gate, Phase-2 params, and an optional fake leader-ask
     /// standing in for the CLOB `/book` poll on the seed path.

@@ -1160,6 +1160,14 @@ async fn main() {
     // live with MM OFF (the copy canary does exactly that), so it has its OWN
     // stash. `None` on paper / arb / whenever copy is paper.
     let mut copy_live_inputs: Option<MmLiveInputs> = None;
+    // Task 7 (Phase-2): the btc5m taker's live inputs — likewise a CLONE of arb's
+    // resolved creds/signer (NO second API key derivation), stashed in the live
+    // arm below iff btc5m is cleared for live. Parallel to the two above; btc5m
+    // trades the SAME deposit-wallet account, so it reuses these identical inputs
+    // to build its OWN `LiveVenue` (own REST limiter) and `.take()`s this stash at
+    // its registration — copy `.take()`s a separate stash, so they never contend.
+    // `None` unless `[strategies.btc5m]` is enabled AND live on a `--live` run.
+    let mut btc5m_live_inputs: Option<MmLiveInputs> = None;
     // M6-7: the LIVE on-chain relayer (deposit-wallet redeem / merge), built in
     // the live arm below when EITHER the reward-farm MM OR the copy executor is
     // cleared for live, and SHARED (same wallet/account) by whichever holds it.
@@ -1177,18 +1185,25 @@ async fn main() {
     {
         // M6-7: build the LIVE on-chain relayer BEFORE `secrets.api` is moved out
         // by the match below (so `&secrets` is still a whole borrow). Attempted
-        // when EITHER the reward-farm MM OR the copy executor is cleared for live
-        // — it is the SAME deposit-wallet account either way, so one client is
-        // built and SHARED. `RelayerClient::new` itself returns `None` unless the
+        // when the reward-farm MM, the copy executor, OR (Task 7) btc5m is cleared
+        // for live — it is the SAME deposit-wallet account any way, so one client
+        // is built and SHARED. `RelayerClient::new` itself returns `None` unless the
         // relayer is enabled AND relayer creds + deposit wallet + a valid EOA key
         // are present (OFF by default, staging-first), so arb-only / non-relayer
-        // live stay no-op. The copy executor uses it to redeem resolved winners;
-        // without it, copy holds resolved positions for the next reconcile.
+        // live stay no-op. The copy executor + btc5m use it to redeem resolved
+        // winners; without it, they hold resolved positions for the next reconcile.
         let mm_live_cleared =
             config.strategies.mm.enabled && mm_use_live(args.live, config.strategies.mm.live);
         let copy_live_cleared =
             config.strategies.copy.enabled && mm_use_live(args.live, config.strategies.copy.live);
-        if mm_live_cleared || copy_live_cleared {
+        // Task 7 (Phase-2): btc5m is a third live-capable strategy on the SAME
+        // account and shares this redeem relayer for its settle-sweep, so its
+        // liveness must also trigger the (SAME-account, no-second-key) relayer
+        // build. Under the shipped config (`btc5m.live = false`) this is `false`,
+        // so the gate is byte-identical to before and arb/mm/copy are unaffected.
+        let btc5m_live_cleared = config.strategies.btc5m.enabled
+            && mm_use_live(args.live, config.strategies.btc5m.live);
+        if mm_live_cleared || copy_live_cleared || btc5m_live_cleared {
             let relayer_http = reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -1294,6 +1309,20 @@ async fn main() {
             && mm_use_live(args.live, config.strategies.copy.live)
         {
             copy_live_inputs = Some(MmLiveInputs {
+                base: config.endpoints.clob_base.clone(),
+                creds: creds.clone(),
+                signer: signer.clone(),
+                proxy,
+                deposit_wallet,
+                auth_address,
+            });
+        }
+        // Task 7: likewise stash a CLONE for btc5m when it is cleared for live
+        // (`btc5m_live_cleared`, computed at the relayer gate above — independent
+        // of MM/copy). Same account/creds/signer/deposit_wallet as arb, so btc5m's
+        // `LiveVenue` is byte-identical with NO second key derivation.
+        if btc5m_live_cleared {
+            btc5m_live_inputs = Some(MmLiveInputs {
                 base: config.endpoints.clob_base.clone(),
                 creds: creds.clone(),
                 signer: signer.clone(),
@@ -2378,9 +2407,48 @@ async fn main() {
             max_daily_notional_usd: config.btc5m_params.max_daily_notional_usd,
             max_daily_loss_usd: config.btc5m_params.max_daily_loss_usd,
         };
-        // `V = LiveVenue` at the type site: Task 5 leaves `venue: None` (shadow —
-        // no orders regardless of `live`); Task 7 wires the real `LiveVenue`.
-        let btc5m = pm_app::strategy::btc5m::Btc5mStrategy::<pm_execution::live::LiveVenue>::new(
+        // LIVE gate (mirrors arb/mm/copy): process `--live` AND
+        // `[strategies.btc5m].live`. SHIPS `false` ⇒ shadow. When true, attach the
+        // shared-wallet sigType-3 taker `LiveVenue`, the shared redeem relayer, and
+        // the store path so btc5m micro-takes + settles for real.
+        let btc5m_live = mm_use_live(args.live, config.strategies.btc5m.live);
+        // Taker venue: a LIVE sigType-3 venue on the SAME deposit-wallet account
+        // arb/mm/copy resolved — byte-identical creds/signer/wallet from the
+        // parallel `btc5m_live_inputs` stash (NO second key derivation, NO second
+        // `LiveSecrets::from_env`). btc5m tokens are DYNAMIC (resolved per-window
+        // via `ensure_token` at entry — Task 5), so, UNLIKE copy, there is NO
+        // universe token pre-registration here. `None` ⇒ shadow: the order path is
+        // unreachable (`entry_allowed` = `self.live && self.venue.is_some()`).
+        // SHARED-ACCOUNT RATE BUDGET: a FOURTH `LiveVenue` (after arb + MM + copy),
+        // each with its OWN conservative REST limiter against the one account
+        // budget (a shared limiter is future work).
+        let btc5m_venue: Option<pm_execution::live::LiveVenue> = if btc5m_live {
+            let inputs = btc5m_live_inputs.take().unwrap_or_else(|| {
+                fatal("internal: btc5m cleared for live but live inputs were not stashed")
+            });
+            Some(
+                pm_execution::live::LiveVenue::new(pm_execution::live::LiveVenueCfg {
+                    base: inputs.base,
+                    creds: inputs.creds,
+                    signer: inputs.signer,
+                    proxy: inputs.proxy,
+                    deposit_wallet: inputs.deposit_wallet,
+                    auth_address: inputs.auth_address,
+                    fill_window: Duration::from_millis(config.execution.fill_window_ms),
+                    rate_per_sec: config.ingestion.rest_rate_per_sec,
+                    rate_capacity: config.ingestion.rest_rate_capacity,
+                    shadow: args.shadow,
+                })
+                .unwrap_or_else(|e| fatal(format!("btc5m LiveVenue: {e}"))),
+            )
+        } else {
+            None
+        };
+        // `V = LiveVenue` at the type site. `btc5m_live` (NOT the raw config flag)
+        // is the master `live` gate, so a paper process run stays shadow even with
+        // `btc5m.live = true`. `venue: None` in shadow keeps the order path
+        // unreachable — the Task 5/6 invariant is preserved.
+        let mut btc5m = pm_app::strategy::btc5m::Btc5mStrategy::<pm_execution::live::LiveVenue>::new(
             gamma,
             slug_fn,
             spot_feed,
@@ -2388,8 +2456,21 @@ async fn main() {
             http,
             clob_base,
             btc5m_params,
-            config.strategies.btc5m.live,
-        );
+            btc5m_live,
+        )
+        // Always set the store path: the startup open-position reload + the
+        // restart-durable daily-loss latch (Task 6). In shadow nothing was ever
+        // persisted, so both are inert no-ops — identical to pre-Task-7 shadow.
+        .with_store_path(std::path::PathBuf::from(&config.store.path))
+        .with_venue(btc5m_venue);
+        // Redeem relayer: SHARE the one `mm_merger` (same deposit-wallet account)
+        // for the settle-sweep on-chain winner redemption — only when live AND the
+        // shared relayer was actually built (btc5m liveness is one of its build
+        // triggers; see the relayer gate above). Absent ⇒ hold-to-resolution
+        // no-op, exactly like copy without a relayer.
+        if btc5m_live && let Some(relayer) = mm_merger.as_ref() {
+            btc5m = btc5m.with_relayer(relayer.clone());
+        }
         host.add(Box::new(btc5m), btc5m_envelope);
         info!(
             btc5m_capital_usd = config.strategies.btc5m.capital_usd,
