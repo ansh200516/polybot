@@ -353,11 +353,13 @@ impl<V: CopyVenue> Btc5mStrategy<V> {
             };
             let _ = store_tx.send(StoreMsg::FillSigned(row, None)).await;
             if realized_delta != 0 {
-                let _ = store_tx.try_send(StoreMsg::DayRealized {
-                    utc_day: utc_day_from_ms(now),
-                    strategy: "btc5m".into(),
-                    delta_micro: realized_delta,
-                });
+                let _ = store_tx
+                    .send(StoreMsg::DayRealized {
+                        utc_day: utc_day_from_ms(now),
+                        strategy: "btc5m".into(),
+                        delta_micro: realized_delta,
+                    })
+                    .await;
             }
         }
         if filled_micro <= 0 {
@@ -365,16 +367,21 @@ impl<V: CopyVenue> Btc5mStrategy<V> {
         }
         let cost_micro = (-cash_total).clamp(0, i128::from(i64::MAX));
         // Upsert the open position (the Task 6 settle sweep reads this row).
-        let _ = store_tx.try_send(StoreMsg::Btc5mPositionUpsert(Btc5mPositionRow {
-            condition_id: win.gamma.condition_id.clone(),
-            outcome_index: if up { 0 } else { 1 },
-            token: leader_token_str.to_string(),
-            qty_micro: filled_micro.clamp(0, i128::from(i64::MAX)) as i64,
-            cost_micro: cost_micro as i64,
-            entry_ts: now,
-            t_close_ms: win.gamma.t_close_ms,
-            strike: win.strike,
-        }));
+        // Awaited (not try_send): btc5m keeps no in-memory position backstop, so
+        // a dropped upsert under backpressure would leave an on-chain fill with
+        // no tracked row — an untracked orphan the Task 6 settle sweep never sees.
+        let _ = store_tx
+            .send(StoreMsg::Btc5mPositionUpsert(Btc5mPositionRow {
+                condition_id: win.gamma.condition_id.clone(),
+                outcome_index: if up { 0 } else { 1 },
+                token: leader_token_str.to_string(),
+                qty_micro: filled_micro.clamp(0, i128::from(i64::MAX)) as i64,
+                cost_micro: cost_micro as i64,
+                entry_ts: now,
+                t_close_ms: win.gamma.t_close_ms,
+                strike: win.strike,
+            }))
+            .await;
         self.day_notional_micro = self.day_notional_micro.saturating_add(cost_micro as i64);
         self.entered_this_window = true;
         tracing::info!(
@@ -641,10 +648,15 @@ mod tests {
 
         let orders: OrderLog = Arc::new(Mutex::new(Vec::new()));
         let venue = MockVenue { token: TokenId(7), orders: Arc::clone(&orders) };
-        // live = FALSE + a venue present + a cheap leader ask ⇒ the order path
-        // MUST stay unreachable (the `live` gate short-circuits before the venue).
+        // live = FALSE + a venue present + the SAME fresh in-window/cheap-ask
+        // setup as `live_places_one_fak_and_records_the_position` below (spot
+        // above strike, |z| ≥ threshold, a leader ask ⇒ `decide_entry` returns
+        // Some and WOULD place an order) ⇒ `live` is the SOLE reason the order
+        // path stays unreachable (the gate short-circuits before the venue is
+        // ever touched).
+        let now = crate::coordinator::now_ms();
         let strat = Btc5mStrategy::new_for_test(
-            window(300_000),
+            window(now + 15_000),
             62_900.0,
             62_940.0,
             40.0,
