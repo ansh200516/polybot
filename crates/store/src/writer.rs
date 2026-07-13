@@ -60,6 +60,12 @@ pub enum StoreMsg {
         condition_id: String,
         outcome_index: i64,
     },
+    /// BTC-5m shadow observation (read-only fair-value-vs-book measurement
+    /// harness): best-effort, un-acked, like `DayRealized` / `RfDecision`. A
+    /// failed write is a CLEAN DROP — logged, but NOT counted as a
+    /// `write_error` (shadow telemetry must never look like a trading-path
+    /// failure or block the loop).
+    Btc5mShadow(crate::Btc5mShadowRow),
 }
 
 /// Run until the channel closes; returns the store for final inspection
@@ -137,6 +143,16 @@ pub async fn run_writer(mut store: Store, mut rx: mpsc::Receiver<StoreMsg>) -> S
                 None,
                 "copy_position_close",
             ),
+            StoreMsg::Btc5mShadow(row) => {
+                // CLEAN DROP on failure: mirrors the DayRealized arm above — a
+                // shadow observation is best-effort telemetry, so a failed write
+                // is logged but NOT surfaced as a `write_error` (returns `Ok(())`
+                // to the unified handler below). Un-acked; never blocks the loop.
+                if let Err(e) = store.add_btc5m_shadow(&row) {
+                    error!(op = "btc5m_shadow", "store btc5m-shadow add dropped: {e}");
+                }
+                (Ok(()), None, "btc5m_shadow")
+            }
         };
         match result {
             Ok(()) => {

@@ -175,6 +175,21 @@ pub struct CopyPositionRow {
     pub cost_micro: i64,
 }
 
+/// One shadow observation of the BTC 5m book vs the model's fair value.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Btc5mShadowRow {
+    pub ts_ms: i64,
+    pub condition_id: String,
+    pub secs_to_go: i64,
+    pub strike: f64,
+    pub spot: f64,
+    pub sigma_tau: f64,
+    pub p_up: f64,
+    pub best_bid_micro: i64,
+    pub best_ask_micro: i64,
+    pub tick_decimals: i64,
+}
+
 /// A split or merge (complete-set conversion). `kind` is "split" | "merge".
 #[derive(Debug, Clone)]
 pub struct ConversionRow {
@@ -299,7 +314,20 @@ CREATE TABLE IF NOT EXISTS copy_positions (
   asset TEXT NOT NULL, neg_risk INTEGER NOT NULL, tick_decimals INTEGER NOT NULL,
   condition_hex TEXT NOT NULL, trader TEXT NOT NULL, entry_ts INTEGER NOT NULL,
   qty_micro INTEGER NOT NULL, cost_micro INTEGER NOT NULL,
-  PRIMARY KEY (condition_id, outcome_index));";
+  PRIMARY KEY (condition_id, outcome_index));
+CREATE TABLE IF NOT EXISTS btc5m_shadow (
+  ts_ms INTEGER NOT NULL,
+  condition_id TEXT NOT NULL,
+  secs_to_go INTEGER NOT NULL,
+  strike REAL NOT NULL,
+  spot REAL NOT NULL,
+  sigma_tau REAL NOT NULL,
+  p_up REAL NOT NULL,
+  best_bid_micro INTEGER NOT NULL,
+  best_ask_micro INTEGER NOT NULL,
+  tick_decimals INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_btc5m_shadow_cond_ts ON btc5m_shadow (condition_id, ts_ms);";
 
 const TERMINAL_STATES: [&str; 4] = ["Filled", "Cancelled", "Rejected", "Expired"];
 
@@ -775,6 +803,21 @@ impl Store {
             "INSERT INTO day_realized (utc_day, strategy, realized_micro) VALUES (?1, ?2, ?3)
              ON CONFLICT(utc_day, strategy) DO UPDATE SET realized_micro = realized_micro + excluded.realized_micro",
             rusqlite::params![utc_day, strategy, delta_i64],
+        )?;
+        Ok(())
+    }
+
+    /// Insert one BTC-5m shadow observation (fair-value-vs-book), append-only.
+    pub fn add_btc5m_shadow(&mut self, r: &Btc5mShadowRow) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO btc5m_shadow
+             (ts_ms, condition_id, secs_to_go, strike, spot, sigma_tau, p_up,
+              best_bid_micro, best_ask_micro, tick_decimals)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params![
+                r.ts_ms, r.condition_id, r.secs_to_go, r.strike, r.spot, r.sigma_tau,
+                r.p_up, r.best_bid_micro, r.best_ask_micro, r.tick_decimals
+            ],
         )?;
         Ok(())
     }
@@ -2184,5 +2227,25 @@ mod tests {
             rs.copy_open_positions().unwrap().is_empty(),
             "CLOSE deletes the row so a restart won't resurrect it"
         );
+    }
+
+    #[test]
+    fn btc5m_shadow_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        s.add_btc5m_shadow(&Btc5mShadowRow {
+            ts_ms: 1_700_000_000_000, condition_id: "0xabc".into(), secs_to_go: 15,
+            strike: 62_922.41, spot: 62_931.0, sigma_tau: 40.0, p_up: 0.58,
+            best_bid_micro: 550_000, best_ask_micro: 560_000, tick_decimals: 2,
+        }).unwrap();
+        s.add_btc5m_shadow(&Btc5mShadowRow {
+            ts_ms: 1_700_000_001_000, condition_id: "0xabc".into(), ..Default::default()
+        }).unwrap();
+        let rs = crate::read::ReadStore::open(&path).unwrap();
+        let rows = rs.btc5m_shadow_rows(10).unwrap();          // newest-first
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].ts_ms, 1_700_000_001_000);
+        assert_eq!(rows[1].secs_to_go, 15);
     }
 }

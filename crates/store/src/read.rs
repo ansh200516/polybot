@@ -322,6 +322,20 @@ impl ReadStore {
         Ok(rows)
     }
 
+    /// Most-recent `limit` BTC-5m shadow observations, newest first.
+    pub fn btc5m_shadow_rows(&self, limit: usize) -> Result<Vec<crate::Btc5mShadowRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts_ms, condition_id, secs_to_go, strike, spot, sigma_tau, p_up,
+                    best_bid_micro, best_ask_micro, tick_decimals
+             FROM btc5m_shadow ORDER BY ts_ms DESC LIMIT ?1")?;
+        let rows = stmt.query_map([limit as i64], |r| Ok(crate::Btc5mShadowRow {
+            ts_ms: r.get(0)?, condition_id: r.get(1)?, secs_to_go: r.get(2)?,
+            strike: r.get(3)?, spot: r.get(4)?, sigma_tau: r.get(5)?, p_up: r.get(6)?,
+            best_bid_micro: r.get(7)?, best_ask_micro: r.get(8)?, tick_decimals: r.get(9)?,
+        }))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn day_realized_micro(&self, strategy: &str, utc_day: i64) -> Result<i128, StoreError> {
         let total: Option<i64> = self
             .conn
