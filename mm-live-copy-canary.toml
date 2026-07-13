@@ -135,3 +135,17 @@ liquid_min_liquidity        = 1000.0
 # while the copy strategy runs — leave it off.
 [confluence]
 enabled = false
+
+[strategies.btc5m]
+enabled = false     # Phase 1 flips this to true (still read-only — no orders)
+live = false
+capital_usd = 25.0
+
+[btc5m]
+vol_half_life_min = 120.0
+vol_warmup_samples = 180
+z_threshold = 1.5
+sample_interval_ms = 1000
+spot_sources = ["coinbase", "kraken"]
+spot_poll_ms = 1000
+dense_window_secs = 60
