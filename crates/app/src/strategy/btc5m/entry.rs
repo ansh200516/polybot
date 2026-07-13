@@ -32,6 +32,10 @@ pub fn decide_entry(secs: i64, z: f64, fair_leader: f64, leader_ask_micro: i64, 
     if leader_ask_micro <= 0 { return None; }
     let offer = leader_ask_micro as f64 / 1_000_000.0;
     if !(offer > 0.0 && offer < 1.0) { return None; }
+    // Polymarket crypto (crypto_fees_v2) taker fee = rate·p·(1−p) — per the live
+    // Gamma feeSchedule (rate 0.07) + docs. This DELIBERATELY differs from
+    // pm_core::fees::fee_microusdc (rate·min(p,1−p), a different/older schedule);
+    // do not "unify" them — these 5-min markets use p·(1−p). Matches btc5m_report.py.
     let fee = p.fee_rate * offer * (1.0 - offer);
     if !fair_leader.is_finite() || fair_leader - offer - fee < p.edge_buffer { return None; }
     let unit = ts.unit_microusdc();
