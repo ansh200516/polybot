@@ -761,8 +761,8 @@ mod tests {
         assert_eq!(w.yes_token, "111");
         assert_eq!(w.no_token, "222");
         assert_eq!(w.tick_decimals, 2);          // 0.01 → Cent
-        assert_eq!(w.t_open_ms, 1_760_341_800_000);
-        assert_eq!(w.t_close_ms, 1_760_342_100_000);
+        assert_eq!(w.t_open_ms, 1_783_929_000_000);   // 2026-07-13T07:50:00Z
+        assert_eq!(w.t_close_ms, 1_783_929_300_000);  // 2026-07-13T07:55:00Z (+300s)
     }
 
     #[test]
