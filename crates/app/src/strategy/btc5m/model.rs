@@ -37,7 +37,7 @@ impl EwmaVol {
 
 /// Fair P(up) for a driftless normal digital. Ties (spot == strike) and τ ≤ 0 → UP.
 pub fn fair_p_up(spot: f64, strike: f64, tau_secs: f64, sigma_1min: f64) -> Option<f64> {
-    if !(spot.is_finite() && strike.is_finite() && sigma_1min.is_finite()) { return None; }
+    if !(spot.is_finite() && strike.is_finite() && tau_secs.is_finite() && sigma_1min.is_finite()) { return None; }
     if tau_secs <= 0.0 { return Some(if spot >= strike { 1.0 } else { 0.0 }); }
     let sigma_tau = sigma_1min * (tau_secs / 60.0).sqrt();
     if sigma_tau <= 0.0 { return Some(if spot >= strike { 1.0 } else { 0.0 }); }
@@ -92,6 +92,8 @@ mod tests {
         assert!(approx(up, norm_cdf(1.0), 1e-9));
         assert_eq!(fair_p_up(100_000.0, 100_000.0, 0.0, 42.0).unwrap(), 1.0);
         assert_eq!(fair_p_up(99_999.0, 100_000.0, 0.0, 42.0).unwrap(), 0.0);
+        assert!(fair_p_up(100_000.0, 100_000.0, f64::NAN, 42.0).is_none());
+        assert!(fair_p_up(100_000.0, 100_000.0, f64::INFINITY, 42.0).is_none());
     }
 
     #[test]
