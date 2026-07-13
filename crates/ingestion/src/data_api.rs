@@ -108,6 +108,11 @@ pub struct Position {
     /// NOT a live, tradeable market.
     #[serde(default)]
     pub redeemable: bool,
+    /// `true` ⇒ a NEGATIVE-RISK (multi-outcome) market — redemption/merge must
+    /// target the NegRisk adapter, not the standard CTF one. Sourced from the Data
+    /// API's `negativeRisk` so the reconcile redeem-sweep routes it correctly.
+    #[serde(rename = "negativeRisk", default)]
+    pub neg_risk: bool,
 }
 
 impl Position {

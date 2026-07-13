@@ -723,9 +723,15 @@ pub struct RelayerClient {
     /// The WALLET request `to` — the deposit-wallet factory (default
     /// [`DEPOSIT_WALLET_FACTORY`]; configurable).
     factory: Address,
-    /// The merge/redeem call TARGET — the `CtfCollateralAdapter` (default
-    /// [`CTF_COLLATERAL_ADAPTER`]; configurable, e.g. the NegRisk adapter).
+    /// The merge/redeem call TARGET for STANDARD (binary) CTF markets
+    /// ([`CTF_COLLATERAL_ADAPTER`]).
     adapter: Address,
+    /// The merge/redeem call TARGET for NEGATIVE-RISK (multi-outcome) markets
+    /// ([`NEGRISK_CTF_COLLATERAL_ADAPTER`]). [`adapter_for`](Self::adapter_for)
+    /// picks between the two per market: redeeming a neg-risk market through the
+    /// STANDARD adapter reverts on-chain ("batch would revert"), which is exactly
+    /// what stranded the copy strategy's neg-risk winnings before this routing.
+    negrisk_adapter: Address,
     /// The collateral token the adapter pulls/returns (default
     /// [`USDC_E_COLLATERAL`]; configurable — pUSD is a staging item).
     collateral: Address,
@@ -779,9 +785,21 @@ impl RelayerClient {
             wallet,
             factory: DEPOSIT_WALLET_FACTORY,
             adapter: CTF_COLLATERAL_ADAPTER,
+            negrisk_adapter: NEGRISK_CTF_COLLATERAL_ADAPTER,
             collateral: USDC_E_COLLATERAL,
             submit_timeout: DEFAULT_SUBMIT_TIMEOUT,
         })
+    }
+
+    /// The correct merge/redeem adapter for a market: the NegRisk adapter for a
+    /// negative-risk (multi-outcome) market, else the standard CTF adapter. Using
+    /// the wrong one reverts on-chain, so callers pass the market's `neg_risk`.
+    fn adapter_for(&self, neg_risk: bool) -> Address {
+        if neg_risk {
+            self.negrisk_adapter
+        } else {
+            self.adapter
+        }
     }
 
     /// The owner EOA address derived from `pk` — both the WALLET request
@@ -803,10 +821,11 @@ impl RelayerClient {
         &self,
         condition_id: B256,
         amount: U256,
+        neg_risk: bool,
         nonce: u64,
         deadline: u64,
     ) -> Result<serde_json::Value, RelayerError> {
-        let calls = [merge_call(self.adapter, self.collateral, condition_id, amount)];
+        let calls = [merge_call(self.adapter_for(neg_risk), self.collateral, condition_id, amount)];
         let sig = sign_batch(&self.pk, self.chain_id, self.wallet, nonce, deadline, &calls)?;
         Ok(build_wallet_request(
             self.owner()?,
@@ -825,10 +844,11 @@ impl RelayerClient {
     fn build_redeem_batch(
         &self,
         condition_id: B256,
+        neg_risk: bool,
         nonce: u64,
         deadline: u64,
     ) -> Result<serde_json::Value, RelayerError> {
-        let calls = [redeem_call(self.adapter, self.collateral, condition_id)];
+        let calls = [redeem_call(self.adapter_for(neg_risk), self.collateral, condition_id)];
         let sig = sign_batch(&self.pk, self.chain_id, self.wallet, nonce, deadline, &calls)?;
         Ok(build_wallet_request(
             self.owner()?,
@@ -852,11 +872,16 @@ impl RelayerClient {
     /// money path panic-free). The LIVE round-trip (auth + endpoints) is the
     /// operator's funded staging validation — every failure here is a typed
     /// [`RelayerError`], never a panic.
-    pub async fn merge(&self, condition_id: B256, amount: U256) -> Result<i128, RelayerError> {
+    pub async fn merge(
+        &self,
+        condition_id: B256,
+        amount: U256,
+        neg_risk: bool,
+    ) -> Result<i128, RelayerError> {
         let owner = self.owner()?;
         let nonce = fetch_wallet_nonce(&self.http, &self.relayer_url, &self.creds, owner).await?;
         let deadline = now_secs() + DEADLINE_SECS;
-        let body = self.build_merge_batch(condition_id, amount, nonce, deadline)?;
+        let body = self.build_merge_batch(condition_id, amount, neg_risk, nonce, deadline)?;
         let tx_id = submit_wallet_batch(&self.http, &self.relayer_url, &self.creds, &body).await?;
         let _hash =
             poll_until_confirmed(&self.http, &self.relayer_url, &self.creds, &tx_id, self.submit_timeout)
@@ -874,11 +899,11 @@ impl RelayerClient {
     /// unknown") rather than guessing; M6-7 reconciles the actual credit from the
     /// Polymarket Data API (the same `redeemable`/positions read the reconcile
     /// path already uses). Failures map to a typed [`RelayerError`]; never panics.
-    pub async fn redeem(&self, condition_id: B256) -> Result<i128, RelayerError> {
+    pub async fn redeem(&self, condition_id: B256, neg_risk: bool) -> Result<i128, RelayerError> {
         let owner = self.owner()?;
         let nonce = fetch_wallet_nonce(&self.http, &self.relayer_url, &self.creds, owner).await?;
         let deadline = now_secs() + DEADLINE_SECS;
-        let body = self.build_redeem_batch(condition_id, nonce, deadline)?;
+        let body = self.build_redeem_batch(condition_id, neg_risk, nonce, deadline)?;
         let tx_id = submit_wallet_batch(&self.http, &self.relayer_url, &self.creds, &body).await?;
         let _hash =
             poll_until_confirmed(&self.http, &self.relayer_url, &self.creds, &tx_id, self.submit_timeout)
@@ -1390,7 +1415,7 @@ mod tests {
         let condition_id: B256 =
             "0xabcdef0000000000000000000000000000000000000000000000000000000123".parse().unwrap();
         let body = c
-            .build_merge_batch(condition_id, U256::from(1_500_000u64), 7, 1234567890)
+            .build_merge_batch(condition_id, U256::from(1_500_000u64), false, 7, 1234567890)
             .unwrap();
 
         assert_eq!(body["type"], "WALLET");
@@ -1432,7 +1457,7 @@ mod tests {
         .unwrap();
         let condition_id: B256 =
             "0x00000000000000000000000000000000000000000000000000000000deadbeef".parse().unwrap();
-        let body = c.build_redeem_batch(condition_id, 0, 1234567890).unwrap();
+        let body = c.build_redeem_batch(condition_id, false, 0, 1234567890).unwrap();
 
         assert_eq!(body["type"], "WALLET");
         assert_eq!(body["to"], DEPOSIT_WALLET_FACTORY.to_string());
@@ -1446,5 +1471,34 @@ mod tests {
         assert_eq!(&data[2..10], hex::encode(&selector[..4]).as_str(), "redeemPositions selector");
         let sig = body["signature"].as_str().unwrap();
         assert_eq!(sig.len(), 132, "0x + 65-byte signature");
+    }
+
+    /// NEG-RISK ROUTING: a redeem for a negative-risk market must target the
+    /// NegRisk adapter, not the standard CTF adapter. This is the fix for the
+    /// on-chain "batch would revert" that stranded neg-risk winnings.
+    #[test]
+    fn build_redeem_batch_routes_neg_risk_to_negrisk_adapter() {
+        let c = RelayerClient::new(
+            &live_cfg(true, false, None),
+            &test_secrets(true, true),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let condition_id: B256 =
+            "0x00000000000000000000000000000000000000000000000000000000deadbeef".parse().unwrap();
+
+        let binary = c.build_redeem_batch(condition_id, false, 0, 1234567890).unwrap();
+        assert_eq!(
+            binary["depositWalletParams"]["calls"][0]["target"],
+            CTF_COLLATERAL_ADAPTER.to_string(),
+            "binary market → standard CTF adapter"
+        );
+
+        let neg = c.build_redeem_batch(condition_id, true, 0, 1234567890).unwrap();
+        assert_eq!(
+            neg["depositWalletParams"]["calls"][0]["target"],
+            NEGRISK_CTF_COLLATERAL_ADAPTER.to_string(),
+            "neg-risk market → NegRisk adapter"
+        );
     }
 }

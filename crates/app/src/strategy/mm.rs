@@ -1820,7 +1820,11 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
                 "mm: spawning LIVE on-chain merge of complete set (non-blocking)"
             );
             tokio::spawn(async move {
-                let result = merger.merge(cond_a, amount).await;
+                // MM merge is binary-only today: this reward-farm/arb path has no
+                // neg_risk source plumbed (unlike copy, which routes per position).
+                // The MM is disabled in the live copy canary; wiring neg-risk here
+                // is a separate follow-up. `false` preserves the prior behavior.
+                let result = merger.merge(cond_a, amount, false).await;
                 // The receiver lives for the loop's lifetime; a send error only
                 // means the loop is shutting down — drop the outcome quietly.
                 let _ = tx.send(MergeOutcome { a, b, amount_micro, result });
@@ -1938,7 +1942,9 @@ impl<V: MakerVenue + UserFillSource> MmLoop<V> {
             });
             let mut done = Vec::new();
             for target in targets {
-                match merger.redeem(target.condition_id).await {
+                // MM redeem stays binary-only (see the merge note above); the MM
+                // is disabled in the live copy canary. `false` = prior behavior.
+                match merger.redeem(target.condition_id, false).await {
                     Ok(_) => {
                         tracing::info!(
                             condition = %target.condition_id,
@@ -4775,6 +4781,7 @@ mod tests {
             avg_price: 0.0,
             cash_pnl: 0.0,
             redeemable,
+            neg_risk: false,
         }
     }
 
