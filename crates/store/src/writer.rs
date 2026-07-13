@@ -66,6 +66,19 @@ pub enum StoreMsg {
     /// `write_error` (shadow telemetry must never look like a trading-path
     /// failure or block the loop).
     Btc5mShadow(crate::Btc5mShadowRow),
+    /// UPSERT one open BTC-5m micro-taker position (Phase 2) so a RESTART
+    /// resumes managing it (settle sweep at window close). Un-acked; a failed
+    /// write surfaces as a `write_error` (a lost persist would orphan the
+    /// position on restart) but never blocks the trading loop. Mirrors
+    /// `CopyPositionUpsert`.
+    Btc5mPositionUpsert(crate::Btc5mPositionRow),
+    /// DELETE a persisted BTC-5m position on a FULL close (settle sweep at
+    /// window close), so a restart does not resurrect a position no longer
+    /// held. Un-acked. Mirrors `CopyPositionClose`.
+    Btc5mPositionClose {
+        condition_id: String,
+        outcome_index: i64,
+    },
 }
 
 /// Run until the channel closes; returns the store for final inspection
@@ -153,6 +166,19 @@ pub async fn run_writer(mut store: Store, mut rx: mpsc::Receiver<StoreMsg>) -> S
                 }
                 (Ok(()), None, "btc5m_shadow")
             }
+            StoreMsg::Btc5mPositionUpsert(r) => (
+                store.upsert_btc5m_position(&r),
+                None,
+                "btc5m_position_upsert",
+            ),
+            StoreMsg::Btc5mPositionClose {
+                condition_id,
+                outcome_index,
+            } => (
+                store.close_btc5m_position(&condition_id, outcome_index),
+                None,
+                "btc5m_position_close",
+            ),
         };
         match result {
             Ok(()) => {

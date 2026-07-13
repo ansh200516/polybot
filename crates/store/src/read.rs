@@ -336,6 +336,33 @@ impl ReadStore {
         Ok(rows)
     }
 
+    /// All persisted OPEN BTC-5m micro-taker positions, for the Phase-2
+    /// strategy to RELOAD on startup and resume managing them (settle sweep at
+    /// window close) instead of orphaning them. Ordered by `(condition_id,
+    /// outcome_index)` for a stable reload. Empty on a fresh DB. Mirrors
+    /// [`Self::copy_open_positions`].
+    pub fn btc5m_open_positions(&self) -> Result<Vec<crate::Btc5mPositionRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT condition_id, outcome_index, token, qty_micro, cost_micro, entry_ts, t_close_ms, strike
+             FROM btc5m_positions ORDER BY condition_id, outcome_index",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::Btc5mPositionRow {
+                    condition_id: r.get(0)?,
+                    outcome_index: r.get(1)?,
+                    token: r.get(2)?,
+                    qty_micro: r.get(3)?,
+                    cost_micro: r.get(4)?,
+                    entry_ts: r.get(5)?,
+                    t_close_ms: r.get(6)?,
+                    strike: r.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn day_realized_micro(&self, strategy: &str, utc_day: i64) -> Result<i128, StoreError> {
         let total: Option<i64> = self
             .conn

@@ -190,6 +190,21 @@ pub struct Btc5mShadowRow {
     pub tick_decimals: i64,
 }
 
+/// One OPEN BTC-5m micro-taker position (Phase 2), persisted so a RESTART
+/// resumes managing it (settle sweep at window close) instead of orphaning it —
+/// mirrors [`CopyPositionRow`]. Keyed by `(condition_id, outcome_index)`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Btc5mPositionRow {
+    pub condition_id: String,
+    pub outcome_index: i64,   // 0 = Up/YES bought, 1 = Down/NO bought
+    pub token: String,        // the CLOB token id we bought
+    pub qty_micro: i64,
+    pub cost_micro: i64,
+    pub entry_ts: i64,
+    pub t_close_ms: i64,      // window close (for the settle sweep)
+    pub strike: f64,          // proxy strike at entry (audit)
+}
+
 /// A split or merge (complete-set conversion). `kind` is "split" | "merge".
 #[derive(Debug, Clone)]
 pub struct ConversionRow {
@@ -327,7 +342,12 @@ CREATE TABLE IF NOT EXISTS btc5m_shadow (
   best_ask_micro INTEGER NOT NULL,
   tick_decimals INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_btc5m_shadow_cond_ts ON btc5m_shadow (condition_id, ts_ms);";
+CREATE INDEX IF NOT EXISTS idx_btc5m_shadow_cond_ts ON btc5m_shadow (condition_id, ts_ms);
+CREATE TABLE IF NOT EXISTS btc5m_positions (
+  condition_id TEXT NOT NULL, outcome_index INTEGER NOT NULL, token TEXT NOT NULL,
+  qty_micro INTEGER NOT NULL, cost_micro INTEGER NOT NULL, entry_ts INTEGER NOT NULL,
+  t_close_ms INTEGER NOT NULL, strike REAL NOT NULL,
+  PRIMARY KEY (condition_id, outcome_index));";
 
 const TERMINAL_STATES: [&str; 4] = ["Filled", "Cancelled", "Rejected", "Expired"];
 
@@ -861,6 +881,46 @@ impl Store {
     ) -> Result<(), StoreError> {
         self.conn.execute(
             "DELETE FROM copy_positions WHERE condition_id = ?1 AND outcome_index = ?2",
+            rusqlite::params![condition_id, outcome_index],
+        )?;
+        Ok(())
+    }
+
+    /// UPSERT one open BTC-5m micro-taker position (keyed by `(condition_id,
+    /// outcome_index)`), so a restart can reload + resume managing it (settle
+    /// sweep at window close). Mirrors [`Store::upsert_copy_position`].
+    pub fn upsert_btc5m_position(&mut self, r: &Btc5mPositionRow) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO btc5m_positions
+               (condition_id, outcome_index, token, qty_micro, cost_micro, entry_ts, t_close_ms, strike)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(condition_id, outcome_index) DO UPDATE SET
+               token=excluded.token, qty_micro=excluded.qty_micro, cost_micro=excluded.cost_micro,
+               entry_ts=excluded.entry_ts, t_close_ms=excluded.t_close_ms, strike=excluded.strike",
+            rusqlite::params![
+                r.condition_id,
+                r.outcome_index,
+                r.token,
+                r.qty_micro,
+                r.cost_micro,
+                r.entry_ts,
+                r.t_close_ms,
+                r.strike,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// DELETE the persisted open BTC-5m position on a FULL close (settle sweep
+    /// at window close), so a restart does not resurrect it. Mirrors
+    /// [`Store::close_copy_position`].
+    pub fn close_btc5m_position(
+        &mut self,
+        condition_id: &str,
+        outcome_index: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM btc5m_positions WHERE condition_id = ?1 AND outcome_index = ?2",
             rusqlite::params![condition_id, outcome_index],
         )?;
         Ok(())
@@ -2247,5 +2307,21 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].ts_ms, 1_700_000_001_000);
         assert_eq!(rows[1].secs_to_go, 15);
+    }
+
+    #[test]
+    fn btc5m_position_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        let mut s = Store::open(&path).unwrap();
+        s.upsert_btc5m_position(&Btc5mPositionRow {
+            condition_id: "0xC".into(), outcome_index: 0, token: "111".into(),
+            qty_micro: 11_000_000, cost_micro: 9_900_000, entry_ts: 1, t_close_ms: 300_000,
+            strike: 62_900.0,
+        }).unwrap();
+        let rs = crate::read::ReadStore::open(&path).unwrap();
+        assert_eq!(rs.btc5m_open_positions().unwrap().len(), 1);
+        s.close_btc5m_position("0xC", 0).unwrap();
+        assert_eq!(crate::read::ReadStore::open(&path).unwrap().btc5m_open_positions().unwrap().len(), 0);
     }
 }
