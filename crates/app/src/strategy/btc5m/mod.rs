@@ -19,17 +19,23 @@ pub mod model;
 pub mod settle;
 pub mod shadow;
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use alloy_primitives::B256;
 use pm_core::num::{Bps, TickSize, Usdc, buy_cost};
 use pm_engine::Action;
 use pm_execution::Order;
+use pm_execution::relayer::RelayerClient;
 use pm_ingestion::gamma::{GammaClient, GammaWindow};
 use pm_ingestion::spot::SpotFeed;
 use pm_risk::inventory::{InventoryConfig, InventoryRisk};
+use pm_store::read::ReadStore;
 use pm_store::writer::StoreMsg;
 use pm_store::{Btc5mPositionRow, FillRow, OrderRow, usdc_to_i64, utc_day_from_ms};
 use tokio::time::MissedTickBehavior;
@@ -45,6 +51,26 @@ use crate::strategy::copy::CopyVenue;
 /// `rate·p·(1−p)` schedule these 5-minute markets use (see the fee doc-comment
 /// in [`entry`]). A VENUE CONSTANT, not a config knob.
 const CRYPTO_FEE_RATE: f64 = 0.07;
+
+/// How long AFTER a window's close to wait before trusting its Gamma outcome as
+/// FINAL (resolution finality lag). The settle sweep only settles a held
+/// position once `now_ms() >= t_close_ms + SETTLE_DELAY_MS`.
+const SETTLE_DELAY_MS: i64 = 120_000;
+
+/// One tracked open micro-taker position — the settle sweep's in-memory working
+/// set (mirrors the durable [`Btc5mPositionRow`]). Keyed in [`Btc5mStrategy::open`]
+/// by `(condition_id, outcome_index)`.
+#[derive(Debug, Clone)]
+struct OpenPos {
+    /// The CLOB token id we bought (audit; settle keys off `condition_id`).
+    token: String,
+    qty_micro: i64,
+    cost_micro: i64,
+    /// Did we buy the UP/YES side (outcome_index 0)? Drives realized PnL sign.
+    bought_up: bool,
+    /// Window close (ms). `open_unix = t_close_ms/1000 - 300` rebuilds the slug.
+    t_close_ms: i64,
+}
 
 /// Phase-2 entry tuning, resolved from `[btc5m]` config (`Btc5mParamsCfg`) by
 /// main and threaded into the strategy at construction.
@@ -78,10 +104,12 @@ impl Default for Btc5mParams {
     }
 }
 
-/// The inventory-ledger caps the cumulative-loss circuit breaker keys off. In
-/// Phase 2 marking is deferred to the Task 6 settle sweep, so only `on_fill`
-/// realized accounting is exercised here; the floors are set sensibly for when
-/// Task 6 wires the mark.
+/// The inventory-ledger caps (gross/notional + `on_fill` realized accounting for
+/// the entry fills). NOTE: the daily-LOSS cap (`max_daily_loss_usd`) is NOT
+/// enforced through these `inv` floors — btc5m positions realize only at
+/// resolution, which the settle sweep books outside `inv`. That cap is instead
+/// enforced by the settle sweep's `day_realized_micro` latch (Task 6), which trips
+/// `halted` once the day's realized reaches `-(max_daily_loss_usd × 1e6)`.
 fn inv_config(params: &Btc5mParams) -> InventoryConfig {
     let daily_loss = Usdc((params.max_daily_loss_usd * 1_000_000.0) as i128);
     let notional = Usdc((params.max_daily_notional_usd * 1_000_000.0) as i128);
@@ -165,6 +193,25 @@ pub struct Btc5mStrategy<V: CopyVenue> {
     /// TEST-ONLY leader ask (µUSDC) substituting for the public CLOB `/book`
     /// poll on the seed (no-network) path; `None` in production.
     seed_leader_ask: Option<i64>,
+    // ── Phase-2 Task 6 (settlement) ─────────────────────────────────────────
+    /// M6 deposit-wallet relayer for on-chain resolved-winner redemption; `None`
+    /// until Task 7 wires it (mirrors copy's `relayer`). Redeem is best-effort.
+    relayer: Option<Arc<RelayerClient>>,
+    /// DB path for the STARTUP open-position reload (via [`ReadStore`]); `None`
+    /// until Task 7 wires it (mirrors copy/mm's `store_path`).
+    store_path: Option<PathBuf>,
+    /// In-memory open-position BACKSTOP keyed by `(condition_id, outcome_index)`
+    /// — the settle sweep's working set. Populated on entry ([`Self::try_enter`])
+    /// and on the startup reload; a settled position is removed (idempotent: a
+    /// key absent from `open` is never swept/booked again).
+    open: HashMap<(String, i64), OpenPos>,
+    /// Cumulative realized µUSDC THIS UTC day (resets on rollover). Latches
+    /// `halted` once it reaches `-(max_daily_loss_usd × 1e6)` — the activation of
+    /// the otherwise-inert `max_daily_loss_usd` cap.
+    day_realized_micro: i64,
+    /// TEST-ONLY resolved-outcome stub (`condition_id` → UP-won) consulted on the
+    /// seed (no-gamma) path, mirroring `seed_leader_ask`. Empty in production.
+    seed_outcomes: HashMap<String, bool>,
 }
 
 impl<V: CopyVenue> Btc5mStrategy<V> {
@@ -201,8 +248,28 @@ impl<V: CopyVenue> Btc5mStrategy<V> {
             day: utc_day_from_ms(Self::now_ms()),
             day_notional_micro: 0,
             seed_leader_ask: None,
+            relayer: None,
+            store_path: None,
+            open: HashMap::new(),
+            day_realized_micro: 0,
+            seed_outcomes: HashMap::new(),
             params,
         }
+    }
+
+    /// Attach the M6 deposit-wallet relayer for on-chain resolved-winner
+    /// redemption (Task 7 wiring; mirrors copy's relayer). Best-effort redeem.
+    pub fn with_relayer(mut self, relayer: Arc<RelayerClient>) -> Self {
+        self.relayer = Some(relayer);
+        self
+    }
+
+    /// Set the DB path for the STARTUP open-position reload (Task 7 wiring;
+    /// mirrors copy/mm's `with_store_path`), so a restart resumes settling
+    /// unsettled positions instead of dropping them.
+    pub fn with_store_path(mut self, store_path: PathBuf) -> Self {
+        self.store_path = Some(store_path);
+        self
     }
 
     /// Test constructor: a pre-seeded window+spot (no network), an injectable
@@ -239,6 +306,11 @@ impl<V: CopyVenue> Btc5mStrategy<V> {
             day: utc_day_from_ms(Self::now_ms()),
             day_notional_micro: 0,
             seed_leader_ask,
+            relayer: None,
+            store_path: None,
+            open: HashMap::new(),
+            day_realized_micro: 0,
+            seed_outcomes: HashMap::new(),
             params,
         }
     }
@@ -370,18 +442,33 @@ impl<V: CopyVenue> Btc5mStrategy<V> {
         // Awaited (not try_send): btc5m keeps no in-memory position backstop, so
         // a dropped upsert under backpressure would leave an on-chain fill with
         // no tracked row — an untracked orphan the Task 6 settle sweep never sees.
+        let qty_micro = filled_micro.clamp(0, i128::from(i64::MAX)) as i64;
+        let outcome_index = if up { 0 } else { 1 };
         let _ = store_tx
             .send(StoreMsg::Btc5mPositionUpsert(Btc5mPositionRow {
                 condition_id: win.gamma.condition_id.clone(),
-                outcome_index: if up { 0 } else { 1 },
+                outcome_index,
                 token: leader_token_str.to_string(),
-                qty_micro: filled_micro.clamp(0, i128::from(i64::MAX)) as i64,
+                qty_micro,
                 cost_micro: cost_micro as i64,
                 entry_ts: now,
                 t_close_ms: win.gamma.t_close_ms,
                 strike: win.strike,
             }))
             .await;
+        // ALSO track it in the in-memory backstop so the settle sweep sees it
+        // without waiting on a durable read-back (and a restart reload rebuilds
+        // this map from the durable row).
+        self.open.insert(
+            (win.gamma.condition_id.clone(), outcome_index),
+            OpenPos {
+                token: leader_token_str.to_string(),
+                qty_micro,
+                cost_micro: cost_micro as i64,
+                bought_up: up,
+                t_close_ms: win.gamma.t_close_ms,
+            },
+        );
         self.day_notional_micro = self.day_notional_micro.saturating_add(cost_micro as i64);
         self.entered_this_window = true;
         tracing::info!(
@@ -391,6 +478,184 @@ impl<V: CopyVenue> Btc5mStrategy<V> {
             cost_micro = cost_micro as i64,
             "btc5m: ENTERED (marketable FAK buy on the near-certain leader)"
         );
+    }
+
+    /// The Task-5 LIVE-ENTRY gate, extracted so both the run loop and the settle
+    /// test read the same predicate: reachable ONLY when live, a venue is
+    /// attached, this window hasn't entered, and the breaker isn't latched. The
+    /// daily-loss halt (settle sweep) flips `halted`, so a breach blocks entries.
+    fn entry_allowed(&self) -> bool {
+        self.live && self.venue.is_some() && !self.entered_this_window && !self.halted
+    }
+
+    /// Reset the per-UTC-day counters on a day rollover — the daily-notional cap
+    /// AND the daily-realized latch share one window. Idempotent within a day, so
+    /// it is safe to call from BOTH the entry gate and the settle sweep (whichever
+    /// fires first rolls; the other is a no-op).
+    fn roll_day(&mut self, now: i64) {
+        let today = utc_day_from_ms(now);
+        if today != self.day {
+            self.day = today;
+            self.day_notional_micro = 0;
+            self.day_realized_micro = 0;
+        }
+    }
+
+    /// Resolve a held window's outcome: `Some(up_won)` if resolved, `None` if not
+    /// yet (retry next sweep). Production reads Gamma via the retained client; the
+    /// seed (no-network) test path reads the injected `seed_outcomes` stub.
+    ///
+    /// An ASSOCIATED fn taking only the two `Sync` pieces (`&GammaClient`,
+    /// `&HashMap`) rather than `&self`, so its future stays `Send` — `&self` would
+    /// require `Btc5mStrategy: Sync`, which the `Box<dyn Fn ..>` `slug_fn` (Send,
+    /// not Sync) blocks.
+    async fn window_outcome_for(
+        gamma: Option<&GammaClient>,
+        seed_outcomes: &HashMap<String, bool>,
+        condition_id: &str,
+        open_unix: i64,
+    ) -> Option<bool> {
+        match gamma {
+            Some(g) => match g.window_outcome(open_unix).await {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(error = %e, open_unix, "btc5m: window_outcome fetch failed — retry next sweep");
+                    None
+                }
+            },
+            None => seed_outcomes.get(condition_id).copied(),
+        }
+    }
+
+    /// Book ONE resolved position: realized PnL → the day-realized ledger, close
+    /// the durable row, drop it from the in-memory backstop, feed the daily-loss
+    /// latch, and (winner + relayer present) redeem on-chain (best-effort). Called
+    /// only for positions still present in `open`, and removes the key, so it can
+    /// never double-book a position.
+    async fn settle_one(
+        &mut self,
+        store_tx: &tokio::sync::mpsc::Sender<StoreMsg>,
+        key: &(String, i64),
+        pos: &OpenPos,
+        outcome_up: bool,
+        now: i64,
+    ) {
+        let realized = crate::strategy::btc5m::settle::realized_micro(
+            outcome_up,
+            pos.bought_up,
+            pos.qty_micro,
+            pos.cost_micro,
+        );
+        // Realized delta → the cumulative day-realized ledger (best-effort).
+        let _ = store_tx
+            .send(StoreMsg::DayRealized {
+                utc_day: utc_day_from_ms(now),
+                strategy: "btc5m".into(),
+                delta_micro: realized as i128,
+            })
+            .await;
+        // Close the durable row + drop the in-memory backstop entry. Removing the
+        // key here is what makes settle IDEMPOTENT: a later sweep can't re-book it.
+        let _ = store_tx
+            .send(StoreMsg::Btc5mPositionClose {
+                condition_id: key.0.clone(),
+                outcome_index: key.1,
+            })
+            .await;
+        self.open.remove(key);
+        // DAILY-LOSS LATCH — this is what activates `max_daily_loss_usd`: once the
+        // day's realized reaches the floor, latch `halted` (the entry gate blocks).
+        self.day_realized_micro = self.day_realized_micro.saturating_add(realized);
+        let loss_floor = -((self.params.max_daily_loss_usd * 1_000_000.0) as i64);
+        if self.day_realized_micro <= loss_floor {
+            self.halted = true;
+            tracing::warn!(
+                day_realized_micro = self.day_realized_micro,
+                loss_floor_micro = loss_floor,
+                "btc5m: daily-loss cap breached — halting new entries for the session"
+            );
+        }
+        tracing::info!(
+            condition_id = %key.0,
+            outcome_index = key.1,
+            token = %pos.token,
+            outcome_up,
+            realized_micro = realized,
+            "btc5m: SETTLED position (Gamma outcome → realized PnL)"
+        );
+        // Redeem winners on-chain (best-effort; off the decision path). btc5m
+        // markets are NOT neg-risk. A parse/relayer failure only logs — the PnL is
+        // already booked locally.
+        let won = outcome_up == pos.bought_up;
+        if won && let Some(relayer) = self.relayer.clone() {
+            match key.0.parse::<B256>() {
+                Ok(condition) => {
+                    if let Err(e) = relayer.redeem(condition, false).await {
+                        tracing::warn!(error = %e, condition_id = %key.0, "btc5m: winner redeem failed (booked locally; reconcile later)");
+                    } else {
+                        tracing::info!(condition_id = %key.0, "btc5m: redeemed resolved winner");
+                    }
+                }
+                Err(_) => tracing::warn!(condition_id = %key.0, "btc5m: winning condition_id did not parse as B256 — redeem skipped"),
+            }
+        }
+    }
+
+    /// Sweep the in-memory `open` map: for each position whose window has resolved
+    /// (past `t_close_ms + SETTLE_DELAY_MS`) and whose Gamma outcome is known,
+    /// settle it. Unresolved windows are left for the next sweep. Snapshots the
+    /// ready keys FIRST (so the per-position async outcome fetch + mutation don't
+    /// hold a borrow of `open`).
+    async fn settle_sweep(&mut self, store_tx: &tokio::sync::mpsc::Sender<StoreMsg>, now: i64) {
+        self.roll_day(now);
+        let ready: Vec<((String, i64), OpenPos)> = self
+            .open
+            .iter()
+            .filter(|(_, p)| now >= p.t_close_ms + SETTLE_DELAY_MS)
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect();
+        for (key, pos) in ready {
+            let open_unix = pos.t_close_ms / 1000 - 300;
+            // Borrow only the two `Sync` fields for the fetch (NOT `&self`), so the
+            // future is `Send`; the borrows end at the await, freeing `&mut self`.
+            let outcome =
+                Self::window_outcome_for(self.gamma.as_ref(), &self.seed_outcomes, &key.0, open_unix)
+                    .await;
+            if let Some(outcome_up) = outcome {
+                self.settle_one(store_tx, &key, &pos, outcome_up, now).await;
+            }
+        }
+    }
+
+    /// RELOAD persisted open positions at startup so a restart RESUMES settling
+    /// them instead of orphaning an on-chain fill with no tracked row. Rebuilds the
+    /// in-memory `open` backstop from the durable rows; a read failure just starts
+    /// flat (prior behavior). Mirrors copy's `reload_positions` (but btc5m settle
+    /// never trades the token, so no venue re-registration is needed).
+    fn reload_open(&mut self, read: &ReadStore) {
+        let rows = match read.btc5m_open_positions() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "btc5m: position reload read failed — starting flat");
+                return;
+            }
+        };
+        let restored = rows.len();
+        for row in rows {
+            self.open.insert(
+                (row.condition_id.clone(), row.outcome_index),
+                OpenPos {
+                    token: row.token,
+                    qty_micro: row.qty_micro,
+                    cost_micro: row.cost_micro,
+                    bought_up: row.outcome_index == 0,
+                    t_close_ms: row.t_close_ms,
+                },
+            );
+        }
+        if restored > 0 {
+            tracing::info!(restored, "btc5m: reloaded open positions from the store — resuming settlement (restart-safe)");
+        }
     }
 }
 
@@ -423,10 +688,22 @@ impl<V: CopyVenue + 'static> Strategy for Btc5mStrategy<V> {
                 rot.adopt(w, strike);
             }
 
+            // RESTART-SAFETY: reload persisted open positions BEFORE the first
+            // sweep so a restart RESUMES settling them instead of orphaning an
+            // on-chain fill with no tracked row. `store_path` is `None` until Task
+            // 7 wires it (like `relayer`), so this is inert until then.
+            if let Some(read) = me.store_path.as_deref().and_then(|p| ReadStore::open(p).ok()) {
+                me.reload_open(&read);
+            }
+
             let mut tick = tokio::time::interval(Duration::from_millis(me.sample_ms.max(1)));
             tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let mut gamma_poll = tokio::time::interval(Duration::from_millis(1000));
             gamma_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // SETTLE sweep on a slow sub-cadence (resolution finality is minutes,
+            // not seconds). Fires immediately on the first tick, then every 30s.
+            let mut settle_poll = tokio::time::interval(Duration::from_millis(30_000));
+            settle_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
             loop {
                 if kill.load(Ordering::Relaxed) {
@@ -446,6 +723,12 @@ impl<V: CopyVenue + 'static> Strategy for Btc5mStrategy<V> {
                             }
                         }
                         if rotated { me.entered_this_window = false; }
+                    }
+                    _ = settle_poll.tick() => {
+                        // Settle any resolved held positions (book realized PnL,
+                        // close, redeem winners, feed the daily-loss latch). Runs
+                        // regardless of `live` — held positions must always settle.
+                        me.settle_sweep(&store_tx, Self::now_ms()).await;
                     }
                     _ = tick.tick() => {
                         if paused { continue; }
@@ -493,10 +776,10 @@ impl<V: CopyVenue + 'static> Strategy for Btc5mStrategy<V> {
                         // ── Phase-2 LIVE ENTRY (capital-critical; gated) ────────
                         // Reachable ONLY when live, a venue is attached, this
                         // window hasn't entered, and the breaker isn't latched.
-                        if me.live && me.venue.is_some() && !me.entered_this_window && !me.halted {
-                            // Daily-notional cap window: reset on UTC-day rollover.
-                            let today = utc_day_from_ms(now);
-                            if today != me.day { me.day = today; me.day_notional_micro = 0; }
+                        if me.entry_allowed() {
+                            // Daily cap window: reset on UTC-day rollover (notional
+                            // + realized share the window via `roll_day`).
+                            me.roll_day(now);
 
                             if let Some(ts) = tick_from_decimals(win.gamma.tick_decimals) {
                                 // Leader = the side the spot deviation favors. z's
@@ -770,5 +1053,94 @@ mod tests {
         assert_eq!(p.token, "999", "the UP/YES CLOB token id string");
         assert_eq!(p.qty_micro, 11_000_000);
         assert_eq!(p.cost_micro, 9_900_000, "11 sh × $0.90 = $9.90 cost");
+    }
+
+    /// SETTLE SWEEP: two resolved positions past their close — one WIN, one LOSS —
+    /// settled via the STUBBED outcome hook (`gamma == None` ⇒ `seed_outcomes`),
+    /// over a REAL in-memory store + writer. Asserts each books the correct
+    /// `DayRealized` delta (win = +(qty−cost), loss = −cost), each is closed
+    /// (removed from BOTH the durable table AND the in-memory `open` backstop),
+    /// and the loss breaching `max_daily_loss_usd` latches `halted` so the entry
+    /// gate blocks a follow-up entry. `relayer == None` ⇒ no on-chain redeem (no
+    /// network); the venue is present only to prove `entry_allowed()` toggles on
+    /// the halt (not on the venue), and that settle places NO orders.
+    #[tokio::test]
+    async fn settle_sweep_books_win_and_loss_and_halts_on_breach() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("btc5m_settle.sqlite");
+        let store = Store::open(&path).unwrap();
+        let (store_tx, store_rx) = mpsc::channel::<StoreMsg>(256);
+        let writer = tokio::spawn(run_writer(store, store_rx));
+
+        let now = crate::coordinator::now_ms();
+        let t_close = now - 300_000; // well past close + SETTLE_DELAY_MS (120s).
+        // max_daily_loss_usd = $5 ⇒ floor −$5M; the single $9.90 loss breaches it.
+        let params = Btc5mParams { max_daily_loss_usd: 5.0, ..Btc5mParams::default() };
+
+        let orders: OrderLog = Arc::new(Mutex::new(Vec::new()));
+        let venue = MockVenue { token: TokenId(7), orders: Arc::clone(&orders) };
+        // live + venue present so `entry_allowed()` reflects ONLY `halted` here.
+        let mut me = Btc5mStrategy::new_for_test(
+            window(t_close), 62_900.0, 62_940.0, 40.0, 5, true, Some(venue), params, None,
+        );
+        assert!(me.entry_allowed(), "pre-settle: entry gate open (live + venue, not halted)");
+
+        // Seed the durable table (so the close DELETE is observable) AND the
+        // in-memory backstop with a WIN (bought UP, UP won) and a LOSS (bought UP,
+        // DOWN won). Distinct condition_ids so the stub can decide each side.
+        for (cid, up_won) in [("CW", true), ("CL", false)] {
+            store_tx
+                .send(StoreMsg::Btc5mPositionUpsert(Btc5mPositionRow {
+                    condition_id: cid.into(),
+                    outcome_index: 0,
+                    token: "999".into(),
+                    qty_micro: 11_000_000,
+                    cost_micro: 9_900_000,
+                    entry_ts: now,
+                    t_close_ms: t_close,
+                    strike: 62_900.0,
+                }))
+                .await
+                .unwrap();
+            me.open.insert(
+                (cid.to_string(), 0),
+                OpenPos {
+                    token: "999".into(),
+                    qty_micro: 11_000_000,
+                    cost_micro: 9_900_000,
+                    bought_up: true,
+                    t_close_ms: t_close,
+                },
+            );
+            me.seed_outcomes.insert(cid.to_string(), up_won);
+        }
+        assert_eq!(me.open.len(), 2);
+
+        // DRIVE THE SWEEP directly (gamma=None ⇒ the seed_outcomes stub decides).
+        me.settle_sweep(&store_tx, now).await;
+
+        // Both settled + removed from the in-memory backstop (idempotent close).
+        assert!(me.open.is_empty(), "both positions removed from `open` after settle");
+        // Win +$1.10 + loss −$9.90 = −$8.80, and −$8.80 ≤ −$5 floor ⇒ halt latched.
+        assert_eq!(me.day_realized_micro, -8_800_000, "cumulative day realized = win − loss");
+        assert!(me.halted, "daily-loss cap breach latches `halted`");
+        assert!(!me.entry_allowed(), "the latched halt now BLOCKS a follow-up entry");
+        assert!(orders.lock().unwrap().is_empty(), "settle places NO orders");
+
+        // Drain the writer (the loop's sender is the only one) and read back.
+        drop(store_tx);
+        let store = writer.await.unwrap();
+        drop(store); // flush + release the write connection before reading.
+        let rs = pm_store::read::ReadStore::open(&path).unwrap();
+        assert!(
+            rs.btc5m_open_positions().unwrap().is_empty(),
+            "both durable positions closed (deleted) by the settle sweep"
+        );
+        let day = pm_store::utc_day_from_ms(now);
+        assert_eq!(
+            rs.day_realized_micro("btc5m", day).unwrap(),
+            -8_800_000,
+            "the day-realized ledger accumulated both settle deltas (+1.10 − 9.90)"
+        );
     }
 }

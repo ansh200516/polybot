@@ -61,6 +61,64 @@ pub fn parse_current_window(body: &str) -> Result<Option<GammaWindow>, IngestErr
     Ok(None)
 }
 
+/// Read an f64 from a JSON number OR a numeric string (Gamma stringifies some
+/// numeric fields, like `clobTokenIds`).
+fn json_f64(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+/// UP-won from a market's `outcomePrices` (`["1","0"]` ⇒ UP, `["0","1"]` ⇒
+/// DOWN). The field is either a JSON array or a JSON-encoded string (like
+/// `clobTokenIds`); the first element ≥ 0.5 ⇒ the UP/YES slot resolved to $1.
+fn outcome_from_prices(op: &serde_json::Value) -> Option<bool> {
+    let first = match op {
+        serde_json::Value::Array(a) => json_f64(a.first()?)?,
+        serde_json::Value::String(s) => {
+            let parsed: serde_json::Value = serde_json::from_str(s).ok()?;
+            json_f64(parsed.as_array()?.first()?)?
+        }
+        _ => return None,
+    };
+    Some(first >= 0.5)
+}
+
+/// Parse a RESOLVED 5-min window's outcome from a Gamma `/events` body.
+/// `Some(true)` = UP won, `Some(false)` = DOWN won, `None` = NOT yet resolved
+/// (or the event/market was not found — the caller retries next sweep).
+///
+/// Resolution is signalled by a NON-NULL `eventMetadata` (present ONLY after the
+/// window resolves), so a `null`/absent `eventMetadata` is treated as unresolved
+/// and never guessed from a live mid-price `outcomePrices`. Within a resolved
+/// event UP won iff `finalPrice >= priceToBeat` (equivalently `outcomePrices ==
+/// ["1","0"]`, used as a fallback when the metadata lacks the prices).
+pub fn parse_window_outcome(body: &str) -> Option<bool> {
+    let events: serde_json::Value = serde_json::from_str(body).ok()?;
+    for ev in events.as_array()? {
+        // `eventMetadata` non-null ⇒ resolved. null/absent ⇒ unresolved: skip
+        // (so an in-progress window is reported `None`, not decided from a mid).
+        let meta = match ev.get("eventMetadata") {
+            Some(m) if !m.is_null() => m,
+            _ => continue,
+        };
+        if let (Some(ptb), Some(fin)) = (
+            meta.get("priceToBeat").and_then(json_f64),
+            meta.get("finalPrice").and_then(json_f64),
+        ) {
+            return Some(fin >= ptb);
+        }
+        // Resolved, but the metadata lacked the prices: read the resolved
+        // market's `outcomePrices` instead.
+        if let Some(up) = ev
+            .get("markets")
+            .and_then(|m| m.as_array())
+            .and_then(|ms| ms.iter().find_map(|m| m.get("outcomePrices").and_then(outcome_from_prices)))
+        {
+            return Some(up);
+        }
+    }
+    None
+}
+
 /// Keyless Gamma client (mirrors `DataApiClient`).
 pub struct GammaClient { http: reqwest::Client, base: String }
 impl GammaClient {
@@ -74,6 +132,20 @@ impl GammaClient {
             .error_for_status().map_err(|e| IngestError::Http(e.to_string()))?
             .text().await.map_err(|e| IngestError::Http(e.to_string()))?;
         parse_current_window(&body)
+    }
+
+    /// Fetch the RESOLVED outcome of the 5-min window that OPENED at `open_unix`
+    /// seconds (series slug `btc-updown-5m-<open_unix>`), if it has resolved.
+    /// `Ok(Some(true))` = UP won, `Ok(Some(false))` = DOWN won, `Ok(None)` =
+    /// not yet resolved / not found. Mirrors [`Self::current_window`]'s I/O; the
+    /// settle sweep rebuilds `open_unix` from a held position's close time
+    /// (`t_close_ms/1000 - 300`).
+    pub async fn window_outcome(&self, open_unix: i64) -> Result<Option<bool>, IngestError> {
+        let url = format!("{}/events?slug=btc-updown-5m-{}", self.base, open_unix);
+        let body = self.http.get(&url).send().await.map_err(|e| IngestError::Http(e.to_string()))?
+            .error_for_status().map_err(|e| IngestError::Http(e.to_string()))?
+            .text().await.map_err(|e| IngestError::Http(e.to_string()))?;
+        Ok(parse_window_outcome(&body))
     }
 }
 
@@ -106,5 +178,39 @@ mod tests {
         assert!(parse_current_window("[]").unwrap().is_none());
         let closed = r#"[{"markets":[{"conditionId":"x","clobTokenIds":"[\"1\",\"2\"]","orderPriceMinTickSize":"0.01","startDate":"2026-07-13T07:50:00Z","endDate":"2026-07-13T07:55:00Z","closed":true}]}]"#;
         assert!(parse_current_window(closed).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_outcome_resolved_up_down_and_unresolved() {
+        // Resolved UP: finalPrice ≥ priceToBeat.
+        let up = r#"[{"eventMetadata":{"priceToBeat":100.0,"finalPrice":105.0},"markets":[{"conditionId":"x"}]}]"#;
+        assert_eq!(parse_window_outcome(up), Some(true), "final ≥ ptb ⇒ UP won");
+        // Resolved DOWN: finalPrice < priceToBeat.
+        let down = r#"[{"eventMetadata":{"priceToBeat":100.0,"finalPrice":95.0}}]"#;
+        assert_eq!(parse_window_outcome(down), Some(false), "final < ptb ⇒ DOWN won");
+        // Exact tie resolves UP (the `>=` convention, matching `outcomePrices`).
+        let tie = r#"[{"eventMetadata":{"priceToBeat":100.0,"finalPrice":100.0}}]"#;
+        assert_eq!(parse_window_outcome(tie), Some(true), "final == ptb ⇒ UP (>=)");
+        // Numeric fields can arrive as strings (Gamma stringifies some).
+        let strnum = r#"[{"eventMetadata":{"priceToBeat":"100.0","finalPrice":"105.0"}}]"#;
+        assert_eq!(parse_window_outcome(strnum), Some(true), "string-encoded numbers parse");
+        // NOT resolved yet: eventMetadata null ⇒ None, even if a live-mid
+        // outcomePrices is present (must NOT be decided from a mid price).
+        let pending = r#"[{"eventMetadata":null,"markets":[{"conditionId":"x","outcomePrices":"[\"0.6\",\"0.4\"]"}]}]"#;
+        assert_eq!(parse_window_outcome(pending), None, "eventMetadata null ⇒ unresolved");
+        // Absent event / not found.
+        assert_eq!(parse_window_outcome("[]"), None);
+        assert_eq!(parse_window_outcome(r#"[{"markets":[]}]"#), None, "no eventMetadata ⇒ unresolved");
+    }
+
+    #[test]
+    fn parse_outcome_via_outcome_prices_fallback() {
+        // Resolved (eventMetadata present) but WITHOUT the numeric prices ⇒ fall
+        // back to the resolved market's outcomePrices. Array form ⇒ UP.
+        let arr = r#"[{"eventMetadata":{},"markets":[{"outcomePrices":["1","0"]}]}]"#;
+        assert_eq!(parse_window_outcome(arr), Some(true), "[\"1\",\"0\"] ⇒ UP won");
+        // Encoded-string form ⇒ DOWN.
+        let enc = r#"[{"eventMetadata":{},"markets":[{"outcomePrices":"[\"0\",\"1\"]"}]}]"#;
+        assert_eq!(parse_window_outcome(enc), Some(false), "[\"0\",\"1\"] ⇒ DOWN won");
     }
 }
