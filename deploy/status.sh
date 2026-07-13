@@ -94,6 +94,42 @@ if m_val or m_cost:
 if unmatched:
     print(f"⚠ {unmatched} position(s) had NO live price — likely resolved/left the wallet but still in the DB (stale row; the on-chain reconcile guard would clear these)")
 print(f"realized P&L today (copy): ${day_realized:+.2f}")
+
+# ON-CHAIN OPEN positions NOT in the tracked DB — orphaned copies the bot opened
+# but no longer actively manages (dropped across restarts/reconciles). Shown so
+# `pnl` matches the Polymarket portfolio. They still auto-redeem at resolution
+# (the reconcile sweep); they just don't get follow-exit while open.
+tracked = {(str(cid).lower(), int(oi)) for cid, oi, *_ in rows}
+orphans = []
+for p in info.values():
+    key = (str(p.get("conditionId", "")).lower(), int(p.get("outcomeIndex", -1)))
+    if key in tracked:
+        continue
+    try:
+        size, cur = float(p.get("size", 0) or 0), float(p.get("curPrice", 0) or 0)
+    except (TypeError, ValueError):
+        continue
+    # OPEN = live/tradeable: not resolved, non-degenerate mark, non-dust.
+    if bool(p.get("redeemable")) or size <= 0.01 or cur <= 0.0 or cur >= 1.0:
+        continue
+    orphans.append(p)
+
+if orphans:
+    print()
+    print("=== ON-CHAIN OPEN, NOT TRACKED (orphaned — bot isn't follow-exit managing these) ===\n")
+    print(hdr)
+    print("-" * len(hdr))
+    o_val = 0.0
+    for p in sorted(orphans, key=lambda x: -(float(x.get("currentValue", 0) or 0))):
+        title = p.get("title") or (str(p.get("conditionId", ""))[:14] + "…")
+        name = (title[:49] + "…") if len(title) > 50 else title
+        oi = int(p.get("outcomeIndex", -1))
+        side = "Yes" if oi == 0 else "No"
+        size, cur = float(p.get("size", 0) or 0), float(p.get("curPrice", 0) or 0)
+        cost, val = size * float(p.get("avgPrice", 0) or 0), size * cur
+        o_val += val
+        print(f"{name:<50} {side:<4} {size:>8.2f} {'$%.2f' % cost:>7} {cur:>6.3f} {'$%.2f' % val:>7} {val - cost:>+8.2f}")
+    print(f"\n{len(orphans)} orphaned open position(s), ${o_val:.2f} value — opened by the bot, now unmanaged; they resolve + auto-redeem on their own.")
 PY
 
 python3 - "$DB" <<'PY' || true

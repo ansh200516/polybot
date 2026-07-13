@@ -663,11 +663,11 @@ fn concurrency_allows(open_positions: usize, max_concurrent: u32) -> bool {
     open_positions < max_concurrent as usize
 }
 
-/// On-chain reconcile thresholds. A wallet position is RESOLVED when its mark
-/// degenerates (`≤ eps` ⇒ loser, `≥ 1-eps` ⇒ winner) or it is `redeemable`; LIVE
-/// otherwise. A tracked row missing from the wallet for [`RECON_MISS_PRUNE`]
-/// consecutive reconciles is pruned (debounce vs a transient Data-API blip).
-const RECON_RESOLVED_EPS: f64 = 0.02;
+/// On-chain reconcile thresholds. A wallet position is RESOLVED only when the
+/// Data API marks it `redeemable` (see [`reconcile_action`]) — NOT inferred from
+/// a near-0/1 mark, which orphaned live in-play positions. A tracked row missing
+/// from the wallet for [`RECON_MISS_PRUNE`] consecutive reconciles is pruned
+/// (debounce vs a transient Data-API blip).
 const RECON_MISS_PRUNE: u32 = 2;
 const RECON_DUST_SHARES: f64 = 0.01;
 /// Max ORPHAN winners the reconcile redeem-sweep collects per pass — resolved-won
@@ -694,8 +694,14 @@ pub(crate) enum ReconAction {
 pub(crate) fn reconcile_action(held: Option<(f64, f64, bool)>) -> ReconAction {
     match held {
         Some((size, cur_price, redeemable)) if size > RECON_DUST_SHARES => {
-            if redeemable || cur_price <= RECON_RESOLVED_EPS || cur_price >= 1.0 - RECON_RESOLVED_EPS
-            {
+            // RESOLVED **only** when the Data API marks it `redeemable` — the
+            // authoritative on-chain-resolution flag. We must NOT infer resolution
+            // from a near-0/1 MARK: in-play markets (tennis especially) routinely
+            // trade to 0.98/0.02 while still OPEN and then swing back, so a
+            // mark-based settle prematurely booked + REMOVED live positions from
+            // tracking (orphaning them — the observed "won't track new trades").
+            // `won` is read off the mark, which is ≈1/≈0 once actually resolved.
+            if redeemable {
                 ReconAction::Settle { won: cur_price >= 0.5 }
             } else {
                 ReconAction::Keep
@@ -3420,18 +3426,20 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_action_categorizes_wallet_state() {
+    fn reconcile_action_settles_only_when_redeemable() {
         use ReconAction::*;
-        // Live holding (held, mid mark, not redeemable) → keep.
+        // Held + NOT redeemable → KEEP, whatever the mark. Critically, a
+        // near-certain 0.99/0.01 in-play mark must still KEEP (it can swing back;
+        // a mark-based settle would orphan the live position — the bug this fixes).
         assert_eq!(reconcile_action(Some((10.0, 0.55, false))), Keep);
-        // Resolved loser (mark ~0) → settle lost.
-        assert_eq!(reconcile_action(Some((10.0, 0.0, false))), Settle { won: false });
-        assert_eq!(reconcile_action(Some((10.0, 0.01, false))), Settle { won: false });
-        // Resolved winner (mark ~1) → settle won.
-        assert_eq!(reconcile_action(Some((10.0, 1.0, false))), Settle { won: true });
-        assert_eq!(reconcile_action(Some((10.0, 0.99, false))), Settle { won: true });
-        // Redeemable ⇒ resolved regardless of mid mark.
+        assert_eq!(reconcile_action(Some((10.0, 0.99, false))), Keep);
+        assert_eq!(reconcile_action(Some((10.0, 1.0, false))), Keep);
+        assert_eq!(reconcile_action(Some((10.0, 0.01, false))), Keep);
+        assert_eq!(reconcile_action(Some((10.0, 0.0, false))), Keep);
+        // RESOLVED (redeemable) → settle; winner/loser read off the resolved mark.
+        assert_eq!(reconcile_action(Some((10.0, 1.0, true))), Settle { won: true });
         assert_eq!(reconcile_action(Some((10.0, 0.6, true))), Settle { won: true });
+        assert_eq!(reconcile_action(Some((10.0, 0.0, true))), Settle { won: false });
         assert_eq!(reconcile_action(Some((10.0, 0.4, true))), Settle { won: false });
         // Not held / dust / absent → gone.
         assert_eq!(reconcile_action(None), Gone);
