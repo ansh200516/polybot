@@ -87,9 +87,9 @@ pub fn inventory_config(cfg: &Config) -> Result<pm_risk::inventory::InventoryCon
 /// [`InventoryConfig`](pm_risk::inventory::InventoryConfig), arb's `RiskEngine`),
 /// not the envelope `RiskConfig`.
 pub struct PlatformEnvelopes {
-    /// Arb's envelope: the WHOLE bankroll when both MM and copy are off, else
-    /// `bankroll − mm_capital − copy_capital`. Its `risk` is
-    /// [`arb_risk`](Self::arb_risk).
+    /// Arb's envelope: the WHOLE bankroll when MM, copy and btc5m are all off,
+    /// else `bankroll − mm_capital − copy_capital − btc5m_capital`. Its `risk`
+    /// is [`arb_risk`](Self::arb_risk).
     pub arb: StrategyEnvelope,
     /// The heartbeat's envelope: always zero capital (it takes no risk).
     pub heartbeat: StrategyEnvelope,
@@ -99,11 +99,16 @@ pub struct PlatformEnvelopes {
     /// C5). Carved out of the bankroll exactly like the MM's, so all three
     /// trading strategies SHARE the bankroll safely (Σ capital == bankroll).
     pub copy: Option<StrategyEnvelope>,
+    /// The btc5m strategy's envelope — `Some` only when
+    /// `[strategies.btc5m] enabled`. Carved out of the bankroll exactly like
+    /// the MM's / copy's, so it shares the bankroll safely (Σ capital ==
+    /// bankroll) and counts against the combined over-allocation guard.
+    pub btc5m: Option<StrategyEnvelope>,
     /// The RiskConfig arb's `RiskEngine` enforces. Byte-identical to the input
-    /// `risk_cfg` when MM and copy are off; when either is on its `bankroll` is
-    /// REDUCED to arb's slice (`bankroll − mm − copy`) so arb genuinely trades
-    /// within its reduced capital (the crux of sharing real funds without
-    /// overlap).
+    /// `risk_cfg` when MM, copy and btc5m are all off; when any is on its
+    /// `bankroll` is REDUCED to arb's slice (`bankroll − mm − copy − btc5m`) so
+    /// arb genuinely trades within its reduced capital (the crux of sharing
+    /// real funds without overlap).
     pub arb_risk: RiskConfig,
 }
 
@@ -135,6 +140,7 @@ pub fn strategy_envelopes(
 ) -> Result<PlatformEnvelopes, ConfigError> {
     let mm = &config.strategies.mm;
     let copy = &config.strategies.copy;
+    let btc5m = &config.strategies.btc5m;
     // The heartbeat always claims zero capital; its risk is record-only.
     let heartbeat = StrategyEnvelope::new(StrategyId("heartbeat"), Usdc(0), risk_cfg.clone());
 
@@ -150,14 +156,19 @@ pub fn strategy_envelopes(
     } else {
         Usdc(0)
     };
+    let btc5m_capital = if btc5m.enabled {
+        Usdc(usd_to_microusdc(btc5m.capital_usd)?)
+    } else {
+        Usdc(0)
+    };
 
-    // The COMBINED carve must fit the bankroll — a copy + MM that each fit but
-    // together exceed it fails startup (sharing funds that don't exist is the
+    // The COMBINED carve must fit the bankroll — strategies that each fit but
+    // together exceed it fail startup (sharing funds that don't exist is the
     // one thing the carve must never allow).
-    let carved = mm_capital.0 + copy_capital.0;
+    let carved = mm_capital.0 + copy_capital.0 + btc5m_capital.0;
     if carved > bankroll.0 {
         return Err(ConfigError::BadMoney(
-            "strategies capital (mm + copy) exceeds the platform bankroll",
+            "strategies capital (mm + copy + btc5m) exceeds the platform bankroll",
         ));
     }
     let arb_capital = Usdc(bankroll.0 - carved);
@@ -190,11 +201,22 @@ pub fn strategy_envelopes(
             },
         )
     });
+    let btc5m_env = btc5m.enabled.then(|| {
+        StrategyEnvelope::new(
+            StrategyId("btc5m"),
+            btc5m_capital,
+            RiskConfig {
+                bankroll: btc5m_capital,
+                ..risk_cfg.clone()
+            },
+        )
+    });
     Ok(PlatformEnvelopes {
         arb: StrategyEnvelope::new(StrategyId("arb"), arb_capital, arb_risk.clone()),
         heartbeat,
         mm: mm_env,
         copy: copy_env,
+        btc5m: btc5m_env,
         arb_risk,
     })
 }
@@ -767,6 +789,19 @@ mod tests {
         let risk = risk_config(&cfg, None).unwrap();
         let bankroll = risk.bankroll;
         assert!(strategy_envelopes(&cfg, &risk, bankroll).is_err());
+    }
+
+    #[test]
+    fn btc5m_envelope_carved_only_when_enabled() {
+        let mut cfg = pm_config::Config::default();
+        cfg.capital.bankroll_usd = 100.0;
+        let risk = risk_config(&cfg, None).unwrap();
+        let env = strategy_envelopes(&cfg, &risk, pm_core::num::Usdc(100_000_000)).unwrap();
+        assert!(env.btc5m.is_none());
+        cfg.strategies.btc5m.enabled = true;
+        cfg.strategies.btc5m.capital_usd = 20.0;
+        let env = strategy_envelopes(&cfg, &risk, pm_core::num::Usdc(100_000_000)).unwrap();
+        assert_eq!(env.btc5m.as_ref().unwrap().capital.0, 20_000_000);
     }
 
     // ── Live gating (Task 4.5) ─────────────────────────────────────────────

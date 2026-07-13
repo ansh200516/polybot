@@ -1537,6 +1537,7 @@ async fn main() {
         heartbeat: hb_envelope,
         mm: mm_envelope,
         copy: copy_envelope,
+        btc5m: btc5m_envelope,
         arb_risk,
     } = strategy_envelopes(&config, &risk_cfg, bankroll)
         .unwrap_or_else(|e| fatal(format!("strategy capital carve-out: {e}")));
@@ -2332,6 +2333,58 @@ async fn main() {
             relayer = copy_has_relayer,
             shadow = args.shadow,
             "copy executor enabled: bankroll carved for the smart-money copy strategy"
+        );
+    }
+
+    // ── btc5m: BTC 5-minute up/down strategy (Task 7) ───────────────────────
+    // Present ONLY when the carve produced a `btc5m_envelope` (i.e.
+    // `[strategies.btc5m] enabled`, DEFAULT OFF). When disabled this whole
+    // block is skipped: the strategy is never constructed, no spot feed / gamma
+    // client / CLOB book poll is spawned, and arb/MM/copy are byte-for-byte
+    // unaffected (the shipped, default behavior).
+    if let Some(btc5m_envelope) = btc5m_envelope {
+        let btc5m_capital = btc5m_envelope.capital;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .user_agent("pm-arb-bot/1.0")
+            .build()
+            .unwrap_or_else(|e| fatal(format!("btc5m http client: {e}")));
+        // Composite BTC spot feed (median of exchanges) + 1-min vol. Stops when
+        // the process-wide `kill` flag flips (the SAME Arc the host + kill watch
+        // share), so it tears down with the rest of the process.
+        let spot_feed = pm_ingestion::spot::spawn(
+            http.clone(),
+            config.btc5m_params.spot_sources.clone(),
+            config.btc5m_params.spot_poll_ms,
+            config.btc5m_params.vol_half_life_min,
+            config.btc5m_params.vol_warmup_samples,
+            Arc::clone(&kill),
+        );
+        let gamma = pm_ingestion::gamma::GammaClient::new(http.clone(), None);
+        // Real CLOB REST base from config (the SAME base arb/copy resolve
+        // against); the strategy polls /book for the rotating 5m window token.
+        let clob_base = config.endpoints.clob_base.clone();
+        // Rotating 5-minute window slug: `btc-updown-5m-<window-open-unix-secs>`
+        // (BEST-GUESS format, to be verified at deploy time — see Task 7 notes).
+        let slug_fn: Box<dyn Fn(i64) -> String + Send> = Box::new(|now_ms: i64| {
+            let boundary = (now_ms / 1000) / 300 * 300;
+            format!("btc-updown-5m-{boundary}")
+        });
+        let btc5m = pm_app::strategy::btc5m::Btc5mStrategy::new(
+            gamma,
+            slug_fn,
+            spot_feed,
+            config.btc5m_params.sample_interval_ms,
+            http,
+            clob_base,
+        );
+        host.add(Box::new(btc5m), btc5m_envelope);
+        info!(
+            btc5m_capital_usd = config.strategies.btc5m.capital_usd,
+            btc5m_capital_micro = btc5m_capital.0,
+            sample_interval_ms = config.btc5m_params.sample_interval_ms,
+            spot_poll_ms = config.btc5m_params.spot_poll_ms,
+            "btc5m strategy enabled: bankroll carved for the BTC 5-minute up/down strategy"
         );
     }
 
