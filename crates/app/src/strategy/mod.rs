@@ -29,6 +29,7 @@ pub mod quote_policy;
 pub mod reward_score;
 pub mod signals;
 pub mod stub;
+pub mod btc5m;
 
 /// Stable identity for a strategy (e.g. `"arb"`, `"mm"`). A `&'static str`
 /// keeps it copyable and cheap to use as a label/map key.
