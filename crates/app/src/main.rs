@@ -2370,13 +2370,25 @@ async fn main() {
             let boundary = (now_ms / 1000) / 300 * 300;
             format!("btc-updown-5m-{boundary}")
         });
-        let btc5m = pm_app::strategy::btc5m::Btc5mStrategy::new(
+        let btc5m_params = pm_app::strategy::btc5m::Btc5mParams {
+            entry_window_secs: config.btc5m_params.entry_window_secs,
+            z_threshold: config.btc5m_params.z_threshold,
+            edge_buffer_c: config.btc5m_params.edge_buffer_c,
+            entry_notional_usd: config.btc5m_params.entry_notional_usd,
+            max_daily_notional_usd: config.btc5m_params.max_daily_notional_usd,
+            max_daily_loss_usd: config.btc5m_params.max_daily_loss_usd,
+        };
+        // `V = LiveVenue` at the type site: Task 5 leaves `venue: None` (shadow —
+        // no orders regardless of `live`); Task 7 wires the real `LiveVenue`.
+        let btc5m = pm_app::strategy::btc5m::Btc5mStrategy::<pm_execution::live::LiveVenue>::new(
             gamma,
             slug_fn,
             spot_feed,
             config.btc5m_params.sample_interval_ms,
             http,
             clob_base,
+            btc5m_params,
+            config.strategies.btc5m.live,
         );
         host.add(Box::new(btc5m), btc5m_envelope);
         info!(
