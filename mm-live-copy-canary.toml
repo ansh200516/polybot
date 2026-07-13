@@ -72,7 +72,7 @@ max_drift                = 0.15  # FRESHNESS: skip if our entry is >15% off the 
 reaction_window_secs    = 1800   # only copy a buy seen within 30 min
 min_bets                = 5     # min resolved bets to rank a trader (EdgePerBet)
 top_n                   = 100     # whitelist size
-whitelist_refresh_secs  = 21600  # re-rank the skilled set every 6h
+whitelist_refresh_secs  = 3600   # re-rank the specialist creamy layer every 1h (faster adaptivity to hot/cold traders; bounded by the 300s refresh timeout, keeps prior on failure)
 signal_poll_secs        = 10    # poll whitelisted traders' fresh buys every 30s (faster = less reaction lag; on-demand sync means a hit trades immediately)
 follow_exit             = true   # sell when the copied trader sells
 

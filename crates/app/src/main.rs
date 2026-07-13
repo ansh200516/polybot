@@ -2840,6 +2840,7 @@ mod tests {
             avg_price: 0.0,
             cash_pnl: 0.0,
             redeemable,
+            neg_risk: false,
         };
 
         let seed = vec![

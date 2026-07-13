@@ -670,6 +670,12 @@ fn concurrency_allows(open_positions: usize, max_concurrent: u32) -> bool {
 const RECON_RESOLVED_EPS: f64 = 0.02;
 const RECON_MISS_PRUNE: u32 = 2;
 const RECON_DUST_SHARES: f64 = 0.01;
+/// Max ORPHAN winners the reconcile redeem-sweep collects per pass — resolved-won
+/// positions the wallet holds that AREN'T in our tracked book (stranded by a past
+/// failed redeem or dropped from tracking). Capped so a backlog drains gradually
+/// instead of bursting the relayer; a successful redeem removes the position, so
+/// the backlog shrinks each reconcile.
+const RECON_SWEEP_MAX_PER_CYCLE: usize = 4;
 
 /// What the on-chain reconcile should do with a tracked position, given the live
 /// wallet state for its `(condition_id, outcome_index)` as `(size, cur_price,
@@ -1329,6 +1335,55 @@ impl<V: CopyVenue> CopyLoop<V> {
                 }
             }
         }
+
+        // ORPHAN-WINNER SWEEP: redeem RESOLVED-WON positions the wallet holds that
+        // are NOT in our tracked book — winners a past (pre-neg-risk-fix) redeem
+        // left stranded on-chain, or positions dropped from tracking across
+        // restarts. Without this their winnings are never collected. LOSERS and
+        // dust are skipped (nothing to redeem — no pointless relayer calls);
+        // tracked positions are handled by `settle_reconciled` above. Deduped by
+        // condition and capped per pass so a backlog drains gradually.
+        if let Some(relayer) = self.relayer.clone() {
+            let tracked: HashSet<(String, i64)> = self
+                .open
+                .keys()
+                .map(|(c, o)| (c.to_lowercase(), *o))
+                .collect();
+            let mut swept = 0usize;
+            let mut done: HashSet<B256> = HashSet::new();
+            for p in &positions {
+                if swept >= RECON_SWEEP_MAX_PER_CYCLE {
+                    break;
+                }
+                // Resolved WINNER with real balance — not a loser/dust, not tracked.
+                let is_winner = p.redeemable && p.cur_price >= 0.5 && p.size > RECON_DUST_SHARES;
+                if !is_winner || tracked.contains(&(p.condition_id.to_lowercase(), p.outcome_index)) {
+                    continue;
+                }
+                let Ok(condition) = p.condition_id.parse::<B256>() else {
+                    continue;
+                };
+                if !done.insert(condition) {
+                    continue; // one redeem per condition clears its winning slot
+                }
+                match relayer.redeem(condition, p.neg_risk).await {
+                    Ok(_) => {
+                        swept += 1;
+                        tracing::info!(
+                            condition_id = %p.condition_id,
+                            neg_risk = p.neg_risk,
+                            "copy: swept orphan winner (redeemed an untracked resolved position)"
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        condition_id = %p.condition_id,
+                        neg_risk = p.neg_risk,
+                        "copy: orphan-winner sweep redeem failed"
+                    ),
+                }
+            }
+        }
     }
 
     /// Settle a tracked position the wallet shows as RESOLVED: book the outcome
@@ -1359,10 +1414,10 @@ impl<V: CopyVenue> CopyLoop<V> {
             "copy: reconciled a resolved position from live on-chain state"
         );
         if let Some(relayer) = self.relayer.clone().filter(|_| won) {
-            match relayer.redeem(pos.condition).await {
-                Ok(_) => tracing::info!(condition_id = %key.0, "copy: redeemed reconciled winner"),
-                Err(e) => tracing::warn!(error = %e, condition_id = %key.0, "copy: reconciled-winner redeem failed (booked locally)"),
-            }
+        match relayer.redeem(pos.condition, pos.neg_risk).await {
+            Ok(_) => tracing::info!(condition_id = %key.0, "copy: redeemed reconciled winner"),
+            Err(e) => tracing::warn!(error = %e, condition_id = %key.0, "copy: reconciled-winner redeem failed (booked locally)"),
+        }
         }
     }
 
@@ -1929,7 +1984,7 @@ impl<V: CopyVenue> CopyLoop<V> {
                 delta_micro: delta,
             });
         }
-        match relayer.redeem(pos.condition).await {
+        match relayer.redeem(pos.condition, pos.neg_risk).await {
             Ok(_) => tracing::info!(
                 condition_id = %key.0,
                 value_micro = value as i64,
