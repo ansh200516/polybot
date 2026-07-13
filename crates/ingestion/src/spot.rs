@@ -45,9 +45,17 @@ impl MinuteBars {
         let mut ret = None;
         match self.cur_min {
             Some(m) if m == minute => {}
-            Some(_) => {
-                if let Some(pc) = self.prev_close { ret = Some(self.last_price - pc); }
-                self.prev_close = Some(self.last_price);
+            Some(m) => {
+                if minute - m == 1 {
+                    // Consecutive bar: emit the close-to-close return (if we have a prior close).
+                    if let Some(pc) = self.prev_close { ret = Some(self.last_price - pc); }
+                    self.prev_close = Some(self.last_price);
+                } else {
+                    // Gap > 1 (data outage across ≥1 whole minute): discard the pre-gap
+                    // baseline so we never emit a multi-minute move weighted as one minute.
+                    // Forces a clean re-warm-up — the next consecutive boundary re-seeds prev_close.
+                    self.prev_close = None;
+                }
             }
             None => {}
         }
@@ -83,6 +91,17 @@ mod tests {
         assert_eq!(agg.push(90_000, 105.0), None);
         assert_eq!(agg.push(120_000, 107.0), None);
         let r = agg.push(181_000, 110.0).unwrap();
+        assert!((r - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn minute_bars_reset_on_multi_minute_gap() {
+        let mut agg = MinuteBars::new();
+        assert_eq!(agg.push(60_000, 100.0), None);   // bar 1
+        assert_eq!(agg.push(120_000, 105.0), None);  // bar 2 (consecutive; no prior close yet)
+        assert_eq!(agg.push(240_000, 130.0), None);  // bar 4 (gap 2 → reset, NO cross-gap return)
+        assert_eq!(agg.push(300_000, 132.0), None);  // bar 5 (consecutive; re-warming after reset)
+        let r = agg.push(360_000, 133.0).unwrap();   // bar 6 (consecutive) → clean 1-min return
         assert!((r - 2.0).abs() < 1e-9);
     }
 }
