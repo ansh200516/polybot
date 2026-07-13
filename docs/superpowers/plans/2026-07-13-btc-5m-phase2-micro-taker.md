@@ -17,6 +17,20 @@
 - **Hard invariants enforced in code + tests:** FAK-only (never rests a quote → no adverse selection); **at most one entry per window**; micro fixed notional; enter **only** when `0 < secs_to_go ≤ entry_window_secs` (default 20s) — a FAK placed too late simply fails to fill, so the ~2–5s relay dead zone is fail-safe (a `min_entry_secs` floor is a recommended refinement to avoid wasted late attempts); **hard daily-loss kill** (halts the strategy) and session-loss halt via `RiskEngine`; buys the leader at its **own token's ask** (near a price extreme where the 7% fee ≈ 0).
 - **Gate-2 stop criteria (post-deploy):** halt + review if realized daily PnL breaches the floor, or the live realized win-rate materially undershoots the shadow-measured rate (adverse selection / model drift). Do not proceed to Phase 3 until live realized PnL lower-CI > 0 over K trades **and** the executor is relocated to London (spec §5, Gate 2→3).
 
+## ✅ Status & arming checklist (built 2026-07-13, final holistic review)
+
+**BUILT + committed (Tasks 1–8 + review fixes), ships INERT** (`[strategies.btc5m] live=false`): full workspace 886 tests green, release build clean, capital-safety envelope verified (ships inert/double-gated; arb/mm/copy byte-identical; bounded loss; durable+idempotent settle; winner-only redeem). Sound to merge as an inert capability — no Critical issues.
+
+**BEFORE an operator flips `live=true`:**
+1. **Gate-1 passed** — the shadow report (`btc5m_report.py`, true-strike backfill) shows a positive median net edge + high realized win% in the `[0,20)s` buckets with a small proxy↔true basis.
+2. **Realized-PnL fee accuracy (must reconcile).** Entry orders are built `Bps(0)`, so `LiveVenue` records `cash` net of a ZERO modeled fee — the real `0.07·p·(1−p)` crypto taker fee is NOT in the recorded realized, so Gate-2 reads ~one fee/trade optimistic. Verify whether the live `/data/trades` fill already carries the on-chain fee; if not, subtract the modeled entry fee in `settle`/at booking so Gate-2 matches the fee-aware Gate-1 report. (Entry discipline is already conservative — the edge must clear the modeled fee — so this is a measurement fix, not an entry fix.)
+3. **`fill_window_ms` wide** (canary = 4000 ms; the config default 500 ms is too short) — a delayed fill landing after the window books a zero-fill → an untracked on-chain orphan (btc5m has no orphan backstop). Relies on the committed `live.rs` `"delayed"/"live"` handling.
+4. **daily-loss latch active** — ✅ confirmed restart-durable (`arm_day_loss_gate` reads the durable ledger at startup; `store_path` always wired).
+5. **~3h vol warmup** — no entries until `vol_ready` (~180 one-minute bars); a fresh deploy is silent ~3 h.
+6. **Slug format** — `btc-updown-5m-<open-unix-secs>` is **VERIFIED** against live Gamma (probe 2026-07-13); the `main.rs` "best-guess" comment is stale.
+
+**Deferred to Phase 3:** two-sided maker quoting, liquidity-reward capture, London colocation.
+
 ---
 
 ## File structure
