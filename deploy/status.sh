@@ -7,12 +7,12 @@ DB="${1:-$HOME/copybot/data/copy-canary.sqlite}"
 ENV_FILE="${2:-$HOME/copybot/.env}"
 [ -f "$DB" ] || { echo "no DB at $DB (bot not started yet?)"; exit 0; }
 # The bot's own wallet — its Data-API positions carry the market names + marks.
-WALLET="$(grep -E '^PM_DEPOSIT_WALLET=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"' ")"
+WALLET="$(grep -E '^PM_DEPOSIT_WALLET=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"' ")" || true
 
 # --- Whole-account portfolio, from the bot's last equity-refresh log: cash + all
 # positions = the Polymarket "Portfolio" figure (the bot recomputes it ~every 60s
 # from the authed CLOB balance + Data-API /value). Strip tracing's ANSI first. ---
-EQ_LINE="$(journalctl -u copybot --no-pager -o cat 2>/dev/null | sed -r 's/\x1b\[[0-9;]*m//g' | grep 'equity refreshed' | tail -1)"
+EQ_LINE="$(journalctl -u copybot --no-pager -o cat 2>/dev/null | sed -r 's/\x1b\[[0-9;]*m//g' | grep 'equity refreshed' | tail -1)" || true
 if [ -n "$EQ_LINE" ]; then
   val() { printf '%s\n' "$EQ_LINE" | grep -oE "$1=[0-9]+" | head -1 | cut -d= -f2; }
   # Age of this reading (the bot refreshes equity every cycle; a large age ⇒ the
@@ -31,7 +31,7 @@ else
   echo "=== ACCOUNT ==="; echo "  (no equity-refresh log yet — bot starting up, or gross_pct=0)"; echo
 fi
 
-python3 - "$DB" "$WALLET" <<'PY'
+python3 - "$DB" "$WALLET" <<'PY' || true
 import sqlite3, json, sys, urllib.request
 
 db, wallet = sys.argv[1], (sys.argv[2] or "").strip()
@@ -94,4 +94,27 @@ if m_val or m_cost:
 if unmatched:
     print(f"⚠ {unmatched} position(s) had NO live price — likely resolved/left the wallet but still in the DB (stale row; the on-chain reconcile guard would clear these)")
 print(f"realized P&L today (copy): ${day_realized:+.2f}")
+PY
+
+python3 - "$DB" <<'PY' || true
+import sqlite3, sys
+db = sys.argv[1]
+con = sqlite3.connect(db)
+try:
+    n = con.execute("SELECT COUNT(*) FROM btc5m_shadow").fetchone()[0]
+except sqlite3.OperationalError:
+    print("=== BTC 5M BOT ===\n  (no btc5m_shadow table yet — strategy not deployed/enabled)\n")
+    raise SystemExit(0)
+try:
+    r = con.execute("SELECT realized_micro FROM day_realized WHERE strategy='btc5m' ORDER BY utc_day DESC LIMIT 1").fetchone()
+except sqlite3.OperationalError:
+    r = None
+realized = (r[0] if r else 0) / 1e6
+last = con.execute("SELECT condition_id, secs_to_go, spot, strike, p_up, best_bid_micro, best_ask_micro FROM btc5m_shadow ORDER BY ts_ms DESC LIMIT 1").fetchone()
+print("=== BTC 5M BOT — shadow measurement ===")
+print(f"  shadow samples: {n}    realized P&L today (btc5m): ${realized:+.2f}")
+if last:
+    cid, secs, spot, strike, p_up, bid, ask = last
+    print(f"  latest: {cid[:10]}…  T-{secs}s  spot ${spot:,.2f} vs strike ${strike:,.2f}  fair(up)={p_up:.3f}  book {bid/1e6:.3f}/{ask/1e6:.3f}")
+print()
 PY
