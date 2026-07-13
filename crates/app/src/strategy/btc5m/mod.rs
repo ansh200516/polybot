@@ -3,6 +3,7 @@
 pub mod entry;
 pub mod market;
 pub mod model;
+pub mod settle;
 pub mod shadow;
 
 use std::future::Future;
