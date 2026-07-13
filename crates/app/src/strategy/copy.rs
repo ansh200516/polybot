@@ -1445,6 +1445,120 @@ impl<V: CopyVenue> CopyLoop<V> {
         );
     }
 
+    /// ONE-TIME orphan liquidation (opt-in via the `COPY_LIQUIDATE_ORPHANS` env at
+    /// startup): market-SELL every OPEN on-chain position the bot is NOT tracking,
+    /// to free the capital that LEGACY orphans lock up (positions the pre-fix
+    /// reconcile dropped from tracking — they starve the cash the caps size
+    /// against). These were never in the copy book, so we deliberately do NOT
+    /// touch copy inventory / realized / the day-loss ledger — the sell proceeds
+    /// land in the wallet and are surfaced by the next equity refresh (lifting the
+    /// caps so the freed cash trades). Best-effort per position: an unresolvable
+    /// market, sub-min size, no bid, or a rejected/zero FAK is logged + skipped.
+    /// Live-only (needs venue + feed + resolver). Meant to run once — remove the
+    /// env after; post-fix there are no orphans, so a stray run is a no-op.
+    async fn liquidate_orphans(&mut self) {
+        let Some(wallet) = self.venue.as_ref().and_then(|v| v.deposit_wallet()) else {
+            return;
+        };
+        let Some(feed) = self.feed.clone() else {
+            return;
+        };
+        let positions = match feed.positions(&wallet, 0.0).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "copy: orphan liquidation skipped — wallet positions fetch failed");
+                return;
+            }
+        };
+        let tracked: HashSet<(String, i64)> = self
+            .open
+            .keys()
+            .map(|(c, o)| (c.to_lowercase(), *o))
+            .collect();
+        let (mut sold, mut skipped) = (0usize, 0usize);
+        let mut freed_usd = 0.0f64;
+        for p in &positions {
+            // OPEN (live/tradeable) + UNTRACKED + non-dust: skip resolved/redeemable
+            // (those redeem, not sell), degenerate marks, dust, and anything we
+            // already manage.
+            if p.redeemable || p.size <= RECON_DUST_SHARES || p.cur_price <= 0.0 || p.cur_price >= 1.0
+            {
+                continue;
+            }
+            if tracked.contains(&(p.condition_id.to_lowercase(), p.outcome_index)) {
+                continue;
+            }
+            // Resolve token/tick/neg_risk LIVE (same path as an on-demand entry).
+            let cand = CopyCandidate {
+                condition_id: p.condition_id.clone(),
+                outcome_index: p.outcome_index,
+                asset: p.asset.clone(),
+                trader: String::new(),
+                trigger_px: 0.0,
+                timestamp: 0,
+            };
+            let Some(info) = self.resolve_ondemand(&cand).await else {
+                skipped += 1;
+                tracing::warn!(condition_id = %p.condition_id, "copy: orphan liquidation — market unresolvable; skipping");
+                continue;
+            };
+            let qty_micro = (p.size * ONE_USDC_MICRO as f64) as i128;
+            if qty_micro < MIN_COPY_SHARES_MICRO {
+                skipped += 1;
+                tracing::warn!(condition_id = %p.condition_id, size = p.size, "copy: orphan liquidation — below venue minimum sellable; skipping");
+                continue;
+            }
+            let bid = match self.venue.as_mut() {
+                Some(v) => v.best_bid(info.token, info.ts).await,
+                None => return,
+            };
+            let Some(bid) = bid else {
+                skipped += 1;
+                tracing::warn!(condition_id = %p.condition_id, "copy: orphan liquidation — no bid to sell into; skipping");
+                continue;
+            };
+            let order = Order::new(
+                format!("copy-liq:{}:{}", p.condition_id, p.outcome_index),
+                info.token,
+                Action::Sell,
+                info.ts,
+                bid,
+                Qty(qty_micro.max(0) as u64),
+                Bps(0),
+            );
+            match self.venue.as_mut() {
+                Some(v) => match v.submit_fak(&order).await {
+                    Ok(o) if o.filled.0 > 0 => {
+                        sold += 1;
+                        let px = bid.microusdc(info.ts) as f64 / ONE_USDC_MICRO as f64;
+                        freed_usd += (o.filled.0 as f64 / ONE_USDC_MICRO as f64) * px;
+                        tracing::info!(
+                            condition_id = %p.condition_id,
+                            outcome_index = p.outcome_index,
+                            filled_micro = o.filled.0 as i64,
+                            "copy: LIQUIDATED an orphan (market sell to free capital)"
+                        );
+                    }
+                    Ok(_) => {
+                        skipped += 1;
+                        tracing::warn!(condition_id = %p.condition_id, "copy: orphan liquidation FAK filled nothing (thin book) — skipping");
+                    }
+                    Err(e) => {
+                        skipped += 1;
+                        tracing::warn!(error = %e, condition_id = %p.condition_id, "copy: orphan liquidation FAK rejected — skipping");
+                    }
+                },
+                None => return,
+            }
+        }
+        tracing::info!(
+            sold,
+            skipped,
+            freed_usd,
+            "copy: orphan liquidation complete — proceeds return to the wallet (equity refresh lifts the caps)"
+        );
+    }
+
     /// View for the per-strategy dashboard. Surfaces the latched HALT reason, the
     /// open-position count, running realized P&L, and (C5) the copy-specific
     /// telemetry — the follow-whitelist size — in a [`CopyStatus`] (mirroring how
@@ -2580,6 +2694,15 @@ async fn run_copy_loop<V: CopyVenue>(
     }
     state.arm_day_loss_gate(day_loss_read.as_ref(), now_ms());
     state.day_loss_read = day_loss_read;
+
+    // ONE-TIME orphan liquidation (opt-in): when COPY_LIQUIDATE_ORPHANS=1, market-
+    // sell every UNTRACKED on-chain OPEN position once, before the first poll, to
+    // free the capital legacy orphans lock up. Remove the env after it runs; with
+    // the reconcile fix there are no new orphans, so a stray run is a no-op.
+    if std::env::var("COPY_LIQUIDATE_ORPHANS").as_deref() == Ok("1") {
+        tracing::info!("copy: COPY_LIQUIDATE_ORPHANS=1 — liquidating untracked on-chain open positions (one-time)");
+        state.liquidate_orphans().await;
+    }
 
     let mut seen = SeenKeys::default();
     // SEEDED whitelist: main shares the snapshot it built for the whitelist-driven

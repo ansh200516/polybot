@@ -46,6 +46,16 @@
 bankroll_usd   = 30.0   # startup carve ceiling — a FALLBACK now: dynamic gross_pct sizing overrides at runtime
 per_market_usd = 10.0   # arb per-market sizing — MOOT (arb neutered below), but must be ≤ bankroll to pass validation (default 1000 > 30 would fail)
 
+[execution]
+# Taker fill window (default 500 ms). Widened to cover Polymarket's MARKETABLE-
+# ORDER MATCHING DELAY + Data-API trade-indexing lag: a copy BUY comes back
+# "delayed" and its trade lands on `/data/trades` a couple seconds later. At
+# 500 ms poll_fills timed out BEFORE the fill appeared, so the entry booked as
+# "filled nothing" while the position landed ON-CHAIN UNTRACKED (orphaned). The
+# poll early-stops the instant a full fill is seen, so this only lengthens the
+# wait for partial/no-fill orders.
+fill_window_ms = 4000
+
 [strategies.copy]
 enabled     = true
 live        = true

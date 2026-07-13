@@ -827,8 +827,17 @@ impl ExecutionVenue for LiveVenue {
             .to_string();
         let venue_status = parsed.get("status").and_then(|v| v.as_str()).unwrap_or("");
 
+        // A taker order FILLS on "matched" — OR "delayed", which is Polymarket's
+        // MARKETABLE-ORDER MATCHING DELAY: the order is accepted and WILL cross a
+        // moment later (server-side delay + Data-API indexing lag), so the POST
+        // returns "delayed" first and the trade lands ON-CHAIN after. The old code
+        // treated everything but "matched" as a zero-fill, so a delayed fill was
+        // never booked and the position landed on-chain UNTRACKED — the observed
+        // "entry FAK filled nothing" that nonetheless filled + orphaned. Now we
+        // poll `/data/trades` for "matched"/"delayed"/"live" alike; only a
+        // definitive "unmatched" (FAK killed, nothing crossed) is a true zero-fill.
         match venue_status {
-            "matched" => {
+            "matched" | "delayed" | "live" => {
                 // The order response's takingAmount/makingAmount are RAW µ-unit
                 // integer strings (matched fixture: takingAmount "10000000" =
                 // 10e6 µshares for a 10-share BUY taker; makingAmount "3300000" =
@@ -845,35 +854,43 @@ impl ExecutionVenue for LiveVenue {
                     .get(target_field)
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or_else(|| {
-                        // DEBUG, not WARN: the live MARKET-order "matched" response
-                        // formats this field differently from the maker fixture, so
-                        // it doesn't parse as a raw µ-integer and this fires on every
-                        // taker fill. It is only an EARLY-STOP hint — `poll_fills`
-                        // with target 0 books every fill over the time window
-                        // instead, so accounting is correct (just not early-stopped).
-                        tracing::debug!(
-                            field = target_field,
-                            "matched response fill target not a raw µ-integer; polling on the window only (fills still book)"
-                        );
-                        0
-                    });
+                    // "delayed"/"live" carry no matched amount yet, and a live
+                    // MARKET "matched" response formats this field differently from
+                    // the maker fixture — either way fall back to the full requested
+                    // qty so poll_fills early-stops on a FULL fill, else books
+                    // whatever lands within `fill_window`.
+                    .unwrap_or(order.qty.0);
                 let (fills, filled_shares) = self
                     .poll_fills(order, &venue_order_id, &venue_token, target)
                     .await?;
+                info!(
+                    order = %order.id,
+                    status = venue_status,
+                    filled_micro = filled_shares,
+                    target_micro = target,
+                    "live: taker order result (polled /data/trades over the fill window)"
+                );
                 Ok(SubmitOutcome {
                     fills,
                     filled: Qty(filled_shares),
                     venue_order_id: Some(venue_order_id),
                 })
             }
-            // "unmatched", or "delayed"/"live" still unfilled at window end:
-            // zero fills, but the order WAS accepted (id present).
-            _ => Ok(SubmitOutcome {
-                fills: Vec::new(),
-                filled: Qty(0),
-                venue_order_id: Some(venue_order_id),
-            }),
+            // A definitive "unmatched" (FAK killed with no crossing) — or any
+            // unknown terminal status — is a true zero-fill; the order was accepted
+            // (id present) but nothing crossed.
+            _ => {
+                info!(
+                    order = %order.id,
+                    status = venue_status,
+                    "live: taker order accepted but not filled (no crossing)"
+                );
+                Ok(SubmitOutcome {
+                    fills: Vec::new(),
+                    filled: Qty(0),
+                    venue_order_id: Some(venue_order_id),
+                })
+            }
         }
     }
 
