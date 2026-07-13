@@ -30,6 +30,11 @@ pub struct Config {
     /// (and the per-strategy entry is `[strategies.copy]`).
     #[serde(rename = "copy")]
     pub copy_params: CopyParamsCfg,
+    /// BTC 5-minute strategy tuning (`[btc5m]`). Renamed so the TOML section
+    /// is the terse `[btc5m]` while the Rust field stays `btc5m_params` (and
+    /// the per-strategy entry is `[strategies.btc5m]`).
+    #[serde(rename = "btc5m")]
+    pub btc5m_params: Btc5mParamsCfg,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -484,6 +489,7 @@ impl Default for Inventory {
 pub struct Strategies {
     pub mm: Mm,
     pub copy: CopyCfg,
+    pub btc5m: Btc5mCfg,
 }
 
 /// Smart-money COPY strategy config (`[strategies.copy]`, Task C2). The copy
@@ -515,6 +521,37 @@ pub struct CopyCfg {
 impl Default for CopyCfg {
     fn default() -> Self {
         CopyCfg {
+            enabled: false,
+            live: false,
+            capital_usd: 25.0,
+        }
+    }
+}
+
+/// BTC 5-minute (up/down) strategy config (`[strategies.btc5m]`). Trades
+/// short-dated BTC up/down markets off a composite spot feed and a
+/// volatility-normalized fair-value model; the model / feed tuning knobs live
+/// in the top-level `[btc5m]` section ([`Btc5mParamsCfg`]). DEFAULT-OFF and
+/// paper-only until an operator flips both `enabled` and `live`, matching the
+/// cross-cutting safety model (mirrors [`CopyCfg`] / [`Mm`]).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Btc5mCfg {
+    /// Master switch. `false` (default) → the btc5m strategy never trades;
+    /// the platform behaves exactly as before.
+    pub enabled: bool,
+    /// Live arm. `false` (default) → paper only.
+    pub live: bool,
+    /// Strategy capital envelope, USD. When `enabled`, this is carved OUT of
+    /// the platform bankroll (mirrors `strategies.copy.capital_usd`): must be
+    /// finite and ≥ 0 always, and ≤ `capital.bankroll_usd` when enabled.
+    /// Inert while disabled.
+    pub capital_usd: f64,
+}
+
+impl Default for Btc5mCfg {
+    fn default() -> Self {
+        Btc5mCfg {
             enabled: false,
             live: false,
             capital_usd: 25.0,
@@ -856,6 +893,48 @@ impl Default for CopyParamsCfg {
             signal_poll_secs: 90,
             // Track the trader's exit by default.
             follow_exit: true,
+        }
+    }
+}
+
+/// BTC 5-minute strategy tuning (`[btc5m]`). Feeds the composite spot feed and
+/// volatility-normalized fair-value model that back the `[strategies.btc5m]`
+/// executor. Defaults are deliberately conservative so the strategy is safe
+/// to flip on in paper.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Btc5mParamsCfg {
+    /// Half-life, in minutes, of the EWMA volatility estimate used to
+    /// normalize the fair-value model's z-score.
+    pub vol_half_life_min: f64,
+    /// Minimum volatility samples required before the model is considered
+    /// warmed up (and the strategy will act on its signal).
+    pub vol_warmup_samples: u32,
+    /// Minimum |z-score| required to treat the fair-value deviation as a
+    /// tradeable signal.
+    pub z_threshold: f64,
+    /// How often the fair-value model samples the composite spot feed, ms.
+    pub sample_interval_ms: u64,
+    /// Composite spot feed sources (e.g. `"coinbase"`, `"kraken"`); must list
+    /// at least one.
+    pub spot_sources: Vec<String>,
+    /// How often each spot source is polled, ms.
+    pub spot_poll_ms: u64,
+    /// Window, seconds, over which spot samples are kept at full (dense)
+    /// resolution before being thinned.
+    pub dense_window_secs: i64,
+}
+
+impl Default for Btc5mParamsCfg {
+    fn default() -> Self {
+        Btc5mParamsCfg {
+            vol_half_life_min: 120.0,
+            vol_warmup_samples: 180,
+            z_threshold: 1.5,
+            sample_interval_ms: 1000,
+            spot_sources: vec!["coinbase".into(), "kraken".into()],
+            spot_poll_ms: 1000,
+            dense_window_secs: 60,
         }
     }
 }
@@ -1316,6 +1395,38 @@ impl Config {
         // `min_bets` (usize) needs no bound: `0` simply ranks even zero-sample
         // wallets (degenerate but valid); any usize is accepted. Documented,
         // not checked — mirrors `strategies.mm.max_markets`.
+        if self.strategies.btc5m.capital_usd < 0.0 || !self.strategies.btc5m.capital_usd.is_finite()
+        {
+            return Err(ConfigError::BadMoney(
+                "strategies.btc5m.capital_usd must be finite and ≥ 0",
+            ));
+        }
+        if self.strategies.btc5m.enabled
+            && self.strategies.btc5m.capital_usd > self.capital.bankroll_usd
+        {
+            return Err(ConfigError::BadMoney(
+                "strategies.btc5m.capital_usd must be ≤ capital.bankroll_usd when enabled",
+            ));
+        }
+        let bp = &self.btc5m_params;
+        if !(bp.vol_half_life_min.is_finite() && bp.vol_half_life_min > 0.0) {
+            return Err(ConfigError::BadMoney("btc5m.vol_half_life_min must be > 0"));
+        }
+        if !(bp.z_threshold.is_finite() && bp.z_threshold >= 0.0) {
+            return Err(ConfigError::BadMoney(
+                "btc5m.z_threshold must be finite and ≥ 0",
+            ));
+        }
+        if bp.sample_interval_ms == 0 || bp.spot_poll_ms == 0 {
+            return Err(ConfigError::BadMoney(
+                "btc5m.sample_interval_ms and spot_poll_ms must be > 0",
+            ));
+        }
+        if bp.spot_sources.is_empty() {
+            return Err(ConfigError::BadMoney(
+                "btc5m.spot_sources must list at least one source",
+            ));
+        }
         Ok(())
     }
 }
@@ -1351,6 +1462,25 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::float_cmp)]
     use super::*;
+
+    #[test]
+    fn btc5m_defaults_and_validation() {
+        let c = Config::default();
+        assert!(!c.strategies.btc5m.enabled);
+        assert_eq!(c.btc5m_params.vol_half_life_min, 120.0);
+
+        let c = Config::from_toml_str(
+            "[strategies.btc5m]\nenabled = true\ncapital_usd = 50.0\n\n[btc5m]\nz_threshold = 1.5\n"
+        ).unwrap();
+        assert!(c.strategies.btc5m.enabled);
+        assert_eq!(c.strategies.btc5m.capital_usd, 50.0);
+        assert_eq!(c.btc5m_params.z_threshold, 1.5);
+
+        let bad = Config::from_toml_str(
+            "[capital]\nbankroll_usd = 10.0\n[strategies.btc5m]\nenabled = true\ncapital_usd = 999.0\n"
+        );
+        assert!(bad.is_err());
+    }
 
     #[test]
     fn defaults_are_the_locked_values() {
