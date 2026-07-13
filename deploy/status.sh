@@ -152,5 +152,23 @@ print(f"  shadow samples: {n}    realized P&L today (btc5m): ${realized:+.2f}")
 if last:
     cid, secs, spot, strike, p_up, bid, ask = last
     print(f"  latest: {cid[:10]}…  T-{secs}s  spot ${spot:,.2f} vs strike ${strike:,.2f}  fair(up)={p_up:.3f}  book {bid/1e6:.3f}/{ask/1e6:.3f}")
+try:
+    pos = con.execute(
+        "SELECT condition_id, outcome_index, qty_micro, cost_micro FROM btc5m_positions "
+        "ORDER BY condition_id, outcome_index"
+    ).fetchall()
+except sqlite3.OperationalError:
+    pos = []
+if pos:
+    print("  open positions:")
+    total_cost = 0.0
+    for cid, oi, qty_micro, cost_micro in pos:
+        side = "Up" if oi == 0 else "Down"
+        shares, cost = qty_micro / 1e6, cost_micro / 1e6
+        total_cost += cost
+        print(f"    {cid[:10]}…  {side:<4}  {shares:>8.2f} shares  ${cost:.2f}")
+    print(f"  open positions: {len(pos)}   total cost: ${total_cost:.2f}")
+else:
+    print("  open positions: 0")
 print()
 PY
