@@ -177,3 +177,18 @@ Phase 1 logs feed a daily report: for each τ-bucket, (fair − best-offer) net 
 ---
 
 *Backtest scripts:* `…/scratchpad/{download,parse,lib,s2_dynamics,s3_model,s4_backtest,s5_robust}.py` (42d 1-s BTC, reproducible).
+
+---
+
+## 11. Phase-1 status & hardening follow-ups (from final code review, 2026-07-13)
+
+**Built + merged (disabled):** Phase-0/1 read-only shadow harness — config gate `[strategies.btc5m]` (default off), composite spot feed (Coinbase+Kraken median → causal EWMA vol), fair-value model, Gamma 5-min discovery/rotation, CLOB `/book` poll, `btc5m_shadow` store, `pnl` BTC section, and `deploy/btc5m_report.py` gate metric. Full workspace green (873 tests), release build clean, grep-verified no order path. Runs in parallel with the copy bot; `enabled=false` ⇒ zero behavior change.
+
+**Close BEFORE trusting the gate number / before Phase 2 (need a live Gamma probe first):**
+1. **Log the real venue strike + basis.** Today `Window.strike` = our composite spot at window-open (a proxy). Near expiry σ_τ is small, so a few-$ strike error swings `p_up` ~10% and the report compares a proxy-strike `fair` against a real-strike `book` — contaminating the go/no-go. If Gamma exposes the numeric "Price to Beat", parse it into the window + log both it and the composite↔strike basis (spec §7).
+2. **Log the resolved outcome per window** (re-query Gamma after close) → enables realized-vs-modeled calibration (spec §8), the sanity check before believing the edge.
+3. **Document/persist the ~3h vol warmup.** `vol_warmup_samples=180` ⇒ ~180 wall-clock minutes before the first non-skipped sample, and it re-warms on every restart (in-memory counter). A fresh deploy shows "shadow samples: 0" for ~3h (not broken). Consider persisting/seeding vol so restarts don't lose coverage.
+
+**Deploy-time checks before flipping `enabled=true`:** window slug format `btc-updown-5m-<open-unix-secs>` (best-guess); `clobTokenIds[0]` == YES/UP outcome; `/book` field shape for these markets; spot-source reachability from the box (**Coinbase geo-restrictions** — if the feed never succeeds, `vol_ready` never flips and no rows log); reward-pool rate (Phase-0 precondition, informs Phase 3).
+
+**Minor (housekeeping):** set canary `[strategies.btc5m].capital_usd = 0` during pure shadow (currently 25, carved from arb though unused); the `z_threshold`/`dense_window_secs`/`live` knobs are future-phase (only the offline report reads `z_threshold`); the report's `n_leader` counts book-less rows while edge stats exclude them (overstates harvestable count).
