@@ -29,7 +29,7 @@ fn rfc3339_to_ms(s: &str) -> Option<i64> {
     let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
-    Some(((days * 86_400 + h * 3600 + mi * 60 + se) * 1000) as i64)
+    Some((days * 86_400 + h * 3600 + mi * 60 + se) * 1000)
 }
 
 /// Pick the current (open, not closed) window from a Gamma `/events` body.

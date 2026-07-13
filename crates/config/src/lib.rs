@@ -1483,6 +1483,28 @@ mod tests {
     }
 
     #[test]
+    fn btc5m_validation_rejects_bad_bounds() {
+        // `[btc5m]` params are validated unconditionally (even with the
+        // strategy disabled), so none of these need `[strategies.btc5m]`.
+
+        // vol_half_life_min must be > 0 (zero and negative both rejected).
+        assert!(Config::from_toml_str("[btc5m]\nvol_half_life_min = 0.0\n").is_err());
+        assert!(Config::from_toml_str("[btc5m]\nvol_half_life_min = -5.0\n").is_err());
+
+        // z_threshold must be finite and >= 0.
+        assert!(Config::from_toml_str("[btc5m]\nz_threshold = -1.0\n").is_err());
+
+        // sample_interval_ms must be > 0.
+        assert!(Config::from_toml_str("[btc5m]\nsample_interval_ms = 0\n").is_err());
+
+        // spot_poll_ms must be > 0.
+        assert!(Config::from_toml_str("[btc5m]\nspot_poll_ms = 0\n").is_err());
+
+        // spot_sources must list at least one source.
+        assert!(Config::from_toml_str("[btc5m]\nspot_sources = []\n").is_err());
+    }
+
+    #[test]
     fn defaults_are_the_locked_values() {
         let c = Config::default();
         assert_eq!(c.capital.bankroll_usd, 10_000.0);

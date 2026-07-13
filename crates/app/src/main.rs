@@ -2574,12 +2574,18 @@ async fn main() {
                     // coordinator AND the MM's quote loop (pausing it cancels its
                     // resting quotes). The header `paused` badge ("any strategy
                     // paused") still lights. `pause` on an absent strategy is a
-                    // harmless no-op.
+                    // harmless no-op (host.rs: `HashMap::get` miss → `false`, no
+                    // panic), so this is safe whether or not btc5m is registered.
                     let _ = running.pause(StrategyId("arb"), p).await;
                     let _ = running.pause(StrategyId("mm"), p).await;
                     // The copy executor is also a real-money trading strategy:
                     // pausing it stops its entry/exit poll cycle (no orders).
                     let _ = running.pause(StrategyId("copy"), p).await;
+                    // btc5m is DEFAULT OFF (`[strategies.btc5m] enabled`) and is
+                    // only registered with the host when on; when off this is
+                    // the harmless no-op above, so the operator pause control
+                    // reaches btc5m whenever it IS running.
+                    let _ = running.pause(StrategyId("btc5m"), p).await;
                 }
                 pm_tui::state::TuiCommand::Kill => kill.store(true, Ordering::Release),
                 pm_tui::state::TuiCommand::GoLive => {

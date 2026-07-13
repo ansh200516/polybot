@@ -27,26 +27,24 @@ struct BookResp {
     asks: Vec<Level>,
 }
 
-/// Venue price decimal string → µUSDC/share (`price × 1_000_000`, rounded).
-/// `None` for a non-finite / unparseable price so that level is SKIPPED (mirrors
-/// `live.rs`'s `filter_map`), never failing the whole book.
-fn price_to_micro(s: &str) -> Option<i64> {
-    let p = s.trim().parse::<f64>().ok()?;
-    if !p.is_finite() {
-        return None;
-    }
-    Some((p * 1_000_000.0).round() as i64)
-}
-
 /// Pure parse of a `/book` body → `(best_bid_micro, best_ask_micro)` in µUSDC.
 /// Best bid = the MAX bid price, best ask = the MIN ask price, over ALL levels
 /// so the result is independent of the venue's sort order. A side that is
 /// empty/absent yields `None`. Malformed top-level JSON → [`IngestError::Parse`].
+/// Per-level prices are parsed with the crate's exact decimal parser
+/// (`crate::decimal::parse_micro`, which never touches f64); an unparseable
+/// price (or one that overflows `i64`) SKIPS just that level, never failing
+/// the whole book (mirrors `live.rs`'s `filter_map`).
 pub fn parse_book_best(body: &str) -> Result<(Option<i64>, Option<i64>), IngestError> {
     let book: BookResp =
         serde_json::from_str(body).map_err(|e| IngestError::Parse(format!("clob /book: {e}")))?;
-    let best_bid = book.bids.iter().filter_map(|l| price_to_micro(&l.price)).max();
-    let best_ask = book.asks.iter().filter_map(|l| price_to_micro(&l.price)).min();
+    let micro = |l: &Level| {
+        crate::decimal::parse_micro(&l.price)
+            .ok()
+            .and_then(|v| i64::try_from(v).ok())
+    };
+    let best_bid = book.bids.iter().filter_map(micro).max();
+    let best_ask = book.asks.iter().filter_map(micro).min();
     Ok((best_bid, best_ask))
 }
 
