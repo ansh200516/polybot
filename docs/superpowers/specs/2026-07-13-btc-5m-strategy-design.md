@@ -11,7 +11,7 @@
 
 Design a trading strategy for Polymarket's **"BTC Up or Down 5m"** market: a recurring binary that locks a strike (the "Price to Beat") at each 5-minute window's open and resolves **UP if the close ≥ the strike**, else DOWN. $1 payout per correct share. Parallel markets exist for ETH/SOL/XRP/DOGE.
 
-We already operate a live Polymarket executor (Rust, CLOB v2, sigType-3 signing) with risk, persistence, fills, and EC2/systemd deployment. This project adds a **new strategy** on that platform — it does **not** rebuild the plumbing.
+We already operate a live Polymarket executor (Rust, CLOB v2, sigType-3 signing) with risk, persistence, fills, and EC2/systemd deployment. This project adds a **new strategy** on that platform — it does **not** rebuild the plumbing. It is a **feature addition that runs in parallel** with the existing copy bot (same `StrategyHost` process, same wallet, **config-gated**); the copy bot is **not modified or replaced**, and the new bot is observable through the **same `pnl` command**. See §6.1.
 
 **The deliverable of this strategy is disciplined, evidence-gated capital deployment — not a forecasting bot.** The research below is unambiguous that naive prediction loses here; the edge (if any) is microstructural and must be *measured live before it is traded*.
 
@@ -77,7 +77,7 @@ The sequencing is the strategy. Each phase must pass its gate before the next be
 
 ### Phase 0 — Preconditions (blocking)
 - **Eligibility:** confirmed (intl CLOB, existing entity). ✅
-- **Latency baseline:** one-shot read-only probe from the current India box: measured RTT + TLS-connect to `clob.polymarket.com` and to a London endpoint. (Command in §10.) Informs the relocation ROI.
+- **Latency baseline (measured 2026-07-13):** from the Pune / Azure Central India box, the Cloudflare edge is ~5 ms away, but **origin (London) round-trips show up as ~150–350 ms TTFB** on dynamic CLOB/Gamma endpoints — well above the ~200 ms cancel-replace bar for making. ⇒ Phases 1–2 are fine from India; **Phase 3 making requires the London VM** (§6.1).
 - **Reward-eligibility check:** pull the live 5-min market's `rewards.rates` / Rewards tab to confirm Liquidity Rewards actually fund these ultra-short windows and record the per-market daily pool (flagged unconfirmed in research).
 - **Market rotation:** implement discovery of the current window's `conditionId` + token IDs via Gamma (`slug = btc-updown-5m-<unix>`), plus the roll to the next window every 5 min, and per-window tick-size read.
 
@@ -127,6 +127,20 @@ Only if Gate 2 passes and colocated. Two-sided model-priced quoting:
 
 ---
 
+## 6.1 Parallel operation, deployment & `pnl` (feature-addition wiring)
+
+**This bot runs in parallel with the copy bot — it does not replace it.** It is added as a second `Strategy` under the existing `StrategyHost` in the **same `arb` process**, gated by `[strategies.btc5m].enabled` (default **false**). Deploying the new binary therefore does **not** change copy-bot behavior until btc5m is explicitly enabled — and even then it starts read-only (Phase 1 shadow).
+
+**Why same-process, not a second service:** both strategies trade the **same Polymarket wallet**. A second independent process on that wallet would race on collateral and, worse, each process's on-chain reconcile would treat the other's positions as foreign/stale and try to prune them. One process = one reconcile view, one collateral manager, coordinated caps, one kill switch — exactly what `StrategyHost` is for (copy + mm already coexist this way).
+
+**Integration guardrail (reconcile scoping):** position management must be per-strategy. Copy owns `copy_positions` (its trader/markets); btc5m gets a new **`btc5m_positions`** table (BTC 5-min `conditionId`s). Verify copy's prune-stale / settle-resolved paths never touch btc5m rows and vice-versa. Capital is a separate carve (`[strategies.btc5m]` capital + its own `RiskConfig`/`InventoryConfig`); copy's caps are untouched.
+
+**`pnl` parity:** `pnl` runs `deploy/status.sh` (locally via `ssh -i $COPYBOT_KEY $COPYBOT_HOST`, on-box directly). Realized PnL is already strategy-tagged (`day_realized.strategy`). Extend `status.sh` with a **"BTC 5M BOT"** section — current-window exposure, fills, `realized P&L today (btc5m)` from `day_realized WHERE strategy='btc5m'`, live marks from the Data-API — keeping the shared ACCOUNT block. The `pnl` alias is **unchanged**; one command shows both bots (optionally `pnl copy|btc` to filter).
+
+**London (Phase 3) implication:** the maker leg needs a London VM. Default: relocate the shared process to London (the copy bot comes along — it's signal-driven, not latency-sensitive, so London is fine), keeping one wallet + one `pnl`. Fallback if copy must stay in India: run the Phase-3 maker as a **separate London service with its own wallet** (full isolation), and extend `pnl` to aggregate both hosts. Decide at Phase-3 entry.
+
+---
+
 ## 7. Risk & correctness controls
 
 - **Settlement fidelity:** key all decisions off the Chainlink aggregate proxy, never the Polymarket UI/display feed. Log basis; alert if composite ↔ strike basis drifts.
@@ -158,7 +172,7 @@ Phase 1 logs feed a daily report: for each τ-bucket, (fair − best-offer) net 
 
 1. **Latency probe (read-only, on user's go):**
    `ssh arnab@135.235.139.216 'for h in clob.polymarket.com; do curl -o /dev/null -s -w "connect=%{time_connect}s ttfb=%{time_starttransfer}s\n" https://$h/; done'`
-2. Confirm this spec, then → **writing-plans** for the Phase-0/1 implementation plan (discovery/rotation + spot feed + model + shadow logger).
+2. Spec **approved 2026-07-13** → **writing-plans** for the Phase-0/1 implementation plan: market discovery/rotation + spot feed + fair-value model + shadow logger + `[strategies.btc5m]` config gate (default off) + `btc5m_positions` table + `status.sh` `pnl` extension. Phase-0/1 deploy ships the new binary with **btc5m in shadow — copy-bot behavior unchanged**.
 
 ---
 
