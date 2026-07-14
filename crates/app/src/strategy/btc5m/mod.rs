@@ -52,6 +52,17 @@ use crate::strategy::copy::CopyVenue;
 /// in [`entry`]). A VENUE CONSTANT, not a config knob.
 const CRYPTO_FEE_RATE: f64 = 0.07;
 
+/// Polymarket crypto (crypto_fees_v2) taker fee in µUSDC for a fill of `qty_micro`
+/// µshares at `px_micro` µUSDC/share: rate·p·(1−p)·shares, p = px_micro/1e6.
+/// (Deliberately the p·(1−p) crypto shape — NOT pm_core::fees::fee_microusdc's
+/// min(p,1−p) schedule. LiveVenue models fee from the order's Bps(0), so it does
+/// NOT charge this; we fold it into the recorded cost so realized is net-of-fee.)
+fn crypto_taker_fee_micro(px_micro: u64, qty_micro: u64) -> i64 {
+    let p = px_micro as f64 / 1_000_000.0;
+    let shares = qty_micro as f64 / 1_000_000.0;
+    (CRYPTO_FEE_RATE * p * (1.0 - p) * shares * 1_000_000.0).round() as i64
+}
+
 /// How long AFTER a window's close to wait before trusting its Gamma outcome as
 /// FINAL (resolution finality lag). The settle sweep only settles a held
 /// position once `now_ms() >= t_close_ms + SETTLE_DELAY_MS`.
@@ -412,15 +423,21 @@ impl<V: CopyVenue> Btc5mStrategy<V> {
             .send(StoreMsg::OrderInsert(order_row(&order, now), None))
             .await;
         // Book each fill into inventory + the durable store, accumulating the
-        // realized delta (the seed Task 6's settle continues).
+        // realized delta (the seed Task 6's settle continues). Also accumulate
+        // the real crypto_fees_v2 taker fee per fill — NOT the same as `f.fee`/
+        // `f.cash` below, which stay fee-EXCLUSIVE here (the order carries
+        // `Bps(0)`, so `LiveVenue::poll_fills` computes a $0 fee off it) — so
+        // the recorded position cost below can be made fee-inclusive.
         let mut filled_micro: i128 = 0;
         let mut cash_total: i128 = 0;
+        let mut fee_micro: i64 = 0;
         for f in &outcome.fills {
             let realized_before = self.inv.realized(token).0;
             self.inv.on_fill(token, f.qty.0 as i128, f.cash);
             let realized_delta = self.inv.realized(token).0 - realized_before;
             filled_micro += f.qty.0 as i128;
             cash_total += f.cash.0;
+            fee_micro += crypto_taker_fee_micro(f.px.microusdc(ts), f.qty.0);
             let row = FillRow {
                 order_id: order.id.to_string(),
                 ts_ms: now,
@@ -447,7 +464,19 @@ impl<V: CopyVenue> Btc5mStrategy<V> {
         if filled_micro <= 0 {
             return;
         }
-        let cost_micro = (-cash_total).clamp(0, i128::from(i64::MAX));
+        // FEE-INCLUSIVE cost: `cash_total` is the venue's raw signed cash,
+        // which excludes the real crypto_fees_v2 taker fee (the order's
+        // `Bps(0)` means `LiveVenue::poll_fills` charges a $0 fee off it — see
+        // `fee_micro`, accumulated above from the actual fill px/qty). Folding
+        // the real fee into the recorded position cost here — rather than
+        // leaving it fee-EXCLUSIVE — makes `settle::realized_micro` (proceeds
+        // − cost) and everything keyed off this `cost_micro` (the
+        // `day_notional_micro` accrual below, and hence `day_realized`'s
+        // Gate-2 read) NET of the fee instead of one fee/trade optimistic.
+        // `inv`/`FillRow` above are UNCHANGED (still the venue's raw signed
+        // cash) — only the position's recorded cost is adjusted.
+        let cost_micro = ((-cash_total).clamp(0, i128::from(i64::MAX)) + i128::from(fee_micro))
+            .clamp(0, i128::from(i64::MAX));
         // Upsert the open position (the Task 6 settle sweep reads this row).
         // Awaited (not try_send): btc5m keeps no in-memory position backstop, so
         // a dropped upsert under backpressure would leave an on-chain fill with
@@ -989,6 +1018,26 @@ mod tests {
         }
     }
 
+    /// The crypto_fees_v2 taker-fee helper: `rate·p·(1−p)·shares` in µUSDC,
+    /// rounded to the nearest µUSDC.
+    #[test]
+    fn crypto_taker_fee_micro_matches_the_rate_p_one_minus_p_shares_formula() {
+        // 11 sh @ $0.90: 0.07·0.9·0.1·11 = 0.0693 ⇒ 69_300 µUSDC (≈$0.0693).
+        assert_eq!(crypto_taker_fee_micro(900_000, 11_000_000), 69_300);
+        // 10 sh @ $0.50: 0.07·0.5·0.5·10 = 0.175 ⇒ 175_000 µUSDC (exact).
+        assert_eq!(crypto_taker_fee_micro(500_000, 10_000_000), 175_000);
+    }
+
+    /// `settle::realized_micro` on the fee-inclusive cost (9_969_300 — see
+    /// `live_places_one_fak_and_records_the_position` below) comes out NET of
+    /// the folded-in crypto taker fee: a win nets $1.0307 (the gross was
+    /// $1.10), a loss is −$9.9693 (the gross was −$9.90).
+    #[test]
+    fn realized_micro_nets_out_the_folded_in_crypto_fee() {
+        assert_eq!(settle::realized_micro(true, true, 11_000_000, 9_969_300), 1_030_700);
+        assert_eq!(settle::realized_micro(false, true, 11_000_000, 9_969_300), -9_969_300);
+    }
+
     /// REGRESSION: the shadow loop still writes a row, AND with `live == false`
     /// (even with a venue present and a leader ask that WOULD trigger an entry)
     /// the order path is unreachable — NO `submit_fak` is called.
@@ -1123,7 +1172,13 @@ mod tests {
         assert_eq!(p.outcome_index, 0, "z>0 ⇒ bought UP (outcome 0)");
         assert_eq!(p.token, "999", "the UP/YES CLOB token id string");
         assert_eq!(p.qty_micro, 11_000_000);
-        assert_eq!(p.cost_micro, 9_900_000, "11 sh × $0.90 = $9.90 cost");
+        // $9.90 raw fill cost + the folded-in crypto_fees_v2 taker fee
+        // (0.07·0.9·0.1·11 = $0.0693) = $9.9693, fee-inclusive.
+        assert_eq!(
+            p.cost_micro,
+            9_969_300,
+            "11 sh × $0.90 = $9.90 cost + $0.0693 crypto taker fee, fee-inclusive"
+        );
     }
 
     /// SETTLE SWEEP: two resolved positions past their close — one WIN, one LOSS —
