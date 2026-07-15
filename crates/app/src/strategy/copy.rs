@@ -287,6 +287,25 @@ pub(crate) fn select_signals(
             }
         }
     }
+    // SKIP-ON-CONFLICT: if creamy-layer specialists signal BOTH outcomes of the
+    // SAME market this cycle, the smart money disagrees — there's no consensus
+    // edge, and copying both sides is a STRUCTURAL loss (long YES + long NO pays
+    // back exactly $1 for ~$1.02+ of spread/fees). Drop EVERY candidate for such
+    // a market rather than arbitrarily picking a side. (Holding one side already
+    // and later seeing the other is handled at entry — we never add the opposite
+    // of a market we already hold.)
+    let mut n_by_condition: HashMap<&str, u32> = HashMap::new();
+    for (cond, _) in best.keys() {
+        *n_by_condition.entry(cond.as_str()).or_insert(0) += 1;
+    }
+    let conflicted: HashSet<String> = n_by_condition
+        .into_iter()
+        .filter(|&(_, n)| n > 1)
+        .map(|(c, _)| c.to_string())
+        .collect();
+    if !conflicted.is_empty() {
+        best.retain(|(cond, _), _| !conflicted.contains(cond));
+    }
     let mut out: Vec<CopyCandidate> = best.into_values().collect();
     out.sort_by(|a, b| {
         a.timestamp
@@ -1669,9 +1688,14 @@ impl<V: CopyVenue> CopyLoop<V> {
         let mut already_holding = 0u32;
         for c in candidates {
             let key = (c.condition_id.clone(), c.outcome_index);
-            // Already holding this market+side (open keys are `seen` so
-            // select_signals excludes them — guard defensively anyway).
-            if self.open.contains_key(&key) {
+            // ONE POSITION PER MARKET: skip if we already hold ANY outcome of this
+            // condition. Same side = a re-entry (open keys are `seen`, so this is
+            // the defensive twin); OPPOSITE side = a both-sides STRADDLE (long YES
+            // + long NO), a guaranteed loss. Because `enter` inserts into `open`
+            // before the next candidate is processed, this also blocks straddling
+            // WITHIN a cycle. Not consumed via `seen`: if the market later frees
+            // (the held side exits), a fresh signal can still be copied.
+            if self.open.keys().any(|(cond, _)| cond == &c.condition_id) {
                 already_holding += 1;
                 continue;
             }
@@ -3067,6 +3091,23 @@ mod tests {
         let out = select_signals(&recent, &creamy, &HashSet::new(), NOW, WINDOW);
         assert_eq!(out.len(), 1, "only the baseball (specialist) buy is a candidate");
         assert_eq!(out[0].condition_id, "mBASE");
+    }
+
+    #[test]
+    fn select_signals_skips_both_sides_on_conflict() {
+        // Two specialists DISAGREE on the SAME market (0xA buys outcome 0, 0xB
+        // buys outcome 1). No consensus edge, and copying both is a structural
+        // loss (long YES + long NO) ⇒ BOTH candidates are dropped.
+        let recent = tmap(vec![
+            trade("0xA", "m1", 0, TradeSide::Buy, 0.55, 9_400),
+            trade("0xB", "m1", 1, TradeSide::Buy, 0.50, 9_300),
+        ]);
+        let out = select_signals(&recent, &creamy_of(&["0xA", "0xB"]), &HashSet::new(), NOW, WINDOW);
+        assert!(out.is_empty(), "both sides of a conflicted market are skipped");
+        // A SINGLE-sided signal on that market is still a candidate (no conflict).
+        let solo = tmap(vec![trade("0xA", "m1", 0, TradeSide::Buy, 0.55, 9_400)]);
+        let out2 = select_signals(&solo, &creamy_of(&["0xA", "0xB"]), &HashSet::new(), NOW, WINDOW);
+        assert_eq!(out2.len(), 1, "a single-sided signal is still a candidate");
     }
 
     #[test]
